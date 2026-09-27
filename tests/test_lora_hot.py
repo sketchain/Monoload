@@ -29,6 +29,7 @@ import comfy.model_management
 import comfy.utils
 import folder_paths
 from comfy_extras.nodes_hooks import SetClipHooks
+from comfy_extras.nodes_model_merging import ModelMergeSimple
 
 DUCK = "rubber_duck.safetensors"
 LOCON = "lycoris_annalise.safetensors"
@@ -73,6 +74,13 @@ def hooked_inputs(clip, lora_sd):
     return hclip, encode(hclip, POS), encode(hclip, NEG)
 
 
+def merged_model(model, clip):
+    """ModelMergeSimple of the model with a LoRA'd clone of itself: patches whose
+    values are weight-sized tensors (nested list branch of calculate_weight)."""
+    m2, _ = apply_loras(model, clip, COMBOS["duck"])
+    return ModelMergeSimple().merge(model, m2, 0.5)[0]
+
+
 def backups(*patchers):
     return sum(len(p.backup) + len(p.hook_backup) + len(p.cached_hook_patches) for p in patchers)
 
@@ -101,6 +109,8 @@ def test_pipeline(kind, a, summary):
         native_backups[combo] = (len(m.backup), len(c.patcher.backup))
     hclip, hpos, hneg = hooked_inputs(clip, hook_sd)
     ref["hook"] = (hpos, hneg, sample(model, hpos, hneg, latent, steps=max(a.steps, 3)))
+    pos0, neg0 = ref["none"][0], ref["none"][1]
+    ref["merge"] = sample(merged_model(model, clip), pos0, neg0, latent, steps=a.steps)
     del model, clip, m, c, hclip
     free_all()
 
@@ -135,6 +145,16 @@ def test_pipeline(kind, a, summary):
     check("{} hook LoRA: hook differs from plain".format(kind), not torch.equal(rout, ref["none"][2]))
     check("{} hook LoRA: no hook_backup / cached_hook_patches".format(kind), backups(model, hclip.patcher, clip.patcher) == 0)
     summary.setdefault(kind, {})["hook"] = {"vs_native": d}
+
+    # model merge (weight-sized patch tensors)
+    free_all()
+    mm = merged_model(model, clip)
+    out = sample(mm, ref["none"][0], ref["none"][1], latent, steps=a.steps)
+    d = diff_stats(ref["merge"], out)
+    check("{} ModelMergeSimple (model + LoRA'd clone, 0.5): {} keys, latent identical".format(kind, len(mm.patches)), d["bit_exact"], str(d))
+    check("{} ModelMergeSimple: no backups".format(kind), backups(mm) == 0)
+    summary.setdefault(kind, {})["merge"] = {"vs_native": d}
+    del mm
 
     # LoRA removed
     free_all()

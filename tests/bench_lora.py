@@ -162,7 +162,8 @@ def layer_probe(model, clip, loras, reps=3):
         f = next((x for x in mod.__dict__.get(attr + "_function", []) if _is_runtime_patch(x)), None)
         if f is None:
             continue
-        items.append((key, getattr(mod, attr), f, _to_device(list(m.patches[key]), dev, cache)))
+        param = getattr(mod, attr)
+        items.append((key, param, f, _to_device(list(m.patches[key]), dev, cache, param.numel(), {"transient": False})))
 
     def run(kind):
         _sync()

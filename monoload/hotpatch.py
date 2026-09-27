@@ -66,12 +66,19 @@ def _state(patcher):
     return st
 
 
-def _to_device(value, device, cache):
+def _to_device(value, device, cache, limit, flags):
     """Same structure as comfy.lora.prefetch_prepared_value: tensors (also inside
-    weight adapters / tuples / lists) moved to `device` once and cached."""
+    weight adapters / tuples / lists) moved to `device`. Tensors smaller than
+    the patched weight (`limit` elements: LoRA factors, alphas, ...) are moved
+    once and cached; weight-sized ones (model merge, full diffs) are moved per
+    call like native does, so no second copy of a model ever stays resident.
+    flags["transient"] is set when anything was moved without caching."""
     if isinstance(value, torch.Tensor):
         if value.device == device:
             return value
+        if value.numel() >= limit:
+            flags["transient"] = True
+            return value.to(device)
         k = (id(value), device)
         hit = cache.get(k)
         if hit is None:
@@ -79,11 +86,11 @@ def _to_device(value, device, cache):
             cache[k] = hit
         return hit[1]
     if isinstance(value, comfy.weight_adapter.WeightAdapterBase):
-        return type(value)(value.loaded_keys, _to_device(value.weights, device, cache))
+        return type(value)(value.loaded_keys, _to_device(value.weights, device, cache, limit, flags))
     if isinstance(value, tuple):
-        return tuple(_to_device(v, device, cache) for v in value)
+        return tuple(_to_device(v, device, cache, limit, flags) for v in value)
     if isinstance(value, list):
-        return [_to_device(v, device, cache) for v in value]
+        return [_to_device(v, device, cache, limit, flags) for v in value]
     return value
 
 
@@ -123,12 +130,16 @@ class MonoloadRuntimePatch(LowVramPatch):
     def prepare(self, destination, stream, copy=True, commit=True):
         return None
 
-    def _base_on(self, base, device):
+    def _base_on(self, base, device, limit):
         sig = (device,) + tuple(id(p) for p in base)
-        if sig != self._base_sig:
-            self._base_moved = _to_device(list(base), device, self.state.device_cache)
+        if sig == self._base_sig:
+            return self._base_moved
+        flags = {"transient": False}
+        moved = _to_device(list(base), device, self.state.device_cache, limit, flags)
+        if not flags["transient"]:
+            self._base_moved = moved
             self._base_sig = sig
-        return self._base_moved
+        return moved
 
     def __call__(self, weight):
         key = self.key
@@ -149,7 +160,7 @@ class MonoloadRuntimePatch(LowVramPatch):
                 temp = weight if cdt == ldt else weight.to(ldt)
             else:
                 temp = comfy.model_management.cast_to_device(param, device, ldt, copy=True)
-            out = comfy.lora.calculate_weight(self._base_on(base, device), temp, key)
+            out = comfy.lora.calculate_weight(self._base_on(base, device, param.numel()), temp, key)
             w = comfy.float.stochastic_rounding(out, pdt, seed=self.seed)
             del temp, out
 
@@ -161,7 +172,8 @@ class MonoloadRuntimePatch(LowVramPatch):
             else:
                 temp = comfy.model_management.cast_to_device(param, device, torch.float32, copy=True)
             original = {key: [(param, _identity)] + list(base or [])}
-            out = comfy.lora.calculate_weight(_to_device(hooks, device, self.state.device_cache), temp, key, original_weights=original)
+            moved_hooks = _to_device(hooks, device, self.state.device_cache, param.numel(), {"transient": False})
+            out = comfy.lora.calculate_weight(moved_hooks, temp, key, original_weights=original)
             w = comfy.float.stochastic_rounding(out, pdt, seed=self.seed)
             del temp, out
 
