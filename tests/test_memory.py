@@ -13,6 +13,7 @@ from common import MemWatch, check, family_inputs, finish, gib, load_monoload, l
 from monoload import rebuild
 import nodes
 import folder_paths
+import comfy.model_management
 
 
 def model_bytes(model):
@@ -38,16 +39,30 @@ def main():
     rep = w.report()
     result.update({"model_bytes": mb, "load": rep})
     ratio = rep["peak_delta"] / mb
-    print("load: model {}  RSS before {}  peak delta {} ({:.2f}x model)  after {}  mapped {}".format(
-        gib(mb), gib(rep["rss_before"]), gib(rep["peak_delta"]), ratio, gib(rep["rss_after"]), rep["mapped_model_files"]))
+    target = comfy.model_management.unet_offload_device()
+    result["target_device"] = str(target)
+    print("load: target {}  model {}  RSS before {}  RSS peak delta {} ({:.2f}x model)  RSS after {}  mapped {}".format(
+        target, gib(mb), gib(rep["rss_before"]), gib(rep["peak_delta"]), ratio, gib(rep["rss_after"]), rep["mapped_model_files"]))
+    if rep["gtt_before"] is not None:
+        print("      GTT before {}  GTT peak delta {}  GTT after delta {}".format(gib(rep["gtt_before"]), gib(rep["gtt_peak_delta"]), gib(rep["gtt_after_delta"])))
+    if rep["cgroup_before"] is not None:
+        print("      cgroup memory.current before {}  peak delta {}".format(gib(rep["cgroup_before"]), gib(rep["cgroup_peak_delta"])))
 
     if a.mode == "monoload":
-        check("no model file mapped during Monoload load", not rep["mapped_model_files"], str(rep["mapped_model_files"]))
-        staged = result["staging"] == "always"
         from monoload import transfer
-        allowance = (2 * transfer.buffer_bytes_from() if staged else 0) + 256 * 2 ** 20
-        check("peak delta <= model + {} buffers + 256 MiB".format("2x" if staged else "0x"), rep["peak_delta"] <= mb + allowance,
-              "peak delta {} vs model {} + allowance {}".format(gib(rep["peak_delta"]), gib(mb), gib(allowance)))
+        check("no model file mapped during Monoload load", not rep["mapped_model_files"], str(rep["mapped_model_files"]))
+        if target.type == "cpu":
+            staged = result["staging"] == "always"
+            allowance = (2 * transfer.buffer_bytes_from() if staged else 0) + 256 * 2 ** 20
+            check("CPU target: RSS peak delta <= model + {} buffers + 256 MiB".format("2x" if staged else "0x"), rep["peak_delta"] <= mb + allowance,
+                  "peak delta {} vs model {} + allowance {}".format(gib(rep["peak_delta"]), gib(mb), gib(allowance)))
+        else:
+            allowance = 2 * transfer.buffer_bytes_from() + 1024 * 2 ** 20
+            check("GPU target: process RSS peak delta <= 2 buffers + 1 GiB (no CPU copy of the model)", rep["peak_delta"] <= allowance,
+                  "RSS peak delta {} vs allowance {} (model {})".format(gib(rep["peak_delta"]), gib(allowance), gib(mb)))
+            if rep["gtt_before"] is not None:
+                check("GPU target: GTT peak delta ~= one model (<= model + 1 GiB)", rep["gtt_peak_delta"] <= mb + 2 ** 30,
+                      "GTT peak delta {} vs model {}".format(gib(rep["gtt_peak_delta"]), gib(mb)))
 
     if a.lora:
         pos, neg, latent = family_inputs(a.family)

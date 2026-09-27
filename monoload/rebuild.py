@@ -285,6 +285,8 @@ def rebuild_model(path, record, load_device, target_device, aux_values):
     fp_now = model_fingerprint(model)
     fp_rec = record["fingerprint"]
     diffs = ["{}: 文件 {} / 重建 {}".format(k, fp_rec.get(k), v) for k, v in fp_now.items() if fp_rec.get(k) != v]
+    if model.model_type != recorded_type:
+        diffs.append("model_type: 文件记录 {} / 重建 {}".format(recorded_type, model.model_type))
     if diffs:
         raise MonoloadFormatError(path, "重建出的模型与转换时的模型不一致", diffs)
     return cfg, model

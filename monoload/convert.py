@@ -301,9 +301,14 @@ def convert(source, output, force=False, comfy_args=(), root=None):
     timings["write"] = time.perf_counter() - t
     total = sum(m[3] for m in entries_meta)
     timings["total"] = time.perf_counter() - t_all
+    n_entries = len(entries)
+    # Drop the loaded model now (not at interpreter shutdown).
+    del tensors, entries
+    patcher.detach(unpatch_all=False)
+    del model, patcher
     return {
         "output": output,
-        "tensors": len(entries),
+        "tensors": n_entries,
         "aux_tensors": len(cap.aux),
         "bytes": total,
         "config_class": record["config_class"],

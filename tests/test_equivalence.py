@@ -17,6 +17,7 @@ def main():
     p.add_argument("--source", required=True)
     p.add_argument("--converted", required=True)
     p.add_argument("--steps", type=int, default=4)
+    p.add_argument("--no-sample", action="store_true")
     a = p.parse_args()
 
     native = load_native(a.source)
@@ -37,6 +38,8 @@ def main():
           "{} / {}".format((native.load_device, native.offload_device, native.model.device), (mono.load_device, mono.offload_device, mono.model.device)))
     check("cached_patcher_init -> monoload loader", mono.cached_patcher_init[0] is load_monoload_diffusion_model)
 
+    if a.no_sample:
+        finish()
     pos, neg, latent = family_inputs(a.family)
     out_n = sample(native, pos, neg, latent, steps=a.steps)
     free_all()

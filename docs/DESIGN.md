@@ -60,14 +60,13 @@ JSON 里非原生类型用带标签的编码：`torch.dtype` → `{"__dtype__": 
 
 写出去的张量就是**加载完之后** `BaseModel` 的全部参数 + persistent buffer（包含 `model_sampling.*`），逐个张量写文件：CPU 张量直接写字节，GPU 张量逐个 `.cpu()` 后写，不再拼第二份 dict。先写 `*.partial`，fsync 后 rename。
 
-### 2.2 转换器的内存（目标机器上的问题）
+### 2.2 转换器怎么读源文件、内存峰值
 
-原生 `load_torch_file` 在 CPU 上拼完整 dict：Krea 2 Turbo 是 26G，而 CT 700 的 cgroup 上限是 16G，**原样照搬会在容器里 OOM**。所以转换器用自己的读取函数代替 `load_torch_file`（其余流程不变）：
+按确认的方案：**走 ComfyUI 原生的 CPU 加载路径，不为省内存做特殊处理**。
 
-* 不 mmap：按文件顺序一次顺序读完，边读边算 blake3，同时把字节分发进各个张量。
-* 源张量默认放在 **load device**（目标机器上就是 GPU → GTT，不计入 cgroup）；`--cpu` 或 `--source-device cpu` 时放在 CPU。
-* 张量的 dtype、形状、key 都和 `load_torch_file` 给出的完全一样，所以识别、dtype 选择结果不变；GPU→GPU 的 `copy_` 与 CPU→GPU 的 dtype 转换都是 IEEE 舍入到最近偶数，结果逐位一致（测试里会验证 CPU 下与原生 `UNETLoader` 逐字节一致）。
-* 代价：转换时 GTT 里会有两份（源 dict + 模型），Krea 2 约 52G。转换时要让 ComfyUI 服务空闲（或先停掉），README 里写明。这一步需求允许两份。
+* 原生 `load_torch_file` 内部用 `safetensors.safe_open`，而它本身就是 mmap（`--disable-mmap` 只是 mmap 之后再 `copy=True`）。为了守住「任何环节都不 mmap 模型文件」，转换器用一个几十行的 `read_state_dict_cpu()` 代替它：同样的 key（同样按名字排序）、同样的 dtype/形状、每个张量一块独立的 CPU 内存，只是用 `preadv` 读。之后原样交给 `comfy.sd.load_diffusion_model_state_dict`。测试里验证了转换结果与原生 `UNETLoader` 加载的模型逐字节一致。
+* 源文件哈希单独顺序读一遍（blake3，没有就 sha256），同样不 mmap。
+* 内存：`--gpu-only` 下模型参数在 GPU（GTT，不计入 cgroup），CPU 上是完整的源 dict。**转换进程的 CPU 峰值 ≈ 源文件大小 + 约 1 GiB 基础开销**；GTT 里是一份模型。具体实测数字和 Krea 2 的估算见 README。
 
 ### 2.3 加载时怎么重建
 
@@ -107,7 +106,8 @@ ComfyUI 已有的机制：`comfy.ops` 的层在 `forward` 里只要 `weight_func
 Monoload 的接入点只有一个：`MonoloadModelPatcher(ModelPatcher)` 重写 `patch_weight_to_device()`。原生 `load()` 在全量加载时对每个参数调用它来「烘焙」LoRA 并备份；Monoload 版本对有 patch 的 key：
 
 * **不备份、不改权重**，而是把 `MonoloadRuntimePatch`（`LowVramPatch` 子类）插到该层 `weight_function`/`bias_function` 的**最前面**（原生全量加载时 LoRA 先于 `weight_wrapper_patches` 生效，顺序保持一致）。
-* `MonoloadRuntimePatch.__call__` 复刻原生 `patch_weight_to_device` 的数值路径：转到 `lora_compute_dtype(device)` → `calculate_weight(patches, w, key)`（intermediate 默认 fp32）→ `stochastic_rounding` 回参数 dtype（同样的 seed）→ 转回计算 dtype。于是结果与原生「烘焙」路径**逐位一致**，而不是原生 lowvram 路径那种在计算 dtype 下算 LoRA 的近似。
+* `MonoloadRuntimePatch.__call__` 复刻原生 `patch_weight_to_device` 的数值路径：直接取**层上的原参数**（而不是 `cast_bias_weight` 传进来的、已转成计算 dtype 的副本），`cast_to_device(param, lora_compute_dtype)` → `calculate_weight(patches, w, key)`（intermediate 默认 fp32）→ `stochastic_rounding` 回参数 dtype（同样的 seed）→ 转成计算 dtype 返回。于是结果与原生「烘焙」路径**逐位一致**（测试实测 max_abs = 0），而不是原生 lowvram 路径那种在计算 dtype 下算 LoRA 的近似。
+* 部分加载（非 `--gpu-only`、显存不够）时原生 `load()`/`partially_unload()` 会给 lowvram 层挂普通 `LowVramPatch`；Monoload 在它们之后把这些换成 `MonoloadRuntimePatch`，数值同样与烘焙一致。
 * 因为 `cast_bias_weight` 每层用完临时权重即丢，同一时刻只有正在计算的那一层有临时权重。
 * 走的是通用的 `calculate_weight`，所以 LoRA/LoHa/LoKr/GLoRA/OFT/BOFT、diff、set 等 ComfyUI 支持的所有类型都一样支持。原生 `LoraLoader` / `LoraLoaderModelOnly` 不用改。
 
@@ -116,12 +116,37 @@ Monoload 的接入点只有一个：`MonoloadModelPatcher(ModelPatcher)` 重写 
 * `unpatch_model()`：原生只在 lowvram 时清 `weight_function`；Monoload 在卸载权重时清掉自己挂的运行时 patch，保证撤掉 LoRA 后模型与文件逐字节一致。
 * `load(force_patch_weights=True)` 且有 patch（模型保存/合并「烘焙」时才会这样）→ 报错：Monoload 模型不支持把 LoRA 烘焙进权重。
 * 某个被 patch 的参数不属于 `comfy.ops` 层（没有运行时路径），或 patch 会改变形状 → 报错，而不是退回备份。
-* Hook 形式的 LoRA（`patch_hook_weight_to_device`，会备份）→ 报错不支持。
+* 原生 `load()` 会清空全量加载层的 `weight_function`，但跳过已标记 `comfy_patched_weights` 的层（原生里它们已烘焙）。Monoload 在 `load()` 前清掉被 patch 层的这个标记，保证重复加载时运行时 patch 一定会重新挂上。
+* 加载结束后断言 `backup` / `hook_backup` 为空，出现即报内部错误。
+
+### 4.1 Hook LoRA（v1 已实现）
+
+原生做法：`patch_hooks(hooks)` 把当前 hook 组的 patch 写进权重（先 `hook_backup` 备份），MaxSpeed 模式还把每个 hook 组的合并结果缓存在 `cached_hook_patches`。
+
+Monoload：
+* `MonoloadModelPatcher` 有一个 `monoload_hook_state`（key → 当前生效的 hook patch 列表），所有运行时 patch 共享它。
+* `patch_hooks(hooks)` 只做状态切换：用原生 `get_combined_hook_patches(hooks)` 算出组合（含 keyframe 强度），写进 `monoload_hook_state`；只被 hook 改到、还没有运行时 patch 的层补挂一个；不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。**
+* `unpatch_hooks()` 清空状态。`patch_hook_weight_to_device` / `patch_cached_hook_weights` 若被调用即报内部错误。
+* 数值：先按 §4 算基础 LoRA 并舍入到参数 dtype，再 `cast_to_device(w, float32)` → `calculate_weight(hook_patches, w, key, original_weights={key: [(原参数, identity)] + 基础 patch})` → `stochastic_rounding`。与原生 `patch_hook_weight_to_device`（在已烘焙基础 LoRA 的权重上转 fp32 再算）一致；测试中带 keyframe 的 hook LoRA 与原生逐位一致。
+* 采样时正/负条件可能挂不同的 hook 组，每一步会来回切换；在 Monoload 里这只是换一个 dict，代价可以忽略。
 * `return_weight=True`（只读取合并结果、不写回）仍交给原生实现，不产生备份。
 
-## 5. 与 stream_loader 共存
+## 5. 与其他加载路径的关系
 
-Monoload 不调用 `comfy.sd.load_diffusion_model`、`load_torch_file`、`Module.load_state_dict`，不改任何全局函数；只注册自己的模型目录 `monoload` 和节点 `MonoloadUNETLoader`。stream_loader 只在它包装的几个函数执行期间替换全局函数，两者的调用路径不相交。
+Monoload 不调用 `comfy.sd.load_diffusion_model`、`load_torch_file`、`Module.load_state_dict`，不改任何全局函数（转换器里的观测包装只存在于转换进程、只在那一次调用期间）；ComfyUI 服务里只注册模型目录 `monoload` 和节点 `MonoloadUNETLoader`。原生 `UNETLoader` 等照常可用。
+
+## 5.1 文本编码器和 VAE：v1 继续走 ComfyUI 原生加载
+
+决定：v1 只转换扩散模型，TE/VAE 留到下一版。理由：
+
+1. **路径差异大、测试矩阵大。** TE 走 `load_clip`：类型由用户在 `CLIPLoader` 里选（`krea2`、`qwen_image`…），可能多文件合并，还带 tokenizer 和 `CLIP` 包装对象；VAE 的构造函数按几十种 key 模式分支建子模型。每个组件都要单独写一套「采集 + 重建」和对应的等价测试，放进 v1 会显著推迟扩散模型这条主线。
+2. **收益相对小。** 目标配置里最大的是扩散模型（Krea 2 为 26G）；`qwen3vl_4b` bf16 约 8G，VAE 不到 1G。原生加载 TE 时 CPU 上短暂有一份完整 dict（约 8G）+ GTT 里一份，CT 内存可以按这个量设。
+3. **格式和搬运层已经为它们留好位置。** `monoload.component` 字段、`fmt`/`transfer` 模块与组件无关，下一版只需加 `text_encoder`、`vae` 两套采集/重建。
+
+## 5.2 「单份权重」的口径
+
+* 允许：LoRA 文件本身常驻内存；正在计算的那一层短暂多出临时副本（含 LoRA 按 fp32/lora_compute_dtype 计算的中间量）；搬运缓冲（默认 2×512MiB）。
+* 不允许：整个模型、或一批层同时存在原权重和合并结果两份；任何形式的备份（`backup`、`hook_backup`、`cached_hook_patches`）。
 
 ## 6. 以后的扩展点
 

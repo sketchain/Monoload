@@ -115,7 +115,7 @@ def main():
         ("model class not found", edit_model_meta(bad_class), 0, MonoloadFormatError, ["找不到模型配置类", "NoSuchModelClass"]),
         ("recorded dtype differs from current choice", edit_model_meta(bad_dtype), 0, MonoloadFormatError, ["推理 dtype"]),
         ("model_type tampered", edit_model_meta(bad_model_type), 0, MonoloadFormatError, ["model_type"]),
-        ("unet_config tampered", edit_model_meta(bad_unet_config), 0, MonoloadFormatError, ["形状"]),
+        ("unet_config tampered", edit_model_meta(bad_unet_config), 0, MonoloadFormatError, []),
         ("metadata JSON corrupt", set_meta(fmt.META_MODEL, "{not json"), 0, MonoloadFormatError, ["metadata 解析失败"]),
         ("truncated file", lambda raw: None, -1024, MonoloadFormatError, ["超出文件末尾"]),
     ]

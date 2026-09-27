@@ -104,8 +104,40 @@ def mapped_model_files(prefix=None):
     return out
 
 
+def gtt_paths():
+    """mem_info_gtt_used of each distinct amdgpu device (empty if none/unreadable)."""
+    import glob
+    import re
+    seen = {}
+    for d in glob.glob("/sys/class/drm/card*"):
+        if not re.search(r"/card\d+$", d):
+            continue
+        p = os.path.join(d, "device", "mem_info_gtt_used")
+        if os.path.exists(p):
+            seen.setdefault(os.path.realpath(os.path.join(d, "device")), p)
+    return list(seen.values())
+
+
+def read_gtt(paths):
+    total = 0
+    for p in paths:
+        with open(p) as f:
+            total += int(f.read().strip())
+    return total
+
+
+def cgroup_memory_current():
+    for p in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        try:
+            with open(p) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            pass
+    return None
+
+
 class MemWatch:
-    """High-frequency RSS sampler + mapping watcher (runs in a thread)."""
+    """High-frequency RSS (+GTT, cgroup) sampler + mapping watcher (runs in a thread)."""
 
     def __init__(self, interval=0.002, maps_every=10):
         self.interval = interval
@@ -115,6 +147,9 @@ class MemWatch:
         self.mapped = set()
         self._stop = threading.Event()
         self._page = os.sysconf("SC_PAGE_SIZE")
+        self._gtt = gtt_paths()
+        self.gtt_peak = None
+        self.cg_peak = None
 
     def _rss(self):
         with open("/proc/self/statm") as f:
@@ -126,6 +161,12 @@ class MemWatch:
             r = self._rss()
             if r > self.peak:
                 self.peak = r
+            if self._gtt:
+                g = read_gtt(self._gtt)
+                self.gtt_peak = g if self.gtt_peak is None else max(self.gtt_peak, g)
+            c = cgroup_memory_current()
+            if c is not None:
+                self.cg_peak = c if self.cg_peak is None else max(self.cg_peak, c)
             if i % self.maps_every == 0:
                 self.mapped |= mapped_model_files()
             i += 1
@@ -135,6 +176,10 @@ class MemWatch:
     def __enter__(self):
         self.base = self._rss()
         self.peak = self.base
+        self.gtt_base = read_gtt(self._gtt) if self._gtt else None
+        self.gtt_peak = self.gtt_base
+        self.cg_base = cgroup_memory_current()
+        self.cg_peak = self.cg_base
         reset_hwm()
         self.hwm0 = proc_status("VmHWM")
         self._t = threading.Thread(target=self._run, daemon=True)
@@ -147,6 +192,8 @@ class MemWatch:
         self.mapped |= mapped_model_files()
         self.end = self._rss()
         self.hwm = proc_status("VmHWM")
+        self.gtt_end = read_gtt(self._gtt) if self._gtt else None
+        self.cg_end = cgroup_memory_current()
 
     def report(self):
         return {
@@ -157,6 +204,11 @@ class MemWatch:
             "peak_delta": max(self.peak, self.hwm or 0) - self.base,
             "mapped_model_files": sorted(self.mapped),
             "samples": self.samples,
+            "gtt_before": self.gtt_base,
+            "gtt_peak_delta": None if self.gtt_base is None else self.gtt_peak - self.gtt_base,
+            "gtt_after_delta": None if self.gtt_base is None else self.gtt_end - self.gtt_base,
+            "cgroup_before": self.cg_base,
+            "cgroup_peak_delta": None if self.cg_base is None else self.cg_peak - self.cg_base,
         }
 
 
