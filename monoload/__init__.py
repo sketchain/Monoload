@@ -1,7 +1,6 @@
-"""Monoload: single-copy weight loading for ComfyUI.
+"""Monoload: runtime (per-layer, per-step) LoRA merge for ComfyUI.
 
-Submodules that touch ComfyUI (loader, patcher, nodes, convert) import
-`comfy.*` themselves; importing this package alone does not.
+`monoload.hotpatch` imports comfy.*; importing this package alone does not.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

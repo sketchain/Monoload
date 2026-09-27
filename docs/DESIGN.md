@@ -1,155 +1,151 @@
-# Monoload 设计说明（v1）
+# Monoload 设计说明（v2：运行时 LoRA 合并）
 
-参考源码：锁定镜像 `kyuz0/amd-strix-halo-comfyui@sha256:384aa1fe…` 里的 `/opt/ComfyUI`，
-ComfyUI 0.31.0，commit `62b3c94bd45154f6486c7abf1b9efcacee96ea69`。下文的函数/行为都按这份源码核实过。
+参考源码：锁定镜像 `kyuz0/amd-strix-halo-comfyui@sha256:384aa1fe…` 里的 `/opt/ComfyUI`（ComfyUI 0.31.0，commit `62b3c94b`）。下文提到的函数和行为都按这份源码核实过。
 
-## 0. 对需求里「原生为什么做不到」的核实
+## 0. 转型
 
-| 说法 | 核实结果 |
-|---|---|
-| `load_torch_file` 在 `--disable-mmap` 下逐张量 `copy=True` 拼完整 dict | 属实（`comfy/utils.py:133-139`）。而且它先用 `safetensors.safe_open` 打开文件，**safe_open 本身就是 mmap**，`--disable-mmap` 只是在 mmap 之后再复制一份。 |
-| `load_diffusion_model_state_dict` 先 `get_model` 建模型，`model.to(offload_device)`，再 `load_state_dict(assign=False)` | 属实（`comfy/sd.py:2211-2216`），dict 和参数同时存在。 |
-| 只有 DynamicVRAM 才 `assign=True` | 属实：`assign=model_patcher.is_dynamic()`。DynamicVRAM 由 `main.py` 在 `enables_dynamic_vram()` 且（`--enable-dynamic-vram` 或 NVIDIA）时打开；`--gpu-only`/`--highvram`/`--cpu` 都会关掉它。这个版本在 AMD 上默认不开。 |
-| 默认打 LoRA 时备份原权重 | 属实：`ModelPatcher.patch_weight_to_device` 把原权重放进 `self.backup`（`model_patcher.py:906-907`）。`--gpu-only` 时 offload_device 就是 GPU，备份也在 GTT 里。 |
+v1（tag `v1-converter`，远端归档分支 `archive/v1-converter`）做的是「离线转换 + pread 直读」，为的是绕开 mmap 的慢和卡死。后来查到根因在 ROCm 的 rocclr：H2D 拷贝超过 1 MiB 时，rocclr 会临时 pin 源内存，在 APU 上这一步走 KFD HMM，逐页处理。上游 ROCm/clr `3ccb59f`（2026-09-23）已经改成「统一内存设备上不做 pin」；修复进入正式版之前，设 `GPU_PINNED_MIN_XFER_SIZE=65536` 效果等价。于是原生加载改成「不开 `--disable-mmap` + 这个环境变量」就足够快，v1 那套不再需要。
 
-## 1. 文件格式
+v2 只做一件事：**在 ComfyUI 原生加载出来的模型上打 LoRA 时，不改原权重、不做任何备份，而是在每一层计算的那一刻临时合并。** 对工作流透明：原生 `UNETLoader`、`CheckpointLoaderSimple`、`CLIPLoader`、`LoraLoader`、`LoraLoaderModelOnly`、Hook LoRA 节点照常使用。
 
-转换产物是**合法的 safetensors 文件**（任何 safetensors 工具都能读），额外约定：
+「单份」的口径不变：
 
-* 张量顺序 = 加载顺序 = 重建出的模型 `named_modules()` 遍历顺序（参数、persistent buffer 依次排列），数据区首尾相接，没有空洞（safetensors 本身也不允许空洞）。
-* 张量名 = **ComfyUI 内部最终名字**，即 `BaseModel` 下的完整路径（`diffusion_model.xxx`、`model_sampling.sigmas` …），不是源文件里的名字。key 转换、`process_unet_state_dict`（拆分/合并权重）都已经在转换时由 ComfyUI 做完。
-* 保留命名空间 `__monoload_aux__.*`：见 §2.3，存放 `get_model()` 构造模型时需要读取的少量源张量。
-* 不做 4K 对齐（v1 不要求）。加载器不依赖对齐：GPU 路径按字节搬运，非连续目标才走带临时张量的拷贝。
-
-`__metadata__`（safetensors 规定只能是 str→str），全部以 `monoload.` 开头：
-
-| key | 内容 |
-|---|---|
-| `monoload.format` | 固定 `"monoload"` |
-| `monoload.format_version` | `"1"`，加载器只接受自己支持的版本 |
-| `monoload.version` | 写文件的 Monoload 版本 |
-| `monoload.component` | v1 只有 `diffusion_model`；预留 `text_encoder` / `vae` |
-| `monoload.quant` | v1 只有 `none`；预留 `fp8_scaled` / `gguf` 等 |
-| `monoload.model` | JSON：重建模型所需的全部信息（§2） |
-| `monoload.source` | JSON：源文件名、大小、mtime、blake3（没有 blake3 时 sha256） |
-| `monoload.env` | JSON：ComfyUI 版本/commit、torch 版本、转换时的 ComfyUI 启动参数、load/offload device |
-| `monoload.convert_log` | JSON：转换时 ComfyUI 打出的 missing/unexpected keys 等警告 |
-
-JSON 里非原生类型用带标签的编码：`torch.dtype` → `{"__dtype__": "bfloat16"}`，tuple → `{"__tuple__": [...]}`，枚举 → `{"__enum__": "comfy.model_base.ModelType", "name": "V_PREDICTION"}`。遇到无法编码的类型，转换器直接报错，不会悄悄丢信息。
-
-## 2. 重建模型需要的信息
-
-原生流程（`load_diffusion_model_state_dict`）里，所有「从权重推断」的东西都集中在这几处：
-
-1. `model_detection.detect_unet_config(sd)` → `unet_config`（形状推断出的结构参数，含 `image_model` 等）
-2. `model_config_from_unet_config()` → 按顺序匹配 `supported_models.models`，选中类（`matches()` 还可能看 `required_keys`）
-3. `detect_layer_quantization()` → `quant_config`（v1 若检测到量化则拒绝转换）
-4. dtype 选择：`unet_dtype(model_params, supported_dtypes, weight_dtype)`、`unet_manual_cast(...)` → `set_inference_dtype(dtype, manual_cast, device)`。注意有的子类会**改写**它（`Anima` 会改 `memory_usage_factor`，`CosmosI2VPredict2` 会根据设备改 manual_cast）
-5. `get_model(sd)`：`model_type(sd)`（SDXL 系看 `v_pred` / `ztsnr` / `edm_*` 这些 key，还可能**改写 `sampling_settings`**）；部分类在 `get_model` 里直接读 state dict 的值或形状（`Stable_Zero123` 的 `cc_projection`、`StableAudio3` 的 padding embedding、`PixelDiT` 的形状）
-6. `process_unet_state_dict()`：key 改名/拆分（在 `load_model_weights` 里做）
-
-### 2.1 转换时怎么采集
-
-转换器**原样调用** `comfy.sd.load_diffusion_model_state_dict`（这正是 `UNETLoader` → `load_diffusion_model` 的主体），只在转换进程里、只在这一次调用期间挂几个观测用的包装：
-
-* 包 `model_detection.model_config_from_unet_config`：记录**传给配置类构造函数的原始 `unet_config`**（深拷贝）和选中的类（`模块.限定名`）。
-* 在选中的 config **实例**上包 `set_inference_dtype`：记录传入参数（dtype、manual_cast、device），以及调用后的结果（`unet_config["dtype"]`、`manual_cast_dtype`、`memory_usage_factor`）。
-* 在同一实例上包 `get_model`：传入一个「访问记录 dict」，记录 `get_model`/`model_type` 读了哪些 key（`in` 的结果、`[]`/`get` 取了哪些值、有没有遍历整个 dict）。取过值的 key 以 `__monoload_aux__.<key>` 存进文件；遍历过的话把全部 key 的形状/dtype 写进 metadata。如果 `get_model` 修改了 state dict，转换直接报错（v1 不支持）。
-* 从加载完的模型上读：`model_type`、`get_model` 之后的 `sampling_settings`、`optimizations`、`latent_format` 类、模型类 / `diffusion_model` 类 / `model_sampling` 类、`adm_channels`、`concat_keys`（inpaint 等）、`memory_usage_factor`。
-* 同时记录原生 dtype 选择的输入：源的参数量、源的主 dtype、`model_options`（v1 只支持 `UNETLoader` 的 `default`）。
-
-写出去的张量就是**加载完之后** `BaseModel` 的全部参数 + persistent buffer（包含 `model_sampling.*`），逐个张量写文件：CPU 张量直接写字节，GPU 张量逐个 `.cpu()` 后写，不再拼第二份 dict。先写 `*.partial`，fsync 后 rename。
-
-### 2.2 转换器怎么读源文件、内存峰值
-
-按确认的方案：**走 ComfyUI 原生的 CPU 加载路径，不为省内存做特殊处理**。
-
-* 原生 `load_torch_file` 内部用 `safetensors.safe_open`，而它本身就是 mmap（`--disable-mmap` 只是 mmap 之后再 `copy=True`）。为了守住「任何环节都不 mmap 模型文件」，转换器用一个几十行的 `read_state_dict_cpu()` 代替它：同样的 key（同样按名字排序）、同样的 dtype/形状、每个张量一块独立的 CPU 内存，只是用 `preadv` 读。之后原样交给 `comfy.sd.load_diffusion_model_state_dict`。测试里验证了转换结果与原生 `UNETLoader` 加载的模型逐字节一致。
-* 源文件哈希单独顺序读一遍（blake3，没有就 sha256），同样不 mmap。
-* 内存：`--gpu-only` 下模型参数在 GPU（GTT，不计入 cgroup），CPU 上是完整的源 dict。**转换进程的 CPU 峰值 ≈ 源文件大小 + 约 1 GiB 基础开销**；GTT 里是一份模型。具体实测数字和 Krea 2 的估算见 README。
-
-### 2.3 加载时怎么重建
-
-1. 读文件头（`pread`，不 mmap），校验 `format`、`format_version`、`component`、`quant`。
-2. `import` 记录的配置类（找不到 → 报错）；`cls(原始 unet_config)` 构造（与原生完全相同的构造路径，`unet_extra_config`、子类 `__init__` 都会照常执行）。
-3. **重算原生会选的 dtype**：用记录的参数量/主 dtype 和当前进程的启动参数、当前设备，调用 `model_management.unet_dtype` / `unet_manual_cast`。与记录值不同（换了 `--bf16-unet` 之类或换了设备）→ 报错要求重新转换，因为文件里存的就是那个 dtype 的权重。
-4. 用记录的参数调用 `set_inference_dtype`，结果与记录不一致 → 报错。
-5. 恢复 `optimizations`、`sampling_settings`；在这个 config **实例**上把 `model_type` 换成返回记录值的函数（只影响 Monoload 自己的实例）。
-6. `get_model(视图 dict, device=目标设备)`：视图 dict 只回答转换时记录过的访问（`in` 结果、aux 张量、遍历时的 meta 张量），出现未记录的访问 → 报错。
-7. 比对指纹：模型类、`diffusion_model` 类、`model_sampling` 类、`model_type`、`latent_format` 类、`adm_channels`、`concat_keys`、`memory_usage_factor`、`manual_cast_dtype`。不一致 → 报错。
-8. 严格校验张量清单：模型的参数 + persistent buffer 名字集合必须与文件完全一致（多了、少了都列出来），每一项形状、dtype 一致。
-9. 搬运（§3），包成 `MonoloadModelPatcher`，`cached_patcher_init = (monoload.loader.load_monoload_diffusion_model, (path, model_options))`。
-
-只有 ComfyUI 版本/commit 与转换时不同才是警告；上面任何一项失败都是 `MonoloadError`，信息里带「请重新转换」和具体差异。
-
-### 2.4 「参数只分配一次」
-
-* 目标设备 = 原生的 `unet_offload_device()`：`--gpu-only`（HIGH_VRAM）时是 GPU，普通模式是 CPU——和原生模型「待机时住在哪」一致。
-* `get_model(..., device=目标设备)`：`comfy.ops` 的层用 `torch.empty(device=…)` 直接在目标设备分配，**这就是唯一的一份**；不依赖「CPU 上未触碰的 empty 页 + `.to()`」。
-* 少数没把 `device` 传下去的模块会在 CPU 上建参数：加载器检查每个要从文件读的张量，不在目标设备上就在目标设备上重新 `empty` 一个替换进去，原来那个随即释放，并在日志里统计这类张量的数量和字节数。实际遇到的主要是 `model_sampling.*`：它们在构造时于 CPU 上算出，只有几 KB，而且文件里有同样的值，会原样读回。
-* DynamicVRAM（comfy-aimdo）开启时 `comfy.ops` 会延迟建参数、并依赖 mmap：v1 **明确报错不支持**，提示用 `--gpu-only` 或 `--disable-dynamic-vram`。
-
-## 3. 搬运
-
-* 打开文件用 `os.open(O_RDONLY)`，读用 `os.preadv`，全程无 mmap。
-* 计划：按文件偏移排序，把**连续**的小张量打包进一块缓冲一次读完；大于缓冲的张量拆成缓冲大小的片段。
-* **GPU 目标**：两块 `torch.empty(size, uint8, pin_memory=True)`（默认 512MiB×2，环境变量 `MONOLOAD_BUFFER_MB` 或节点参数可调）。单线程流水：
-  等 `event[b]`（上一次从缓冲 b 发出的 H2D 完成）→ `preadv` 读进缓冲 b → 在专用 copy stream 上对每段 `dst_bytes.copy_(buf[b][..], non_blocking=True)` → `event[b].record()`。于是读缓冲 B 的同时，GPU 在搬缓冲 A。目标张量按字节视图（`view(uint8)`）拷贝，与对齐无关。开始前 copy stream 等待默认流（保证参数分配已完成），结束后同步。
-* **CPU 目标**（普通模式 / `--cpu` 测试）：目标内存就是最终位置，直接 `preadv` 进参数的内存，零中转。设 `MONOLOAD_STAGING=always` 可强制走双缓冲路径（测试用；无 GPU 时缓冲不 pin）。
-* 缓冲在加载结束后释放，并调用 `torch._C._host_emptyCache()`（存在时）把 PyTorch 缓存的 pinned 内存还给系统。
-* 峰值：CPU 内存 ≈ 缓冲（2×512MiB）+ 少量；GPU ≈ 1 份模型。
-
-## 4. LoRA：运行时临时合并
-
-ComfyUI 已有的机制：`comfy.ops` 的层在 `forward` 里只要 `weight_function`/`bias_function` 非空就走 `cast_bias_weight`，它会先 `copy=True` 拿一份临时权重，再依次调用这些函数——lowvram 模式就是把 `LowVramPatch`（内部调 `comfy.lora.calculate_weight`）挂到这里。
-
-Monoload 的接入点只有一个：`MonoloadModelPatcher(ModelPatcher)` 重写 `patch_weight_to_device()`。原生 `load()` 在全量加载时对每个参数调用它来「烘焙」LoRA 并备份；Monoload 版本对有 patch 的 key：
-
-* **不备份、不改权重**，而是把 `MonoloadRuntimePatch`（`LowVramPatch` 子类）插到该层 `weight_function`/`bias_function` 的**最前面**（原生全量加载时 LoRA 先于 `weight_wrapper_patches` 生效，顺序保持一致）。
-* `MonoloadRuntimePatch.__call__` 复刻原生 `patch_weight_to_device` 的数值路径：直接取**层上的原参数**（而不是 `cast_bias_weight` 传进来的、已转成计算 dtype 的副本），`cast_to_device(param, lora_compute_dtype)` → `calculate_weight(patches, w, key)`（intermediate 默认 fp32）→ `stochastic_rounding` 回参数 dtype（同样的 seed）→ 转成计算 dtype 返回。于是结果与原生「烘焙」路径**逐位一致**（测试实测 max_abs = 0），而不是原生 lowvram 路径那种在计算 dtype 下算 LoRA 的近似。
-* 部分加载（非 `--gpu-only`、显存不够）时原生 `load()`/`partially_unload()` 会给 lowvram 层挂普通 `LowVramPatch`；Monoload 在它们之后把这些换成 `MonoloadRuntimePatch`，数值同样与烘焙一致。
-* 因为 `cast_bias_weight` 每层用完临时权重即丢，同一时刻只有正在计算的那一层有临时权重。
-* 走的是通用的 `calculate_weight`，所以 LoRA/LoHa/LoKr/GLoRA/OFT/BOFT、diff、set 等 ComfyUI 支持的所有类型都一样支持。原生 `LoraLoader` / `LoraLoaderModelOnly` 不用改。
-
-配套的重写：
-
-* `unpatch_model()`：原生只在 lowvram 时清 `weight_function`；Monoload 在卸载权重时清掉自己挂的运行时 patch，保证撤掉 LoRA 后模型与文件逐字节一致。
-* `load(force_patch_weights=True)` 且有 patch（模型保存/合并「烘焙」时才会这样）→ 报错：Monoload 模型不支持把 LoRA 烘焙进权重。
-* 某个被 patch 的参数不属于 `comfy.ops` 层（没有运行时路径），或 patch 会改变形状 → 报错，而不是退回备份。
-* 原生 `load()` 会清空全量加载层的 `weight_function`，但跳过已标记 `comfy_patched_weights` 的层（原生里它们已烘焙）。Monoload 在 `load()` 前清掉被 patch 层的这个标记，保证重复加载时运行时 patch 一定会重新挂上。
-* 加载结束后断言 `backup` / `hook_backup` 为空，出现即报内部错误。
-
-### 4.1 Hook LoRA（v1 已实现）
-
-原生做法：`patch_hooks(hooks)` 把当前 hook 组的 patch 写进权重（先 `hook_backup` 备份），MaxSpeed 模式还把每个 hook 组的合并结果缓存在 `cached_hook_patches`。
-
-Monoload：
-* `MonoloadModelPatcher` 有一个 `monoload_hook_state`（key → 当前生效的 hook patch 列表），所有运行时 patch 共享它。
-* `patch_hooks(hooks)` 只做状态切换：用原生 `get_combined_hook_patches(hooks)` 算出组合（含 keyframe 强度），写进 `monoload_hook_state`；只被 hook 改到、还没有运行时 patch 的层补挂一个；不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。**
-* `unpatch_hooks()` 清空状态。`patch_hook_weight_to_device` / `patch_cached_hook_weights` 若被调用即报内部错误。
-* 数值：先按 §4 算基础 LoRA 并舍入到参数 dtype，再 `cast_to_device(w, float32)` → `calculate_weight(hook_patches, w, key, original_weights={key: [(原参数, identity)] + 基础 patch})` → `stochastic_rounding`。与原生 `patch_hook_weight_to_device`（在已烘焙基础 LoRA 的权重上转 fp32 再算）一致；测试中带 keyframe 的 hook LoRA 与原生逐位一致。
-* 采样时正/负条件可能挂不同的 hook 组，每一步会来回切换；在 Monoload 里这只是换一个 dict，代价可以忽略。
-* `return_weight=True`（只读取合并结果、不写回）仍交给原生实现，不产生备份。
-
-## 5. 与其他加载路径的关系
-
-Monoload 不调用 `comfy.sd.load_diffusion_model`、`load_torch_file`、`Module.load_state_dict`，不改任何全局函数（转换器里的观测包装只存在于转换进程、只在那一次调用期间）；ComfyUI 服务里只注册模型目录 `monoload` 和节点 `MonoloadUNETLoader`。原生 `UNETLoader` 等照常可用。
-
-## 5.1 文本编码器和 VAE：v1 继续走 ComfyUI 原生加载
-
-决定：v1 只转换扩散模型，TE/VAE 留到下一版。理由：
-
-1. **路径差异大、测试矩阵大。** TE 走 `load_clip`：类型由用户在 `CLIPLoader` 里选（`krea2`、`qwen_image`…），可能多文件合并，还带 tokenizer 和 `CLIP` 包装对象；VAE 的构造函数按几十种 key 模式分支建子模型。每个组件都要单独写一套「采集 + 重建」和对应的等价测试，放进 v1 会显著推迟扩散模型这条主线。
-2. **收益相对小。** 目标配置里最大的是扩散模型（Krea 2 为 26G）；`qwen3vl_4b` bf16 约 8G，VAE 不到 1G。原生加载 TE 时 CPU 上短暂有一份完整 dict（约 8G）+ GTT 里一份，CT 内存可以按这个量设。
-3. **格式和搬运层已经为它们留好位置。** `monoload.component` 字段、`fmt`/`transfer` 模块与组件无关，下一版只需加 `text_encoder`、`vae` 两套采集/重建。
-
-## 5.2 「单份权重」的口径
-
-* 允许：LoRA 文件本身常驻内存；正在计算的那一层短暂多出临时副本（含 LoRA 按 fp32/lora_compute_dtype 计算的中间量）；搬运缓冲（默认 2×512MiB）。
+* 允许：LoRA 文件本身常驻内存；LoRA 张量在计算设备上的一份副本（见 §5.2）；正在计算的那一层短暂多出的临时副本（含 LoRA 按 fp32 计算的中间量）。
 * 不允许：整个模型、或一批层同时存在原权重和合并结果两份；任何形式的备份（`backup`、`hook_backup`、`cached_hook_patches`）。
 
-## 6. 以后的扩展点
+## 1. 原生是怎么打 LoRA 的
 
-* `component`：`text_encoder` / `vae` 各自一套「采集 + 重建」即可，文件格式和搬运层通用。
-* `quant`：量化张量（fp8 scaled 的 scale、GGUF 块）作为额外张量写入，重建时由对应 ops 接管；v1 碰到量化直接拒绝。
-* O_DIRECT：搬运层已经按大块顺序读，届时只需在张量间补齐对齐（需要格式版本 2）。
+* `LoraLoader` → `comfy.sd.load_lora_for_models` → `ModelPatcher.add_patches()`：只记录 patch（key → `(strength, adapter, strength_model, offset, function)` 列表），不碰权重。MODEL 和 CLIP（`clip.patcher`）各有一个 `ModelPatcher`。
+* 真正改权重在加载时：`model_management.load_models_gpu` → `LoadedModel.model_load` → `ModelPatcher.patch_model` → `load()`。全量加载时，`load()` 对每个参数调用 `patch_weight_to_device(key)`：先把原权重放进 `self.backup`，再用 `comfy.lora.calculate_weight` 算出合并结果，**原地替换参数**。
+* 切换 LoRA 组合：新的克隆和旧的共享同一个 `model`。换组合时 `unpatch_model()` 把备份写回，新组合再重新合并一遍。
+* Hook LoRA：`patch_hooks(hooks)` 把当前 hook 组合并进权重（先写 `hook_backup`）；MaxSpeed 模式还会把每个 hook 组的合并结果缓存进 `cached_hook_patches`。
+* lowvram（部分加载）时，被卸到 CPU 的层不合并，而是在 `weight_function` 上挂 `LowVramPatch`：`comfy.ops` 的层在 `forward` 里只要 `weight_function` 非空就走 `cast_bias_weight`，先 `copy=True` 拷一份临时权重，再依次调用这些函数。**这条运行时路径是 Monoload 复用的机制。**
+
+## 2. 挂载方式：替换 `ModelPatcher` 类上的方法
+
+`install()`（插件被 ComfyUI 导入时执行）直接在 `comfy.model_patcher.ModelPatcher` **这个类**上替换 8 个方法，原函数保存起来，由替换函数在需要时调用：
+
+| 方法 | Monoload 版本做什么 |
+|---|---|
+| `patch_weight_to_device` | 对有 patch 的 key：**不备份、不改权重**，把 `MonoloadRuntimePatch` 插到该层 `weight_function` / `bias_function` 的最前面。没有 patch 的 key，以及只取合并结果、不写回的 `return_weight=True`，交给原函数。 |
+| `load` | 检查 DynamicVRAM 和 `force_patch_weights`，清掉被 patch 层的 `comfy_patched_weights` 标记（见 §4），调用原 `load()`，最后断言没有产生备份。 |
+| `partially_unload` | 调用原函数后，去掉被原生 `LowVramPatch` 取代的那些运行时 patch（见 §4）。 |
+| `unpatch_model` | 调用原函数；卸载权重时摘掉所有运行时 patch，清空设备上的 LoRA 缓存。 |
+| `patch_hooks` / `unpatch_hooks` | 只切换「当前生效的 hook patch」这个状态，不写权重（§3.2）。 |
+| `patch_hook_weight_to_device` / `patch_cached_hook_weights` | 不应再被调用，被调用即报内部错误。 |
+
+为什么选这种方式：
+
+* **覆盖面正好。** ComfyUI 里所有模型包装都是 `ModelPatcher` 的实例：`UNETLoader`、`CheckpointLoaderSimple` 的 MODEL、`CLIP.patcher`（文本编码器）、VAE、ControlNet 等。`CoreModelPatcher` 在没开 DynamicVRAM 时就是 `ModelPatcher` 本身。方法在类上查找，所以装上之前已经建好的实例、以及没有重写这些方法的子类也都生效。
+* **侵入小。** 不替换加载函数，不换类，不包装节点，不改 `comfy.ops` 和 `cast_bias_weight`，也不修改 ComfyUI 源码。工作流里的节点都不用换。
+* **时机确定。** ComfyUI 在启动时（`init_extra_nodes`）导入 custom node，这时还没有执行任何 prompt，也就没有加载任何模型。
+* **可以关。** 设了 `MONOLOAD_DISABLE=1`，插件不调用 `install()`，行为与原生完全一致。`uninstall()` 恢复原方法（测试里用来在同一进程中对比原生和 Monoload；调用前要先卸载所有模型）。
+
+子类的处理：
+
+* 自己重写了 `patch_weight_to_device` 的子类（例如 ComfyUI-GGUF 的 `GGUFModelPatcher`，它对量化权重有自己的一套 patch 机制，而且 `load` 时强制 `force_patch_weights=True`）不归 Monoload 管：所有替换函数先判断 `type(self).patch_weight_to_device` 是否还是 Monoload 的版本，不是就原样调用原函数，并对这个类打一次警告日志。
+* `ModelPatcherDynamic`（DynamicVRAM）重写了 `load`，所以它的 `load` 也被包了一层，只做 DynamicVRAM 检查（§6）。
+
+## 3. 运行时合并
+
+### 3.1 `MonoloadRuntimePatch`
+
+它是 `LowVramPatch` 的子类，挂在层的 `weight_function` 上。`cast_bias_weight` 在该层计算时给它一份**私有的**临时权重（因为存在 weight function，`cast_to(..., copy=True)`，再转成计算 dtype），它返回合并后的权重，用完即丢。同一时刻只有正在计算的那一层有临时权重。
+
+数值上复刻原生的合并路径，所以结果与原生**逐位一致**（测试里 max_abs = 0）：
+
+```
+基础 LoRA（复刻 patch_weight_to_device）:
+    W  -> lora_compute_dtype(device)          # 原生：cast_to_device(param, device, lora_dtype, copy=True)
+       -> calculate_weight(patches, W, key)   # intermediate_dtype 默认 fp32
+       -> stochastic_rounding(参数 dtype, seed=string_to_seed(key))
+Hook LoRA（复刻 patch_hook_weight_to_device，在已合并基础 LoRA 的权重上）:
+       -> float32 -> calculate_weight(hook_patches, W, key, original_weights={key: [(原参数, identity)] + 基础 patch})
+       -> stochastic_rounding(参数 dtype, seed)
+最后 -> 转成 cast_bias_weight 要的计算 dtype
+```
+
+插在 `weight_function` 的**最前面**：原生全量加载时 LoRA 已经合并进权重，先于 `weight_wrapper_patches` 生效，顺序保持一致。
+
+走的是通用的 `calculate_weight`，所以 LoRA / LoCon / LoHa / LoKr / GLoRA / OFT / BOFT、diff、set 等 ComfyUI 支持的类型都能用。
+
+### 3.2 Hook LoRA
+
+每个 patcher 有一份 `hook_patches`（key → 当前生效的 hook patch 列表），它的所有运行时 patch 共享这一份。`patch_hooks(hooks)` 用原生的 `get_combined_hook_patches(hooks)` 算出组合（包括 keyframe 强度），写进这份状态；只被 hook 改到、还没有运行时 patch 的层补挂一个，不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。** 采样时正/负条件可能挂着不同的 hook 组，每一步会来回切换；在这里只是换一个 dict。CLIP 的 `SetClipHooks`（`forced_hooks`）走同一条路。
+
+## 4. 与原生状态机的配合
+
+* **重复加载。** 原生 `load()` 会清空所有全量加载层的 `weight_function`，但跳过已标记 `comfy_patched_weights` 的层（原生里它们已经合并好了）。Monoload 的 patch 并没有合并进权重，所以 `load()` 之前先清掉被 patch 层的这个标记，保证这些层会重新走一遍 `patch_weight_to_device`。
+* **切换组合 / 卸载。** 原生 `unpatch_model()` 只在 lowvram 时清 `weight_function`；Monoload 在卸载权重时摘掉自己挂的所有运行时 patch。所以撤掉 LoRA 后，权重与加载时逐字节一致（本来也从未改过），也没有残留的 weight function。
+* **部分加载（非 `--gpu-only`、显存不够）。** 原生对被卸载的层本来就用 `LowVramPatch`，而且不备份。Monoload **不改这部分**，只接管原生会合并进权重的那些层，所以在部分加载下结果也和原生逐位一致。原生 `partially_unload()` 会给已经合并过的层追加 `LowVramPatch`（原生里是先写回备份）；这时同一层会同时挂着 Monoload 的 patch 和原生的 `LowVramPatch`，Monoload 摘掉自己那个，得到的结果和原生一样。
+* 每次 `load()` / `partially_unload()` 之后都断言 `backup` / `hook_backup` 为空。
+
+## 5. 效率
+
+### 5.1 代价在哪
+
+原生是「每次加载合并一次，之后每步零开销」；运行时合并是「每步、每个被 patch 的层都合并一次」。没被 patch 的层完全不受影响：`weight_function` 为空，`forward` 走原来的快路径。被 patch 的层每次计算要多做这些事：
+
+1. `cast_bias_weight` 拷一份临时权重（有 weight function 时它必须 `copy=True`）；
+2. 如果 `lora_compute_dtype` 和权重 dtype 不同，就要做一次转换，最后再转回来（逐位一致需要）；
+3. `calculate_weight`：LoRA 低秩矩阵乘（intermediate 是 fp32），再加回权重；
+4. `stochastic_rounding` 回到参数 dtype（bf16/fp16 时就是一次 `.to()`），再转成计算 dtype（相同时不做任何事）。
+
+### 5.2 已经省掉的
+
+* **不再从参数重新读一遍。** `cast_bias_weight` 传进来的 `weight` 已经是一份私有副本。只要它和参数逐位相同（dtype 相同，或者是 fp16/bf16→fp32 这类无损加宽），就直接用它当原生路径里的 `temp`，不再 `cast_to_device(param, …, copy=True)`。如果它的 dtype 恰好就是 `lora_compute_dtype`，就原地在它上面合并，一次额外拷贝都没有。只有计算 dtype 比参数窄的时候（有损），才退回去从参数读，以保证逐位一致。
+* **LoRA 张量只搬一次。** 原生 `calculate_weight` 每次都 `cast_to_device(LoRA 张量, 权重设备)`；LoRA 文件是读到 CPU 上的，在运行时合并下就变成每步每层一次 H2D。Monoload 在每个 patcher 里按张量缓存一份计算设备上的副本（同 dtype 搬运，数值不变），卸载时释放。代价是计算设备上多一份被用到的 LoRA 张量（LoRA 大小，属于允许的范围）。
+* seed（`string_to_seed(key)`）在挂 patch 时算好；基础 patch 列表按设备缓存好的结构复用；没有 patch 的 key 直接返回。
+
+### 5.3 实测开销（CPU）与可选的放宽（未实现，等拍板）
+
+**CPU 参考数字**（锁定镜像，`--cpu --fp16-unet`，SD1.5，256×256，3 步，`tests/bench_lora.py`，第二遍的数字）。这台机器是 4 核 CPU，256px 下模型本身的计算量很小，所以合并开销显得特别突出，**不代表 GPU**：
+
+| 组合（UNet 被 patch 的层） | 每步 原生 | 每步 Monoload | 比值 | 切换组合（patch）原生 | Monoload | 结果差异 |
+|---|---|---|---|---|---|---|
+| Rubber Duck（192 层，0.50 GiB） | 7.13s | 15.74s | 2.21× | 6.57s | 0.08s | 0（逐位一致） |
+| Annalise LoCon（278 层） | 9.13s | 24.23s | 2.65× | 12.55s | 0.08s | 0 |
+| 两个叠加（278 层） | 9.37s | 26.56s | 2.83× | 16.64s | 0.08s | 0 |
+| 不打 LoRA | 7.85s | 8.34s | 1.06× | 0.05s | 0.06s | 0 |
+
+layer probe（Rubber Duck，一次模型调用、全部 192 层合计）：临时拷贝 0.075s，逐位一致合并 8.19s，放宽合并（方案 A）6.07s。最大的一层（1280→10240，fp16）拆开来看：`calculate_weight` 64ms（其中低秩矩阵乘 17ms，其余是几遍逐元素运算），舍入回 fp16 再转回 fp32 19ms，临时拷贝 11ms。
+
+结论：
+
+1. **运行时合并的每步开销 ≈ 每次模型调用都重做一遍原生那次性的合并。** 在 GPU 上可以直接用基准脚本里原生的 `patch` 列来估算。一步通常只有一次模型调用：CFG 的正负条件在显存允许时会合批；Krea 2 的 CFG=1 时只有正条件。
+2. 这部分开销主要是对被 patch 权重的几遍逐元素读写（拷贝、加上 delta、dtype 往返），低秩矩阵乘本身不贵。所以在带宽受限的 APU 上，它和「被 LoRA 改到的权重有多大」成正比，和分辨率无关。分辨率越高，模型本身的计算越多，占比就越小。
+3. 逐位一致带来的额外开销（dtype 往返 + 舍入）在 CPU 上约占合并本身的 35%。GPU 上 bf16/fp16 转换很便宜，但 gfx1151 上的 `lora_compute_dtype` 是 fp16，而权重是 bf16，所以每层每步要多两遍转换。GPU 上的数字请看 layer probe。
+
+可选的放宽方案（都**没有实现**）：
+
+* **A. 按原生 lowvram 的数值合并：** 直接在计算 dtype 下 `calculate_weight(patches, weight, key, intermediate_dtype=计算 dtype)`，省掉 dtype 往返和舍入。与原生合并不再逐位一致，但与原生 lowvram 路径一致。CPU 上比逐位一致快约 25%。
+* **B. 计算 dtype 下合并，intermediate 保持 fp32：** 省掉 dtype 往返，精度介于 A 和逐位一致之间。
+* **C. 融合的 `addmm_`：** 把「低秩乘 → 缩放 → 转 dtype → 加回」合成一次 `weight.addmm_(up, down, alpha=scale)`，少几遍逐元素读写。只适用于普通 LoRA/LoCon，舍入顺序和原生不同。
+* **D. bypass（低秩前向）：** `y = W·x + scale·up(down(x))`，完全不物化合并后的权重，每层的额外开销从「对整块权重做几遍逐元素运算」变成「两个很瘦的矩阵乘」（与 token 数 × rank 成正比）。在带宽受限的 APU 上，这很可能是唯一能把开销降一个量级的办法。ComfyUI 已经自带实现（`comfy/weight_adapter/bypass.py`、节点 `LoraLoaderBypass`），但数值与合并路径不同，而且不是所有 adapter 都支持。
+
+建议先在 CT 700 上跑基准，看 GPU 上的每步比值再决定。如果 Krea 2 这类大模型的开销不可接受，A/B/C 大概只能省掉一部分，D 才可能根本解决问题。
+
+## 6. 报错（绝不退回「改权重 + 备份」）
+
+| 情况 | kind | 何时 |
+|---|---|---|
+| DynamicVRAM（comfy-aimdo）开启且模型有 LoRA/hook patch | `dynamic_vram` | 加载该模型时 |
+| 要求把 patch 合并进权重（`force_patch_weights`，常见于 `ModelSave` / `CheckpointSave` / 模型合并后保存） | `force_patch_weights` | 加载时 |
+| 被 patch 的参数不属于 `comfy.ops` 层（没有 `comfy_cast_weights`，没有运行时路径） | `lora_non_comfy_ops_param` | 挂 patch 时 |
+| patch 会改变权重形状 | `lora_shape_change` | 挂 patch 时 |
+| 被 patch 的参数是量化张量（有 `set_*`/`convert_*`，例如 fp8 scaled） | `lora_quantized_param` | 挂 patch 时 |
+
+报错信息里写明是哪种情况和对应的 key，例如：
+
+```
+[Monoload] 不支持（lora_shape_change） key=diffusion_model.input_blocks.1.1.proj_in.weight: patch 会把权重形状从 [320, 320, 1, 1] 改成 [328, 320, 1, 1]，运行时合并无法支持
+```
+
+最后一种（量化参数）是这次新增的：原生加载的模型可能带 fp8 scaled 之类的量化层，原生会把合并结果重新量化后写回，并且备份。要做到运行时逐位一致，得复刻「反量化 → 合并 → 以同样的 seed 重新量化 → 再反量化」，v2 先不做，明确报错。需要时设 `MONOLOAD_DISABLE=1`。
+
+## 7. 限制
+
+* 只接管没有重写 `patch_weight_to_device` 的 `ModelPatcher`（ComfyUI 自带的加载器都属于这种）。GGUF 等自带 patch 机制的插件保持原生行为，日志里会提示。
+* 每步都有合并开销（§5）。LoRA 越多、改的层越大，开销越明显；没被 patch 的层没有影响。
+* LoRA 文件由原生 `LoraLoader` 读取，读进来之后常驻 CPU 内存（原生也是这样）；计算设备上另有一份被用到的 LoRA 张量缓存。
+* 本仓库的测试都在无 GPU 的机器上用 `--cpu` 跑；GPU 上的数值一致性和耗时要按 README 的真机验收步骤确认。
