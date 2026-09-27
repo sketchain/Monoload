@@ -90,7 +90,53 @@ def main():
         check("param {} / compute {} / lora {} / {:10s} ({})".format(pn, cn, ln, mode, "reuse copy" if exact else "re-read param"),
               ok, "" if ok else "max_abs {}".format(float((got.float() - ref.float()).abs().max())))
         n += 1
+    n += quantized_cases(loaded, orig_ldt)
     finish({"cases": n})
+
+
+class Holder(torch.nn.Module):
+    pass
+
+
+def quantized_cases(loaded, orig_ldt):
+    """Quantized (fp8) parameter: relaxed merge on the dequantized temporary.
+    Reference = the bit-exact path applied to the same parameter dequantized
+    beforehand (a plain tensor in the dequantized dtype)."""
+    from comfy.quant_ops import QuantizedTensor
+    g = torch.Generator().manual_seed(1)
+    n = 0
+    for (dn, ddt), (cn, cdt), (ln, ldt), mode in itertools.product(DT.items(), DT.items(), [("fp32", torch.float32), ("fp16", torch.float16)], ("base", "hooks", "base+hooks")):
+        w = (torch.randn(64, 96, generator=g) * 0.05).to(ddt)
+        qt = QuantizedTensor.from_float(w, "TensorCoreFP8E4M3Layout")
+        deq = qt.dequantize()
+        results = []
+        for kind in ("quantized", "dequantized"):
+            holder = Holder()
+            holder.__dict__["weight"] = qt if kind == "quantized" else deq
+            patcher = comfy.model_patcher.ModelPatcher(Net(ddt), torch.device("cpu"), torch.device("cpu"))
+            base = None
+            if "base" in mode:
+                patcher.add_patches(loaded, 0.8, 1.0)
+                base = patcher.patches[KEY]
+            st = hotpatch._state(patcher)
+            if "hooks" in mode:
+                st.hook_patches[KEY] = [(0.6, loaded[KEY], 1.0, None, None)]
+            comfy.model_management.lora_compute_dtype = lambda device, _d=ldt: _d
+            try:
+                f = hotpatch.MonoloadRuntimePatch(KEY, patcher.patches, holder, "weight", st)
+                if kind == "quantized":
+                    weight_in = qt.clone().to(dtype=cdt).dequantize()   # what cast_bias_weight passes in
+                else:
+                    weight_in = deq.clone().to(cdt)
+                results.append(f(weight_in))
+            finally:
+                comfy.model_management.lora_compute_dtype = orig_ldt
+        got, ref = results
+        ok = got.dtype == ref.dtype and torch.equal(got, ref)
+        check("fp8 from {} / compute {} / lora {} / {:10s} == dequantize-first".format(dn, cn, ln, mode), ok,
+              "" if ok else "max_abs {}".format(float((got.float() - ref.float()).abs().max())))
+        n += 1
+    return n
 
 
 if __name__ == "__main__":

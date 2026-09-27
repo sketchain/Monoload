@@ -46,6 +46,16 @@ def _identity(a, **kwargs):
     return a
 
 
+try:
+    from comfy.quant_ops import QuantizedTensor as _QuantizedTensor
+except Exception:  # pragma: no cover
+    _QuantizedTensor = ()
+
+
+def _is_quantized(t):
+    return bool(_QuantizedTensor) and isinstance(t, _QuantizedTensor)
+
+
 # ---------------------------------------------------------------------------
 # per-patcher state
 # ---------------------------------------------------------------------------
@@ -111,6 +121,12 @@ class MonoloadRuntimePatch(LowVramPatch):
     (copy=True because a weight function is present), so when it carries the
     parameter's exact values it is used directly (and modified in place)
     instead of re-reading the parameter.
+
+    Quantized parameters (QuantizedTensor, e.g. fp8 scaled) are the one
+    relaxed case: the LoRA is merged on the dequantized temporary and the
+    result is used as is, not re-quantized. This equals running the bit-exact
+    path on a model whose quantized weights were dequantized beforehand; it
+    is not bit-identical to native, which re-quantizes after merging.
     """
 
     is_monoload_patch = True
@@ -141,6 +157,21 @@ class MonoloadRuntimePatch(LowVramPatch):
             self._base_sig = sig
         return moved
 
+    def _source(self, weight, param, device):
+        """A private tensor holding exactly the parameter's values (in its own
+        dtype or an exact widening of it), or None if only the parameter can
+        provide that. For quantized parameters "the parameter's values" are
+        its dequantized values (dtype = param.dtype = the dequantized dtype)."""
+        cdt = weight.dtype
+        pdt = param.dtype
+        if _is_quantized(param):
+            if cdt == pdt:
+                return weight  # cast_bias_weight dequantized straight into pdt
+            return comfy.model_management.cast_to_device(param, device, None, copy=True).dequantize()
+        if cdt == pdt or (pdt, cdt) in _EXACT_WIDENING:
+            return weight
+        return None
+
     def __call__(self, weight):
         key = self.key
         base = self.patches.get(key)
@@ -149,15 +180,15 @@ class MonoloadRuntimePatch(LowVramPatch):
             return weight
         param = getattr(self._module(), self.attr)
         device = weight.device
-        pdt = param.dtype
+        pdt = param.dtype  # for a QuantizedTensor: its dequantized dtype
         cdt = weight.dtype
-        src_exact = cdt == pdt or (pdt, cdt) in _EXACT_WIDENING
+        src = self._source(weight, param, device)
 
         w = None
         if base:
             ldt = comfy.model_management.lora_compute_dtype(device)
-            if src_exact:
-                temp = weight if cdt == ldt else weight.to(ldt)
+            if src is not None:
+                temp = src if src.dtype == ldt else src.to(ldt)
             else:
                 temp = comfy.model_management.cast_to_device(param, device, ldt, copy=True)
             out = comfy.lora.calculate_weight(self._base_on(base, device, param.numel()), temp, key)
@@ -167,11 +198,12 @@ class MonoloadRuntimePatch(LowVramPatch):
         if hooks:
             if w is not None:
                 temp = w.to(torch.float32)
-            elif src_exact:
-                temp = weight.to(torch.float32)
+            elif src is not None:
+                temp = src.to(torch.float32)
             else:
                 temp = comfy.model_management.cast_to_device(param, device, torch.float32, copy=True)
-            original = {key: [(param, _identity)] + list(base or [])}
+            orig_param = param.dequantize() if _is_quantized(param) else param
+            original = {key: [(orig_param, _identity)] + list(base or [])}
             moved_hooks = _to_device(hooks, device, self.state.device_cache, param.numel(), {"transient": False})
             out = comfy.lora.calculate_weight(moved_hooks, temp, key, original_weights=original)
             w = comfy.float.stochastic_rounding(out, pdt, seed=self.seed)
@@ -236,12 +268,10 @@ def _install_runtime_patch(patcher, key):
             "被 LoRA/patch 修改的参数所在的模块 {} 不是 comfy.ops 层，没有运行时合并路径；"
             "Monoload 不会退回到「改权重+备份」。".format(type(module).__name__),
             key=key)
-    weight, set_func, convert_func = get_key_weight(patcher.model, key)
-    if set_func is not None or convert_func is not None:
-        raise MonoloadUnsupportedError(
-            "lora_quantized_param",
-            "量化参数（{}）上的 LoRA 暂不支持运行时合并".format(type(weight).__name__),
-            key=key)
+    # Quantized weights (mixed-precision ops, set_/convert_ functions) are
+    # handled in relaxed mode: merged on the dequantized temporary and never
+    # re-quantized (see MonoloadRuntimePatch._source).
+    weight, _set_func, _convert_func = get_key_weight(patcher.model, key)
     patches = list(patcher.patches.get(key, [])) + list(st.hook_patches.get(key, []))
     new_shape = comfy.lora.calculate_shape(patches, weight, key)
     if tuple(new_shape) != tuple(weight.shape):
