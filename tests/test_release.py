@@ -4,8 +4,10 @@ Workflows (API format, SD1.5 checkpoint):
   lora  : CheckpointLoaderSimple -> LoraLoader -> CLIPTextEncode x2 -> KSampler -> SaveLatent
   plain : the same without the LoRA
   hook  : CreateHookLora -> SetClipHooks -> CLIPTextEncode (hooked conds) -> KSampler
+  bypass: LoraLoaderBypass (bypass-LoRA injections instead of weight patches)
 
-Sequence: lora -> plain -> hook -> plain. Checked after each LoRA prompt:
+Sequence: lora -> plain -> hook -> plain -> bypass -> plain -> lora (seed 8).
+Checked after each LoRA prompt:
   * every LoRA tensor (loaded from models/loras) and every patcher carrying
     LoRA patches is garbage (weakrefs dead) -- i.e. freed on CPU and, since
     device copies only live on those objects, on the GPU as well
@@ -72,6 +74,11 @@ def workflow(kind, ckpt=CKPT, lora=LORA, seed=7):
                                                           "strength_model": 0.8, "strength_clip": 0.8}}
         wf["6"]["inputs"]["model"] = ["2", 0]
         clip = ["2", 1]
+    elif kind == "bypass":
+        wf["2"] = {"class_type": "LoraLoaderBypass", "inputs": {"model": ["1", 0], "clip": ["1", 1], "lora_name": lora,
+                                                                "strength_model": 0.8, "strength_clip": 0.8}}
+        wf["6"]["inputs"]["model"] = ["2", 0]
+        clip = ["2", 1]
     elif kind == "hook":
         wf["8"] = {"class_type": "CreateHookLora", "inputs": {"lora_name": lora, "strength_model": 0.9, "strength_clip": 0.8}}
         wf["9"] = {"class_type": "SetClipHooks", "inputs": {"clip": ["1", 1], "apply_to_conds": True, "schedule_clip": False, "hooks": ["8", 0]}}
@@ -101,7 +108,7 @@ def instrument():
     comfy.utils.load_torch_file = load_torch_file
 
     MP = comfy.model_patcher.ModelPatcher
-    for name in ("add_patches", "add_hook_patches"):
+    for name in ("add_patches", "add_hook_patches", "set_injections"):
         orig = MP.__dict__[name]
 
         def wrapper(self, *a, _orig=orig, **k):
@@ -142,7 +149,7 @@ def alive_patched(refs):
     n = 0
     for r in refs:
         p = r()
-        if p is not None and (len(p.patches) > 0 or len(p.hook_patches) > 0):
+        if p is not None and (len(p.patches) > 0 or len(p.hook_patches) > 0 or "bypass_lora" in p.injections):
             n += 1
     return n
 
@@ -214,7 +221,7 @@ def main():
     ref = refs["plain"]
     rss0 = rss_gib()
     summary = {"cache": a.cache, "keep": KEEP}
-    for lora_kind in ("lora", "hook"):
+    for lora_kind in ("lora", "hook", "bypass"):
         before = dict(COUNT)
         out_l = run(e, workflow(lora_kind))
         rss_l = rss_gib()

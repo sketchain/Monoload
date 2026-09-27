@@ -4,7 +4,8 @@ install() wraps execution.PromptExecutor.execute_async. When a prompt has
 finished (successfully or not), release_after_prompt():
 
   1. loaded models: every LoadedModel whose patcher carries weight patches
-     (LoRA, hook LoRA, model merges, ...) is unpatched in place -- runtime
+     (LoRA, hook LoRA, model merges, ...) or a bypass-LoRA injection is
+     unpatched in place -- runtime
      patches removed, device-side LoRA copies dropped, nothing moved -- and
      re-pointed at its base patcher (the nearest ancestor without weight
      patches, i.e. the loader node's output), with the model's
@@ -41,8 +42,14 @@ _MAX_DEPTH = 8
 # what carries LoRA
 # ---------------------------------------------------------------------------
 
+BYPASS_INJECTION_KEY = "bypass_lora"  # comfy.sd.load_bypass_lora_for_models / LoraLoaderBypass
+
+
 def patcher_has_weight_patches(p):
-    return len(getattr(p, "patches", {}) or {}) > 0 or len(getattr(p, "hook_patches", {}) or {}) > 0
+    """Weight patches, hook patches, or bypass-LoRA injections."""
+    return (len(getattr(p, "patches", {}) or {}) > 0
+            or len(getattr(p, "hook_patches", {}) or {}) > 0
+            or BYPASS_INJECTION_KEY in (getattr(p, "injections", {}) or {}))
 
 
 def _hook_group_has_weights(g):

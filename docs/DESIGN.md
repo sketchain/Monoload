@@ -8,6 +8,8 @@ v1（tag `v1-converter`，远端归档分支 `archive/v1-converter`）做的是�
 
 v2 只做一件事：**在 ComfyUI 原生加载出来的模型上打 LoRA 时，不改原权重、不做任何备份，而是在每一层计算的那一刻临时合并。** 对工作流透明：原生 `UNETLoader`、`CheckpointLoaderSimple`、`CLIPLoader`、`LoraLoader`、`LoraLoaderModelOnly`、Hook LoRA 节点照常使用。
 
+在此基础上还做了两件事：量化层（fp8 scaled 等）上的 LoRA 采用放宽合并（§3.3，这是唯一不与原生逐位一致的地方）；每个 prompt 结束后释放 LoRA，底模继续常驻（§7）。
+
 「单份」的口径不变：
 
 * 允许：LoRA 文件本身常驻内存；LoRA 张量在计算设备上的一份副本（见 §5.2）；正在计算的那一层短暂多出的临时副本（含 LoRA 按 fp32 计算的中间量）。
@@ -136,6 +138,16 @@ layer probe（Rubber Duck，一次模型调用、全部 192 层合计）：临�
 2. 这部分开销主要是对被 patch 权重的几遍逐元素读写（拷贝、加上 delta、dtype 往返），低秩矩阵乘本身不贵。所以在带宽受限的 APU 上，它和「被 LoRA 改到的权重有多大」成正比，和分辨率无关。分辨率越高，模型本身的计算越多，占比就越小。
 3. 逐位一致带来的额外开销（dtype 往返 + 舍入）在 CPU 上约占合并本身的 35%。GPU 上 bf16/fp16 转换很便宜，但 gfx1151 上的 `lora_compute_dtype` 是 fp16，而权重是 bf16，所以每层每步要多两遍转换。GPU 上的数字请看 layer probe。
 
+`bypass` 对照（同一台 CPU、同样设置、机器空闲时重跑；Monoload 的数字也是这一轮的）：
+
+| 组合 | 每步 原生 | Monoload（逐位一致） | ComfyUI bypass | bypass 与原生的 latent max\|Δ\| |
+|---|---|---|---|---|
+| Rubber Duck | 8.56s | 16.90s（1.97×） | 10.27s（1.20×） | 0.033 |
+| Annalise LoCon | 9.10s | 24.60s（2.70×） | 13.54s（1.49×） | 0.155 |
+| 不打 LoRA | 8.40s | 9.09s | 8.96s | 0 |
+
+（作为参照，这两个 LoRA 本身对 latent 的影响 max_abs 约 34。）
+
 可选的放宽方案（都**没有实现**）：
 
 * **A. 按原生 lowvram 的数值合并：** 直接在计算 dtype 下 `calculate_weight(patches, weight, key, intermediate_dtype=计算 dtype)`，省掉 dtype 往返和舍入。与原生合并不再逐位一致，但与原生 lowvram 路径一致。CPU 上比逐位一致快约 25%。
@@ -174,7 +186,7 @@ layer probe（Rubber Duck，一次模型调用、全部 192 层合计）：临�
 
 按**内容**判断，不按节点类型判断。原生 LoRA 节点、Hook LoRA 节点，以及第三方 LoRA 加载节点，只要产出的是带 patch 的 clone，就都覆盖到。一个值「带 LoRA」，指它（递归地，在 list/tuple/dict 里）包含下面任何一种：
 
-* 带权重 patch 或 hook patch 的 `ModelPatcher`（`patches` 或 `hook_patches` 非空）；
+* 带权重 patch 或 hook patch 的 `ModelPatcher`（`patches` 或 `hook_patches` 非空），或者带 bypass LoRA 注入的 `ModelPatcher`（`injections["bypass_lora"]`，来自 `LoraLoaderBypass` / `load_bypass_lora_for_models`）；
 * `patcher` 属性是这样一个 `ModelPatcher` 的对象（`CLIP`），或者带有 `apply_hooks_to_conds` 的 `CLIP`（`SetClipHooks` 的输出）；
 * 含有权重 hook 的 `HookGroup` / `Hook`（`CreateHookLora` 的输出）；
 * 挂着这类 hooks 的 conditioning（conditioning 的 dict 里有 `hooks`）。
@@ -197,7 +209,7 @@ layer probe（Rubber Duck，一次模型调用、全部 192 层合计）：临�
 
 ### 7.4 验证（`tests/test_release.py`，真正的 `PromptExecutor`）
 
-连续执行 API 格式的工作流：LoRA → 无 LoRA → Hook LoRA → 无 LoRA → LoRA（换一个种子），三种缓存模式各跑一遍，并在 `MONOLOAD_KEEP_LORA=1` 下再跑一遍：
+连续执行 API 格式的工作流：LoRA → 无 LoRA → Hook LoRA → 无 LoRA → bypass LoRA → 无 LoRA → LoRA（换一个种子），三种缓存模式各跑一遍，并在 `MONOLOAD_KEEP_LORA=1` 下再跑一遍：
 
 * 每个 LoRA prompt 结束后：从 `models/loras` 读出的**每一个**张量的弱引用都已失效（CPU 上被回收；GPU 上的副本只挂在这些对象上，也一起被回收）；没有仍带 patch 的 patcher；模块上没有运行时 patch；设备缓存为空；节点实例上没有 `loaded_lora`。
 * 接下来的无 LoRA prompt：`CheckpointLoaderSimple` 没有再次执行，底模对象是同一个，`ModelPatcher.load()` 一次也没被调用；输出与**另一个从没见过 LoRA 的进程**的输出逐位一致。
@@ -208,5 +220,6 @@ layer probe（Rubber Duck，一次模型调用、全部 192 层合计）：临�
 
 * 只接管没有重写 `patch_weight_to_device` 的 `ModelPatcher`（ComfyUI 自带的加载器都属于这种）。GGUF 等自带 patch 机制的插件保持原生行为，日志里会提示。
 * 每步都有合并开销（§5）。LoRA 越多、改的层越大，开销越明显；没被 patch 的层没有影响。
-* LoRA 文件由原生 `LoraLoader` 读取，读进来之后常驻 CPU 内存（原生也是这样）；计算设备上另有一份被用到的 LoRA 张量缓存。
+* LoRA 文件由原生 `LoraLoader` 读取，在一个 prompt 执行期间常驻 CPU 内存；计算设备上另有一份被用到的 LoRA 张量缓存。prompt 结束后两者都会释放（§7），设了 `MONOLOAD_KEEP_LORA=1` 则保留，和原生一样。
+* 量化层上的 LoRA 与原生不逐位一致（§3.3，有意为之）。
 * 本仓库的测试都在无 GPU 的机器上用 `--cpu` 跑；GPU 上的数值一致性和耗时要按 README 的真机验收步骤确认。
