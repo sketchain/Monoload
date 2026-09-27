@@ -73,6 +73,26 @@ Hook LoRA（复刻 patch_hook_weight_to_device，在已合并基础 LoRA 的权�
 
 每个 patcher 有一份 `hook_patches`（key → 当前生效的 hook patch 列表），它的所有运行时 patch 共享这一份。`patch_hooks(hooks)` 用原生的 `get_combined_hook_patches(hooks)` 算出组合（包括 keyframe 强度），写进这份状态；只被 hook 改到、还没有运行时 patch 的层补挂一个，不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。** 采样时正/负条件可能挂着不同的 hook 组，每一步会来回切换；在这里只是换一个 dict。CLIP 的 `SetClipHooks`（`forced_hooks`）走同一条路。
 
+### 3.3 量化参数：放宽合并（唯一不逐位一致的情况）
+
+原生对 fp8 scaled 这类量化层（`mixed_precision_ops`，权重是 `QuantizedTensor`）打 LoRA 时：先反量化，合并，然后用 `set_weight` 以随机舍入**重新量化回 fp8** 写回，并且备份原权重。
+
+Monoload 的做法：量化层挂上 weight function 后，`forward` 会走 `cast_bias_weight`，先拷一份量化张量，转成计算 dtype，再 `dequantize()`，然后才交给 weight function。Monoload 直接在这份**反量化出来的临时权重**上合并 LoRA，用完就丢，**不再量化回 fp8**。它把「参数 dtype」当作反量化后的 dtype（`QuantizedTensor.dtype`），其余步骤和 §3.1 完全相同。计算 dtype 与反量化 dtype 不同时，从参数重新反量化一次，而不是复用临时权重。
+
+* **速度：** gfx1151 上 `supports_fp8_compute()` 为 False（`torch._scaled_mm` 只支持 MI300+），原生对 fp8 模型本来就是每次 forward 先反量化再算，所以放宽合并不会带来额外的速度损失。
+* **精度：** 少了一次 fp8 重新量化，比原生更精确，但与原生**不逐位一致**。
+* **正确性的判定标准：** 与「先把这些层反量化成高精度参数，再走 §3.1 的逐位一致路径」逐位一致。
+* **一个实测发现：** 没挂 weight function 的 fp8 层，在原生 ComfyUI 里根本不反量化，而是把 `QuantizedTensor` 直接交给 `F.linear`，由 comfy_kitchen 的算子计算，运算顺序与「先反量化再乘」不同。所以把整个模型都反量化，即使不打 LoRA，结果也和 fp8 模型不一样（CPU 上 latent 的 max_abs 约 3e-4）。参照模型因此只反量化**被 LoRA 改到的那些层**，其余层保持 fp8，这与 Monoload 实际做的事一一对应。
+
+实测（`tests/test_quant.py`，SD1.5 UNet 的 184 个 Linear 转成 fp8 scaled，CPU，采样 2 步）：
+
+| LoRA | 被 patch 的 key | 其中 fp8 层 | 与「先反量化」参照 | 与原生 fp8 LoRA（合并 + 重新量化 + 备份） |
+|---|---|---|---|---|
+| Rubber Duck | 192 | 160 | 逐位一致 | max_abs 4.76，mean_abs 0.70（LoRA 本身的影响 max_abs 34.2） |
+| Annalise LoCon | 278 | 182 | 逐位一致 | max_abs 1.88，mean_abs 0.34（LoRA 本身的影响 max_abs 26.4） |
+
+与原生的差异来自原生的 fp8 重新量化，只报告，不作判定。另外 dtype 矩阵测试里，对 fp8 参数的 54 种组合（反量化 dtype × 计算 dtype × lora dtype × 基础 / hook）逐一对照「先反量化」参照，全部逐位一致。
+
 ## 4. 与原生状态机的配合
 
 * **重复加载。** 原生 `load()` 会清空所有全量加载层的 `weight_function`，但跳过已标记 `comfy_patched_weights` 的层（原生里它们已经合并好了）。Monoload 的 patch 并没有合并进权重，所以 `load()` 之前先清掉被 patch 层的这个标记，保证这些层会重新走一遍 `patch_weight_to_device`。
@@ -123,7 +143,7 @@ layer probe（Rubber Duck，一次模型调用、全部 192 层合计）：临�
 * **C. 融合的 `addmm_`：** 把「低秩乘 → 缩放 → 转 dtype → 加回」合成一次 `weight.addmm_(up, down, alpha=scale)`，少几遍逐元素读写。只适用于普通 LoRA/LoCon，舍入顺序和原生不同。
 * **D. bypass（低秩前向）：** `y = W·x + scale·up(down(x))`，完全不物化合并后的权重，每层的额外开销从「对整块权重做几遍逐元素运算」变成「两个很瘦的矩阵乘」（与 token 数 × rank 成正比）。在带宽受限的 APU 上，这很可能是唯一能把开销降一个量级的办法。ComfyUI 已经自带实现（`comfy/weight_adapter/bypass.py`、节点 `LoraLoaderBypass`），但数值与合并路径不同，而且不是所有 adapter 都支持。
 
-建议先在 CT 700 上跑基准，看 GPU 上的每步比值再决定。如果 Krea 2 这类大模型的开销不可接受，A/B/C 大概只能省掉一部分，D 才可能根本解决问题。
+`tests/bench_lora.py` 带 `bypass` 模式，直接调用 ComfyUI 自带的 `comfy.sd.load_bypass_lora_for_models`，只提供对照数据，设计上不做改动。建议先在 CT 700 上跑基准，看 GPU 上的每步比值再决定。如果 Krea 2 这类大模型的开销不可接受，A/B/C 大概只能省掉一部分，D 才可能根本解决问题。
 
 ## 6. 报错（绝不退回「改权重 + 备份」）
 
@@ -133,7 +153,6 @@ layer probe（Rubber Duck，一次模型调用、全部 192 层合计）：临�
 | 要求把 patch 合并进权重（`force_patch_weights`，常见于 `ModelSave` / `CheckpointSave` / 模型合并后保存） | `force_patch_weights` | 加载时 |
 | 被 patch 的参数不属于 `comfy.ops` 层（没有 `comfy_cast_weights`，没有运行时路径） | `lora_non_comfy_ops_param` | 挂 patch 时 |
 | patch 会改变权重形状 | `lora_shape_change` | 挂 patch 时 |
-| 被 patch 的参数是量化张量（有 `set_*`/`convert_*`，例如 fp8 scaled） | `lora_quantized_param` | 挂 patch 时 |
 
 报错信息里写明是哪种情况和对应的 key，例如：
 
@@ -141,9 +160,51 @@ layer probe（Rubber Duck，一次模型调用、全部 192 层合计）：临�
 [Monoload] 不支持（lora_shape_change） key=diffusion_model.input_blocks.1.1.proj_in.weight: patch 会把权重形状从 [320, 320, 1, 1] 改成 [328, 320, 1, 1]，运行时合并无法支持
 ```
 
-最后一种（量化参数）是这次新增的：原生加载的模型可能带 fp8 scaled 之类的量化层，原生会把合并结果重新量化后写回，并且备份。要做到运行时逐位一致，得复刻「反量化 → 合并 → 以同样的 seed 重新量化 → 再反量化」，v2 先不做，明确报错。需要时设 `MONOLOAD_DISABLE=1`。
+量化参数（fp8 scaled 等）不报错，走放宽合并，见 §3.3。
 
-## 7. 限制
+## 7. 每个 prompt 结束后释放 LoRA（底模常驻）
+
+目的：一个工作流用完 LoRA 后，LoRA 相关的内存（CPU 和 GPU）全部还回去，底模（Checkpoint / UNET / CLIP 加载节点的输出）原样留在内存和执行缓存里，下一个工作流直接复用，不重新加载。设 `MONOLOAD_KEEP_LORA=1` 时不启用。
+
+### 7.1 时机
+
+`release.install()` 包装 `execution.PromptExecutor.execute_async`：原函数跑完之后（不管成功、失败还是被中断，写在 `finally` 里），调用 `release_after_prompt(executor)`。`main.py` 的 prompt worker 是一个接一个执行 prompt 的，这个点正好在「上一个 prompt 的所有节点都执行完」和「下一个 prompt 开始」之间，执行器的缓存也在手上（`executor.caches`）。释放过程中出错只记错误日志，不影响服务。
+
+### 7.2 怎么判断哪些东西属于 LoRA
+
+按**内容**判断，不按节点类型判断。原生 LoRA 节点、Hook LoRA 节点，以及第三方 LoRA 加载节点，只要产出的是带 patch 的 clone，就都覆盖到。一个值「带 LoRA」，指它（递归地，在 list/tuple/dict 里）包含下面任何一种：
+
+* 带权重 patch 或 hook patch 的 `ModelPatcher`（`patches` 或 `hook_patches` 非空）；
+* `patcher` 属性是这样一个 `ModelPatcher` 的对象（`CLIP`），或者带有 `apply_hooks_to_conds` 的 `CLIP`（`SetClipHooks` 的输出）；
+* 含有权重 hook 的 `HookGroup` / `Hook`（`CreateHookLora` 的输出）；
+* 挂着这类 hooks 的 conditioning（conditioning 的 dict 里有 `hooks`）。
+
+底模加载节点的输出是**没有** patch 的 patcher，因此不受影响。`ModelSamplingDiscrete` 这类只带 object patch 的 clone 也不受影响。带权重 patch 的模型合并结果按同样的规则释放，下次用到时重新执行合并节点即可，这一步很便宜。
+
+### 7.3 释放什么、怎么释放
+
+1. **已加载的模型**（`model_management.current_loaded_models`）：对 patcher 带 LoRA、或模块上还挂着运行时 patch 的 `LoadedModel`：
+   * 就地 `unpatch_hooks()` + `unpatch_model(device_to=None, unpatch_weights=True)`。Monoload 版本会摘掉所有运行时 patch，清空设备上的 LoRA 缓存；**权重一个字节都不搬**，因为本来就没被改过。
+   * 原生 `unpatch_model` 即使不搬权重，也会把模型标成「未加载」（`model_loaded_weight_memory = 0`，删掉 `comfy_patched_weights`）。权重其实还在原位，所以卸之前先记下这些状态，卸完原样恢复。
+   * 沿 `patcher.parent` 往上找到第一个没有权重 patch 的祖先，也就是底模的 patcher（`LoraLoader` 的输出是它的 clone）。把 `LoadedModel` 切到这个 patcher（ComfyUI 自己在 patcher 被回收时也用 `_set_model` 做同样的事），并把 `model.current_weight_patches_uuid` 设为底模的。这样在 ComfyUI 看来，现在「已加载的就是底模、而且没有 patch」：下一个不带 LoRA 的工作流会直接复用，不调用 `ModelPatcher.load()`；下一个带 LoRA 的工作流因为 uuid 不同，会照常重新挂 patch。
+   * 找不到干净的祖先时，把 uuid 设成一个新的随机值，强制下次使用时重新评估。
+   * 部分加载（`model_lowvram`，只在非 `--gpu-only` 时出现）时，就地卸会连被卸载层的原生 lowvram 状态一起清掉，所以改用原生的 `LoadedModel.model_unload()`，权重回到 offload 设备。
+2. **输出缓存**（`caches.outputs`，包括子图的 subcache；CLASSIC / LRU / RAM_PRESSURE 三种都支持）：删掉值带 LoRA 的条目，同时清理 LRU / RAM_PRESSURE 的附属字典（`used_generation`、`children`、`timestamps`）。下游节点的输出（latent、图片、普通 conditioning）不含 LoRA，照常保留。下次跑同一个工作流时，如果下游已经命中缓存，LoRA 节点就根本不会被执行。
+3. **节点实例缓存**（`caches.objects`）：清掉节点实例上的 `loaded_lora`。`LoraLoader`、`LoraLoaderModelOnly`、`CreateHookLora`、`LoraLoaderBypass` 都用这个属性缓存读进来的 LoRA 文件。
+4. `gc.collect()` + `soft_empty_cache()`，日志里打一行 `[Monoload] released LoRA after prompt: ...`。
+
+到这一步，LoRA 张量已经没有任何引用：LoRA 文件读出的 dict、clone 上的 patch、运行时 patch 和它在计算设备上的副本、hook 组都已被回收。测试里用弱引用逐个确认（§7.4）。
+
+### 7.4 验证（`tests/test_release.py`，真正的 `PromptExecutor`）
+
+连续执行 API 格式的工作流：LoRA → 无 LoRA → Hook LoRA → 无 LoRA → LoRA（换一个种子），三种缓存模式各跑一遍，并在 `MONOLOAD_KEEP_LORA=1` 下再跑一遍：
+
+* 每个 LoRA prompt 结束后：从 `models/loras` 读出的**每一个**张量的弱引用都已失效（CPU 上被回收；GPU 上的副本只挂在这些对象上，也一起被回收）；没有仍带 patch 的 patcher；模块上没有运行时 patch；设备缓存为空；节点实例上没有 `loaded_lora`。
+* 接下来的无 LoRA prompt：`CheckpointLoaderSimple` 没有再次执行，底模对象是同一个，`ModelPatcher.load()` 一次也没被调用；输出与**另一个从没见过 LoRA 的进程**的输出逐位一致。
+* 释放后再用 LoRA：结果与全新进程逐位一致。
+* `MONOLOAD_KEEP_LORA=1`：LoRA 保留。
+
+## 8. 限制
 
 * 只接管没有重写 `patch_weight_to_device` 的 `ModelPatcher`（ComfyUI 自带的加载器都属于这种）。GGUF 等自带 patch 机制的插件保持原生行为，日志里会提示。
 * 每步都有合并开销（§5）。LoRA 越多、改的层越大，开销越明显；没被 patch 的层没有影响。

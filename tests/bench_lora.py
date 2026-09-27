@@ -1,8 +1,9 @@
 """Benchmark: native LoRA (baked + backup) vs Monoload runtime merge.
 
-Runs the same LoRA sequence twice in one process -- once with Monoload
-uninstalled (native ComfyUI), once installed -- on the same loaded models, and
-reports per combination:
+Runs the same LoRA sequence in one process, on the same loaded models, in
+several modes: native ComfyUI (Monoload uninstalled), Monoload installed, and
+ComfyUI's own bypass LoRA (comfy.sd.load_bypass_lora_for_models, as the
+LoraLoaderBypass node does; comparison data only). Reports per combination:
   lora   : LoraLoader node calls (reads the LoRA files, builds patches)
   encode : CLIPTextEncode of positive + negative (includes loading/patching the TE)
   patch  : load_models_gpu of the diffusion model (native: restore previous
@@ -85,15 +86,37 @@ def parse_combo(s, default_strength):
     return out
 
 
+_BYPASS_LORA_CACHE = {}
+
+
+def apply_mode_loras(model, clip, loras, mode):
+    """native*/monoload*: the LoraLoader node. bypass*: ComfyUI's own bypass
+    LoRA (comfy.sd.load_bypass_lora_for_models, what the LoraLoaderBypass node
+    calls) -- comparison data only, Monoload is uninstalled for it."""
+    m, c = model, clip
+    for name, sm, sc in loras:
+        if mode.startswith("bypass"):
+            import comfy.sd
+            import comfy.utils
+            import folder_paths
+            lora = _BYPASS_LORA_CACHE.get(name)
+            if lora is None:
+                lora = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", name), safe_load=True)
+                _BYPASS_LORA_CACHE.clear()
+                _BYPASS_LORA_CACHE[name] = lora
+            m, c = comfy.sd.load_bypass_lora_for_models(m, c, lora, sm, sc)
+        else:
+            m, c = nodes.LoraLoader().load_lora(m, c, name, sm, sc)
+    return m, c
+
+
 def run_sequence(model, clip, combos, a, results, mode):
     latent0 = torch.zeros(1, 4, a.height // 8, a.width // 8)
     for rep in range(a.repeat):
         for label, loras in combos:
             _sync()
             t0 = time.perf_counter()
-            m, c = model, clip
-            for name, sm, sc in loras:
-                m, c = nodes.LoraLoader().load_lora(m, c, name, sm, sc)
+            m, c = apply_mode_loras(model, clip, loras, mode)
             t_lora = time.perf_counter() - t0
 
             _sync()
@@ -208,8 +231,9 @@ def main():
     p.add_argument("--scheduler", default="simple")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--repeat", type=int, default=2, help="run the combo sequence this many times per mode (first pass includes warm-up)")
-    p.add_argument("--modes", default="native,monoload",
-                   help="comma list run in order; names starting with 'monoload' run with Monoload installed, others native")
+    p.add_argument("--modes", default="native,monoload,bypass",
+                   help="comma list run in order: 'monoload*' = Monoload installed; 'bypass*' = ComfyUI's bypass LoRA "
+                        "(load_bypass_lora_for_models, Monoload uninstalled, comparison only); anything else = native")
     p.add_argument("--prompt", default="a photo of a red fox sitting in fresh snow, golden hour, detailed fur")
     p.add_argument("--negative", default="blurry, lowres")
     p.add_argument("--no-probe", action="store_true", help="skip the per-layer weight-function probe")
@@ -256,7 +280,8 @@ def main():
                 label, rn["step"], rm["step"], rm["step"] / rn["step"] if rn["step"] else float("nan"),
                 rn["patch"], rm["patch"], rn["encode"], rm["encode"], delta))
     print("\nmax|Δ| = max abs difference of the final latent between the two modes (0 = bit-identical).")
-    print("Run with --modes native,monoload,native2 to see how much native differs from itself on this GPU.")
+    print("Run with --modes native,monoload,bypass,native2 to see how much native differs from itself on this GPU.")
+    print("bypass is not bit-identical to merging by design (it adds up(down(x)) to the layer output); its max|Δ| is for reference.")
     probe = next((l for _, l in combos if l), None)
     if probe and not a.no_probe:
         layer_probe(model, clip, probe)
