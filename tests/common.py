@@ -282,9 +282,16 @@ def diff_stats(a, b):
     return {"bit_exact": bool(torch.equal(a, b)), "max_abs": float(d.max()), "mean_abs": float(d.mean())}
 
 
-def family_inputs(family, seed=0):
-    """Deterministic fake conditioning + empty latent for a model family."""
+def family_inputs(family, seed=0, model=None):
+    """Deterministic fake conditioning + empty latent for a model family.
+    `zimage` reads the caption dim / latent channels from `model` (a ModelPatcher)."""
     g = torch.Generator().manual_seed(seed)
+    if family == "zimage":
+        dim = model.model.model_config.unet_config.get("cap_feat_dim", 2560)
+        ch = model.model.latent_format.latent_channels
+        pos = [[torch.randn(1, 32, dim, generator=g), {}]]
+        neg = [[torch.randn(1, 32, dim, generator=g) * 0.1, {}]]
+        return pos, neg, torch.zeros(1, ch, 32, 32)
     if family == "sd15":
         pos = [[torch.randn(1, 77, 768, generator=g), {}]]
         neg = [[torch.randn(1, 77, 768, generator=g) * 0.1, {}]]

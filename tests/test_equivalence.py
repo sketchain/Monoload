@@ -40,7 +40,7 @@ def main():
 
     if a.no_sample:
         finish()
-    pos, neg, latent = family_inputs(a.family)
+    pos, neg, latent = family_inputs(a.family, model=native)
     out_n = sample(native, pos, neg, latent, steps=a.steps)
     free_all()
     out_m = sample(mono, pos, neg, latent, steps=a.steps)

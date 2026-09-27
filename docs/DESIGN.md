@@ -86,7 +86,7 @@ JSON 里非原生类型用带标签的编码：`torch.dtype` → `{"__dtype__": 
 
 * 目标设备 = 原生的 `unet_offload_device()`：`--gpu-only`（HIGH_VRAM）时是 GPU，普通模式是 CPU——和原生模型「待机时住在哪」一致。
 * `get_model(..., device=目标设备)`：`comfy.ops` 的层用 `torch.empty(device=…)` 直接在目标设备分配，**这就是唯一的一份**；不依赖「CPU 上未触碰的 empty 页 + `.to()`」。
-* 少数没把 `device` 传下去的模块会在 CPU 上建参数：加载器检查每个要从文件读的张量，不在目标设备上就在目标设备上重新 `empty` 一个替换进去（CPU 上那个是未触碰的 empty，随即释放），并在日志里统计这类张量的数量和字节数。
+* 少数没把 `device` 传下去的模块会在 CPU 上建参数：加载器检查每个要从文件读的张量，不在目标设备上就在目标设备上重新 `empty` 一个替换进去，原来那个随即释放，并在日志里统计这类张量的数量和字节数。实际遇到的主要是 `model_sampling.*`：它们在构造时于 CPU 上算出，只有几 KB，而且文件里有同样的值，会原样读回。
 * DynamicVRAM（comfy-aimdo）开启时 `comfy.ops` 会延迟建参数、并依赖 mmap：v1 **明确报错不支持**，提示用 `--gpu-only` 或 `--disable-dynamic-vram`。
 
 ## 3. 搬运
