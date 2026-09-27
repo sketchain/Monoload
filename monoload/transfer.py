@@ -213,6 +213,7 @@ def stream_into_tensors(fd, items, device, buf_bytes, path="<file>"):
         bufs.append(b)
         mvs.append(cpu_memoryview(b))
         stats.pinned = pinned
+    stream = None
     try:
         if _is_cuda(device):
             stream = torch.cuda.Stream(device=device)
@@ -238,6 +239,8 @@ def stream_into_tensors(fd, items, device, buf_bytes, path="<file>"):
                 for p in chunk.pieces:
                     _copy_piece(bufs[b][p.buf_off:p.buf_off + p.n], p, non_blocking=False)
     finally:
+        if stream is not None:
+            stream.synchronize()  # never free a pinned buffer with an H2D copy in flight
         del mvs
         del bufs
         release_host_cache()
