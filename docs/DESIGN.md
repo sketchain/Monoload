@@ -248,6 +248,20 @@ u = 比较精度的单位舍入：fp16 2⁻¹¹ ≈ 4.9e-4，bf16 2⁻⁸ ≈ 3.
   * `test_dtype_paths.py`：参数 × 计算 × lora dtype × 8 种 patch 组合（LoRA、两个 LoRA、strength_model ≠ 1、LoHa、LoRA+LoHa、diff、hook、LoRA+hook），共 144 项。每项检查两件事：一是与独立实现的参照（普通 LoRA 用 `addmm_`，其余用原生 `LowVramPatch`）**逐位一致**，二是与原生合并的差异在上述阈值以内。
   * `test_lora_hot.py`：两条管线、8 个组合，UNet 和 TE 所有被 patch 的权重整体与原生合并比较，必须在阈值以内。同时在同样的 key 上重算逐位一致路径，必须与原生逐位一致。模型合并同样检查。latent 与原生的差异只报告；hook LoRA 要求 latent 的 mean|Δ| 小于 hook 本身作用的 10%。
   * `test_quant.py`：fp8 与「先反量化 + 同一路径」逐位一致。
+CPU 实测（`--cpu --fp16-unet`：UNet 参数 fp16、计算 fp32，所以按 fp16 比较；SD1.5，采样 2 步，两条管线结果相同）：
+
+| 组合 | UNet：rel / 阈值 | TE：rel / 阈值 | latent 与原生 mean\|Δ\|（LoRA 本身的作用 mean） |
+|---|---|---|---|
+| Rubber Duck | 7.3e-5 / 0.056 | 2.8e-4 / 0.27 | 0.0092（7.28） |
+| Annalise LoCon | 2.6e-5 / 0.031 | 3.9e-5 / 0.065 | 0.0074（4.92） |
+| 两者叠加 | 1.5e-5 / 0.039 | 4.7e-5 / 0.080 | 0.0081（5.95） |
+| LoKr（A） | 0 / 0.016 | 0 / 0.012 | 0.0055（4.86） |
+| LoHa（A） | 0 / 0.085 | 0 / 0.034 | 0.0069（0.39） |
+| ModelMergeSimple（A） | 0 / 0.14（686 个 key） | | 0.012 |
+| Hook LoRA | （由 dtype 矩阵覆盖） | | 0.024（7.51） |
+
+CPU 上计算 dtype 是 fp32，默认路径在 fp32 下合并、不舍入回 fp16，比原生更精确。所以权重按 fp16 比较时几乎完全一样（LoKr / LoHa / 模型合并是 0），latent 的差异主要来自原生那次舍入回 fp16。gfx1151 上三种 dtype 都是 fp16，差异的形态见上面的 2.54e-3。
+
 * 两种模式都要通过的行为测试：没有备份、权重逐字节不变、撤掉 LoRA 后与没打过逐位一致、报错、每个 prompt 结束后的释放（三种缓存加 KEEP）。
 
 ## 6. 报错（绝不退回「改权重 + 备份」）
