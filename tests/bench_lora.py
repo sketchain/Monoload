@@ -464,7 +464,7 @@ def main():
         print("{:28s} | ".format(label[:28]) + " | ".join(cells))
     print("\nmax|Δ| / mean|Δ| = difference of the final latent between the two modes (0 = bit-identical).")
     print("effect = what the LoRA changes in that mode (combo vs the same mode's 'none'); compare mean|Δ| with it.")
-    print("Run with --modes native,monoload,bypass,native2 to see how much native differs from itself on this GPU.")
+    print("Add native2 to --modes (e.g. native,monoload,monoload-exact,native2) to see how much native differs from itself on this GPU.")
     print("bypass is not bit-identical to merging by design (it adds up(down(x)) to the layer output).")
     if BYPASS_NOISE["suppressed"]:
         print("({} '[BypassLoRA] Adapter key not in model state_dict' warnings suppressed: text-encoder keys seen while "
