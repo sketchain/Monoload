@@ -17,7 +17,10 @@ finished (successfully or not), release_after_prompt():
      base patchers) and everything else stay cached.
   3. node instance cache: `loaded_lora` (LoraLoader, LoraLoaderModelOnly,
      CreateHookLora, LoraLoaderBypass, ...) is cleared.
-  4. gc + soft_empty_cache.
+  4. gc (LoRA clones die; LoadedModels of patch-free clones such as the
+     CLIP clone of a UNet-only LoRA switch to their parent) + re-sync of
+     current_weight_patches_uuid for patch-free loaded patchers +
+     soft_empty_cache.
 
 MONOLOAD_KEEP_LORA=1 (checked by the plugin entry) skips installing this.
 """
@@ -190,18 +193,42 @@ def _release_objects(objects_cache):
     return n
 
 
+def _sync_clean_loaded_models():
+    """A LoadedModel whose patcher carries no patches at all may still hold the
+    patches_uuid of another clone: e.g. LoraLoader always clones the CLIP and
+    add_patches() always rolls a new uuid, even when the LoRA has no
+    text-encoder keys; once that clone is garbage, ComfyUI's finalizer points
+    the LoadedModel back at the parent but leaves the model's
+    current_weight_patches_uuid as it was, so the next prompt would run a full
+    load() again. Under Monoload weights are never modified, so a model with
+    no runtime patches is in exactly the state of any patcher without
+    patches: sync the uuid."""
+    n = 0
+    for lm in comfy.model_management.current_loaded_models:
+        p = lm.model
+        if p is None or patcher_has_weight_patches(p) or _model_has_runtime_patches(p.model):
+            continue
+        if p.model.current_weight_patches_uuid != p.patches_uuid:
+            p.model.current_weight_patches_uuid = p.patches_uuid
+            n += 1
+    return n
+
+
 def release_after_prompt(executor):
     t0 = time.perf_counter()
     n_models = _release_loaded_models()
     caches = getattr(executor, "caches", None)
     n_out = _release_outputs(getattr(caches, "outputs", None))
     n_obj = _release_objects(getattr(caches, "objects", None))
+    n_sync = 0
     if n_models or n_out or n_obj:
-        gc.collect()
+        gc.collect()  # LoRA clones die here; LoadedModels of clean clones switch to their parents
+        n_sync = _sync_clean_loaded_models()
         comfy.model_management.soft_empty_cache()
         logging.info("[Monoload] released LoRA after prompt: {} loaded model(s) back to base, {} cached output(s), "
-                     "{} node LoRA cache(s) ({:.2f}s)".format(n_models, n_out, n_obj, time.perf_counter() - t0))
-    return {"models": n_models, "outputs": n_out, "objects": n_obj}
+                     "{} node LoRA cache(s), {} clean clone(s) re-synced ({:.2f}s)".format(
+                         n_models, n_out, n_obj, n_sync, time.perf_counter() - t0))
+    return {"models": n_models, "outputs": n_out, "objects": n_obj, "synced": n_sync}
 
 
 # ---------------------------------------------------------------------------

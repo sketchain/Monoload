@@ -27,6 +27,7 @@ main process (PID 1), otherwise "--cpu".
 """
 
 import argparse
+import logging
 import os
 import shlex
 import statistics
@@ -87,26 +88,99 @@ def parse_combo(s, default_strength):
 
 
 _BYPASS_LORA_CACHE = {}
+BYPASS_NOISE = {"suppressed": 0}
+
+
+class _QuietBypassWarnings(logging.Filter):
+    """load_bypass_lora_for_models walks UNet and text-encoder adapters in one
+    dict and warns for every text-encoder key while attaching to the UNet
+    (they are attached to the CLIP right after). Count instead of print."""
+
+    def filter(self, record):
+        if "[BypassLoRA] Adapter key not in model state_dict" in record.getMessage():
+            BYPASS_NOISE["suppressed"] += 1
+            return False
+        return True
+
+
+def _bypass_lora(name):
+    import comfy.utils
+    import folder_paths
+    lora = _BYPASS_LORA_CACHE.get(name)
+    if lora is None:
+        lora = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", name), safe_load=True)
+        _BYPASS_LORA_CACHE[name] = lora
+    return lora
+
+
+def _combined_injection(injections):
+    """One PatcherInjection running several bypass injections: inject in order,
+    eject in reverse, so stacked hooks on the same module unwind correctly
+    (ModelPatcher.eject_model ejects in insertion order)."""
+    from comfy.patcher_extension import PatcherInjection
+
+    def inject(mp):
+        for inj in injections:
+            inj.inject(mp)
+
+    def eject(mp):
+        for inj in reversed(injections):
+            inj.eject(mp)
+    return PatcherInjection(inject=inject, eject=eject)
+
+
+def apply_bypass(model, clip, loras):
+    """ComfyUI's bypass LoRA for one or several LoRAs. Calling
+    load_bypass_lora_for_models repeatedly does not stack: every call stores
+    its injection under the same key "bypass_lora", replacing the previous
+    LoRA. So each LoRA is loaded against the base, and the injections (and any
+    regular, non-adapter patches) are combined on one clone."""
+    import uuid as _uuid
+    import comfy.sd
+    m, c = model.clone(), clip.clone()
+    inj_m, inj_c = [], []
+    root = logging.getLogger()
+    flt = _QuietBypassWarnings()
+    root.addFilter(flt)
+    try:
+        for name, sm, sc in loras:
+            mi, ci = comfy.sd.load_bypass_lora_for_models(model, clip, _bypass_lora(name), sm, sc)
+            inj_m += mi.injections.get("bypass_lora", [])
+            inj_c += ci.patcher.injections.get("bypass_lora", [])
+            for src, dst in ((mi, m), (ci.patcher, c.patcher)):
+                for k, v in src.patches.items():
+                    dst.patches.setdefault(k, []).extend(v)
+                    dst.patches_uuid = _uuid.uuid4()
+    finally:
+        root.removeFilter(flt)
+    if inj_m:
+        m.set_injections("bypass_lora", [_combined_injection(inj_m)])
+    if inj_c:
+        c.patcher.set_injections("bypass_lora", [_combined_injection(inj_c)])
+    return m, c
+
+
+def bypass_hooks(module):
+    """Modules whose forward is currently a bypass hook (an ejected hook leaves
+    the original bound method behind in __dict__, so check the owner)."""
+    from comfy.weight_adapter.bypass import BypassForwardHook
+    n = 0
+    for mm in module.modules():
+        f = mm.__dict__.get("forward")
+        if f is not None and isinstance(getattr(f, "__self__", None), BypassForwardHook):
+            n += 1
+    return n
 
 
 def apply_mode_loras(model, clip, loras, mode):
     """native*/monoload*: the LoraLoader node. bypass*: ComfyUI's own bypass
     LoRA (comfy.sd.load_bypass_lora_for_models, what the LoraLoaderBypass node
     calls) -- comparison data only, Monoload is uninstalled for it."""
+    if mode.startswith("bypass"):
+        return apply_bypass(model, clip, loras) if loras else (model, clip)
     m, c = model, clip
     for name, sm, sc in loras:
-        if mode.startswith("bypass"):
-            import comfy.sd
-            import comfy.utils
-            import folder_paths
-            lora = _BYPASS_LORA_CACHE.get(name)
-            if lora is None:
-                lora = comfy.utils.load_torch_file(folder_paths.get_full_path_or_raise("loras", name), safe_load=True)
-                _BYPASS_LORA_CACHE.clear()
-                _BYPASS_LORA_CACHE[name] = lora
-            m, c = comfy.sd.load_bypass_lora_for_models(m, c, lora, sm, sc)
-        else:
-            m, c = nodes.LoraLoader().load_lora(m, c, name, sm, sc)
+        m, c = nodes.LoraLoader().load_lora(m, c, name, sm, sc)
     return m, c
 
 
@@ -125,11 +199,13 @@ def run_sequence(model, clip, combos, a, results, mode):
             neg = nodes.CLIPTextEncode().encode(c, a.negative)[0]
             _sync()
             t_encode = time.perf_counter() - t0
+            te_keys = bypass_hooks(c.patcher.model) if mode.startswith("bypass") else len(c.patcher.patches)
 
             t0 = time.perf_counter()
             comfy.model_management.load_models_gpu([m])
             _sync()
             t_patch = time.perf_counter() - t0
+            unet_keys = bypass_hooks(m.model) if mode.startswith("bypass") else len(m.patches)
 
             latent = comfy.sample.fix_empty_latent_channels(m, latent0)
             noise = comfy.sample.prepare_noise(latent, a.seed, None)
@@ -148,7 +224,7 @@ def run_sequence(model, clip, combos, a, results, mode):
             steps = [stamps[0] - t0] + [b - x for x, b in zip(stamps, stamps[1:])]
             row = {
                 "mode": mode, "rep": rep, "combo": label,
-                "unet_keys": len(m.patches), "te_keys": len(c.patcher.patches),
+                "unet_keys": unet_keys, "te_keys": te_keys,
                 "backups": len(m.backup) + len(c.patcher.backup),
                 "lora": t_lora, "encode": t_encode, "patch": t_patch,
                 "step1": steps[0], "step": statistics.median(steps[1:]) if len(steps) > 1 else steps[0],
@@ -161,12 +237,33 @@ def run_sequence(model, clip, combos, a, results, mode):
             del m, c, pos, neg
 
 
+def _fused_spec(moved_patches, cdt, dev):
+    """For the fused probe: (up, down, scale) list if every patch on this key is a
+    plain LoRA/LoCon (no mid, dora, reshape, offset, function, strength_model),
+    else None (the probe then uses the relaxed merge for that key)."""
+    import comfy.weight_adapter
+    spec = []
+    for strength, v, strength_model, offset, function in moved_patches:
+        if not isinstance(v, comfy.weight_adapter.LoRAAdapter) or offset is not None or function is not None or strength_model != 1.0:
+            return None
+        up, down, alpha, mid, dora, reshape = v.weights[:6]
+        if mid is not None or dora is not None or reshape is not None:
+            return None
+        a = (alpha / down.shape[0]) if alpha is not None else 1.0
+        spec.append((up.flatten(1).to(dev, cdt), down.flatten(1).to(dev, cdt), float(strength * a)))
+    return spec
+
+
 def layer_probe(model, clip, loras, reps=3):
     """Per-step cost of the weight functions alone, summed over all patched
-    layers of the diffusion model: the temporary copy cast_bias_weight makes,
-    Monoload's bit-exact merge, and a relaxed merge (native lowvram numerics:
-    calculate_weight directly in the compute dtype, no lora dtype round trip,
-    no rounding). Measurement only; the relaxed variant is not used anywhere."""
+    layers of the diffusion model, for:
+      copy    : the temporary copy cast_bias_weight makes (paid by every variant)
+      exact   : Monoload's bit-exact merge (what the plugin does)
+      relaxed : calculate_weight directly in the compute dtype (native lowvram numerics)
+      fused   : weight.addmm_(up, down, alpha=scale) in the compute dtype for plain
+                LoRA/LoCon keys (others fall back to relaxed)
+    plus the weight error of relaxed/fused against exact, relative to what the
+    LoRA changes in the weight. Measurement only: only `exact` is used by the plugin."""
     import comfy.lora
     import comfy.utils
     from monoload.hotpatch import _to_device, _is_runtime_patch
@@ -186,30 +283,58 @@ def layer_probe(model, clip, loras, reps=3):
         if f is None:
             continue
         param = getattr(mod, attr)
-        items.append((key, param, f, _to_device(list(m.patches[key]), dev, cache, param.numel(), {"transient": False})))
+        moved = _to_device(list(m.patches[key]), dev, cache, param.numel(), {"transient": False})
+        items.append((key, param, f, moved, _fused_spec(moved, cdt, dev)))
+
+    def variant(kind, key, f, moved, spec, w):
+        if kind == "exact":
+            return f(w)
+        if kind == "relaxed" or (kind == "fused" and spec is None):
+            return comfy.lora.calculate_weight(moved, w, key, intermediate_dtype=cdt)
+        if kind == "fused":
+            w2 = w.view(w.shape[0], -1)
+            for up, down, scale in spec:
+                w2.addmm_(up, down, alpha=scale)
+            return w
+        return w
 
     def run(kind):
         _sync()
         t0 = time.perf_counter()
         for _ in range(reps):
-            for key, param, f, moved in items:
+            for key, param, f, moved, spec in items:
                 w = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
-                if kind == "exact":
-                    w = f(w)
-                elif kind == "relaxed":
-                    w = comfy.lora.calculate_weight(moved, w, key, intermediate_dtype=cdt)
+                w = variant(kind, key, f, moved, spec, w)
                 del w
         _sync()
         return (time.perf_counter() - t0) / reps
 
+    # accuracy against the bit-exact merge, relative to the LoRA's own change
+    err = {"relaxed": [0.0, 0.0, 0.0], "fused": [0.0, 0.0, 0.0]}  # sum |Δ|^2, max |Δ|, -
+    lora_sq = 0.0
+    for key, param, f, moved, spec in items:
+        base = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
+        exact = f(base.clone()).float()
+        lora_sq += float(((exact - base.float()) ** 2).sum())
+        for kind in err:
+            d = variant(kind, key, f, moved, spec, base.clone()).float() - exact
+            err[kind][0] += float((d ** 2).sum())
+            err[kind][1] = max(err[kind][1], float(d.abs().max()))
+        del base, exact
+    n_fused = sum(1 for it in items if it[4] is not None)
+
     run("exact")  # warm-up
-    t_copy, t_exact, t_relaxed = run("copy"), run("exact"), run("relaxed")
-    nbytes = sum(p.numel() * p.element_size() for _, p, _, _ in items)
+    t_copy, t_exact, t_relaxed, t_fused = run("copy"), run("exact"), run("relaxed"), run("fused")
+    nbytes = sum(it[1].numel() * it[1].element_size() for it in items)
     print("\n=== layer probe: {} patched layers, {:.2f} GiB of patched weights, compute dtype {}, lora dtype {} ===".format(
         len(items), nbytes / 2 ** 30, cdt, comfy.model_management.lora_compute_dtype(dev)))
-    print("  per model call: temporary copy {:.3f}s | bit-exact merge {:.3f}s (+copy) | relaxed merge {:.3f}s (+copy)".format(
-        t_copy, t_exact - t_copy, t_relaxed - t_copy))
-    print("  (one sampling step = 1 model call without CFG batching, the TE is separate)")
+    print("  per model call: temporary copy {:.3f}s | bit-exact merge {:.3f}s (+copy) | relaxed merge {:.3f}s (+copy) | "
+          "fused addmm {:.3f}s (+copy; {} of {} layers fused, rest relaxed)".format(
+              t_copy, t_exact - t_copy, t_relaxed - t_copy, t_fused - t_copy, n_fused, len(items)))
+    for kind in ("relaxed", "fused"):
+        rel = (err[kind][0] / lora_sq) ** 0.5 if lora_sq > 0 else float("nan")
+        print("  weight difference from bit-exact (= native merge), {:7s}: max |Δw| {:.3g}, ||Δw|| / ||LoRA change|| = {:.3g}".format(kind, err[kind][1], rel))
+    print("  (one sampling step = 1 model call when cond/uncond are batched; the TE is separate)")
     free_all()
 
 
@@ -263,11 +388,21 @@ def main():
     modes = a.modes.split(",")
     by = {(r["mode"], r["combo"]): (r, out) for r, out in results if r["rep"] == last}
     ref_mode = modes[0]
+
+    def effect(mode, label):
+        """What the LoRA does in this mode: max/mean |combo - none| of the same mode."""
+        cur, none = by.get((mode, label)), by.get((mode, "none"))
+        if cur is None or none is None or label == "none":
+            return None
+        d = (cur[1] - none[1]).abs()
+        return float(d.max()), float(d.mean())
+
     for other in modes[1:]:
         print("\n=== summary (repetition {}): {} vs {} ===".format(last + 1, other, ref_mode))
-        print("{:28s} | {:>12s} {:>12s} {:>8s} | {:>12s} {:>12s} | {:>12s} {:>12s} | {:>10s}".format(
-            "combo", "step " + ref_mode[:6], "step " + other[:6], "ratio", "patch " + ref_mode[:5], "patch " + other[:5],
-            "enc " + ref_mode[:6], "enc " + other[:6], "max|Δ|"))
+        print("{:28s} | {:>9s} {:>9s} {:>6s} | {:>8s} {:>8s} | {:>8s} {:>8s} | {:>9s} {:>9s} | {:>17s} {:>17s}".format(
+            "combo", "step " + ref_mode[:4], "step " + other[:4], "ratio", "patch " + ref_mode[:2], "patch " + other[:2],
+            "enc " + ref_mode[:4], "enc " + other[:4], "max|Δ|", "mean|Δ|",
+            "effect " + ref_mode[:6] + " max/mean", "effect " + other[:6] + " max/mean"))
         for label, _ in combos:
             n = by.get((ref_mode, label))
             m = by.get((other, label))
@@ -275,13 +410,19 @@ def main():
                 continue
             rn, on = n
             rm, om = m
-            delta = float((on - om).abs().max())
-            print("{:28s} | {:11.3f}s {:11.3f}s {:7.2f}x | {:11.2f}s {:11.2f}s | {:11.2f}s {:11.2f}s | {:10.3g}".format(
-                label, rn["step"], rm["step"], rm["step"] / rn["step"] if rn["step"] else float("nan"),
-                rn["patch"], rm["patch"], rn["encode"], rm["encode"], delta))
-    print("\nmax|Δ| = max abs difference of the final latent between the two modes (0 = bit-identical).")
+            d = (on - om).abs()
+            en, eo = effect(ref_mode, label), effect(other, label)
+            fmt_e = lambda e: "n/a" if e is None else "{:.3g}/{:.3g}".format(*e)
+            print("{:28s} | {:8.3f}s {:8.3f}s {:5.2f}x | {:7.2f}s {:7.2f}s | {:7.2f}s {:7.2f}s | {:9.3g} {:9.3g} | {:>17s} {:>17s}".format(
+                label[:28], rn["step"], rm["step"], rm["step"] / rn["step"] if rn["step"] else float("nan"),
+                rn["patch"], rm["patch"], rn["encode"], rm["encode"], float(d.max()), float(d.mean()), fmt_e(en), fmt_e(eo)))
+    print("\nmax|Δ| / mean|Δ| = difference of the final latent between the two modes (0 = bit-identical).")
+    print("effect = what the LoRA changes in that mode (combo vs the same mode's 'none'); compare mean|Δ| with it.")
     print("Run with --modes native,monoload,bypass,native2 to see how much native differs from itself on this GPU.")
-    print("bypass is not bit-identical to merging by design (it adds up(down(x)) to the layer output); its max|Δ| is for reference.")
+    print("bypass is not bit-identical to merging by design (it adds up(down(x)) to the layer output).")
+    if BYPASS_NOISE["suppressed"]:
+        print("({} '[BypassLoRA] Adapter key not in model state_dict' warnings suppressed: text-encoder keys seen while "
+              "attaching to the UNet; they are attached to the CLIP separately)".format(BYPASS_NOISE["suppressed"]))
     probe = next((l for _, l in combos if l), None)
     if probe and not a.no_probe:
         layer_probe(model, clip, probe)

@@ -119,7 +119,7 @@ Monoload 的做法：量化层挂上 weight function 后，`forward` 会走 `cas
 * **LoRA 张量只搬一次。** 原生 `calculate_weight` 每次都 `cast_to_device(LoRA 张量, 权重设备)`。LoRA 文件读在 CPU 上，放在运行时合并里，就成了每步每层一次 H2D。Monoload 在每个 patcher 里按张量缓存一份计算设备上的副本（同 dtype 搬运，数值不变），卸载时释放。**只缓存比被 patch 的权重小的张量**（LoRA 的低秩因子、alpha 等）；整层大小的 patch 张量（例如 `ModelMergeSimple` 等模型合并节点带进来的另一个模型的权重、完整的 diff）照原生的做法，每次临时搬运、用完即丢，所以不会让另一份模型常驻计算设备。缓存的代价是计算设备上多一份被用到的 LoRA 张量，大小不超过 LoRA 本身，在允许的范围内。
 * seed（`string_to_seed(key)`）在挂 patch 时算好；基础 patch 列表按设备缓存好的结构复用；没有 patch 的 key 直接返回。
 
-### 5.3 实测开销（CPU）与可选的放宽（未实现，等拍板）
+### 5.3 实测开销（CPU）与可选的放宽
 
 **CPU 参考数字**（锁定镜像，`--cpu --fp16-unet`，SD1.5，256×256，3 步，`tests/bench_lora.py`，第二遍的数字）。这台机器是 4 核 CPU，256px 下模型本身的计算量很小，所以合并开销显得特别突出，**不代表 GPU**：
 
@@ -153,9 +153,44 @@ layer probe（Rubber Duck，一次模型调用、全部 192 层合计）：临�
 * **A. 按原生 lowvram 的数值合并：** 直接在计算 dtype 下 `calculate_weight(patches, weight, key, intermediate_dtype=计算 dtype)`，省掉 dtype 往返和舍入。与原生合并不再逐位一致，但与原生 lowvram 路径一致。CPU 上比逐位一致快约 25%。
 * **B. 计算 dtype 下合并，intermediate 保持 fp32：** 省掉 dtype 往返，精度介于 A 和逐位一致之间。
 * **C. 融合的 `addmm_`：** 把「低秩乘 → 缩放 → 转 dtype → 加回」合成一次 `weight.addmm_(up, down, alpha=scale)`，少几遍逐元素读写。只适用于普通 LoRA/LoCon，舍入顺序和原生不同。
-* **D. bypass（低秩前向）：** `y = W·x + scale·up(down(x))`，完全不物化合并后的权重，每层的额外开销从「对整块权重做几遍逐元素运算」变成「两个很瘦的矩阵乘」（与 token 数 × rank 成正比）。在带宽受限的 APU 上，这很可能是唯一能把开销降一个量级的办法。ComfyUI 已经自带实现（`comfy/weight_adapter/bypass.py`、节点 `LoraLoaderBypass`），但数值与合并路径不同，而且不是所有 adapter 都支持。
+* **D. bypass（低秩前向）：** `y = W·x + scale·up(down(x))`，完全不物化合并后的权重，每层的额外开销从「对整块权重做几遍逐元素运算」变成「两个很瘦的矩阵乘」（与 token 数 × rank 成正比）。ComfyUI 已经自带实现（`comfy/weight_adapter/bypass.py`、节点 `LoraLoaderBypass`），但数值与合并路径不同，不是所有 adapter 都支持，而且连续调用 `load_bypass_lora_for_models` 叠加多个 LoRA 时，后一个会覆盖前一个（它们的注入都存在同一个 key `bypass_lora` 下）。GPU 实测见 §5.4。
 
-`tests/bench_lora.py` 带 `bypass` 模式，直接调用 ComfyUI 自带的 `comfy.sd.load_bypass_lora_for_models`，只提供对照数据，设计上不做改动。建议先在 CT 700 上跑基准，看 GPU 上的每步比值再决定。如果 Krea 2 这类大模型的开销不可接受，A/B/C 大概只能省掉一部分，D 才可能根本解决问题。
+`tests/bench_lora.py` 带 `bypass` 模式，直接调用 ComfyUI 自带的 `comfy.sd.load_bypass_lora_for_models`，只提供对照数据，设计上不做改动。
+
+### 5.4 真机数据（CT 700，gfx1151）与放宽建议（未实现，等拍板）
+
+**实测**（WAI v17，SDXL 整合包，1344×768，20 步，CFG 6，`--gpu-only`）。权重、计算 dtype、`lora_compute_dtype` 都是 fp16；`native2 vs native` 全部逐位一致，说明 GPU 计算是确定的。
+
+| 组合 | 原生每步 | Monoload | 比值 | 切换组合（patch）原生 → Monoload | GTT 原生 → Monoload |
+|---|---|---|---|---|---|
+| Smooth Booster（788 层 UNet） | 0.640s | 0.889s | 1.39× | 0.43s → 0.09s | 13.9G → 8.6G |
+| S1 Dramatic Lighting（722 UNet + 264 TE） | 0.641s | 0.852s | 1.33× | 0.65s → 0.11s | |
+| 两者叠加 | 0.639s | 1.062s | 1.66× | 0.62s → 0.11s | |
+
+layer probe（Smooth Booster，一次模型调用、788 层、4.77 GiB）：临时拷贝 0.038s，逐位一致合并 0.221s，放宽合并 0.119s。0.038 + 0.221 = 0.259s，基本等于实测每步多出的 0.249s：CFG 的正负条件合成一批，每步只有一次模型调用，开销就是一次完整的合并。
+
+**开销拆解：** 在这台机器上，权重、计算和 LoRA 的 dtype 都是 fp16，逐位一致路径里**没有** dtype 往返，舍入也是空操作。剩下的开销来自 `calculate_weight` 默认的 fp32 intermediate：低秩矩阵乘用 fp32 做，生成一个整层大小的 fp32 delta，再乘缩放系数、转回 fp16、加回权重，对 4.77 GiB 的权重要做好几遍逐元素读写。
+
+**方案与预估**（以 Smooth Booster 为例，原生 0.640s/步、现在 0.889s/步）：
+
+| 方案 | 做法 | 每次调用的额外开销 | 预估每步 | 与原生的数值关系 |
+|---|---|---|---|---|
+| 现状（逐位一致） | fp32 intermediate | 0.038 + 0.221 = 0.259s（实测） | 0.889s（1.39×，实测） | 逐位一致 |
+| A. 放宽合并 | `calculate_weight(..., intermediate_dtype=fp16)`，即原生 lowvram 的数值 | 0.038 + 0.119 = 0.157s（实测） | 约 0.80s（约 1.25×） | 与原生 lowvram 路径一致，与原生合并不逐位一致 |
+| C. 融合 addmm | 普通 LoRA/LoCon 用一次 `w.view(out,-1).addmm_(up, down, alpha=scale)`（fp16，GEMM 内部 fp32 累加），其他类型用 A 兜底 | 拷贝 0.038s + 约一遍权重读写（与拷贝同量级）≈ 0.07–0.10s（估计，probe 新增一行可实测） | 约 0.71–0.74s（约 1.11–1.16×） | 同上 |
+| D. bypass | ComfyUI 自带 | — | 实测 0.868s（1.36×）、0.795s（1.24×） | 数值路径不同 |
+
+叠加两个 LoRA 时，现状要做两遍整层大小的 fp32 运算（实测 1.66×）。用 C 的话是两次 `addmm_`，预估约 1.2–1.25×。
+
+**建议：采用 C，A 兜底，保留逐位一致作为开关。**
+
+1. 收益最大：单 LoRA 的每步开销从 +39% 降到约 +11–16%，叠加从 +66% 降到约 +20–25%。拷贝和一遍读写是任何「物化合并权重」方案的下限（约 +6% + 一遍读写），C 已经接近这个下限。
+2. bypass 在这个分辨率下不比 A 好（1.24–1.36×），而且 token 越多越慢。它还有两个限制：ComfyUI 自带的实现叠加多个 LoRA 时只保留最后一个，不是所有 adapter 都支持。所以不建议走 D。
+3. 精度：C 和 A 都去掉了 fp32 的中间 delta，delta 先在 fp16 下算好再加上去。与原生合并的差异大致是 delta 的 fp16 舍入量级；原生在 lowvram 时本来也是这么算的。`bench_lora.py` 的 layer probe 现在会直接报出 A 和 C 相对原生合并的权重差异（`||Δw|| / ||LoRA 改动||`），请在 GPU 上跑一次看实际数字。
+4. 开关：保留一个环境变量（比如 `MONOLOAD_EXACT=1`）切回现在的逐位一致路径，用于验收和对比。默认值由你定：默认用 C，或者默认逐位一致、C 作为选项。
+5. 量化层（§3.3）本来就是放宽路径，与这个开关无关。
+
+**需要的数据：** 用更新后的 `bench_lora.py` 在 GPU 上再跑一次 layer probe。它会给出 C 的实测耗时，以及 A / C 相对原生合并的权重差异。拿到之后再定。
 
 ## 6. 报错（绝不退回「改权重 + 备份」）
 
@@ -203,13 +238,15 @@ layer probe（Rubber Duck，一次模型调用、全部 192 层合计）：临�
    * 部分加载（`model_lowvram`，只在非 `--gpu-only` 时出现）时，就地卸会连被卸载层的原生 lowvram 状态一起清掉，所以改用原生的 `LoadedModel.model_unload()`，权重回到 offload 设备。
 2. **输出缓存**（`caches.outputs`，包括子图的 subcache；CLASSIC / LRU / RAM_PRESSURE 三种都支持）：删掉值带 LoRA 的条目，同时清理 LRU / RAM_PRESSURE 的附属字典（`used_generation`、`children`、`timestamps`）。下游节点的输出（latent、图片、普通 conditioning）不含 LoRA，照常保留。下次跑同一个工作流时，如果下游已经命中缓存，LoRA 节点就根本不会被执行。
 3. **节点实例缓存**（`caches.objects`）：清掉节点实例上的 `loaded_lora`。`LoraLoader`、`LoraLoaderModelOnly`、`CreateHookLora`、`LoraLoaderBypass` 都用这个属性缓存读进来的 LoRA 文件。
-4. `gc.collect()` + `soft_empty_cache()`，日志里打一行 `[Monoload] released LoRA after prompt: ...`。
+4. `gc.collect()`：被丢掉的 LoRA clone 在这里被回收。
+5. **同步不带 patch 的 clone 的 uuid**（真机验收时发现的问题）。`LoraLoader` 总会克隆 CLIP；而 `add_patches()` 不管有没有匹配到 key，都会换一个新的 `patches_uuid`。所以对 Smooth Booster 这种没有 TE key 的 LoRA，会得到一个「没有任何 patch、但 uuid 不同」的 CLIP clone，它被当作已加载模型。第 1 步只处理带 patch 的 patcher，没有处理它。缓存清掉之后它被回收，ComfyUI 的 finalizer 把 `LoadedModel` 切回父 patcher（底模的 CLIP），但模型上的 `current_weight_patches_uuid` 还是那个 clone 的，于是下一个工作流的 CLIP 又完整 `load()` 了一次（日志里只有 `loaded completely`，没有 `Requested to load`）。修法：gc 之后再检查一遍已加载模型，凡是 patcher 不带任何 patch 或 bypass 注入、模型上也没有运行时 patch 的，就把模型的 uuid 同步成这个 patcher 的。Monoload 下权重从不被修改，所以「没有 patch 的模型」与任何一个没有 patch 的 patcher 状态等价。
+6. `soft_empty_cache()`，日志里打一行 `[Monoload] released LoRA after prompt: ...`（含 `N clean clone(s) re-synced`）。
 
 到这一步，LoRA 张量已经没有任何引用：LoRA 文件读出的 dict、clone 上的 patch、运行时 patch 和它在计算设备上的副本、hook 组都已被回收。测试里用弱引用逐个确认（§7.4）。
 
 ### 7.4 验证（`tests/test_release.py`，真正的 `PromptExecutor`）
 
-连续执行 API 格式的工作流：LoRA → 无 LoRA → Hook LoRA → 无 LoRA → bypass LoRA → 无 LoRA → LoRA（换一个种子），三种缓存模式各跑一遍，并在 `MONOLOAD_KEEP_LORA=1` 下再跑一遍：
+连续执行 API 格式的工作流：LoRA → 无 LoRA → 只改 UNet 的 LoRA（没有 TE key）→ 无 LoRA → Hook LoRA → 无 LoRA → bypass LoRA → 无 LoRA → LoRA（换一个种子），三种缓存模式各跑一遍，并在 `MONOLOAD_KEEP_LORA=1` 下再跑一遍：
 
 * 每个 LoRA prompt 结束后：从 `models/loras` 读出的**每一个**张量的弱引用都已失效（CPU 上被回收；GPU 上的副本只挂在这些对象上，也一起被回收）；没有仍带 patch 的 patcher；模块上没有运行时 patch；设备缓存为空；节点实例上没有 `loaded_lora`。
 * 接下来的无 LoRA prompt：`CheckpointLoaderSimple` 没有再次执行，底模对象是同一个，`ModelPatcher.load()` 一次也没被调用；输出与**另一个从没见过 LoRA 的进程**的输出逐位一致。

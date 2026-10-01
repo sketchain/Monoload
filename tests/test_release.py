@@ -4,9 +4,11 @@ Workflows (API format, SD1.5 checkpoint):
   lora  : CheckpointLoaderSimple -> LoraLoader -> CLIPTextEncode x2 -> KSampler -> SaveLatent
   plain : the same without the LoRA
   hook  : CreateHookLora -> SetClipHooks -> CLIPTextEncode (hooked conds) -> KSampler
+  unet_only: LoraLoader with a LoRA that has no text-encoder keys (the CLIP
+          clone LoraLoader returns carries no patches but a new patches_uuid)
   bypass: LoraLoaderBypass (bypass-LoRA injections instead of weight patches)
 
-Sequence: lora -> plain -> hook -> plain -> bypass -> plain -> lora (seed 8).
+Sequence: lora -> plain -> unet_only -> plain -> hook -> plain -> bypass -> plain -> lora (seed 8).
 Checked after each LoRA prompt:
   * every LoRA tensor (loaded from models/loras) and every patcher carrying
     LoRA patches is garbage (weakrefs dead) -- i.e. freed on CPU and, since
@@ -43,6 +45,7 @@ import nodes
 
 CKPT = "v1-5-pruned-emaonly-fp16.safetensors"
 LORA = "rubber_duck.safetensors"
+UNET_ONLY_LORA = "synthetic_unet_only_sd15.safetensors"  # no text-encoder keys: the CLIP clone carries no patches
 POS = "a photo of a yellow rubber duck on a wooden table"
 NEG = "blurry"
 KEEP = os.environ.get("MONOLOAD_KEEP_LORA", "") == "1"
@@ -69,6 +72,8 @@ def workflow(kind, ckpt=CKPT, lora=LORA, seed=7):
         "7": {"class_type": "SaveLatent", "inputs": {"samples": ["6", 0], "filename_prefix": "monoload_test"}},
     }
     clip = ["1", 1]
+    if kind == "unet_only":
+        kind, lora = "lora", UNET_ONLY_LORA
     if kind == "lora":
         wf["2"] = {"class_type": "LoraLoader", "inputs": {"model": ["1", 0], "clip": ["1", 1], "lora_name": lora,
                                                           "strength_model": 0.8, "strength_clip": 0.8}}
@@ -221,7 +226,7 @@ def main():
     ref = refs["plain"]
     rss0 = rss_gib()
     summary = {"cache": a.cache, "keep": KEEP}
-    for lora_kind in ("lora", "hook", "bypass"):
+    for lora_kind in ("lora", "unet_only", "hook", "bypass"):
         before = dict(COUNT)
         out_l = run(e, workflow(lora_kind))
         rss_l = rss_gib()

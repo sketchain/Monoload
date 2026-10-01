@@ -1,4 +1,5 @@
-"""Synthesize small SD1.5 LoKr and LoHa files (no public SD1.5 LoKr was found).
+"""Synthesize small SD1.5 LoKr and LoHa files (no public SD1.5 LoKr was found),
+plus a UNet-only copy of the reference LoRA (no text-encoder keys).
 
 Layer names/shapes are taken from a real kohya SD1.5 LoRA, so ComfyUI's key
 mapping treats them exactly like downloaded LyCORIS files.
@@ -38,7 +39,16 @@ def main(ref, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     save_file(lokr, os.path.join(out_dir, "synthetic_lokr_sd15.safetensors"), metadata={"ss_network_module": "lycoris.kohya", "ss_network_args": '{"algo": "lokr"}'})
     save_file(loha, os.path.join(out_dir, "synthetic_loha_sd15.safetensors"), metadata={"ss_network_module": "lycoris.kohya", "ss_network_args": '{"algo": "loha"}'})
-    print("lokr keys", len(lokr), "loha keys", len(loha))
+    # UNet-only LoRA (no text-encoder keys): LoraLoader still clones the CLIP,
+    # the clone just carries no patches -- a case the release logic must handle.
+    from safetensors import safe_open
+    unet_only = {}
+    with safe_open(ref, "pt") as f:
+        for k in f.keys():
+            if k.startswith("lora_unet_"):
+                unet_only[k] = f.get_tensor(k)
+    save_file(unet_only, os.path.join(out_dir, "synthetic_unet_only_sd15.safetensors"))
+    print("lokr keys", len(lokr), "loha keys", len(loha), "unet-only keys", len(unet_only))
 
 
 if __name__ == "__main__":

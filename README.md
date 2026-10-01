@@ -127,8 +127,9 @@ docker logs comfyui 2>&1 | grep -i monoload
 #       https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors
 #   loras/rubber_duck.safetensors          Norod78/SD15-Rubber-Duck-LoRA（LoRA，UNet + TE）
 #   loras/lycoris_annalise.safetensors     pmczip/SD1.5_LyCORIS_Models（LyCORIS LoCon，含卷积层，UNet + TE）
-#   loras/synthetic_{lokr,loha}_sd15.safetensors
-#       tests/make_synthetic_loras.py 生成（HF 上找不到 SD1.5 的 LoKr，按真实 LoRA 的层名和形状合成，UNet + TE）
+#   loras/synthetic_{lokr,loha,unet_only}_sd15.safetensors
+#       tests/make_synthetic_loras.py 生成（HF 上找不到 SD1.5 的 LoKr，按真实 LoRA 的层名和形状合成，UNet + TE；
+#       unet_only 是 Rubber Duck 去掉 TE key 的版本）
 MODELS=/path/to/models tests/run_all.sh
 ```
 
@@ -138,7 +139,7 @@ MODELS=/path/to/models tests/run_all.sh
 | `tests/test_dtype_paths.py` | 参数 dtype × 计算 dtype × lora dtype（含 gfx1151 上的 fp16）× {基础 LoRA、hook、两者都有}，54 种组合逐位对比原生合并的数值；再加 fp8 参数的 54 种组合，对比「先反量化」参照 |
 | `tests/test_lora_hot.py` | 两条管线：`CheckpointLoaderSimple`；`UNETLoader` + `CLIPLoader`。同一串 LoRA 组合先用原生跑、再装上 Monoload 连续切换着跑，比较 TE 输出和采样结果；加上 Hook LoRA、模型合并和报错场景 |
 | `tests/test_quant.py` | fp8 scaled UNet + LoRA：与「先反量化被改到的层 + 逐位一致路径」逐位一致、无备份、fp8 权重不变；与原生的误差只报告 |
-| `tests/test_release.py` | 用真正的 `PromptExecutor` 连续跑 LoRA → 无 LoRA → Hook LoRA → 无 LoRA → bypass LoRA → 无 LoRA → LoRA（换种子）：弱引用确认 LoRA 全部释放、底模不重新加载、结果与从没见过 LoRA 的进程逐位一致；RAM pressure / classic / LRU 三种缓存各一遍，外加 `MONOLOAD_KEEP_LORA=1` |
+| `tests/test_release.py` | 用真正的 `PromptExecutor` 连续跑 LoRA → 无 LoRA → 只改 UNet 的 LoRA → 无 LoRA → Hook LoRA → 无 LoRA → bypass LoRA → 无 LoRA → LoRA（换种子）：弱引用确认 LoRA 全部释放、底模不重新加载、结果与从没见过 LoRA 的进程逐位一致；RAM pressure / classic / LRU 三种缓存各一遍，外加 `MONOLOAD_KEEP_LORA=1` |
 
 **实测结果**（`--cpu --fp16-unet`，SD1.5，每个组合采样 2 步，hook 3 步）：
 
@@ -151,8 +152,8 @@ MODELS=/path/to/models tests/run_all.sh
 * 报错：`force_patch_weights`（MODEL 和 CLIP 各一次）、非 comfy.ops 参数、形状改变、DynamicVRAM，都给出了预期的 kind 和 key。
 * `ModelMergeSimple`（模型与挂了 LoRA 的自身克隆按 0.5 混合，patch 是整层大小的张量）：与原生逐位一致，无备份。
 * fp8（量化层放宽合并）：Rubber Duck（160 个 fp8 层被 patch）、Annalise LoCon（182 个）都与「先反量化」参照逐位一致，无备份，fp8 权重（qdata + scale）不变；与原生 fp8 LoRA（合并后重新量化成 fp8）的 latent 差异 max_abs 4.76 / 1.88（LoRA 本身的影响 max_abs 34 / 26）。另外发现：不打 LoRA 时，把整个模型都反量化也会和 fp8 模型差 3e-4，因为原生没挂 LoRA 的 fp8 层直接用 `QuantizedTensor` 做 `F.linear`，所以参照只反量化被改到的层（DESIGN.md §3.3）。
-* 自动释放（三种缓存都一样）：每个 LoRA prompt 结束后，从 `models/loras` 读出的全部张量都已回收（到三个 LoRA prompt 结束时累计登记 792 / 1584 / 2376 个，弱引用全部失效），没有残留的带 patch 的 patcher、运行时 patch、设备缓存、`loaded_lora`；接下来的无 LoRA prompt 没有再执行 `CheckpointLoaderSimple`，`ModelPatcher.load()` 调用 0 次，结果与从没见过 LoRA 的进程逐位一致；释放后再用 LoRA 也与全新进程逐位一致。`MONOLOAD_KEEP_LORA=1` 时 LoRA 保留。
-* `tests/run_all.sh` 合计 322 项检查（入口 11，dtype 矩阵 108，LoRA 80，fp8 8，释放 2 + 32×3 + 17），0 失败。
+* 自动释放（三种缓存都一样）：每个 LoRA prompt 结束后，从 `models/loras` 读出的全部张量都已回收（每个 LoRA prompt 结束时，此前登记的全部弱引用都已失效），没有残留的带 patch 的 patcher、运行时 patch、设备缓存、`loaded_lora`；接下来的无 LoRA prompt 没有再执行 `CheckpointLoaderSimple`，`ModelPatcher.load()` 调用 0 次，结果与从没见过 LoRA 的进程逐位一致；释放后再用 LoRA 也与全新进程逐位一致。`MONOLOAD_KEEP_LORA=1` 时 LoRA 保留。
+* `tests/run_all.sh` 合计 357 项检查（入口 11，dtype 矩阵 108，LoRA 80，fp8 8，释放 2 + 42×3 + 22），0 失败。
 
 **CPU 上的基准参考**（`tests/bench_lora.py`，SD1.5，256×256，3 步，只能看相对比例，不代表 GPU）：
 
@@ -198,8 +199,9 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_lor
 **看这些数：**
 
 * 每个组合一行：`keys` 是被 patch 的 UNet/TE key 数，`backups` 是备份数；`lora` / `encode` / `patch` 分别是 LoRA 节点耗时、文本编码耗时（含 TE 打 patch）、扩散模型加载耗时（原生是「写回上一组备份 + 合并新组合」，也就是切换 LoRA 组合的代价）；`step1` 和 `step` 是第一步和中位数的每步耗时，最后是当时的 GTT。
-* 汇总表（每种模式对 `native` 各一张）：每步耗时和比值、patch 耗时、encode 耗时、`max|Δ|`（最终 latent 的最大差异）。`bypass` 按设计就和合并路径的数值不同，它的 `max|Δ|` 只作参考。
-* 最后的 layer probe：一次模型调用中，所有被 patch 层的临时拷贝耗时、逐位一致合并耗时、放宽合并耗时（放宽合并只在这里测量，插件并不使用）。
+* 汇总表（每种模式对 `native` 各一张）：每步耗时和比值、patch 耗时、encode 耗时、`max|Δ|` / `mean|Δ|`（最终 latent 的差异），以及两种模式下各自的 `effect`（这个组合相对同模式 `none` 的变化，也就是 LoRA 本身的作用）。差异要和 effect 对比着看。`bypass` 按设计就和合并路径的数值不同，它的差异只作参考。
+* bypass 模式下：多个 LoRA 叠加时，脚本把各个 LoRA 的 bypass 注入合并成一个（装的时候正序、卸的时候倒序）。ComfyUI 自带的 `load_bypass_lora_for_models` 连续调用时，后一个会覆盖前一个，所以不能直接用。`keys` 列显示实际挂上的 bypass hook 数（UNet / TE）。`[BypassLoRA] Adapter key not in model state_dict: clip_...` 这类警告只是挂 UNet 时遍历到 TE 的 key 打出的噪音，TE 的 adapter 会单独挂上，脚本只在最后汇总一行。
+* 最后的 layer probe：一次模型调用中，所有被 patch 层的临时拷贝、逐位一致合并、放宽合并（A）、融合 addmm（C）各自的耗时，以及 A / C 相对逐位一致结果的权重差异。A 和 C 只在这里测量，插件并不使用，见 DESIGN.md §5.4。
 
 **通过标准：**
 
@@ -251,7 +253,21 @@ docker exec comfyui python /opt/ComfyUI/custom_nodes/monoload/tools/compare_imag
 
 `docker logs comfyui 2>&1 | grep -iE "monoload|traceback"`，以及 `dmesg | grep -iE "oom|killed process|amdgpu.*(fault|timeout)"`：不应出现 `不支持`、`内部错误`、OOM、amdgpu fault。
 
-## 10. 仓库结构
+## 10. 真机验收结果（CT 700，2026-10）
+
+* **9.1 基准**（WAI v17 SDXL，1344×768，20 步，CFG 6）：
+  * `monoload vs native` 的 max|Δ| 全部为 0；Monoload 的 backups 全部为 0，原生是 788 / 986 / 1052。
+  * 切换组合的 patch 耗时：原生 0.43–0.65s，Monoload 0.09–0.11s。
+  * 每步耗时：原生约 0.64s，Monoload 0.85–1.06s（1.33× / 1.39× / 叠加 1.66×）。
+  * GTT：原生 13.9G，Monoload 8.6G。`native2 vs native` 全部为 0，GPU 计算是确定的。
+  * 那一轮 bypass 叠加组合的数据无效（只挂上了第二个 LoRA），已在脚本里修正。放宽方案的分析和建议见 DESIGN.md §5.4。
+* **9.4 释放：**
+  * GTT 依次为 7.20 → 7.37 → 7.37，cgroup 一直是 1.40；不带 LoRA 的第三个工作流，出图与重启后的参照图 identical。
+  * 发现的问题：Smooth Booster 没有 TE key，`LoraLoader` 产出的 CLIP clone 不带 patch，却换了 uuid。释放后它被回收，模型上的 uuid 还是它的，导致下一个工作流的 CLIP 又 `load()` 了一次。已修复（DESIGN.md §7.3 第 5 步），并加了只改 UNet 的 LoRA 的测试。
+* **9.5 fp8**（WAI 生成的 fp8 UNet）：采样时挂 LoRA 只多出 0.58G GTT，没有备份，没有报错，出图正常。
+* **9.6 日志：** 没有 traceback / 不支持 / 内部错误，没有 OOM。
+
+## 11. 仓库结构
 
 ```
 __init__.py                 ComfyUI 入口：按 MONOLOAD_DISABLE / MONOLOAD_KEEP_LORA 调用 hotpatch.install()、release.install()

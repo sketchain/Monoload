@@ -4,7 +4,7 @@
 #   diffusion_models/v1-5-pruned-emaonly-fp16.safetensors   (UNETLoader; same file, a hard link is fine)
 #   diffusion_models/sd15_unet_fp8_scaled.safetensors       (tests/make_fp8_unet.py)
 #   text_encoders/clip_l.safetensors                        (CLIPLoader)
-#   loras/{rubber_duck,lycoris_annalise,synthetic_lokr_sd15,synthetic_loha_sd15}.safetensors
+#   loras/{rubber_duck,lycoris_annalise,synthetic_lokr_sd15,synthetic_loha_sd15,synthetic_unet_only_sd15}.safetensors
 # (see README "测试" for download links; the synthetic ones come from tests/make_synthetic_loras.py)
 set -uo pipefail
 cd "$(dirname "$0")/.."
