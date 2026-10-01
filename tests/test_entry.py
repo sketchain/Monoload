@@ -4,6 +4,7 @@ runtime merge on ModelPatcher; MONOLOAD_DISABLE=1 leaves ComfyUI native.
     python tests/test_entry.py            # expects installed
     MONOLOAD_DISABLE=1 python tests/test_entry.py
     MONOLOAD_KEEP_LORA=1 python tests/test_entry.py
+    MONOLOAD_EXACT=1 python tests/test_entry.py
 """
 
 import asyncio
@@ -29,6 +30,9 @@ if disabled:
 else:
     check("installed: ModelPatcher methods replaced by Monoload", len(changed) == len(native) and all("hotpatch" in now[n].__module__ for n in changed), str(changed))
     check("CoreModelPatcher alias covered", comfy.model_patcher.CoreModelPatcher.patch_weight_to_device is now["patch_weight_to_device"])
+    from monoload import hotpatch
+    exact = os.environ.get("MONOLOAD_EXACT", "") == "1"
+    check("merge path: {}".format("bit-exact (MONOLOAD_EXACT=1)" if exact else "fused/relaxed default"), hotpatch.is_exact() == exact)
     if keep:
         check("MONOLOAD_KEEP_LORA=1: per-prompt release NOT installed", not release_hooked)
     else:

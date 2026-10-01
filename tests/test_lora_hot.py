@@ -7,22 +7,29 @@ Pipelines:
 For every pipeline the same sequence of LoRA combinations (LoraLoader, model
 and CLIP strengths) is run natively (Monoload uninstalled) and with Monoload,
 switching combinations without unloading in between. Checked:
-  * text-encoder output and sampled latent bit-identical to native
+  * MONOLOAD_EXACT=1: text-encoder output and sampled latent bit-identical to native
+  * default path: every patched weight (UNet and TE) against native's merge
+    within the tolerance of docs/DESIGN.md §5.5, the bit-exact path
+    recomputed on the same keys == native; output difference reported
   * no backups (ModelPatcher.backup / hook_backup / cached_hook_patches) on MODEL and CLIP
   * weights never change: equal to the state right after loading, during and after LoRA
   * hook LoRA (keyframed, SetClipHooks + conditioning hooks) bit-identical
+    (default path: reported)
+  * model merge (ModelMergeSimple) bit-identical (default path: weights within tolerance)
+  * after removing the LoRA: output bit-identical to the no-LoRA reference (both paths)
   * refusals: force_patch_weights, non-comfy.ops param, shape change, DynamicVRAM
 
     python tests/test_lora_hot.py --checkpoint SD.safetensors --unet SD.safetensors --clip clip_l.safetensors
+    MONOLOAD_EXACT=1 python tests/test_lora_hot.py ...
 """
 
 import argparse
 
 import torch
 
-from common import (MonoloadUnsupportedError, apply_loras, check, cond_equal, diff_stats, digests_diff, encode,
-                    expect_raises, finish, free_all, load_checkpoint, load_clip, load_unet, sample, set_runtime,
-                    weight_digests)
+from common import (EXACT, MODE_TAG, ComputeDtypes, MonoloadUnsupportedError, apply_loras, check, check_merge_error,
+                    cond_equal, diff_stats, digests_diff, encode, expect_raises, finish, free_all, load_checkpoint, load_clip,
+                    load_unet, sample, set_runtime, weight_digests)
 import comfy.hooks
 import comfy.memory_management
 import comfy.model_management
@@ -120,16 +127,30 @@ def test_pipeline(kind, a, summary):
     d_model = weight_digests(model.model)
     d_clip = weight_digests(clip.patcher.model)
     for i, combo in enumerate(SEQUENCE):
-        m, c, pos, neg, out = run_combo(model, clip, combo, latent, a.steps)
+        with ComputeDtypes() as dtypes:
+            m, c, pos, neg, out = run_combo(model, clip, combo, latent, a.steps)
         rpos, rneg, rout = ref[combo]
         d = diff_stats(rout, out)
         te_ok = cond_equal(rpos, pos) and cond_equal(rneg, neg)
         n_te = len(c.patcher.patches)
         n_unet = len(m.patches)
-        check("{} #{} {}: TE output identical ({} TE keys patched)".format(kind, i, combo, n_te), te_ok)
-        check("{} #{} {}: sampled latent identical ({} UNet keys patched)".format(kind, i, combo, n_unet), d["bit_exact"], str(d))
-        check("{} #{} {}: no backups on MODEL/CLIP (native had {})".format(kind, i, combo, native_backups[combo]), backups(m, c.patcher) == 0)
-        summary.setdefault(kind, {})[combo] = {"unet_keys": n_unet, "te_keys": n_te, "native_backups": native_backups[combo], "vs_native": d}
+        tag = "{} #{} {}".format(kind, i, combo)
+        row = {"unet_keys": n_unet, "te_keys": n_te, "native_backups": native_backups[combo], "vs_native": d}
+        if EXACT:
+            check("{}: TE output identical ({} TE keys patched)".format(tag, n_te), te_ok)
+            check("{}: sampled latent identical ({} UNet keys patched)".format(tag, n_unet), d["bit_exact"], str(d))
+        else:
+            if n_unet:
+                row["unet_weights"] = check_merge_error(tag + " UNet", m, dtypes, n_unet)
+            if n_te:
+                row["te_weights"] = check_merge_error(tag + " TE", c.patcher, dtypes, n_te)
+            if not n_unet and not n_te:
+                check("{}: no LoRA: TE output and latent identical".format(tag), te_ok and d["bit_exact"], str(d))
+            effect = diff_stats(ref["none"][2], rout)
+            print("[INFO] {}: latent vs native max {:.3g} mean {:.3g} (LoRA effect max {:.3g} mean {:.3g}); TE output identical: {}".format(
+                tag, d["max_abs"], d["mean_abs"], effect["max_abs"], effect["mean_abs"], te_ok))
+        check("{}: no backups on MODEL/CLIP (native had {})".format(tag, native_backups[combo]), backups(m, c.patcher) == 0)
+        summary.setdefault(kind, {})[combo] = row
     lora_effect = diff_stats(ref["none"][2], ref["duck"][2])["max_abs"]
     check("{}: LoRA changes the output (duck vs none max_abs {:.3f})".format(kind, lora_effect), lora_effect > 0)
     check("{}: while switching LoRA, MODEL weights equal the loaded state".format(kind), not digests_diff(d_model, weight_digests(model.model)))
@@ -139,9 +160,17 @@ def test_pipeline(kind, a, summary):
     hclip, hpos, hneg = hooked_inputs(clip, hook_sd)
     out = sample(model, hpos, hneg, latent, steps=max(a.steps, 3))
     rpos, rneg, rout = ref["hook"]
-    check("{} hook LoRA: TE output identical (SetClipHooks)".format(kind), cond_equal(rpos, hpos) and cond_equal(rneg, hneg))
     d = diff_stats(rout, out)
-    check("{} hook LoRA (keyframed): sampled latent identical".format(kind), d["bit_exact"], str(d))
+    if EXACT:
+        check("{} hook LoRA: TE output identical (SetClipHooks)".format(kind), cond_equal(rpos, hpos) and cond_equal(rneg, hneg))
+        check("{} hook LoRA (keyframed): sampled latent identical".format(kind), d["bit_exact"], str(d))
+    else:
+        # weight-level numerics of the hook path are covered by test_dtype_paths
+        effect = diff_stats(ref["none"][2], rout)
+        print("[INFO] {} hook LoRA: latent vs native max {:.3g} mean {:.3g} (hook effect max {:.3g} mean {:.3g}); TE identical: {}".format(
+            kind, d["max_abs"], d["mean_abs"], effect["max_abs"], effect["mean_abs"], cond_equal(rpos, hpos) and cond_equal(rneg, hneg)))
+        check("{} hook LoRA: latent difference to native well below the hook's effect".format(kind), d["mean_abs"] < 0.1 * effect["mean_abs"],
+              "mean {:.3g} vs effect mean {:.3g}".format(d["mean_abs"], effect["mean_abs"]))
     check("{} hook LoRA: hook differs from plain".format(kind), not torch.equal(rout, ref["none"][2]))
     check("{} hook LoRA: no hook_backup / cached_hook_patches".format(kind), backups(model, hclip.patcher, clip.patcher) == 0)
     summary.setdefault(kind, {})["hook"] = {"vs_native": d}
@@ -149,9 +178,14 @@ def test_pipeline(kind, a, summary):
     # model merge (weight-sized patch tensors)
     free_all()
     mm = merged_model(model, clip)
-    out = sample(mm, ref["none"][0], ref["none"][1], latent, steps=a.steps)
+    with ComputeDtypes() as dtypes:
+        out = sample(mm, ref["none"][0], ref["none"][1], latent, steps=a.steps)
     d = diff_stats(ref["merge"], out)
-    check("{} ModelMergeSimple (model + LoRA'd clone, 0.5): {} keys, latent identical".format(kind, len(mm.patches)), d["bit_exact"], str(d))
+    if EXACT:
+        check("{} ModelMergeSimple (model + LoRA'd clone, 0.5): {} keys, latent identical".format(kind, len(mm.patches)), d["bit_exact"], str(d))
+    else:
+        check_merge_error("{} ModelMergeSimple (model + LoRA'd clone, 0.5)".format(kind), mm, dtypes, len(mm.patches))
+        print("[INFO] {} ModelMergeSimple: latent vs native max {:.3g} mean {:.3g}".format(kind, d["max_abs"], d["mean_abs"]))
     check("{} ModelMergeSimple: no backups".format(kind), backups(mm) == 0)
     summary.setdefault(kind, {})["merge"] = {"vs_native": d}
     del mm
@@ -219,6 +253,8 @@ def main():
     a = p.parse_args()
     summary = {}
     last = None
+    print("merge path: {}".format(MODE_TAG))
+    summary["mode"] = MODE_TAG
     for kind in ("checkpoint", "unet+clip"):
         if a.only and kind != a.only:
             continue

@@ -2,7 +2,8 @@
 
 Checked:
   * fp8 model + LoRA (Monoload) is bit-identical to the same model whose fp8
-    weights were dequantized beforehand + LoRA (Monoload, bit-exact path).
+    weights were dequantized beforehand + LoRA (Monoload, same merge path:
+    bit-exact with MONOLOAD_EXACT=1, otherwise the default fused/relaxed one).
     "Dequantized beforehand" covers the layers the LoRA patches: fp8 layers
     without a weight function never dequantize in native ComfyUI either (the
     QuantizedTensor goes straight into F.linear via comfy_kitchen, a different
@@ -19,7 +20,7 @@ import hashlib
 
 import torch
 
-from common import (apply_loras, byte_view, check, diff_stats, encode, finish, free_all, load_clip, load_unet, sample,
+from common import (MODE_TAG, apply_loras, byte_view, check, diff_stats, encode, finish, free_all, load_clip, load_unet, sample,
                     set_runtime)
 from comfy.quant_ops import QuantizedTensor
 
@@ -69,7 +70,8 @@ def main():
     p.add_argument("--steps", type=int, default=2)
     a = p.parse_args()
     latent = torch.zeros(1, 4, 32, 32)
-    summary = {}
+    summary = {"mode": MODE_TAG}
+    print("merge path: {}".format(MODE_TAG))
 
     set_runtime(True)
     fp8 = load_unet(a.unet)

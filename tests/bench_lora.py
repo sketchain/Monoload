@@ -1,9 +1,13 @@
 """Benchmark: native LoRA (baked + backup) vs Monoload runtime merge.
 
 Runs the same LoRA sequence in one process, on the same loaded models, in
-several modes: native ComfyUI (Monoload uninstalled), Monoload installed, and
-ComfyUI's own bypass LoRA (comfy.sd.load_bypass_lora_for_models, as the
-LoraLoaderBypass node does; comparison data only). Reports per combination:
+several modes (--modes, run in order):
+  native*          native ComfyUI (Monoload uninstalled)
+  monoload         Monoload, default merge path (fused fp16 addmm / relaxed)
+  monoload-exact*  Monoload with the bit-exact path (= MONOLOAD_EXACT=1)
+  bypass*          ComfyUI's own bypass LoRA (comfy.sd.load_bypass_lora_for_models,
+                   as the LoraLoaderBypass node does; comparison data only)
+Reports per combination:
   lora   : LoraLoader node calls (reads the LoRA files, builds patches)
   encode : CLIPTextEncode of positive + negative (includes loading/patching the TE)
   patch  : load_models_gpu of the diffusion model (native: restore previous
@@ -43,7 +47,8 @@ if "COMFY_ARGS" not in os.environ:
 
 import torch  # noqa: E402
 
-from common import COMFY_ARGS, free_all, hotpatch, load_checkpoint, load_clip, load_unet, set_runtime  # noqa: E402
+from common import (COMFY_ARGS, UNIT_ROUNDOFF, compare_dtype, error_bound, free_all, hotpatch, load_checkpoint,  # noqa: E402
+                    load_clip, load_unet, set_runtime)
 import comfy.model_management  # noqa: E402
 import comfy.sample  # noqa: E402
 import nodes  # noqa: E402
@@ -237,36 +242,18 @@ def run_sequence(model, clip, combos, a, results, mode):
             del m, c, pos, neg
 
 
-def _fused_spec(moved_patches, cdt, dev):
-    """For the fused probe: (up, down, scale) list if every patch on this key is a
-    plain LoRA/LoCon (no mid, dora, reshape, offset, function, strength_model),
-    else None (the probe then uses the relaxed merge for that key)."""
-    import comfy.weight_adapter
-    spec = []
-    for strength, v, strength_model, offset, function in moved_patches:
-        if not isinstance(v, comfy.weight_adapter.LoRAAdapter) or offset is not None or function is not None or strength_model != 1.0:
-            return None
-        up, down, alpha, mid, dora, reshape = v.weights[:6]
-        if mid is not None or dora is not None or reshape is not None:
-            return None
-        a = (alpha / down.shape[0]) if alpha is not None else 1.0
-        spec.append((up.flatten(1).to(dev, cdt), down.flatten(1).to(dev, cdt), float(strength * a)))
-    return spec
-
-
 def layer_probe(model, clip, loras, reps=3):
-    """Per-step cost of the weight functions alone, summed over all patched
-    layers of the diffusion model, for:
+    """Per-model-call cost of the weight functions alone, summed over all
+    patched layers of the diffusion model:
       copy    : the temporary copy cast_bias_weight makes (paid by every variant)
-      exact   : Monoload's bit-exact merge (what the plugin does)
-      relaxed : calculate_weight directly in the compute dtype (native lowvram numerics)
-      fused   : weight.addmm_(up, down, alpha=scale) in the compute dtype for plain
-                LoRA/LoCon keys (others fall back to relaxed)
-    plus the weight error of relaxed/fused against exact, relative to what the
-    LoRA changes in the weight. Measurement only: only `exact` is used by the plugin."""
+      exact   : Monoload's bit-exact path (MONOLOAD_EXACT=1)
+      default : Monoload's default path (fused addmm_ for plain LoRA/LoCon, relaxed for the rest)
+      relaxed : calculate_weight in the compute dtype for every key (native lowvram numerics)
+    plus the weight difference of default / relaxed against native's merge
+    (= exact), with the tolerance of docs/DESIGN.md §5.5."""
     import comfy.lora
     import comfy.utils
-    from monoload.hotpatch import _to_device, _is_runtime_patch
+    from monoload.hotpatch import _to_device, _is_runtime_patch, fused_factors
     set_runtime(True)
     m, c = model, clip
     for name, sm, sc in loras:
@@ -274,6 +261,7 @@ def layer_probe(model, clip, loras, reps=3):
     comfy.model_management.load_models_gpu([m])
     dev = comfy.model_management.get_torch_device()
     cdt = m.model.get_dtype_inference() if hasattr(m.model, "get_dtype_inference") else m.model.get_dtype()
+    ldt = comfy.model_management.lora_compute_dtype(dev)
     items = []
     cache = {}
     for key in m.patches:
@@ -284,58 +272,101 @@ def layer_probe(model, clip, loras, reps=3):
             continue
         param = getattr(mod, attr)
         moved = _to_device(list(m.patches[key]), dev, cache, param.numel(), {"transient": False})
-        items.append((key, param, f, moved, _fused_spec(moved, cdt, dev)))
+        items.append((key, param, f, moved, all(fused_factors(p) is not None for p in moved)))
 
-    def variant(kind, key, f, moved, spec, w):
-        if kind == "exact":
+    def variant(kind, key, f, moved, w):
+        if kind in ("exact", "default"):
+            hotpatch.set_exact(kind == "exact")
             return f(w)
-        if kind == "relaxed" or (kind == "fused" and spec is None):
+        if kind == "relaxed":
             return comfy.lora.calculate_weight(moved, w, key, intermediate_dtype=cdt)
-        if kind == "fused":
-            w2 = w.view(w.shape[0], -1)
-            for up, down, scale in spec:
-                w2.addmm_(up, down, alpha=scale)
-            return w
         return w
 
     def run(kind):
         _sync()
         t0 = time.perf_counter()
         for _ in range(reps):
-            for key, param, f, moved, spec in items:
+            for key, param, f, moved, _fused in items:
                 w = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
-                w = variant(kind, key, f, moved, spec, w)
+                w = variant(kind, key, f, moved, w)
                 del w
         _sync()
         return (time.perf_counter() - t0) / reps
 
-    # accuracy against the bit-exact merge, relative to the LoRA's own change
-    err = {"relaxed": [0.0, 0.0, 0.0], "fused": [0.0, 0.0, 0.0]}  # sum |Δ|^2, max |Δ|, -
-    lora_sq = 0.0
-    for key, param, f, moved, spec in items:
-        base = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
-        exact = f(base.clone()).float()
-        lora_sq += float(((exact - base.float()) ** 2).sum())
-        for kind in err:
-            d = variant(kind, key, f, moved, spec, base.clone()).float() - exact
-            err[kind][0] += float((d ** 2).sum())
-            err[kind][1] = max(err[kind][1], float(d.abs().max()))
-        del base, exact
-    n_fused = sum(1 for it in items if it[4] is not None)
+    prev = hotpatch.is_exact()
+    try:
+        # accuracy against the bit-exact merge (= native), relative to the LoRA's own change
+        if not items:
+            print("\n=== layer probe: no patched layers ===")
+            return
+        cmp = compare_dtype(items[0][1].dtype, cdt, ldt)
+        err = {k: {"d_sq": 0.0, "max": 0.0} for k in ("default", "relaxed")}
+        lora_sq = w_sq = bound_sq = 0.0
+        for key, param, f, moved, _fused in items:
+            base = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
+            exact = variant("exact", key, f, moved, base.clone()).to(cmp).double()
+            ch = float(((exact - base.to(cmp).double()) ** 2).sum())
+            wn = float(exact.norm())
+            lora_sq += ch
+            w_sq += wn ** 2
+            bound_sq += error_bound(cmp, wn, ch ** 0.5) ** 2
+            for kind in err:
+                d = variant(kind, key, f, moved, base.clone()).to(cmp).double() - exact
+                err[kind]["d_sq"] += float((d ** 2).sum())
+                err[kind]["max"] = max(err[kind]["max"], float(d.abs().max()))
+            del base, exact
+        n_fused = sum(1 for it in items if it[4])
 
-    run("exact")  # warm-up
-    t_copy, t_exact, t_relaxed, t_fused = run("copy"), run("exact"), run("relaxed"), run("fused")
+        timings = {}
+        run("exact")  # warm-up
+        for kind in ("copy", "exact", "default", "relaxed"):
+            timings[kind] = run(kind)
+        if dev.type == "cuda":
+            # diagnostic: the fp16 GEMM with reduced-precision reduction off
+            flag = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+            try:
+                timings["default-noreduce"] = run("default")
+                d_sq = 0.0
+                for key, param, f, moved, _fused in items:
+                    base = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
+                    exact = variant("exact", key, f, moved, base.clone()).to(cmp).double()
+                    d_sq += float(((variant("default", key, f, moved, base.clone()).to(cmp).double() - exact) ** 2).sum())
+                err["default-noreduce"] = {"d_sq": d_sq, "max": float("nan")}
+            finally:
+                torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = flag
+    finally:
+        hotpatch.set_exact(prev)
+
     nbytes = sum(it[1].numel() * it[1].element_size() for it in items)
-    print("\n=== layer probe: {} patched layers, {:.2f} GiB of patched weights, compute dtype {}, lora dtype {} ===".format(
-        len(items), nbytes / 2 ** 30, cdt, comfy.model_management.lora_compute_dtype(dev)))
-    print("  per model call: temporary copy {:.3f}s | bit-exact merge {:.3f}s (+copy) | relaxed merge {:.3f}s (+copy) | "
-          "fused addmm {:.3f}s (+copy; {} of {} layers fused, rest relaxed)".format(
-              t_copy, t_exact - t_copy, t_relaxed - t_copy, t_fused - t_copy, n_fused, len(items)))
-    for kind in ("relaxed", "fused"):
-        rel = (err[kind][0] / lora_sq) ** 0.5 if lora_sq > 0 else float("nan")
-        print("  weight difference from bit-exact (= native merge), {:7s}: max |Δw| {:.3g}, ||Δw|| / ||LoRA change|| = {:.3g}".format(kind, err[kind][1], rel))
+    t_copy = timings["copy"]
+    print("\n=== layer probe: {} patched layers ({} fused), {:.2f} GiB of patched weights, compute dtype {}, lora_compute_dtype {} ===".format(
+        len(items), n_fused, nbytes / 2 ** 30, cdt, ldt))
+    print("  per model call: temporary copy {:.3f}s | bit-exact {:.3f}s (+copy) | default (fused/relaxed) {:.3f}s (+copy) | "
+          "relaxed only {:.3f}s (+copy)".format(t_copy, timings["exact"] - t_copy, timings["default"] - t_copy, timings["relaxed"] - t_copy))
+    tol = (bound_sq / lora_sq) ** 0.5 if lora_sq else float("nan")
+    u = UNIT_ROUNDOFF[cmp]
+    print("  weight difference from bit-exact (= native merge), compared in {}; ||W|| / ||ΔW_lora|| = {:.3g}; tolerance (DESIGN §5.5) {:.3g}".format(
+        cmp, (w_sq / lora_sq) ** 0.5 if lora_sq else float("nan"), tol))
+    for kind, e in err.items():
+        rel = (e["d_sq"] / lora_sq) ** 0.5 if lora_sq else float("nan")
+        print("    {:16s}: ||Δw|| / ||ΔW_lora|| = {:.3g} ({}), ||Δw|| = {:.3g} u·||W||, max |Δw| {:.3g}".format(
+            kind, rel, "within tolerance" if rel <= tol else "OVER TOLERANCE", (e["d_sq"] / w_sq) ** 0.5 / u if w_sq else float("nan"), e["max"]))
+    if "default-noreduce" in timings:
+        print("    (default-noreduce = default with torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction=False: "
+              "{:.3f}s (+copy); diagnostic only)".format(timings["default-noreduce"] - t_copy))
     print("  (one sampling step = 1 model call when cond/uncond are batched; the TE is separate)")
     free_all()
+
+
+def _mode_desc(mode):
+    if mode.startswith("monoload-exact"):
+        return "Monoload, bit-exact path = MONOLOAD_EXACT=1"
+    if mode.startswith("monoload"):
+        return "Monoload, default path: fused fp16 addmm / relaxed"
+    if mode.startswith("bypass"):
+        return "ComfyUI bypass LoRA, comparison only"
+    return "native ComfyUI"
 
 
 def main():
@@ -356,8 +387,9 @@ def main():
     p.add_argument("--scheduler", default="simple")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--repeat", type=int, default=2, help="run the combo sequence this many times per mode (first pass includes warm-up)")
-    p.add_argument("--modes", default="native,monoload,bypass",
-                   help="comma list run in order: 'monoload*' = Monoload installed; 'bypass*' = ComfyUI's bypass LoRA "
+    p.add_argument("--modes", default="native,monoload,monoload-exact,bypass",
+                   help="comma list run in order: 'monoload' = Monoload, default path (fused/relaxed); 'monoload-exact*' = "
+                        "Monoload, bit-exact path (MONOLOAD_EXACT=1); 'bypass*' = ComfyUI's bypass LoRA "
                         "(load_bypass_lora_for_models, Monoload uninstalled, comparison only); anything else = native")
     p.add_argument("--prompt", default="a photo of a red fox sitting in fresh snow, golden hour, detailed fur")
     p.add_argument("--negative", default="blurry, lowres")
@@ -379,7 +411,8 @@ def main():
     results = []
     for mode in a.modes.split(","):
         set_runtime(mode.startswith("monoload"))
-        print("\n=== {} ===".format(mode))
+        hotpatch.set_exact(mode.startswith("monoload-exact"))
+        print("\n=== {} ({}) ===".format(mode, _mode_desc(mode)))
         run_sequence(model, clip, combos, a, results, mode)
     free_all()
 
@@ -416,6 +449,19 @@ def main():
             print("{:28s} | {:8.3f}s {:8.3f}s {:5.2f}x | {:7.2f}s {:7.2f}s | {:7.2f}s {:7.2f}s | {:9.3g} {:9.3g} | {:>17s} {:>17s}".format(
                 label[:28], rn["step"], rm["step"], rm["step"] / rn["step"] if rn["step"] else float("nan"),
                 rn["patch"], rm["patch"], rn["encode"], rm["encode"], float(d.max()), float(d.mean()), fmt_e(en), fmt_e(eo)))
+    print("\n=== seconds per step (repetition {}), ratio to {} ===".format(last + 1, ref_mode))
+    print("{:28s} | ".format("combo") + " | ".join("{:>17s}".format(m_[:17]) for m_ in modes))
+    for label, _ in combos:
+        r0 = by.get((ref_mode, label))
+        cells = []
+        for m_ in modes:
+            r = by.get((m_, label))
+            if r is None:
+                cells.append("{:>17s}".format("n/a"))
+            else:
+                ratio = r[0]["step"] / r0[0]["step"] if r0 and r0[0]["step"] else float("nan")
+                cells.append("{:>9.3f}s {:5.2f}x".format(r[0]["step"], ratio))
+        print("{:28s} | ".format(label[:28]) + " | ".join(cells))
     print("\nmax|Δ| / mean|Δ| = difference of the final latent between the two modes (0 = bit-identical).")
     print("effect = what the LoRA changes in that mode (combo vs the same mode's 'none'); compare mean|Δ| with it.")
     print("Run with --modes native,monoload,bypass,native2 to see how much native differs from itself on this GPU.")

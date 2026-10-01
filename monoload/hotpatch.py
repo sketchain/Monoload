@@ -7,12 +7,22 @@ VAELoader, ...). With it installed, a LoRA/patch is never baked into the
 weights and nothing is ever backed up: each patched layer gets a
 MonoloadRuntimePatch in its weight_function/bias_function list, and
 comfy.ops' cast_bias_weight merges it into a temporary copy of that one layer
-when the layer runs. Results are bit-identical to native ComfyUI.
+when the layer runs.
+
+Two merge paths (switch: MONOLOAD_EXACT, read at import; set_exact() at runtime):
+  default         plain LoRA / LoCon patches are added with one fused
+                  addmm_ into the compute-dtype temporary (C); every other
+                  patch type goes through comfy.lora.calculate_weight with the
+                  compute dtype as intermediate dtype (A, the numerics of
+                  native ComfyUI's lowvram LowVramPatch). Not bit-identical to
+                  a native (baked) merge; see docs/DESIGN.md for the error.
+  MONOLOAD_EXACT=1  bit-identical to native ComfyUI.
 
 uninstall() restores the original methods (models should be unloaded first).
 """
 
 import logging
+import os
 import weakref
 
 import torch
@@ -31,6 +41,26 @@ from .errors import MonoloadError, MonoloadUnsupportedError
 _ORIG = {}
 _ORIG_DYNAMIC = {}
 _WARNED = set()
+
+
+def _env_flag(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+_MODE = {"exact": _env_flag("MONOLOAD_EXACT")}
+
+
+def set_exact(on):
+    """True: bit-exact merge (= native ComfyUI). False: fused/relaxed default.
+    Takes effect at the next layer call; nothing has to be reloaded."""
+    _MODE["exact"] = bool(on)
+
+
+def is_exact():
+    return _MODE["exact"]
+
+
+_MATH_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 # dtype pairs (param dtype, compute dtype) where param -> compute is exact, so
 # the compute-dtype copy handed to the weight function can stand in for the
@@ -111,7 +141,12 @@ def _to_device(value, device, cache, limit, flags):
 class MonoloadRuntimePatch(LowVramPatch):
     """Weight function computing patched(W) for one key while the layer runs.
 
-    Numerics replicate ModelPatcher.patch_weight_to_device (baked LoRA) and
+    Default path (_call_fast): merged straight into the compute-dtype
+    temporary, plain LoRA/LoCon via one fused addmm_ per patch, everything
+    else via calculate_weight(intermediate_dtype=compute dtype); see
+    _merge_fast.
+
+    MONOLOAD_EXACT=1 path: numerics replicate ModelPatcher.patch_weight_to_device (baked LoRA) and
     patch_hook_weight_to_device (hook LoRA), so outputs are bit-identical:
       base  : W -> lora_compute_dtype -> calculate_weight -> stochastic_rounding(param dtype)
       hooks : -> float32 -> calculate_weight(original_weights) -> stochastic_rounding(param dtype)
@@ -179,6 +214,8 @@ class MonoloadRuntimePatch(LowVramPatch):
         if not base and not hooks:
             return weight
         param = getattr(self._module(), self.attr)
+        if not _MODE["exact"]:
+            return self._call_fast(weight, param, base, hooks)
         device = weight.device
         pdt = param.dtype  # for a QuantizedTensor: its dequantized dtype
         cdt = weight.dtype
@@ -210,6 +247,66 @@ class MonoloadRuntimePatch(LowVramPatch):
             del temp, out
 
         return w.to(dtype=cdt)
+
+    def _call_fast(self, weight, param, base, hooks):
+        """Default path. The temporary is the one cast_bias_weight made, in the
+        compute dtype (the tensor native lowvram LowVramPatch merges into). For
+        a quantized parameter whose dequantized dtype differs from the compute
+        dtype it is re-read as dequantize -> compute dtype, i.e. what a model
+        dequantized beforehand would hand over."""
+        key = self.key
+        device = weight.device
+        cdt = weight.dtype
+        w = weight
+        if _is_quantized(param) and cdt != param.dtype:
+            w = comfy.model_management.cast_to_device(param, device, None, copy=True).dequantize().to(cdt)
+        if w.dtype not in _MATH_DTYPES:
+            w = w.to(torch.float32)
+        if base:
+            w = _merge_fast(self._base_on(base, device, param.numel()), w, key)
+        if hooks:
+            orig_param = param.dequantize() if _is_quantized(param) else param
+            original = {key: [(orig_param, _identity)] + list(base or [])}
+            moved_hooks = _to_device(hooks, device, self.state.device_cache, param.numel(), {"transient": False})
+            w = _merge_fast(moved_hooks, w, key, original_weights=original)
+        return w.to(dtype=cdt)
+
+
+def fused_factors(patch):
+    """(up, down, scale) when `patch` is a plain LoRA / LoCon (LoRAAdapter
+    without Tucker mid, DoRA or reshape; no offset, custom function or
+    strength_model), else None. scale = strength * alpha / rank, the factor
+    LoRAAdapter.calculate_weight applies to up @ down."""
+    strength, v, strength_model, offset, function = patch
+    if not isinstance(v, comfy.weight_adapter.LoRAAdapter) or offset is not None or function is not None or strength_model != 1.0:
+        return None
+    up, down, alpha, mid, dora, reshape = v.weights[:6]
+    if mid is not None or dora is not None or reshape is not None:
+        return None
+    a = (alpha / down.shape[0]) if alpha is not None else 1.0
+    return up, down, float(strength * a)
+
+
+def _merge_fast(patches, w, key, original_weights=None):
+    """Apply `patches` in order to the temporary `w` (modified in place):
+      C  plain LoRA / LoCon: w.view(out, -1).addmm_(up, down, alpha=scale), in
+         w's dtype (one pass over the weight, no weight-sized intermediate)
+      A  anything else: calculate_weight with w's dtype as intermediate dtype
+    Patches are independent steps of calculate_weight, so mixing the two per
+    patch keeps the order of operations of a native merge."""
+    for p in patches:
+        f = fused_factors(p)
+        if f is not None and w.is_contiguous():
+            up, down, scale = f
+            w2 = w.view(w.shape[0], -1)
+            up = up.flatten(1).to(w.dtype)
+            down = down.flatten(1).to(w.dtype)
+            if up.shape[0] == w2.shape[0] and down.shape[1] == w2.shape[1] and up.shape[1] == down.shape[0]:
+                if scale != 0.0:
+                    w2.addmm_(up, down, alpha=scale)
+                continue
+        w = comfy.lora.calculate_weight([p], w, key, intermediate_dtype=w.dtype, original_weights=original_weights)
+    return w
 
 
 def _is_runtime_patch(f):

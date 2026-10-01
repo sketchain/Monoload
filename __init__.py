@@ -5,7 +5,8 @@ loaded) installs
   * the runtime LoRA merge on comfy.model_patcher.ModelPatcher, and
   * the per-prompt LoRA release on execution.PromptExecutor
     (skipped when MONOLOAD_KEEP_LORA=1).
-Set MONOLOAD_DISABLE=1 to leave ComfyUI completely native.
+Set MONOLOAD_DISABLE=1 to leave ComfyUI completely native, MONOLOAD_EXACT=1
+for the bit-exact merge instead of the fused default (monoload/hotpatch.py).
 """
 
 import logging
@@ -25,7 +26,8 @@ else:
     from .monoload import hotpatch, release
 
     hotpatch.install()
-    logging.info("[Monoload] runtime LoRA merge installed on ModelPatcher (no in-place LoRA, no weight backups)")
+    logging.info("[Monoload] runtime LoRA merge installed on ModelPatcher (no in-place LoRA, no weight backups), merge: {}".format(
+        "bit-exact (MONOLOAD_EXACT=1)" if hotpatch.is_exact() else "fused fp16 addmm / relaxed (set MONOLOAD_EXACT=1 for bit-exact)"))
     if _flag("MONOLOAD_KEEP_LORA"):
         logging.info("[Monoload] MONOLOAD_KEEP_LORA is set: LoRA state is kept between prompts")
     else:

@@ -20,18 +20,26 @@ run() { "$@" 2>&1 | grep -vE "agent.cpp|sysfs nodes|comfy_kitchen backend|it/s\]
 step "plugin entry (installed)";            run $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_DISABLE=1)";   run env MONOLOAD_DISABLE=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_KEEP_LORA=1)"; run env MONOLOAD_KEEP_LORA=1 $R python tests/test_entry.py
-step "dtype paths vs native numerics (incl. fp8)"; run $R python tests/test_dtype_paths.py
-step "LoRA: CheckpointLoaderSimple, UNETLoader + CLIPLoader, hooks, merge, refusals"
-run $R env COMFY_ARGS="$ARGS" python tests/test_lora_hot.py --checkpoint $SD --unet $SD --clip clip_l.safetensors
-step "fp8 model + LoRA (relaxed merge)"
-run $R env COMFY_ARGS="$ARGS" python tests/test_quant.py --unet sd15_unet_fp8_scaled.safetensors --clip clip_l.safetensors
-step "per-prompt release: reference from a process that never saw a LoRA"
-run env DOCKER_EXTRA="-v $OUT:/out" $R env COMFY_ARGS="$ARGS" python tests/test_release.py --save-reference /out/ref.pt
-for c in ram_pressure classic lru; do
-  step "per-prompt release ($c cache)"
-  run env DOCKER_EXTRA="-v $OUT:/out" $R env COMFY_ARGS="$ARGS" python tests/test_release.py --reference /out/ref.pt --cache $c
+step "plugin entry (MONOLOAD_EXACT=1)";     run env MONOLOAD_EXACT=1 $R python tests/test_entry.py
+# every functional suite runs on both merge paths: bit-exact (MONOLOAD_EXACT=1)
+# and the default (fused / relaxed, checked against native within tolerance)
+for EXACT in 1 ""; do
+  M=$([ -n "$EXACT" ] && echo "MONOLOAD_EXACT=1" || echo "default path")
+  E="env MONOLOAD_EXACT=$EXACT"
+  step "[$M] dtype paths (incl. fp8)"; run $E $R python tests/test_dtype_paths.py
+  step "[$M] LoRA: CheckpointLoaderSimple, UNETLoader + CLIPLoader, hooks, merge, refusals"
+  run $E $R env COMFY_ARGS="$ARGS" python tests/test_lora_hot.py --checkpoint $SD --unet $SD --clip clip_l.safetensors
+  step "[$M] fp8 model + LoRA (relaxed merge)"
+  run $E $R env COMFY_ARGS="$ARGS" python tests/test_quant.py --unet sd15_unet_fp8_scaled.safetensors --clip clip_l.safetensors
+  REF=/out/ref${EXACT:+_exact}.pt
+  step "[$M] per-prompt release: reference from a process that never saw a LoRA"
+  run $E DOCKER_EXTRA="-v $OUT:/out" $R env COMFY_ARGS="$ARGS" python tests/test_release.py --save-reference $REF
+  for c in ram_pressure classic lru; do
+    step "[$M] per-prompt release ($c cache)"
+    run $E DOCKER_EXTRA="-v $OUT:/out" $R env COMFY_ARGS="$ARGS" python tests/test_release.py --reference $REF --cache $c
+  done
+  step "[$M] MONOLOAD_KEEP_LORA=1"
+  run $E MONOLOAD_KEEP_LORA=1 DOCKER_EXTRA="-v $OUT:/out" $R env COMFY_ARGS="$ARGS" python tests/test_release.py --reference $REF
 done
-step "MONOLOAD_KEEP_LORA=1"
-run env MONOLOAD_KEEP_LORA=1 DOCKER_EXTRA="-v $OUT:/out" $R env COMFY_ARGS="$ARGS" python tests/test_release.py --reference /out/ref.pt
 echo; echo "######## suites failed: $fails"
 exit $fails

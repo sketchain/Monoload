@@ -21,6 +21,8 @@ and for the following plain prompt:
     (--save-reference writes that output, --reference reads it)
 
 MONOLOAD_KEEP_LORA=1: expects the LoRA to be kept instead.
+Runs on either merge path (MONOLOAD_EXACT=1 or default); the reference must
+come from the same path.
 
     python tests/test_release.py --save-reference /out/ref.pt
     python tests/test_release.py --reference /out/ref.pt [--cache ram_pressure|classic|lru]
@@ -225,7 +227,7 @@ def main():
     refs = torch.load(a.reference)
     ref = refs["plain"]
     rss0 = rss_gib()
-    summary = {"cache": a.cache, "keep": KEEP}
+    summary = {"cache": a.cache, "keep": KEEP, "mode": "exact" if os.environ.get("MONOLOAD_EXACT", "") == "1" else "default"}
     for lora_kind in ("lora", "unet_only", "hook", "bypass"):
         before = dict(COUNT)
         out_l = run(e, workflow(lora_kind))

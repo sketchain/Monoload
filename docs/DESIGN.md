@@ -8,11 +8,15 @@ v1（tag `v1-converter`，远端归档分支 `archive/v1-converter`）做的是�
 
 v2 只做一件事：**在 ComfyUI 原生加载出来的模型上打 LoRA 时，不改原权重、不做任何备份，而是在每一层计算的那一刻临时合并。** 对工作流透明：原生 `UNETLoader`、`CheckpointLoaderSimple`、`CLIPLoader`、`LoraLoader`、`LoraLoaderModelOnly`、Hook LoRA 节点照常使用。
 
-在此基础上还做了两件事：量化层（fp8 scaled 等）上的 LoRA 采用放宽合并（§3.3，这是唯一不与原生逐位一致的地方）；每个 prompt 结束后释放 LoRA，底模继续常驻（§7）。
+在此基础上还有三点：
+
+* **合并有两条路径（§3.1）。** 默认路径：普通 LoRA / LoCon 用一次融合的 `addmm_` 直接加进计算 dtype 的临时权重（方案 C），其他类型在计算 dtype 下走 `calculate_weight`（方案 A，与原生 lowvram 的数值相同）。这条路径与原生合并不逐位一致，误差界见 §5.5。设 `MONOLOAD_EXACT=1` 时走逐位一致路径，结果与原生完全相同。
+* 量化层（fp8 scaled 等）上的 LoRA 合并在反量化出来的临时权重上，不再重新量化（§3.3）。
+* 每个 prompt 结束后释放 LoRA，底模继续常驻（§7）。
 
 「单份」的口径不变：
 
-* 允许：LoRA 文件本身常驻内存；LoRA 张量在计算设备上的一份副本（见 §5.2）；正在计算的那一层短暂多出的临时副本（含 LoRA 按 fp32 计算的中间量）。
+* 允许：LoRA 文件本身常驻内存；LoRA 张量在计算设备上的一份副本（见 §5.2）；正在计算的那一层短暂多出的临时副本（逐位一致路径下还包括 LoRA 按 fp32 计算的中间量）。
 * 不允许：整个模型、或一批层同时存在原权重和合并结果两份；任何形式的备份（`backup`、`hook_backup`、`cached_hook_patches`）。
 
 ## 1. 原生是怎么打 LoRA 的
@@ -54,6 +58,32 @@ v2 只做一件事：**在 ComfyUI 原生加载出来的模型上打 LoRA 时，
 
 它是 `LowVramPatch` 的子类，挂在层的 `weight_function` 上。`cast_bias_weight` 在该层计算时给它一份**私有的**临时权重（因为存在 weight function，`cast_to(..., copy=True)`，再转成计算 dtype），它返回合并后的权重，用完即丢。同一时刻只有正在计算的那一层有临时权重。
 
+合并有两条路径，由 `MONOLOAD_EXACT` 选择。插件导入时读取这个环境变量；测试和基准脚本用 `hotpatch.set_exact()` 在进程内切换，下一次层计算就生效，不需要重新加载。
+
+#### 3.1.1 默认路径：融合 addmm（C），其余类型放宽合并（A）
+
+直接在 `cast_bias_weight` 给的那份计算 dtype 临时权重上**原地**合并，patch 逐个处理：
+
+```
+对 key 的每个 patch (strength, adapter, strength_model, offset, function)：
+  普通 LoRA / LoCon（LoRAAdapter，没有 Tucker mid、DoRA、reshape；offset、function 为空；strength_model == 1）:
+      C: W.view(out, -1).addmm_(up.flatten(1), down.flatten(1), alpha=strength * alpha / rank)
+         # 计算 dtype 下一个 GEMM，累加和加回在同一个 kernel 里完成，不产生整层大小的中间量
+  其他（LoHa、LoKr、DoRA、diff、模型合并、带 offset/function/strength_model 的 patch ……）:
+      A: W = calculate_weight([patch], W, key, intermediate_dtype=W.dtype)
+         # 与原生 lowvram 的 LowVramPatch 完全相同的算法
+Hook LoRA：在基础 patch 之后，同样逐个 patch 处理，A 带上 original_weights（与原生 hook 路径相同的参数）
+```
+
+* `calculate_weight` 本来就是对 patch 列表逐个独立处理的，所以 C 和 A 按 patch 混用，运算顺序和原生一致。一个 key 上全是不能融合的 patch 时，结果与原生 lowvram 的 `LowVramPatch` **逐位一致**（测试里对照）。
+* 不做 `lora_compute_dtype` 的往返，也不做 `stochastic_rounding`。临时权重本身就是计算 dtype，合并完直接用。
+* 计算 dtype 不是 fp32/fp16/bf16 时（实际上不会出现），先转成 fp32 合并，最后再转回去。
+* 量化参数：反量化 dtype 与计算 dtype 相同时，直接用 `cast_bias_weight` 反量化出来的临时权重；不同时，从参数重新反量化再转成计算 dtype（等于「先反量化好的模型」交给 weight function 的那份）。
+
+与原生的差异只来自计算 dtype 下的舍入，误差界和真机数据见 §5.5。
+
+#### 3.1.2 `MONOLOAD_EXACT=1`：逐位一致路径
+
 数值上复刻原生的合并路径，所以结果与原生**逐位一致**（测试里 max_abs = 0）：
 
 ```
@@ -67,26 +97,26 @@ Hook LoRA（复刻 patch_hook_weight_to_device，在已合并基础 LoRA 的权�
 最后 -> 转成 cast_bias_weight 要的计算 dtype
 ```
 
-插在 `weight_function` 的**最前面**：原生全量加载时 LoRA 已经合并进权重，先于 `weight_wrapper_patches` 生效，顺序保持一致。
+两条路径都插在 `weight_function` 的**最前面**：原生全量加载时 LoRA 已经合并进权重，先于 `weight_wrapper_patches` 生效，顺序保持一致。
 
-走的是通用的 `calculate_weight`，所以 LoRA / LoCon / LoHa / LoKr / GLoRA / OFT / BOFT、diff、set 等 ComfyUI 支持的类型都能用。
+两条路径都以通用的 `calculate_weight` 为基础（默认路径只把普通 LoRA/LoCon 换成等价的融合运算），所以 LoRA / LoCon / LoHa / LoKr / GLoRA / OFT / BOFT、diff、set 等 ComfyUI 支持的类型都能用。
 
 ### 3.2 Hook LoRA
 
 每个 patcher 有一份 `hook_patches`（key → 当前生效的 hook patch 列表），它的所有运行时 patch 共享这一份。`patch_hooks(hooks)` 用原生的 `get_combined_hook_patches(hooks)` 算出组合（包括 keyframe 强度），写进这份状态；只被 hook 改到、还没有运行时 patch 的层补挂一个，不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。** 采样时正/负条件可能挂着不同的 hook 组，每一步会来回切换；在这里只是换一个 dict。CLIP 的 `SetClipHooks`（`forced_hooks`）走同一条路。
 
-### 3.3 量化参数：放宽合并（唯一不逐位一致的情况）
+### 3.3 量化参数：在反量化的临时权重上合并，不重新量化
 
 原生对 fp8 scaled 这类量化层（`mixed_precision_ops`，权重是 `QuantizedTensor`）打 LoRA 时：先反量化，合并，然后用 `set_weight` 以随机舍入**重新量化回 fp8** 写回，并且备份原权重。
 
-Monoload 的做法：量化层挂上 weight function 后，`forward` 会走 `cast_bias_weight`，先拷一份量化张量，转成计算 dtype，再 `dequantize()`，然后才交给 weight function。Monoload 直接在这份**反量化出来的临时权重**上合并 LoRA，用完就丢，**不再量化回 fp8**。它把「参数 dtype」当作反量化后的 dtype（`QuantizedTensor.dtype`），其余步骤和 §3.1 完全相同。计算 dtype 与反量化 dtype 不同时，从参数重新反量化一次，而不是复用临时权重。
+Monoload 的做法：量化层挂上 weight function 后，`forward` 会走 `cast_bias_weight`，先拷一份量化张量，转成计算 dtype，再 `dequantize()`，然后才交给 weight function。Monoload 直接在这份**反量化出来的临时权重**上合并 LoRA，用完就丢，**不再量化回 fp8**。它把「参数 dtype」当作反量化后的 dtype（`QuantizedTensor.dtype`），其余步骤与当前的合并路径（§3.1.1 或 §3.1.2）完全相同。计算 dtype 与反量化 dtype 不同时，从参数重新反量化一次，而不是复用临时权重。这一节与 `MONOLOAD_EXACT` 无关：两条路径都不重新量化。
 
 * **速度：** gfx1151 上 `supports_fp8_compute()` 为 False（`torch._scaled_mm` 只支持 MI300+），原生对 fp8 模型本来就是每次 forward 先反量化再算，所以放宽合并不会带来额外的速度损失。
 * **精度：** 少了一次 fp8 重新量化，比原生更精确，但与原生**不逐位一致**。
-* **正确性的判定标准：** 与「先把这些层反量化成高精度参数，再走 §3.1 的逐位一致路径」逐位一致。
+* **正确性的判定标准：** 与「先把这些层反量化成高精度参数，再走同一条合并路径」逐位一致。两种模式下都这样测。
 * **一个实测发现：** 没挂 weight function 的 fp8 层，在原生 ComfyUI 里根本不反量化，而是把 `QuantizedTensor` 直接交给 `F.linear`，由 comfy_kitchen 的算子计算，运算顺序与「先反量化再乘」不同。所以把整个模型都反量化，即使不打 LoRA，结果也和 fp8 模型不一样（CPU 上 latent 的 max_abs 约 3e-4）。参照模型因此只反量化**被 LoRA 改到的那些层**，其余层保持 fp8，这与 Monoload 实际做的事一一对应。
 
-实测（`tests/test_quant.py`，SD1.5 UNet 的 184 个 Linear 转成 fp8 scaled，CPU，采样 2 步）：
+实测（`tests/test_quant.py`，SD1.5 UNet 的 184 个 Linear 转成 fp8 scaled，CPU，采样 2 步，`MONOLOAD_EXACT=1`）：
 
 | LoRA | 被 patch 的 key | 其中 fp8 层 | 与「先反量化」参照 | 与原生 fp8 LoRA（合并 + 重新量化 + 备份） |
 |---|---|---|---|---|
@@ -106,12 +136,14 @@ Monoload 的做法：量化层挂上 weight function 后，`forward` 会走 `cas
 
 ### 5.1 代价在哪
 
-原生是「每次加载合并一次，之后每步零开销」；运行时合并是「每步、每个被 patch 的层都合并一次」。没被 patch 的层完全不受影响：`weight_function` 为空，`forward` 走原来的快路径。被 patch 的层每次计算要多做这些事：
+原生是「每次加载合并一次，之后每步零开销」；运行时合并是「每步、每个被 patch 的层都合并一次」。没被 patch 的层完全不受影响：`weight_function` 为空，`forward` 走原来的快路径。被 patch 的层在逐位一致路径（`MONOLOAD_EXACT=1`）下每次计算要多做这些事：
 
 1. `cast_bias_weight` 拷一份临时权重（有 weight function 时它必须 `copy=True`）；
 2. 如果 `lora_compute_dtype` 和权重 dtype 不同，就要做一次转换，最后再转回来（逐位一致需要）；
 3. `calculate_weight`：LoRA 低秩矩阵乘（intermediate 是 fp32），再加回权重；
 4. `stochastic_rounding` 回到参数 dtype（bf16/fp16 时就是一次 `.to()`），再转成计算 dtype（相同时不做任何事）。
+
+默认路径（§3.1.1）只剩第 1 步的拷贝，加上每个普通 LoRA patch 一次 `addmm_`（读一遍、写一遍权重）。
 
 ### 5.2 已经省掉的
 
@@ -119,7 +151,7 @@ Monoload 的做法：量化层挂上 weight function 后，`forward` 会走 `cas
 * **LoRA 张量只搬一次。** 原生 `calculate_weight` 每次都 `cast_to_device(LoRA 张量, 权重设备)`。LoRA 文件读在 CPU 上，放在运行时合并里，就成了每步每层一次 H2D。Monoload 在每个 patcher 里按张量缓存一份计算设备上的副本（同 dtype 搬运，数值不变），卸载时释放。**只缓存比被 patch 的权重小的张量**（LoRA 的低秩因子、alpha 等）；整层大小的 patch 张量（例如 `ModelMergeSimple` 等模型合并节点带进来的另一个模型的权重、完整的 diff）照原生的做法，每次临时搬运、用完即丢，所以不会让另一份模型常驻计算设备。缓存的代价是计算设备上多一份被用到的 LoRA 张量，大小不超过 LoRA 本身，在允许的范围内。
 * seed（`string_to_seed(key)`）在挂 patch 时算好；基础 patch 列表按设备缓存好的结构复用；没有 patch 的 key 直接返回。
 
-### 5.3 实测开销（CPU）与可选的放宽
+### 5.3 实测开销（CPU，逐位一致路径）与放宽方案
 
 **CPU 参考数字**（锁定镜像，`--cpu --fp16-unet`，SD1.5，256×256，3 步，`tests/bench_lora.py`，第二遍的数字）。这台机器是 4 核 CPU，256px 下模型本身的计算量很小，所以合并开销显得特别突出，**不代表 GPU**：
 
@@ -148,7 +180,7 @@ layer probe（Rubber Duck，一次模型调用、全部 192 层合计）：临�
 
 （作为参照，这两个 LoRA 本身对 latent 的影响 max_abs 约 34。）
 
-可选的放宽方案（都**没有实现**）：
+当时列出的放宽方案（这些是逐位一致路径时期的分析；C 和作为后备的 A 后来成了默认路径，见 §5.4）：
 
 * **A. 按原生 lowvram 的数值合并：** 直接在计算 dtype 下 `calculate_weight(patches, weight, key, intermediate_dtype=计算 dtype)`，省掉 dtype 往返和舍入。与原生合并不再逐位一致，但与原生 lowvram 路径一致。CPU 上比逐位一致快约 25%。
 * **B. 计算 dtype 下合并，intermediate 保持 fp32：** 省掉 dtype 往返，精度介于 A 和逐位一致之间。
@@ -157,40 +189,66 @@ layer probe（Rubber Duck，一次模型调用、全部 192 层合计）：临�
 
 `tests/bench_lora.py` 带 `bypass` 模式，直接调用 ComfyUI 自带的 `comfy.sd.load_bypass_lora_for_models`，只提供对照数据，设计上不做改动。
 
-### 5.4 真机数据（CT 700，gfx1151）与放宽建议（未实现，等拍板）
+### 5.4 真机数据（CT 700，gfx1151）与决定：默认用 C
 
-**实测**（WAI v17，SDXL 整合包，1344×768，20 步，CFG 6，`--gpu-only`）。权重、计算 dtype、`lora_compute_dtype` 都是 fp16；`native2 vs native` 全部逐位一致，说明 GPU 计算是确定的。
+**实测**（WAI v17，SDXL 整合包，1344×768，20 步，CFG 6，`--gpu-only`；`bench_sdxl_v2`，第二遍的数字）。权重、计算 dtype、`lora_compute_dtype` 都是 fp16；`native2 vs native` 全部逐位一致，说明 GPU 计算是确定的。
 
-| 组合 | 原生每步 | Monoload | 比值 | 切换组合（patch）原生 → Monoload | GTT 原生 → Monoload |
+| 组合 | 原生每步 | Monoload 逐位一致 | ComfyUI bypass | 切换组合（patch）原生 → Monoload | GTT 原生 → Monoload |
 |---|---|---|---|---|---|
-| Smooth Booster（788 层 UNet） | 0.640s | 0.889s | 1.39× | 0.43s → 0.09s | 13.9G → 8.6G |
-| S1 Dramatic Lighting（722 UNet + 264 TE） | 0.641s | 0.852s | 1.33× | 0.65s → 0.11s | |
-| 两者叠加 | 0.639s | 1.062s | 1.66× | 0.62s → 0.11s | |
+| Smooth Booster（788 层 UNet） | 0.638s | 0.891s（1.40×） | 0.870s（1.36×） | 0.42s → 0.10s | 13.9G → 8.6G |
+| S1 Dramatic Lighting（722 UNet + 264 TE） | 0.640s | 0.855s（1.34×） | 0.799s（1.25×） | 0.66s → 0.11s | |
+| 两者叠加 | 0.643s | 1.064s（1.66×） | 1.024s（1.59×） | 0.62s → 0.11s | |
 
-layer probe（Smooth Booster，一次模型调用、788 层、4.77 GiB）：临时拷贝 0.038s，逐位一致合并 0.221s，放宽合并 0.119s。0.038 + 0.221 = 0.259s，基本等于实测每步多出的 0.249s：CFG 的正负条件合成一批，每步只有一次模型调用，开销就是一次完整的合并。
+（这一轮的 bypass 叠加已经修正为两个 LoRA 都挂上。逐位一致路径与原生的 latent max|Δ| 全部为 0。）
 
-**开销拆解：** 在这台机器上，权重、计算和 LoRA 的 dtype 都是 fp16，逐位一致路径里**没有** dtype 往返，舍入也是空操作。剩下的开销来自 `calculate_weight` 默认的 fp32 intermediate：低秩矩阵乘用 fp32 做，生成一个整层大小的 fp32 delta，再乘缩放系数、转回 fp16、加回权重，对 4.77 GiB 的权重要做好几遍逐元素读写。
+layer probe（Smooth Booster，一次模型调用、788 层、4.77 GiB）：
 
-**方案与预估**（以 Smooth Booster 为例，原生 0.640s/步、现在 0.889s/步）：
+| | 耗时（不含临时拷贝 0.038s） | 与原生合并的权重差异 ‖Δw‖/‖ΔW_lora‖ | max\|Δw\| |
+|---|---|---|---|
+| 逐位一致 | 0.221s | 0 | 0 |
+| A. 放宽合并（`calculate_weight`，fp16 intermediate） | 0.117s | 3.56e-5 | 6.1e-5 |
+| C. 融合 addmm（788 层全部可融合） | 0.040s | 2.54e-3 | 1.22e-4 |
 
-| 方案 | 做法 | 每次调用的额外开销 | 预估每步 | 与原生的数值关系 |
-|---|---|---|---|---|
-| 现状（逐位一致） | fp32 intermediate | 0.038 + 0.221 = 0.259s（实测） | 0.889s（1.39×，实测） | 逐位一致 |
-| A. 放宽合并 | `calculate_weight(..., intermediate_dtype=fp16)`，即原生 lowvram 的数值 | 0.038 + 0.119 = 0.157s（实测） | 约 0.80s（约 1.25×） | 与原生 lowvram 路径一致，与原生合并不逐位一致 |
-| C. 融合 addmm | 普通 LoRA/LoCon 用一次 `w.view(out,-1).addmm_(up, down, alpha=scale)`（fp16，GEMM 内部 fp32 累加），其他类型用 A 兜底 | 拷贝 0.038s + 约一遍权重读写（与拷贝同量级）≈ 0.07–0.10s（估计，probe 新增一行可实测） | 约 0.71–0.74s（约 1.11–1.16×） | 同上 |
-| D. bypass | ComfyUI 自带 | — | 实测 0.868s（1.36×）、0.795s（1.24×） | 数值路径不同 |
+0.038 + 0.221 = 0.259s，基本等于实测每步多出的 0.25s：CFG 的正负条件合成一批，每步只有一次模型调用，开销就是一次完整的合并。逐位一致路径的开销主要来自 `calculate_weight` 默认的 fp32 intermediate：生成整层大小的 fp32 delta，乘系数、转回 fp16、再加回权重，对 4.77 GiB 的权重做好几遍逐元素读写。C 只剩一次 GEMM 带加回，耗时和一次拷贝相当。
 
-叠加两个 LoRA 时，现状要做两遍整层大小的 fp32 运算（实测 1.66×）。用 C 的话是两次 `addmm_`，预估约 1.2–1.25×。
+**决定（2026-10）：** 默认采用 C；C 不支持的类型用 A；设 `MONOLOAD_EXACT=1` 回到逐位一致路径（§3.1）。D（bypass）不采用：在这个分辨率下不比 A 快，token 越多越慢，ComfyUI 自带实现叠加多个 LoRA 时只保留最后一个，也不是所有 adapter 都支持。
 
-**建议：采用 C，A 兜底，保留逐位一致作为开关。**
+**预估：** Smooth Booster 每步 0.638 + 0.038 + 0.040 ≈ 0.72s（约 1.12×，逐位一致是 1.40×）；叠加两个 LoRA 是两次 `addmm_`，约 0.76s（约 1.2×）。`bench_lora.py` 的 `monoload` 模式就是默认路径，用它在 GPU 上实测（`monoload-exact` 是逐位一致路径，两者分开列）。
 
-1. 收益最大：单 LoRA 的每步开销从 +39% 降到约 +11–16%，叠加从 +66% 降到约 +20–25%。拷贝和一遍读写是任何「物化合并权重」方案的下限（约 +6% + 一遍读写），C 已经接近这个下限。
-2. bypass 在这个分辨率下不比 A 好（1.24–1.36×），而且 token 越多越慢。它还有两个限制：ComfyUI 自带的实现叠加多个 LoRA 时只保留最后一个，不是所有 adapter 都支持。所以不建议走 D。
-3. 精度：C 和 A 都去掉了 fp32 的中间 delta，delta 先在 fp16 下算好再加上去。与原生合并的差异大致是 delta 的 fp16 舍入量级；原生在 lowvram 时本来也是这么算的。`bench_lora.py` 的 layer probe 现在会直接报出 A 和 C 相对原生合并的权重差异（`||Δw|| / ||LoRA 改动||`），请在 GPU 上跑一次看实际数字。
-4. 开关：保留一个环境变量（比如 `MONOLOAD_EXACT=1`）切回现在的逐位一致路径，用于验收和对比。默认值由你定：默认用 C，或者默认逐位一致、C 作为选项。
-5. 量化层（§3.3）本来就是放宽路径，与这个开关无关。
+### 5.5 默认路径与原生的精度差异、容差测试
 
-**需要的数据：** 用更新后的 `bench_lora.py` 在 GPU 上再跑一次 layer probe。它会给出 C 的实测耗时，以及 A / C 相对原生合并的权重差异。拿到之后再定。
+**差异从哪来。** 原生（= 逐位一致路径）先把 delta 用 fp32 算好，W + delta 在 fp32 下求和，最后舍入一次回 fp16。C 在 fp16 下做 `addmm_`：低秩乘的累加和加回在 GEMM 内部完成，再舍入成 fp16。真实的和若落在两个 fp16 值的中点附近，只要累加顺序或中间精度稍有不同，就会被舍入到相邻的那个值。所以差异的形态是：个别元素差 1 个 ulp。CT 700 上 max|Δw| = 1.22e-4，正好是 [0.125, 0.25) 区间内 fp16 的 1 个 ulp；A 的 6.1e-5 是 [0.0625, 0.125) 的 1 个 ulp。C 的差异总量比 A 大约 70 倍，可能是 hipBLASLt 的 fp16 GEMM 用了降精度的累加或 epilogue。layer probe 现在多测一行 `default-noreduce`（关掉 `allow_fp16_reduced_precision_reduction`）用来确认，只作诊断，插件不改这个全局设置。
+
+**指标（与 layer probe 相同）：**
+
+```
+rel = ‖Δw‖ / ‖ΔW_lora‖        Δw = w_default − w_native，ΔW_lora = w_native − w_base
+```
+
+对一个模型所有被 patch 的权重整体求和。w_native 是原生 `patch_weight_to_device(return_weight=True)` 的结果，也就是原生烘焙进去的权重。
+
+**比较精度。** 两边先舍入到参数 dtype、计算 dtype、`lora_compute_dtype` 三者中最粗的那个，再比较。原生合并的精度受这三者里最粗的那个限制：例如 CPU 测试里是 fp16 参数、fp32 计算，原生会把合并结果舍入回 fp16，默认路径则在 fp32 下合并、不舍入，比原生更精确，这部分不算误差。gfx1151 上三者都是 fp16，等于直接比较。
+
+**阈值：**
+
+```
+‖Δw‖ ≤ u · (1 · ‖W‖ + 20 · ‖ΔW_lora‖)，即  rel ≤ u · (‖W‖ / ‖ΔW_lora‖ + 20)
+u = 比较精度的单位舍入：fp16 2⁻¹¹ ≈ 4.9e-4，bf16 2⁻⁸ ≈ 3.9e-3，fp32 2⁻²⁴
+```
+
+* 第一项是最终舍入：合并时求和顺序不同，就可能落到相邻的 ulp。每个变了的元素差 1 个 ulp（≤ 2u·|w|），所以整体 ‖Δw‖ ≤ u·‖W‖，相当于最多约四分之一的元素各差 1 个 ulp。
+* 第二项是在计算 dtype 下算 delta 带来的误差，按 delta 本身的 20 个单位舍入计。
+* 不用固定的 rel 阈值：rel 的下限就是 W 的舍入，LoRA 改动相对 W 越小，rel 就越大。纯舍入就可能让 LoHa 这种改动极小的 patch 得到 rel ≈ 1。
+* gfx1151 上 C 的 2.54e-3，只占第二项（20u = 9.8e-3）的约四分之一，与 ‖W‖/‖ΔW_lora‖ 无关，都在阈值以内。
+
+**测试**（全部在两种模式下各跑一遍，见 `tests/run_all.sh`）：
+
+* `MONOLOAD_EXACT=1`：原有的逐位一致测试（dtype 矩阵 108 项、两条管线的 TE 输出和 latent、hook、模型合并），结果必须逐位一致。
+* 默认路径：
+  * `test_dtype_paths.py`：参数 × 计算 × lora dtype × 8 种 patch 组合（LoRA、两个 LoRA、strength_model ≠ 1、LoHa、LoRA+LoHa、diff、hook、LoRA+hook），共 144 项。每项检查两件事：一是与独立实现的参照（普通 LoRA 用 `addmm_`，其余用原生 `LowVramPatch`）**逐位一致**，二是与原生合并的差异在上述阈值以内。
+  * `test_lora_hot.py`：两条管线、8 个组合，UNet 和 TE 所有被 patch 的权重整体与原生合并比较，必须在阈值以内。同时在同样的 key 上重算逐位一致路径，必须与原生逐位一致。模型合并同样检查。latent 与原生的差异只报告；hook LoRA 要求 latent 的 mean|Δ| 小于 hook 本身作用的 10%。
+  * `test_quant.py`：fp8 与「先反量化 + 同一路径」逐位一致。
+* 两种模式都要通过的行为测试：没有备份、权重逐字节不变、撤掉 LoRA 后与没打过逐位一致、报错、每个 prompt 结束后的释放（三种缓存加 KEEP）。
 
 ## 6. 报错（绝不退回「改权重 + 备份」）
 

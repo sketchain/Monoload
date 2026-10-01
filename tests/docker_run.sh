@@ -11,7 +11,7 @@ for d in checkpoints diffusion_models text_encoders loras; do
   [ -d "$MODELS/$d" ] && mounts+=(-v "$MODELS/$d":/opt/ComfyUI/models/$d:ro)
 done
 exec docker run --rm --network none ${DOCKER_EXTRA:-} \
-  -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONUNBUFFERED=1 -e MONOLOAD_DISABLE="${MONOLOAD_DISABLE:-}" -e MONOLOAD_KEEP_LORA="${MONOLOAD_KEEP_LORA:-}" \
+  -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONUNBUFFERED=1 -e MONOLOAD_DISABLE="${MONOLOAD_DISABLE:-}" -e MONOLOAD_KEEP_LORA="${MONOLOAD_KEEP_LORA:-}" -e MONOLOAD_EXACT="${MONOLOAD_EXACT:-}" \
   -v "$REPO":/opt/ComfyUI/custom_nodes/monoload:ro "${mounts[@]}" \
   -w /opt/ComfyUI/custom_nodes/monoload \
   "$IMG" "$@"
