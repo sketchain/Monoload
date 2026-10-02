@@ -27,15 +27,17 @@ VAEDecodeTiled / VAE.decode_tiled -- stays native (logged).
 Layer 1 (stripe decoding for recognized decoders) plugs in through
 STRIPE_ADAPTERS. Phase 2 ships the Wan 2.1 VAE single-frame adapter
 (monoload/vae_stripe.py): a recognized, self-tested decoder is decoded in
-stripes of output rows from a low-resolution checkpoint, with a peak budget
-(MONOLOAD_VAE_BUDGET) instead of the whole-image activations; everything else
-keeps layer 2.
+stripes of output rows from a low-resolution checkpoint instead of the
+whole-image activations; everything else keeps layer 2. Default stripe height:
+the lowest peak that does not cost speed (DEFAULT_POLICY_ROWS, DESIGN
+§9.13.4); MONOLOAD_VAE_BUDGET / MONOLOAD_VAE_STRIPE_ROWS override it.
 
 Switches (read at import / by the plugin entry): MONOLOAD_DISABLE_VAE=1 or
 MONOLOAD_EXACT=1 -> not installed; MONOLOAD_VAE_WORKSPACE (default 1G);
 MONOLOAD_DISABLE_VAE_STRIPE=1 -> layer 1 off; MONOLOAD_VAE_BUDGET (layer-1
-peak budget, default 3G); MONOLOAD_VAE_STRIPE_ROWS (force the stripe core
-height, for sweeps / debugging).
+peak budget: the tallest stripes within it; unset = the default policy);
+MONOLOAD_VAE_STRIPE_ROWS (force the stripe core height, for sweeps /
+debugging).
 """
 
 import inspect
@@ -58,7 +60,8 @@ from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
 _ORIG = {}
 
 DEFAULT_WORKSPACE = 1 * GIB
-DEFAULT_BUDGET = 3 * GIB   # layer-1 peak budget (DESIGN §9.13.4)
+DEFAULT_POLICY_ROWS = 128  # layer-1 default: the peak of 128-row stripes, with the tallest stripes that stay at it (DESIGN §9.13.4)
+LAYER1_WORKSPACE = 384 * MIB  # layer-1 workspace without MONOLOAD_VAE_BUDGET (capped by MONOLOAD_VAE_WORKSPACE)
 MIN_WORKSPACE = 64 * MIB
 ACTIVATION_COPIES = 4      # live full-size activations bounded by 4x the largest one (DESIGN §9.4)
 PROBE_SIZE = 8             # latent rows/cols of the shape probe
@@ -100,12 +103,12 @@ def _env_flag(name):
 def _budget_from_env():
     raw = os.environ.get("MONOLOAD_VAE_BUDGET", "").strip()
     if not raw:
-        return DEFAULT_BUDGET, False
+        return None
     try:
-        return parse_size(raw), True
+        return parse_size(raw)
     except ValueError:
-        logging.warning("[Monoload] MONOLOAD_VAE_BUDGET={!r} not understood (examples: 3G, 2560M); using {}".format(raw, fmt_bytes(DEFAULT_BUDGET)))
-        return DEFAULT_BUDGET, False
+        logging.warning("[Monoload] MONOLOAD_VAE_BUDGET={!r} not understood (examples: 3G, 2560M); using the default stripe policy".format(raw))
+        return None
 
 
 def _rows_from_env():
@@ -122,8 +125,7 @@ def _rows_from_env():
         return None
 
 
-_b, _b_explicit = _budget_from_env()
-_SETTINGS = {"workspace": _workspace_from_env(), "budget": _b, "budget_explicit": _b_explicit,
+_SETTINGS = {"workspace": _workspace_from_env(), "budget": _budget_from_env(),
              "stripe": not _env_flag("MONOLOAD_DISABLE_VAE_STRIPE"), "stripe_rows": _rows_from_env()}
 _LAST = {}
 
@@ -141,12 +143,17 @@ def budget():
     return _SETTINGS["budget"]
 
 
-def set_budget(n, explicit=True):
-    """Layer-1 peak budget in bytes (tests / bench); MONOLOAD_VAE_BUDGET at import.
-    explicit=False behaves like the default: raised (with a warning) when even
-    the smallest stripes do not fit; explicit: such a decode is an error."""
-    _SETTINGS["budget"] = int(n)
-    _SETTINGS["budget_explicit"] = bool(explicit)
+def set_budget(n):
+    """Layer-1 peak budget in bytes, None = the default policy (tests / bench);
+    MONOLOAD_VAE_BUDGET at import. With a budget, a decode whose smallest
+    stripes do not fit it is an error."""
+    _SETTINGS["budget"] = int(n) if n else None
+
+
+def layer1_workspace(bud=None):
+    """Workspace of layer 1: a budget's eighth (at least MIN_WORKSPACE), else
+    LAYER1_WORKSPACE; never above MONOLOAD_VAE_WORKSPACE."""
+    return min(workspace(), max(MIN_WORKSPACE, bud // 8) if bud else LAYER1_WORKSPACE)
 
 
 def stripe_enabled():
@@ -163,7 +170,7 @@ def stripe_rows():
 
 
 def set_stripe_rows(n):
-    """Force the stripe core height (output rows), None = from the budget."""
+    """Force the stripe core height (output rows), None = from the policy / budget."""
     _SETTINGS["stripe_rows"] = int(n) if n else None
 
 
@@ -435,37 +442,49 @@ def _out_bytes(vae, samples, h_out, w_out, channels):
     return samples.shape[0] * channels * t * h_out * w_out * mm.dtype_size(vae.vae_output_dtype())
 
 
-def _decode_layer1(self, samples_in, bound, t0, selftest):
+def choose_plan(vae, samples_in, bound, out_bytes):
+    """(plan, budget, workspace, policy) for a layer-1 decode (DESIGN §9.13.4).
+
+    forced rows   MONOLOAD_VAE_STRIPE_ROWS: exactly that core height.
+    budget        MONOLOAD_VAE_BUDGET: the tallest stripes whose estimate fits
+                  it; MonoloadError when even MIN_ROWS-row stripes do not.
+    default       the lowest peak that does not cost speed: the estimate of
+                  DEFAULT_POLICY_ROWS-row stripes is the target (shorter stripes
+                  were clearly slower on the hardware, 128 rows as fast as the
+                  tallest), and the tallest stripes whose estimate stays at that
+                  target are used. Where the whole-image prefix sets the peak
+                  (large images) that is taller than DEFAULT_POLICY_ROWS at no
+                  extra memory; a small image may become a single stripe.
+    """
     bud = budget()
-    explicit = _SETTINGS["budget_explicit"]
-    ws = min(workspace(), max(MIN_WORKSPACE, bud // 8))
-    floor_ws = min(MIN_WORKSPACE, ws)
+    ws = layer1_workspace(bud)
+    forced = _SETTINGS["stripe_rows"]
+    if forced:
+        plan = bound.plan(vae, samples_in, bud or 0, ws, rows=forced, out_bytes=out_bytes)
+        return plan, bud or plan.estimate, ws, "forced {} rows (MONOLOAD_VAE_STRIPE_ROWS){}".format(
+            forced, "; estimate above MONOLOAD_VAE_BUDGET" if bud and plan.estimate > bud else "")
+    if bud:
+        plan = bound.plan(vae, samples_in, bud, ws, out_bytes=out_bytes)
+        if plan is None:
+            smallest = bound.plan(vae, samples_in, bud, ws, rows=vae_stripe.MIN_ROWS, out_bytes=out_bytes)
+            raise MonoloadError(
+                "[Monoload] VAE 第一层（条带解码）在峰值预算 MONOLOAD_VAE_BUDGET={} 内放不下：latent {} 即使用 {} 行的条带也需要约 {}"
+                "（前缀 {}、条带 {}）。请调大 MONOLOAD_VAE_BUDGET 或去掉它（用默认策略），或设 MONOLOAD_DISABLE_VAE_STRIPE=1 改走第二层。".format(
+                    fmt_bytes(bud), list(samples_in.shape), vae_stripe.MIN_ROWS, fmt_bytes(smallest.estimate),
+                    fmt_bytes(smallest.prefix_bytes), fmt_bytes(smallest.stripe_bytes)))
+        return plan, bud, ws, "MONOLOAD_VAE_BUDGET"
+    ref = bound.plan(vae, samples_in, 0, ws, rows=DEFAULT_POLICY_ROWS, out_bytes=out_bytes)
+    target = ref.estimate
+    plan = bound.plan(vae, samples_in, target, ws, out_bytes=out_bytes) or ref
+    return plan, target, ws, "default: peak of {}-row stripes".format(DEFAULT_POLICY_ROWS)
+
+
+def _decode_layer1(self, samples_in, bound, t0, selftest):
     h_out, w_out = int(samples_in.shape[-2]) * 8, int(samples_in.shape[-1]) * 8
     outb = _out_bytes(self, samples_in, h_out, w_out, bound.units[-1].cout)
     forced = _SETTINGS["stripe_rows"]
-    note = ""
-    if forced:
-        plan = bound.plan(self, samples_in, bud, ws, rows=forced, out_bytes=outb)
-        if plan.estimate > bud:
-            note = " (forced stripe height: estimate above the budget)"
-    else:
-        plan = bound.plan(self, samples_in, bud, ws, out_bytes=outb)
-        if plan is None:
-            smallest = bound.plan(self, samples_in, bud, ws, rows=vae_stripe.MIN_ROWS, out_bytes=outb)
-            if explicit:
-                raise MonoloadError(
-                    "[Monoload] VAE 第一层（条带解码）在峰值预算 MONOLOAD_VAE_BUDGET={} 内放不下：latent {} 即使用 {} 行的条带也需要约 {}"
-                    "（前缀 {}、条带 {}）。请调大 MONOLOAD_VAE_BUDGET，或设 MONOLOAD_DISABLE_VAE_STRIPE=1 改走第二层。".format(
-                        fmt_bytes(bud), list(samples_in.shape), vae_stripe.MIN_ROWS, fmt_bytes(smallest.estimate),
-                        fmt_bytes(smallest.prefix_bytes), fmt_bytes(smallest.stripe_bytes)))
-            # the smallest stripes set the lowest reachable peak (usually the whole-image prefix dominates it):
-            # take that as the budget and the largest stripes that stay within it
-            raised = smallest.estimate
-            plan = bound.plan(self, samples_in, raised, ws, out_bytes=outb) or smallest
-            note = " (default budget too small for this size: raised to the lowest reachable peak {})".format(fmt_bytes(raised))
-            logging.warning("[Monoload] VAE layer 1: the default peak budget {} does not fit latent {}; using {} instead, the lowest "
-                            "reachable peak (set MONOLOAD_VAE_BUDGET to choose)".format(fmt_bytes(bud), list(samples_in.shape), fmt_bytes(raised)))
-            bud = raised
+    plan, bud, ws, policy = choose_plan(self, samples_in, bound, outb)
+    floor_ws = min(MIN_WORKSPACE, ws)
     min_rows = min(vae_stripe.MIN_ROWS, max(b - a for a, b in plan.stripes))
     mm.load_models_gpu([self.patcher], memory_required=plan.estimate, force_full_load=self.disable_offload)
     retries = 0
@@ -504,12 +523,12 @@ def _decode_layer1(self, samples_in, bound, t0, selftest):
     _LAST.clear()
     _LAST.update({"strategy": "layer1", "adapter": bound.name, "estimate": {"total": plan.estimate, "first": first_est,
                   "prefix": plan.prefix_bytes, "stripes": plan.stripe_bytes, "checkpoint": plan.ckpt_bytes, "persistent": plan.persistent},
-                  "native_estimate": native_est, "budget": bud, "workspace": ws, "retries": retries, "seconds": dt,
+                  "native_estimate": native_est, "budget": bud, "policy": policy, "workspace": ws, "retries": retries, "seconds": dt,
                   "stripes": len(plan.stripes), "rows": max(b - a for a, b in plan.stripes), "recompute": plan.recompute,
                   "checkpoint_bytes": plan.ckpt_bytes, "boundaries": boundaries, "forced_rows": forced, "selftest": selftest,
                   "stats": stats.as_dict()})
-    logging.info("[Monoload] VAE decode {} -> layer 1 ({}): {}; budget {}, workspace {}{}{}; memory estimate {} (native {}), {:.2f}s".format(
-        "x".join(str(d) for d in samples_in.shape), bound.name, plan.describe(), fmt_bytes(bud), fmt_bytes(ws), note,
+    logging.info("[Monoload] VAE decode {} -> layer 1 ({}): {}; {}, workspace {}{}; memory estimate {} (native {}), {:.2f}s".format(
+        "x".join(str(d) for d in samples_in.shape), bound.name, plan.describe(), policy, fmt_bytes(ws),
         ", {} OOM retries".format(retries) if retries else "", fmt_bytes(plan.estimate), fmt_bytes(native_est), dt))
     return pixel_samples
 

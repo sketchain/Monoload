@@ -53,9 +53,10 @@ else:
                          "images only (4D / 5D T=1), set MONOLOAD_DISABLE_VAE=1 for native".format(fmt_bytes(vae.workspace())))
             if vae.stripe_enabled():
                 logging.info("[Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae single frame; "
-                             "self-tested on first use): peak budget {}{} (MONOLOAD_VAE_BUDGET){}; other decoders use layer 2; "
+                             "self-tested on first use): {}{}; other decoders use layer 2; "
                              "set MONOLOAD_DISABLE_VAE_STRIPE=1 to use layer 2 everywhere".format(
-                                 fmt_bytes(vae.budget()), "" if vae._SETTINGS["budget_explicit"] else " (default)",
+                                 "peak budget {} (MONOLOAD_VAE_BUDGET)".format(fmt_bytes(vae.budget())) if vae.budget() else
+                                 "default stripe policy: the peak of {}-row stripes, tallest stripes within it (MONOLOAD_VAE_BUDGET to choose a budget)".format(vae.DEFAULT_POLICY_ROWS),
                                  ", stripe height forced to {} rows (MONOLOAD_VAE_STRIPE_ROWS)".format(vae.stripe_rows()) if vae.stripe_rows() else ""))
             else:
                 logging.info("[Monoload] VAE layer 1 (stripe decoding) off (MONOLOAD_DISABLE_VAE_STRIPE): every managed decode uses layer 2")

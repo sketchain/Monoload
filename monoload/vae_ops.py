@@ -24,7 +24,9 @@ floating-point differences (different GEMM shapes), with ~1x the arithmetic:
             (so comfy's Conv3d autopad="causal_zero" weight truncation and any
             backend workaround still apply) with the H padding of the module
             temporarily set to 0. Output is preallocated once and filled block
-            by block.
+            by block. A single-frame Conv3d call (effective kT=1) on the
+            SlowDilated3d backend runs as the equivalent F.conv2d instead
+            (DESIGN §9.13.9).
   attention the `optimized_attention` instance attribute of attention blocks
             (comfy.ldm.modules.diffusionmodules.model.AttnBlock, Wan's
             AttentionBlock) when it is one of ComfyUI's VAE attention functions
@@ -63,6 +65,8 @@ class OpStats:
         self.attn_tokens_max = 0      # largest N (keys = queries)
         self.attn_rows_min = None     # smallest query-block size used
         self.attn_score_max = 0       # largest per-block score bytes (x2: scores + softmax)
+        self.cache_releases = 0       # allocator cache emptied between the layer-1 prefix and its stripes
+        self.conv3d_as_2d = 0         # single-frame Conv3d calls run as conv2d (no per-channel bias fill)
 
     def as_dict(self):
         d = dict(self.__dict__)
@@ -126,14 +130,43 @@ def conv_workspace_per_row(weight_shape, ksize_eff, out_other, batch, elem):
     return n * batch * elem
 
 
-class _ConvChunker:
-    __slots__ = ("mod", "orig", "budget", "stats")
+def slow_dilated3d(x):
+    """True where torch runs a 5D conv on x with the SlowDilated3d backend
+    (CUDA / HIP without cuDNN / MIOpen, e.g. ComfyUI's AMD default): it fills
+    the output with the bias one channel at a time (one fill_ per output
+    channel and call) before the GEMM."""
+    return x.is_cuda and not torch.backends.cudnn.enabled and not getattr(comfy.ops, "NVIDIA_MEMORY_CONV_BUG_WORKAROUND", False)
 
-    def __init__(self, mod, orig, budget, stats):
+
+# Conv3d classes whose _conv_forward is known: torch's, and comfy.ops' (causal_zero autopad = weight[:, :, -T:])
+_CONV3D_FORWARDS = (torch.nn.Conv3d._conv_forward, comfy.ops.disable_weight_init.Conv3d._conv_forward)
+
+
+class _ConvChunker:
+    __slots__ = ("mod", "orig", "budget", "stats", "as2d")
+
+    def __init__(self, mod, orig, budget, stats, as2d=False):
         self.mod = mod
         self.orig = orig
         self.budget = budget
         self.stats = stats
+        self.as2d = as2d   # Conv3d with a known _conv_forward: single-frame calls may run as conv2d
+
+    def _conv(self, x, weight, bias, args, kwargs):
+        """self.orig(x, weight, bias, ...), except a single-frame Conv3d call on
+        the SlowDilated3d backend: that runs as F.conv2d on frame 0 with the
+        (effective) kT=1 weight -- the Slow2d backend sets the bias with one
+        copy instead of a fill_ per output channel; im2col columns and the
+        GEMM (operands, shapes, beta=1 onto the bias) are those of the 3D path."""
+        mod = self.mod
+        if self.as2d and x.shape[2] == 1 and slow_dilated3d(x) and mod.padding_mode == "zeros" and isinstance(mod.padding, tuple):
+            autopad = kwargs.get("autopad", args[0] if args else None)
+            pt, ph, pw = (int(p) for p in mod.padding)
+            if pt == 0 and (autopad == "causal_zero" or weight.shape[2] == 1):
+                self.stats.conv3d_as_2d += 1
+                y = F.conv2d(x[:, :, 0], weight[:, :, -1], bias, _tuple(mod.stride, 3)[1:], (ph, pw), _tuple(mod.dilation, 3)[1:], mod.groups)
+                return y.unsqueeze(2)
+        return self.orig(x, weight, bias, *args, **kwargs)
 
     def __call__(self, input, weight, bias, *args, **kwargs):
         st = self.stats
@@ -180,7 +213,7 @@ class _ConvChunker:
         full = per_row * h_out
         st.conv_ws_max_full = max(st.conv_ws_max_full, full)
         if full <= self.budget:
-            return self.orig(input, weight, bias, *args, **kwargs)
+            return self._conv(input, weight, bias, args, kwargs)
 
         rows = max(1, int(self.budget // per_row))
         st.conv_chunked += 1
@@ -230,7 +263,7 @@ class _ConvChunker:
                         fpad += [0, 0]
                 if any(fpad):
                     xc = F.pad(xc, fpad)
-                yc = self.orig(xc, weight, bias, *args, **kwargs)
+                yc = self._conv(xc, weight, bias, args, kwargs)
                 del xc
                 if yc.shape[hdim] != o1 - o0:
                     raise RuntimeError("[Monoload] internal error: conv row block produced {} rows, expected {}".format(yc.shape[hdim], o1 - o0))
@@ -393,7 +426,8 @@ class OpChunking:
                     prev = m.__dict__.get("_conv_forward", _MISSING)
                     orig = m._conv_forward  # bound method (or a previous instance override)
                     self._saved.append((m, "_conv_forward", prev))
-                    m.__dict__["_conv_forward"] = _ConvChunker(m, orig, self.budget, self.stats)
+                    as2d = isinstance(m, torch.nn.Conv3d) and prev is _MISSING and type(m)._conv_forward in _CONV3D_FORWARDS
+                    m.__dict__["_conv_forward"] = _ConvChunker(m, orig, self.budget, self.stats, as2d)
                     self.stats.conv_modules += 1
                 fn = m.__dict__.get("optimized_attention", None)
                 if fn is not None:

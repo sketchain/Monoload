@@ -19,9 +19,15 @@ random weights, fp32 on the CPU.
   4. self-test: a halo one row short (caught by the per-unit validity check) and
      a halo one row short with a matching wrong validity rule (caught
      numerically) both fail the self-test and the decode falls back to layer 2;
-  5. budget (explicit too small -> error naming the need; default -> raised
-     with a warning), OOM -> smaller stripes, at the floor
-     MonoloadVAEOOMError, never tiled, never layer 2.
+  5. budget (explicit too small -> error naming the need), OOM -> smaller
+     stripes, at the floor MonoloadVAEOOMError, never tiled, never layer 2;
+  6. default policy (the peak of 128-row stripes, tallest stripes within it),
+     memory model (estimate = persistent + max(prefix, stripes), monotone in
+     the stripe height, the largest stripe runs first), the allocator cache is
+     emptied after the self-test and between prefix and stripes;
+  7. single-frame Conv3d as conv2d (forced on the CPU): same result as the
+     module, only where the 3D call is single-frame with an effective kT=1 and
+     a known _conv_forward.
 
     python tests/test_vae_stripe.py
 """
@@ -168,21 +174,21 @@ def decoder_tests():
     v = wan_vae_model()
     g = torch.Generator().manual_seed(11)
     lat = torch.randn(1, 16, 1, 12, 10, generator=g)
-    mvae.set_budget(mvae.DEFAULT_BUDGET, explicit=False)
+    mvae.set_budget(None)
     for rows, n in ((1, 96), (7, 14), (40, 3), (96, 1)):
         compare_layer1("12x10 latent, stripe height {}".format(rows), v, lat, rows=rows, expect_stripes=n)
     # budget-chosen height with several stripes (tiny workspace, so the activations decide)
     mvae.set_workspace(16 * 1024)
     bound, _ = vs.match(v, lat, {})
     p24 = bound.plan(v, lat, 0, 16 * 1024, rows=24, out_bytes=mvae._out_bytes(v, lat, 96, 80, 3))
-    mvae.set_budget(p24.estimate, explicit=True)
+    mvae.set_budget(p24.estimate)
     last = compare_layer1("12x10 latent, height from a budget that fits 24-row stripes", v, lat)
     check("budget-chosen plan: estimate {} <= budget {}, {} stripes of {} rows (24 rows fit, the whole image does not)".format(
         vae_ops.fmt_bytes(last["estimate"]["total"]), vae_ops.fmt_bytes(last["budget"]), last["stripes"], last["rows"]),
         last["estimate"]["total"] <= last["budget"] and 1 < last["stripes"] <= 4 and last["rows"] >= 24)
     mvae.set_workspace(mvae.DEFAULT_WORKSPACE)
-    mvae.set_budget(mvae.DEFAULT_BUDGET, explicit=False)
-    compare_layer1("12x10 latent, default budget (whole image fits: 1 stripe)", v, lat, expect_stripes=1)
+    mvae.set_budget(None)
+    compare_layer1("12x10 latent, default policy (96 rows, shorter than {} rows: 1 stripe)".format(mvae.DEFAULT_POLICY_ROWS), v, lat, expect_stripes=1)
     compare_layer1("odd 13x9 latent, stripe height 9", v, torch.randn(1, 16, 1, 13, 9, generator=g), rows=9)
     compare_layer1("tiny 1x1 latent, stripe height 3", v, torch.randn(1, 16, 1, 1, 1, generator=g), rows=3)
     compare_layer1("3x5 latent, stripe height 5", v, torch.randn(1, 16, 1, 3, 5, generator=g), rows=5)
@@ -292,20 +298,10 @@ def selftest_tests(v, lat):
 # ---------------------------------------------------------------------------
 
 def budget_oom_tests(v, lat):
-    mvae.set_budget(1 << 20, explicit=True)
-    expect_raises("explicit budget too small -> MonoloadError naming what is needed", MonoloadError,
+    mvae.set_budget(1 << 20)
+    expect_raises("budget too small (MONOLOAD_VAE_BUDGET) -> MonoloadError naming what is needed", MonoloadError,
                   lambda: managed_decode(v, lat), "MONOLOAD_VAE_BUDGET", "需要")
-    mvae.set_budget(1 << 20, explicit=False)
-    out = managed_decode(v, lat, raw=True)
-    last = mvae.last_decode()
-    bound, _ = vs.match(v, lat, {})
-    ws_used = last["workspace"]
-    p8 = bound.plan(v, lat, 0, ws_used, rows=vs.MIN_ROWS, out_bytes=mvae._out_bytes(v, lat, 96, 80, 3))
-    check("default budget too small -> raised (warning) to the lowest reachable peak {} with the largest stripes within it ({} x {} rows), still layer 1".format(
-        vae_ops.fmt_bytes(p8.estimate), last.get("stripes"), last.get("rows")),
-          last.get("strategy") == "layer1" and last["budget"] == p8.estimate and last["estimate"]["total"] <= p8.estimate
-          and last["rows"] >= vs.MIN_ROWS and float((out - native_decode(v, lat, raw=True)).abs().max()) <= 1e-5)
-    mvae.set_budget(mvae.DEFAULT_BUDGET, explicit=False)
+    mvae.set_budget(None)
 
     orig_run = vs.run_stripes
     calls_l2 = [0]
@@ -345,6 +341,106 @@ def budget_oom_tests(v, lat):
         mvae.set_stripe_rows(None)
 
 
+# ---------------------------------------------------------------------------
+# 6. default policy, memory model, allocator cache
+# ---------------------------------------------------------------------------
+
+def policy_memory_tests(v):
+    g = torch.Generator().manual_seed(5)
+    lat = torch.randn(1, 16, 1, 40, 6, generator=g)   # 320 output rows
+    bound, _ = vs.match(v, lat, {})
+    outb = mvae._out_bytes(v, lat, 320, 48, 3)
+    ws = mvae.layer1_workspace()
+    mvae.set_budget(None)
+    ref = bound.plan(v, lat, 0, ws, rows=mvae.DEFAULT_POLICY_ROWS, out_bytes=outb)
+    last = compare_layer1("320-row image, default policy", v, lat, expect_stripes=3)
+    check("default policy: target = estimate of {}-row stripes ({}), tallest stripes within it: {} x {} rows, estimate {} ({})".format(
+        mvae.DEFAULT_POLICY_ROWS, vae_ops.fmt_bytes(ref.estimate), last["stripes"], last["rows"], vae_ops.fmt_bytes(last["estimate"]["total"]), last["policy"]),
+        last["policy"].startswith("default") and last["budget"] == ref.estimate and last["estimate"]["total"] <= ref.estimate
+        and bound.plan(v, lat, 0, ws, rows=160, out_bytes=outb).estimate > ref.estimate)
+    mvae.set_stripe_rows(64)
+    p, bud, _, policy = mvae.choose_plan(v, lat, bound, outb)
+    mvae.set_budget(ref.estimate)
+    pb, budb, _, policyb = mvae.choose_plan(v, lat, bound, outb)
+    mvae.set_stripe_rows(None)
+    pc, budc, _, policyc = mvae.choose_plan(v, lat, bound, outb)
+    mvae.set_budget(None)
+    check("MONOLOAD_VAE_STRIPE_ROWS overrides the policy and the budget ({} x {} rows: {}); MONOLOAD_VAE_BUDGET alone: tallest within it ({} x {} rows: {})".format(
+        len(pb.stripes), max(b - a for a, b in pb.stripes), policyb, len(pc.stripes), max(b - a for a, b in pc.stripes), policyc),
+        len(p.stripes) == 5 and len(pb.stripes) == 5 and "forced" in policy and "forced" in policyb
+        and policyc == "MONOLOAD_VAE_BUDGET" and budc == ref.estimate and pc.estimate <= budc and len(pc.stripes) <= 3)
+    for w in (16 * 1024, 1 << 20, 384 << 20):
+        plans = [bound.plan(v, lat, 0, w, rows=r, out_bytes=outb) for r in (1, 8, 16, 40, 64, 107, 160, 320)]
+        mono = all(a.estimate <= b.estimate for a, b in zip(plans, plans[1:]))
+        parts = all(q.estimate == q.persistent + max(q.prefix_bytes, q.stripe_bytes)
+                    and q.prefix_bytes == vs.with_slack(q.prefix_live) and q.stripe_bytes == q.ckpt_bytes + vs.with_slack(q.stripe_live) for q in plans)
+        order = True
+        for q in plans:
+            size = [sum(n[1] - n[0] for n in needs) for needs in q.needs]
+            order = order and sorted(q.order) == list(range(len(q.stripes))) and size[q.order[0]] == max(size)
+        check("workspace {}: estimate monotone in the stripe height ({} .. {}), = persistent + max(prefix, stripes) with the allocator slack, "
+              "largest stripe first".format(vae_ops.fmt_bytes(w), vae_ops.fmt_bytes(plans[0].estimate), vae_ops.fmt_bytes(plans[-1].estimate)),
+              mono and parts and order)
+    # allocator cache: emptied after the self-test and between prefix and stripes
+    calls = []
+    orig = comfy.model_management.soft_empty_cache
+    comfy.model_management.soft_empty_cache = lambda force=False: calls.append(force)
+    try:
+        vs._SELFTEST.clear()
+        ok, _ = vs.self_test(bound, v)
+        n_selftest = len(calls)
+        mvae.set_stripe_rows(40)
+        managed_decode(v, torch.randn(2, 16, 1, 12, 10, generator=g))
+        mvae.set_stripe_rows(None)
+        last = mvae.last_decode()
+    finally:
+        comfy.model_management.soft_empty_cache = orig
+    check("allocator cache emptied after the self-test ({} call) and once per sample between prefix and stripes ({} for batch 2)".format(
+        n_selftest, last["stats"]["cache_releases"]), ok and n_selftest == 1 and last["stats"]["cache_releases"] == 2 and all(calls))
+
+
+# ---------------------------------------------------------------------------
+# 7. single-frame Conv3d as conv2d
+# ---------------------------------------------------------------------------
+
+def conv2d_route_tests(v, lat):
+    orig_gate = vae_ops.slow_dilated3d
+    vae_ops.slow_dilated3d = lambda x: True   # as on CUDA / HIP without cuDNN
+    try:
+        g = torch.Generator().manual_seed(9)
+        cases = []
+        for label, mod, x in (
+                ("3x3 CausalConv3d, T=1 (causal_zero)", init_conv(wan.CausalConv3d(8, 12, 3, padding=1)), torch.randn(1, 8, 1, 21, 13, generator=g)),
+                ("1x1 CausalConv3d shortcut, T=1, sliced input", init_conv(wan.CausalConv3d(8, 12, 1)), torch.randn(1, 8, 1, 30, 13, generator=g)[:, :, :, 3:24]),
+                ("3x3 CausalConv3d, T=3 (not single-frame)", init_conv(wan.CausalConv3d(8, 12, 3, padding=1)), torch.randn(1, 8, 3, 21, 13, generator=g))):
+            ref = mod(x)
+            for budget in (1 << 30, 4 * 1024):
+                st = vae_ops.OpStats()
+                with vae_ops.OpChunking(mod, budget, st):
+                    y = mod(x)
+                cases.append((label, budget, float((y - ref).abs().max()), st.conv3d_as_2d, st.conv_chunked, y.shape == ref.shape))
+        for label, budget, e, n2d, nch, shape_ok in cases:
+            single = "T=3" not in label
+            check("{} (workspace {}): max|Δ| vs the module {:.2g}, {} call(s) as conv2d, {} in row blocks".format(
+                label, vae_ops.fmt_bytes(budget), e, n2d, nch), shape_ok and e <= 1e-5 and ((n2d > 0) == single))
+        m = init_conv(wan.CausalConv3d(8, 12, 3, padding=1))
+        m._conv_forward = m._conv_forward   # an instance-level override from someone else: left alone
+        st = vae_ops.OpStats()
+        with vae_ops.OpChunking(m, 1 << 30, st):
+            m(torch.randn(1, 8, 1, 9, 9, generator=g))
+        del m.__dict__["_conv_forward"]
+        check("Conv3d with an instance-level _conv_forward override: not routed", st.conv3d_as_2d == 0)
+        last = compare_layer1("layer 1 with single-frame Conv3d as conv2d, stripe height 24", v, lat, rows=24)
+        check("  ... {} Conv3d calls ran as conv2d".format(last["stats"]["conv3d_as_2d"]), last["stats"]["conv3d_as_2d"] > 0)
+    finally:
+        vae_ops.slow_dilated3d = orig_gate
+    st = vae_ops.OpStats()
+    m = init_conv(wan.CausalConv3d(8, 12, 3, padding=1))
+    with vae_ops.OpChunking(m, 1 << 30, st):
+        m(torch.randn(1, 8, 1, 9, 9))
+    check("CPU tensor: SlowDilated3d gate off ({}), Conv3d left as is".format(vae_ops.slow_dilated3d(torch.zeros(1))), st.conv3d_as_2d == 0)
+
+
 def main():
     if not mvae.is_installed():
         check("vae.install() on this ComfyUI", mvae.install())
@@ -354,6 +450,8 @@ def main():
     recognition_tests(v, lat)
     selftest_tests(v, lat)
     budget_oom_tests(v, lat)
+    policy_memory_tests(v)
+    conv2d_route_tests(v, lat)
     finish()
 
 
