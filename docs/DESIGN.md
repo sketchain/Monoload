@@ -10,7 +10,7 @@ v2 只做一件事：**在 ComfyUI 原生加载出来的模型上打 LoRA 时，
 
 在此基础上还有四点：
 
-* **VAE 解码降峰值（§9，第一阶段）。** 接管 `comfy.sd.VAE.decode`：自己估算内存、batch 逐张、卷积按输出行分块、注意力按 query 分块，结果与整图解码数学等价；OOM 只缩小分块重试，绝不退回 tiled 近似解码。与 LoRA 部分相互独立。
+* **VAE 解码降峰值（§9）。** 接管 `comfy.sd.VAE.decode`：自己估算内存、batch 逐张；认得的结构（Wan 2.1 VAE 单帧）按输出条带倒推重算（第一层，§9.13），其余的卷积按输出行分块、注意力按 query 分块（第二层）；结果与整图解码数学等价；OOM 只缩小分块重试，绝不退回 tiled 近似解码。与 LoRA 部分相互独立。
 * **合并有两条路径（§3.1）。** 默认路径：普通 LoRA / LoCon 用一次融合的 `addmm_` 直接加进计算 dtype 的临时权重（方案 C），其他类型在计算 dtype 下走 `calculate_weight`（方案 A，与原生 lowvram 的数值相同）。这条路径与原生合并不逐位一致，误差界见 §5.5。设 `MONOLOAD_EXACT=1` 时走逐位一致路径，结果与原生完全相同。
 * 量化层（fp8 scaled 等）上的 LoRA 合并在反量化出来的临时权重上，不再重新量化（§3.3）。
 * 每个 prompt 结束后释放 LoRA，底模继续常驻（§7）。
@@ -385,9 +385,9 @@ CPU 上计算 dtype 是 fp32，默认路径在 fp32 下合并、不舍入回 fp1
 
 | 层 | 适用 | 做法 | 状态 |
 |---|---|---|---|
-| 第一层：条带解码 | 认得的结构（LDM `Decoder`、Wan `Decoder3d` 单帧） | 低分辨率前缀（含 mid 全局注意力）整图算；只在每个分辨率阶段末尾存档；按输出条带倒推每层所需的输入行区间并重算；GroupNorm 的全局统计逐层空跑求得（条带内 fp32 Welford，跨条带 Chan 合并）；按峰值预算自动选条带高度和存档方案，满足不了就报错 | 第二阶段（Qwen）、第三阶段（LDM） |
-| 第二层：逐算子分块 | 不认识结构也能用 | 原 forward 原样运行，只在受管理的解码过程中替换重算子：卷积按输出行分块，限制 im2col 工作区；注意力按 query 分块，K/V 完整，每个 query 仍对全图做 softmax。整图语义不变，算量约 1 倍 | **本阶段实现** |
-| 兜底 | 前两层都处理不了 | 原生整图解码（结果本身正确），打一条日志 | 本阶段实现 |
+| 第一层：条带解码 | 认得的结构（LDM `Decoder`、Wan `Decoder3d` 单帧） | 低分辨率前缀（含 mid 全局注意力）整图算；只在每个分辨率阶段末尾存档；按输出条带倒推每层所需的输入行区间并重算；GroupNorm 的全局统计逐层空跑求得（条带内 fp32 Welford，跨条带 Chan 合并）；按峰值预算自动选条带高度和存档方案，满足不了就报错 | **第二阶段已实现 Wan `Decoder3d` 单帧（§9.13）**；第三阶段做 LDM |
+| 第二层：逐算子分块 | 不认识结构也能用 | 原 forward 原样运行，只在受管理的解码过程中替换重算子：卷积按输出行分块，限制 im2col 工作区；注意力按 query 分块，K/V 完整，每个 query 仍对全图做 softmax。整图语义不变，算量约 1 倍 | 第一阶段实现（真机验收通过，§9.12） |
+| 兜底 | 前两层都处理不了 | 原生整图解码（结果本身正确），打一条日志 | 第一阶段实现 |
 
 第二层不减少激活本身（每层的完整输入输出仍然存在），只去掉 columns 和分数矩阵这两类「临时大块」；第一层再去掉高分辨率激活。报告 E.1 的建议也是先做第二层这个 baseline：如果它已经满足 62.5G GTT 的目标，第一层可以按需推进。
 
@@ -510,6 +510,9 @@ loop:
 | 默认 | 安装管理入口，预算 1 GiB |
 | `MONOLOAD_VAE_WORKSPACE` | 预算：`1G`、`512M`、`768`（纯数字按 MiB）等 |
 | `MONOLOAD_DISABLE_VAE=1` | 只关 VAE 部分，LoRA 部分照常 |
+| `MONOLOAD_DISABLE_VAE_STRIPE=1` | 只关第一层（§9.13），所有受管理的解码走第二层 |
+| `MONOLOAD_VAE_BUDGET` | 第一层的峰值预算，默认 3G（§9.13.4） |
+| `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（扫参、调试） |
 | `MONOLOAD_EXACT=1` | VAE 走原生：分块改变 GEMM 形状，不保证逐位一致 |
 | `MONOLOAD_DISABLE=1` | 什么都不装 |
 
@@ -540,12 +543,16 @@ loop:
 3. 精度：`monoload vs native` 与 `native2 vs native` 的量级对比，块边界附近有没有系统性误差。——PSNR ≥ 60 dB，没有接缝；max|Δ| 离群点经 fp32 参照确认是 bf16 固有噪声。
 4. 速度：冷/热耗时与原生相比。——低分辨率慢 1–4%，高分辨率快 9–17%。
 
-### 9.11 后两阶段计划
+### 9.11 后两阶段计划（第二阶段已完成，见 §9.13）
 
-* **共同部分。** 结构识别按真实模块（类型、通道、kernel、stride、padding、norm、注意力）而不是文件名；每种结构第一次使用时用小 latent 和原生对比自检，不通过就对这个 VAE 禁用第一层、醒目警告，退回第二层。适配按积木写：残差块（GN 版、RMS 版）、nearest 上采样 + 卷积、低分辨率注意力块、头尾。接口已在 `vae.STRIPE_ADAPTERS` 留好（`match` / `self_test` / `estimate` / `decode`），第一阶段为空。
-* **第二阶段：Qwen（Wan `Decoder3d` 单帧）。** RMS 逐位置归一化，没有全局统计：conv1 + middle（含全局注意力，用第二层的 query 分块）整图算，存档放在每个分辨率阶段末尾；之后按输出条带倒推每层的输入行区间（§9.5 的公式逐层递推，nearest 2× 为 `[⌊a/2⌋, ⌈b/2⌉)`，残差两支取并集），条带高度和存档方案按预算自动选择。
-* **第三阶段：LDM（SDXL / Flux `ae`）。** 30 个 GroupNorm 需要全局统计：每个 GN 的 (n, mean, M2) 在生成其输入时按条带用 fp32 Welford 累计，跨条带 Chan 合并，冻结后再算下游；残差块边界 + 上采样边界滚动存档（报告 C.5 的 pass A / pass B），旧存档直到所有消费者完成才释放。
-* 两个阶段都要求：预算满足不了就报错；OOM 只缩小条带；误差验收照 §9.10 的指标，另加逐 GN 统计对照。
+* **共同部分。** 结构识别按真实模块（类型、通道、kernel、stride、padding、norm、注意力）而不是文件名；每种结构第一次使用时用小 latent 和原生对比自检，不通过就对这个 VAE 禁用第一层、醒目警告，退回第二层。适配接口是 `vae.STRIPE_ADAPTERS`（`match` / `self_test` / `plan` / `run`），第二阶段登记了 Wan 2.1 的适配器。
+* **第二阶段：Qwen（Wan `Decoder3d` 单帧）。** 已实现，见 §9.13。
+* **第三阶段：LDM（SDXL / Flux `ae`）。** 与第二阶段的区别是 30 个 GroupNorm 需要全图统计，GN 的输出依赖整张图，不能像 RMS 那样只看局部行。计划：
+  * 前缀同样整图算到最低分辨率的残差块之后（H/8，512 通道），中间的全局注意力用第二层的 query 分块。
+  * 之后按「统计调度」逐个残差块推进：对一个残差块，pass A 按条带计算 `GN1 → SiLU → conv1`，只累计 GN2 输入的统计 (n, mean, M2)（条带内 fp32 Welford，跨条带 Chan 合并，只统计核心行，不统计 halo），不保存 conv1 的完整输出；统计冻结后，pass B 按条带重算 conv1，再 `GN2 → SiLU → conv2`，加上正确坐标上的 shortcut，写出完整的块输出 Y，同时累计下一个块 GN1 的统计。旧的输入 X 等所有消费者完成后才释放。这样每个块的 conv1 算两遍、conv2 一遍，全 decoder 的卷积约 1.3 倍（报告 C.5），峰值是两份完整的块输入输出（4K 时 C256 约 4 GiB + C128 约 2 GiB）加条带工作集。
+  * 上采样边界同样滚动存档；全尺寸的块输出若太大，可以只存到 H/2，最后一级做全条带。按预算选条带高度和存档位置。
+  * 区间倒推、精确行检查、自检、OOM 和开关都沿用第二阶段的框架；统计另做逐 GN 的对照测试（条带累计的 mean / var 与整图 GroupNorm 的统计比较，fp32 下 1e-6 量级）。
+* 两个阶段都要求：预算满足不了就报错；OOM 只缩小条带；误差验收照 §9.10 的指标。
 
 ### 9.12 真机结果（CT 700，2026-10，af9abc6）
 
@@ -616,3 +623,132 @@ columns 的大小与 §9.1 / 调研 E.2 的推导吻合（`18·Cin·Hout·Wout` 
 * **原生估算会挤掉其他模型（实测例子）**：这一轮进程里同时加载了 bf16 和 fp32 两份 VAE。原生的估算（bf16 4K 91.86 GiB；fp32 2688 91.45 GiB、4K 183.72 GiB；Qwen fp32 4K 67.98 GiB）超过空闲显存，`load_models_gpu` → `free_memory` 就把另一份 VAE 卸载了：这些原生行的 `unload = 1`，日志里下一次运行前出现 `Requested to load … loaded completely`。monoload 的行全部是 0。服务里常驻 UNet / CLIP 时，被挤掉的就是它们，下一次采样要重新加载。这是 §9.1「`--gpu-only` 下也会走卸载流程」的实测例子。
 
 **结论（2026-10）：第一阶段验收通过。** 峰值主因确认是 im2col 展开缓冲；4K 峰值降到原来的 1/4～1/6，原生 4K「先 OOM 再重试」的边缘状态消失；高分辨率速度不降反升；没有接缝；估算是有效上界，原生的过大估算会挤掉其他模型而 monoload 不会；精度与原生同为 bf16 的水平，max|Δ| 离群点是 bf16 固有噪声，分块在 fp32 下与整图等价。日志计时已改为同步后计时。第二、三阶段（第一层条带解码）的优先级待定：第二层之后 4K 峰值已在 15 GiB 以内，第一层主要的收益是进一步去掉全尺寸激活（SDXL 4K 约 4 GiB 一张）。
+
+### 9.13 第一层：Wan 2.1 VAE 单帧的条带解码（第二阶段）
+
+实现：`monoload/vae_stripe.py`（结构识别、区间倒推、执行计划和内存模型、自检），接入在 `monoload/vae.py` 的 `_decode_layer1`。测试：`tests/test_vae_stripe.py`。
+
+#### 9.13.1 结构核对（62b3c94）
+
+逐项核对了需求里写的结构，结论一致：
+
+* `WanVAE.decode(z)`：`iter_ = 1 + T//2`，T=1 时为 1，`feat_map=None`；`x = conv2(z)`，`decoder(x[:, :, 0:1], feat_cache=None)`，返回 `torch.cat(out_chunks, 2)`，形状 `[b, C_out, 1, 8H8, 8W8]`。
+* `CausalConv3d.forward`：`cache_x is None and x.shape[2] == 1` 时走 `super().forward(x, autopad="causal_zero")`，comfy Conv3d 把时间 kernel 截成最后一片，空间 padding 由模块自己的 `padding=(0, k//2, k//2)` 负责，没有整张 pad 的副本。
+* `Decoder3d.forward` 在 `feat_cache=None` 时对 conv1、middle、head 都是 `layer(x)`；`run_up` 对 upsamples 也是 `layer(x)`，拆帧分支要求 `upsample3d` 且 `x.shape[2] > 2`，T=1 永远不走。`Resample` 在 `feat_cache=None` 时不执行 `time_conv`，`rearrange` 成 4D 后 `nn.Upsample(scale_factor=2, mode='nearest-exact')` + `Conv2d(3×3, padding 1)`。
+* `nearest-exact` 在 scale 2 时，输出行 i 取输入行 `⌊(i + 0.5)/2⌋ = ⌊i/2⌋`，与 nearest 相同。
+* `RMS_norm`：`F.normalize(x, dim=1) * sqrt(C) * gamma (+ bias)`，逐位置，沿通道。`ResidualBlock`：`residual(x) + shortcut(x)`，residual 为 RMS → SiLU → conv3×3 → RMS → SiLU → Dropout → conv3×3，shortcut 为 Identity 或 1×1 CausalConv3d。
+* dim=96、dim_mult [1,2,4,4]：通道 384 → 384 → (×2 上采样到 192) 192→384 → 384 → (192) → 192 → (96) → 96，head 96→3，与需求一致。
+
+所以单帧解码就是一串模块依次调用 `conv2 → decoder.conv1 → middle[*] → upsamples[*] → head[*]`，条带解码直接在这串模块上做，不需要改 Wan 的任何代码。
+
+#### 9.13.2 拆点与存档
+
+* **前缀（整图）：** `conv2`、`decoder.conv1`、`middle`（残差块、全局注意力、残差块）和 upsamples 里第一个 Resample 之前的所有模块（最低分辨率的 3 个残差块），都在 H/8 上整图计算；注意力继续用第二层的 query 分块。
+* **存档：** 前缀的输出，即第一个 Resample 的输入（H/8，384 通道；4K 时 95 MiB，bf16）。
+* **为什么放在这里：** 这是调研推荐的拆点，核对后仍然认为最合适。往后挪一个分辨率（H/4 末尾），存档变成 4 倍（380 MiB），而且 H/4 上 384 通道的残差块整图计算本身就要 2 GiB 左右，超出 2–4 GiB 的目标；往前挪（middle 之前）则全局注意力进入条带，不可能。H/8 存档的代价是 H/4 那一级的重算比例最大（halo 在 H/4 上每侧约 12 行），但它在总算量里只占约 1/4（各级卷积算量大致为 H : H/2 : H/4 ≈ 74 : 74 : 55），整体重算在常用条带高度下是 1.05–1.26 倍（§9.13.4）。
+
+#### 9.13.3 区间倒推与「精确行」
+
+条带部分拆成单元（unit），每个单元记下 halo（在它的输出分辨率上每侧需要多算几行）和 scale（输出行 / 输入行）：
+
+| 单元 | halo | scale | 倒推 `need_in([a, b))` |
+|---|---|---|---|
+| ResidualBlock（两个 3×3 卷积；shortcut 是逐点的） | 2 | 1 | `[a−2, b+2)` ∩ 图像 |
+| Resample（nearest×2 + 3×3 卷积） | 1（在输出分辨率上） | 2 | 先 `[a−1, b+1)` ∩ 输出图像，再 `[⌊c0/2⌋, ⌈c1/2⌉)` ∩ 输入图像 |
+| head 的 3×3 CausalConv3d | 1 | 1 | `[a−1, b+1)` ∩ 图像 |
+| RMS_norm、SiLU（head） | 0 | 1 | 不变 |
+
+一条输出条带 `[o0, o1)` 从 head 往回逐个单元推出每个单元需要的输入行（`stripe_needs`），所有区间都是全局行号；4K 时推到存档上是每侧约 7 行。残差块两条支路的需求取并集，就是 residual 支路的需求（shortcut 是逐点的），所以整个残差块按一个单元处理。
+
+**执行（和需求的写法不同之处）：** 每个单元都是原模型里的模块实例，**原样**调用在一段行的切片上，不改它的 padding，也不绕过它直接调 `F.conv2d`。模块会对切片的上下边照常补零；凡是受切片内部边界补零影响的输出行，恰好是每侧 halo 行。`valid_out` 按切片的全局起止行算出哪些输出行是精确的：靠近不是图像真实边缘的切片边的 halo 行不精确，真实边缘处的补零与整图相同。每个单元运行后都检查「下一步需要的行 ⊆ 精确的行」，不满足就是内部错误（`StripeError`），然后只保留需要的那些行（按全局坐标裁剪）。所以：
+
+* 补零只在图像真实的上下边缘进入结果，条带内部边界上用的都是真实的相邻行（halo）；
+* 模块、权重、cast / weight_function、第二层的卷积分块全都原样生效，条带里的大卷积仍受工作区约束；
+* 代价是每个卷积在切片两侧多算几行随后丢掉的输出（残差块每侧最多 3 行、卷积 1 行），在常用条带高度下是 1–3% 的额外算量（已计入下面的重算比例）。
+
+需求里设想的是「按块位置决定是否补零、内部边界不补零」，也就是复用第二层改 padding 的逻辑。这里改为「原样调用 + 丢掉受影响的行」：效果相同，不碰模块属性，而且对残差块这样的复合模块也能直接用（不必拆开它的 forward）。正确性由逐单元的精确行检查和测试保证（§9.13.7）。
+
+每条带最后的核心行用 `copy_` 直接写进预先分配的输出缓冲（输出 dtype，相当于原生的 `.to(dtype)` + `copy_`），整张输出只有这一份，没有整张的中间结果。`process_output` 在一个样本写完后对它原地执行，和原生相同。
+
+#### 9.13.4 内存模型、预算与条带高度
+
+估算（`Plan`，全部按形状事先算出，是上界）：
+
+```
+estimate = 常驻 + max(前缀峰值, 存档 + 条带峰值)
+  常驻     = 输出缓冲（整个 batch，输出 dtype，输出设备就是 VAE 设备时） + 一个 latent 样本
+  前缀峰值 = max over 前缀模块 live(整图 H/8) + 2 × min(工作区, 前缀最大的 im2col / 注意力分数块)
+  条带峰值 = max over 条带、单元 live(该单元的切片行数) + 2 × min(工作区, 条带内最大的 im2col 块)
+  live（r 行、宽 w、元素 e 字节；按 62b3c94 的代码逐个数同时存活的张量）：
+    ResidualBlock  r·w·e·(2·Cin + 4·Cout)   old_x、RMS 的两个临时量、SiLU、卷积输入输出、shortcut、相加
+    Resample       r·w·e·(6·Cin + 4·Cout)   输入、连续化拷贝、上采样后（4 倍）、卷积输出（4 倍）
+    3×3 卷积       r·w·e·(2·Cin + 2·Cout)
+    RMS / SiLU     r·w·e·4·C
+    AttentionBlock h·w·e·10·C               identity、norm 临时量、qkv、注意力输出、proj（前缀）
+```
+
+`2 × min(工作区, 最大块)` 与第二层的估算相同（columns 或分数块，加上块前后的拷贝），只是不超过计划里最大的卷积 / 注意力实际要的块：小图不会因为工作区而被高估。
+
+**条带高度：** 不强制时，在 `[8, H]` 上二分查找估算不超过预算的最高核心高度，再把输出均分成条带（`split_rows`，各条相差不超过 1 行）。强制高度用 `MONOLOAD_VAE_STRIPE_ROWS` 或 bench 的 `--stripe-rows`（只用于扫参和调试，估算超过预算时只在日志里注明）。
+
+**工作区：** 条带模式下取 `min(MONOLOAD_VAE_WORKSPACE, max(64 MiB, 预算 / 8))`。默认 1 GiB 的工作区按第二层的方式计入（2 倍）会占掉 3 GiB 预算的三分之二；按预算的 1/8（384 MiB）分块，4K 全分辨率的卷积每块仍有约 30–60 行 × 3840 列，GEMM 足够大，而条带可以高得多（重算更少）。
+
+**默认预算 3 GiB 的理由：**
+
+* 目标是 4K 总峰值 2–4 GiB。估算是上界，第一阶段的实测是估算的 0.6–0.9 倍；3 GiB 的估算对应实测约 2–2.7 GiB。
+* 4K 的下限约 1.8 GiB，由整图前缀决定（全局注意力的 q/k/v、注意力输出和分数块），再低也只能把条带切得更矮，重算变多而峰值降不下去。
+* 在 3 GiB 下，4K 选出 5 条 432 行的条带，重算 1.07 倍，条带内的 GEMM 很大，GPU 吃得饱。2 GiB 时是 8 条 270 行（重算 1.11 倍），4 GiB 时是 4 条 540 行（1.05 倍），收益已经很小。
+
+用全尺寸 Qwen 结构（dim 96，bf16，输出在 GPU 上）按模型算出的计划：
+
+| 输出 | 预算 2 GiB | 预算 3 GiB（默认） | 预算 4 GiB | 强制 128 行 | 强制 32 行 |
+|---|---|---|---|---|---|
+| 1344×768 | 1 条 768 行，1.00×，估 1.63 GiB | 1 条，1.00×，估 1.88 GiB | 1 条，估 2.13 GiB | 6 条，1.23×，估 1.0 GiB | 24 条，2.05× |
+| 2688×1536 | 4 条 384 行，1.07×，估 1.74 GiB | 3 条 512 行，1.05×，估 2.36 GiB | 2 条 768 行，1.02×，估 3.33 GiB | 12 条，1.25×，估 1.26 GiB | 48 条，2.08× |
+| 3840×2160 | 8 条 270 行，1.11×，估 1.86 GiB | 5 条 432 行，1.07×，估 2.78 GiB | 4 条 540 行，1.05×，估 3.47 GiB | 17 条，1.26×，估 1.77 GiB | 68 条，2.09× |
+| 7680×4320 | 放不下（最低约 4.6 GiB） | 放不下（最低约 4.8 GiB） | 放不下（最低约 5.1 GiB） | 34 条，1.27×，估 4.84 GiB | 135 条，2.10× |
+
+（「1.07×」是重算比例：整个 decoder 的卷积算量相对整图解码，前缀只算一次。「估」是估算值，用 `MONOLOAD_VAE_STRIPE_ROWS` 强制高度时预算只影响工作区。）
+
+**预算放不下：** 显式设了 `MONOLOAD_VAE_BUDGET` 时直接抛 `MonoloadError`，写明 8 行条带也需要多少（前缀 / 条带两部分）。需求里写的是「预算满足不了就直接报错」；这里对**默认**预算做了放宽：没有显式设置时，把预算提高到能达到的最低峰值（8 行条带的估算，通常由整图前缀决定），在它之内取最高的条带，并打警告。理由是默认值是为 4K 选的，若因此让 8K 的解码直接报错，就比第一阶段（第二层能解）退步了；用户显式给的预算则严格执行。
+
+#### 9.13.5 OOM
+
+条带高度和工作区一起减半，重新做计划、重跑整个解码（前缀在 H/8 上，重跑代价小）；高度到 8 行（或强制的更小值）且工作区到 64 MiB 仍 OOM，就抛 `MonoloadVAEOOMError`。不退回 tiled，也不退回第二层：第二层的峰值更高，退回去没有意义。测试里替换 `run_stripes` 模拟 OOM，确认 `decode_tiled_` 和第二层的 `_run` 都没有被调用。
+
+#### 9.13.6 识别、自检、开关、日志
+
+* **识别（`wan_structure`，按真实结构，不看文件名）：**
+  * `type(first_stage_model) is WanVAE`、`type(decoder) is Decoder3d`（精确类型，子类不算）；
+  * `conv2` 是 1×1、`conv1` 是 3×3 的 CausalConv3d：stride 1、dilation 1、groups 1、zeros、padding `(0, k//2, k//2)`；
+  * upsamples 只含 ResidualBlock 和 Resample（`upsample2d` / `upsample3d`、`nearest(-exact)` ×2、3×3 / stride 1 / padding 1 的 Conv2d），至少有一个 Resample，没有 AttentionBlock；
+  * 每个 ResidualBlock 的 residual 正好是 `[RMS_norm, SiLU, CausalConv3d(3), RMS_norm, SiLU, Dropout, CausalConv3d(3)]`，shortcut 是 Identity（输入输出通道相同）或 1×1 CausalConv3d；
+  * RMS_norm 都是 channel_first，Dropout 处于 eval 或 p=0；head 是 `[RMS_norm, SiLU, CausalConv3d(3)]`；middle 只含 ResidualBlock / AttentionBlock；
+  * 模型的任何模块上都没有 forward hook 或实例级 `forward` 替换（例如 bypass LoRA 注入），全局 module hook 也没有；
+  * latent 是 5D、T=1、通道数等于 conv2 的输入通道；没有 vae_options。
+  * 任何一项不符就不匹配，走第二层；对每个模型实例打一次日志写明原因（例如 `upsamples[14].residual[5]: Dropout p=0.5 in training mode`、`first-stage model is AutoencoderKL, not comfy.ldm.wan.vae.WanVAE`）。Wan 2.2 的 48 通道 VAE（`comfy.ldm.wan.vae2_2.WanVAE`）类型就不同，不匹配。
+* **自检（`self_test`）：** 每种结构（签名：z 通道、dim、dim_mult、残差块数、各单元的类型和通道）在本进程第一次使用时运行一次，结果缓存：
+  * 用模型的配置重新构造 `conv2` 和 `Decoder3d`，以 fp32 加载模型的权重（不复制 encoder，测完释放；全尺寸 Qwen 约 0.35 GB）。重新识别这个副本，确认结构签名一致。
+  * 24×24 latent（固定种子），参照是原生的 `WanVAE.decode(副本, z)` 整图解码；条带解码强制 40 行（192 行输出，5 条，最后一条 32 行），工作区 8 MiB，让条带内的大卷积也走第二层的分块。
+  * 通过条件：输出全部有限，且 `max|条带 − 整图| / max(1, max|整图|) ≤ 1e-4`。fp32 下实测在 1e-6 量级或为 0（测试模型），而 halo 少算一行的错误在 1e-1 量级，阈值两边都有两个数量级以上的余量。
+  * 在 fp32 下比较，不会被 bf16 噪声误判；参照用的是 Wan 自己的 `decode`，所以 Wan 的 forward 将来若有变化（例如单帧路径改了），自检也能发现。
+  * 全局随机数状态不变（`fork_rng`）；需要的显存在启动自检前单独报给 `load_models_gpu`（副本权重 + 工作区 + 256 MiB）。
+  * 不通过（数值不符、内部错误或任何异常）：这种结构在本进程内禁用第一层，改走第二层，日志里用醒目的警告写明原因。测试里故意把残差块的 halo 少算一行：单元检查会抓到（`StripeError`）；若连精确行的规则也一起写错，数值比较会抓到（误差 0.086）。两种情况都回退到第二层，结果与原生相同。
+* **开关：** `MONOLOAD_DISABLE_VAE_STRIPE=1` 关掉第一层（所有受管理的解码走第二层）；`MONOLOAD_VAE_BUDGET`（默认 3G）；`MONOLOAD_VAE_STRIPE_ROWS`（强制条带高度）。`MONOLOAD_DISABLE_VAE=1`、`MONOLOAD_EXACT=1` 时 VAE 走原生，`MONOLOAD_DISABLE=1` 时什么都不装，都不变。
+* **日志：** 启动时写明第一层开 / 关和预算；每次解码写明用了哪一层，第一层写出条带数、核心高度、重算比例、存档大小、预算、工作区、估算和耗时，第二层写出没用第一层的原因。
+
+#### 9.13.7 测试（`tests/test_vae_stripe.py`，CPU，fp32，不需要模型文件）
+
+* 区间：`need_in` / `stripe_needs` 与暴力依赖展开逐条对照（300 条随机单元链、993 条条带，0 处不符）；`split_rows` 均分、覆盖全图。
+* 精确行：残差块（有 / 无 1×1 shortcut）、两种 Resample、head 卷积，在 17 行输入的每一个切片上，`valid_out` 给出的行与整图结果一致（≤ 3.6e-7），紧邻的下一行在内部边界上不一致，也就是 halo 不多不少。
+* 整个 decoder（ComfyUI 的 `WanVAE`，dim 16，随机权重，经 `comfy.sd.VAE`）：条带高度 1（96 条）、7（不整除）、40、整图、按预算自动选（4 条 24 行）、默认预算（1 条）；13×9 奇数尺寸、1×1 和 3×5 的很小 latent、batch 2、条带内再分块（工作区 16 KiB）、bf16。与原生整图解码的 raw 输出差 ≤ 2e-6（fp32；bf16 为 0），条带边界附近 ±4 行的误差不比其他区域大；像素的形状、dtype、设备、范围与原生一致。
+* 识别、开关、自检、预算、OOM：见上文各节；SDXL 式 / Flux 式结构继续走第二层（日志原因是「不是 WanVAE」），与原生的差和第一阶段相同。
+* `tests/test_vae.py`（第二层）在关掉第一层后照旧全部通过，`tests/test_entry.py` 在各开关组合下通过。
+
+#### 9.13.8 限制与待真机确认
+
+* 只覆盖 Wan 2.1 VAE 的单帧解码。多帧视频仍交给原生；LDM decoder（SDXL、Flux）在第三阶段之前继续走第二层。
+* 前缀整图计算，4K 的峰值下限约 1.8 GiB（估算），主要是全局注意力；8K 时前缀本身约 4.5 GiB。
+* 内存模型的各项系数是按代码数出来的上界，没有在 GPU 上标定过；真机要看 bench 里「估算 vs 实测」。
+* 条带越矮重算越多；条带内的卷积在切片两侧多算几行随后丢掉（已计入重算比例）。
+* 待真机确认（README 9.7「第二阶段」命令）：4K 实测峰值是否在 2–4 GiB、是否不超过估算；与 fp32 的精度是否与原生相当、条带边界附近有无系统误差；条带高度扫参下的峰值 / 耗时曲线（检验默认预算）；第一层的峰值构成（profile）；SDXL 是否仍走第二层、数字不变。

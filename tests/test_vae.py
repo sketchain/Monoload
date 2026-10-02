@@ -431,6 +431,7 @@ def timing_sync_test(v):
 def main():
     if not mvae.is_installed():
         check("vae.install() on this ComfyUI", mvae.install())
+    mvae.set_stripe(False)  # this file tests layer 2; layer 1 (Wan stripes): tests/test_vae_stripe.py
     conv_matrix()
     attention_tests()
     sdxl, wan = decoder_tests()

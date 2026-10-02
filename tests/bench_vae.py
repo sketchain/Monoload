@@ -5,8 +5,14 @@ Runs, in one process with one loaded VAE, every resolution x mode:
             An OOM, or native's fallback to tiled decoding, is detected and
             reported as OOM (the tiled fallback is aborted, never counted as a
             native result).
-  monoload  Monoload's managed decode (layer 2: conv row blocks + attention
-            query blocks, own memory estimate, OOM -> smaller blocks).
+  monoload  Monoload's managed decode as the plugin runs it: layer 1 (stripe
+            decoding) for recognized decoders (Wan 2.1 single frame), layer 2
+            (conv row blocks + attention query blocks) for the rest; own memory
+            estimate, OOM -> smaller blocks.
+  monoload-l2  Monoload with layer 1 switched off: op-level chunking only
+            (what monoload was in phase 1), for comparison.
+  monoload-r<N>  monoload with the layer-1 stripe core height forced to N
+            output rows (--stripe-rows adds these for a sweep).
   native2   native again: how much the GPU differs from itself.
 and reports per run (printed as it happens) and in summary tables:
   time      cold = first run of that mode at that resolution, warm = median
@@ -380,12 +386,57 @@ def decode_once(vae, latent, capture, sampler_interval):
     return row, raw, px
 
 
+_DEFAULT_ROWS = mvae.stripe_rows()
+
+
+def configure(mode):
+    """Install / uninstall Monoload's VAE wrapper and set layer 1 for `mode`."""
+    if not mode.startswith("monoload"):
+        mvae.uninstall()
+        return
+    mvae.install()
+    m = re.match(r"monoload-r(\d+)", mode)
+    if mode.startswith("monoload-l2"):
+        mvae.set_stripe(False)
+        mvae.set_stripe_rows(_DEFAULT_ROWS)
+    elif m:
+        mvae.set_stripe(True)
+        mvae.set_stripe_rows(int(m.group(1)))
+    else:
+        mvae.set_stripe(True)
+        mvae.set_stripe_rows(_DEFAULT_ROWS)
+
+
+def mono_line(m):
+    """One line on what Monoload did in a run."""
+    if m.get("strategy") == "layer1":
+        e = m["estimate"]
+        return ("layer 1 ({}): {} stripes of {} rows, recompute {:.2f}x, checkpoint {}, budget {}, workspace {}, {} OOM retries; "
+                "estimate {} GiB (prefix {} / stripes {} / persistent {}; native {})").format(
+            m.get("adapter"), m["stripes"], m["rows"], m["recompute"], vae_ops.fmt_bytes(m["checkpoint_bytes"]), vae_ops.fmt_bytes(m["budget"]),
+            vae_ops.fmt_bytes(m["workspace"]), m["retries"], gib(e["total"]).strip(), vae_ops.fmt_bytes(e["prefix"]), vae_ops.fmt_bytes(e["stripes"]),
+            vae_ops.fmt_bytes(e["persistent"]), gib(m.get("native_estimate")).strip())
+    st = m.get("stats", {})
+    return ("layer 2 ({}): estimate {} GiB (native {}), workspace {}, {} OOM retries; conv {} of {} calls in {} row blocks "
+            "(largest block workspace {}, largest whole-conv workspace {}); attention {} call(s), query block {} of {} tokens").format(
+        (m.get("layer1") or "")[:90], gib(m["estimate"]["total"]).strip(), gib(m.get("native_estimate")).strip(), vae_ops.fmt_bytes(m["workspace"]),
+        m["retries"], st.get("conv_chunked"), st.get("conv_calls"), st.get("conv_blocks"), vae_ops.fmt_bytes(st.get("conv_ws_max_block")),
+        vae_ops.fmt_bytes(st.get("conv_ws_max_full")), st.get("attn_calls"), st.get("attn_rows_min"), st.get("attn_tokens_max"))
+
+
+def boundary_stats(m):
+    """Rows where blocks meet, for the boundary / elsewhere statistics: layer-1
+    stripe boundaries, or layer-2 conv block boundaries."""
+    if not m:
+        return None
+    if m.get("strategy") == "layer1":
+        return {"conv_boundaries": m.get("boundaries", [])}
+    return m.get("stats")
+
+
 def run_mode(vae, latent, mode, a, label):
     """cold + warm runs of one mode; returns summary dict and the captured tensors of the last successful run."""
-    if mode.startswith("monoload"):
-        mvae.install()
-    else:
-        mvae.uninstall()
+    configure(mode)
     runs = []
     raw = px = None
     total = 1 + a.warm
@@ -405,12 +456,8 @@ def run_mode(vae, latent, mode, a, label):
             ("  [" + row["error"] + "]") if row.get("error") else ""), flush=True)
         if mode.startswith("monoload") and row["status"] == "ok":
             m = row["mono"]
-            st = m.get("stats", {})
-            print("{:13s} {:>11s}       estimate {} GiB (native {}), workspace {}, {} OOM retries; conv {} of {} calls in {} row blocks "
-                  "(largest block workspace {}, largest whole-conv workspace {}); attention {} call(s), query block {} of {} tokens".format(
-                      "", "", gib(m["estimate"]["total"]).strip(), gib(m.get("native_estimate")).strip(), vae_ops.fmt_bytes(m["workspace"]),
-                      m["retries"], st.get("conv_chunked"), st.get("conv_calls"), st.get("conv_blocks"), vae_ops.fmt_bytes(st.get("conv_ws_max_block")),
-                      vae_ops.fmt_bytes(st.get("conv_ws_max_full")), st.get("attn_calls"), st.get("attn_rows_min"), st.get("attn_tokens_max")), flush=True)
+            print("{:13s} {:>11s}       {}; measured alloc +{} / reserved +{} GiB".format(
+                "", "", mono_line(m), gib(row.get("alloc_delta")).strip(), gib(row.get("res_delta")).strip()), flush=True)
         if r is not None or p is not None:
             raw, px = r, p
         if row["status"] != "ok":
@@ -599,10 +646,7 @@ def _frames_str(frames, n=8):
 
 
 def profile_decode(vae, latent, label, top, mode, cpp):
-    if mode == "monoload":
-        mvae.install()
-    else:
-        mvae.uninstall()
+    configure(mode)
     print("\n=== profile: {} decode {} (torch.profiler, profile_memory=True) ===".format(mode, label), flush=True)
     from torch.profiler import ProfilerActivity, profile
     acts = [ProfilerActivity.CPU]
@@ -766,7 +810,10 @@ def main():
     p.add_argument("--latent", action="append", help="SaveLatent .latent file instead of random latents (repeatable; path, or name in input/ or output/)")
     p.add_argument("--seed", type=int, default=0, help="seed of the random latents")
     p.add_argument("--latent-std", type=float, default=1.0, help="std of the random latents")
-    p.add_argument("--modes", default="native,monoload,native2", help="comma list run in order per resolution: native, monoload, native2")
+    p.add_argument("--modes", default="native,monoload,native2",
+                   help="comma list run in order per resolution: native, monoload (layer 1 where recognized, else layer 2), "
+                        "monoload-l2 (layer 2 only), monoload-r<N> (layer 1 with N-row stripes), native2")
+    p.add_argument("--stripe-rows", help="comma list of layer-1 stripe core heights to sweep (adds a monoload-r<N> mode per value)")
     p.add_argument("--warm", type=int, default=3, help="warm runs after the cold one (median reported)")
     p.add_argument("--workspace", help="Monoload workspace for this run (e.g. 1G, 512M); default MONOLOAD_VAE_WORKSPACE or 1G")
     p.add_argument("--sample-ms", type=float, default=10.0, help="GTT / VRAM / cgroup sampling interval (5-20 ms)")
@@ -774,7 +821,7 @@ def main():
     p.add_argument("--profile", action="store_true", help="profile one native decode per --profile-res (torch.profiler + allocator history)")
     p.add_argument("--profile-res", help="resolutions to profile (default: all of --res)")
     p.add_argument("--profile-only", action="store_true", help="only the profile, no benchmark")
-    p.add_argument("--profile-modes", default="native", help="modes to profile: native and/or monoload (comma list)")
+    p.add_argument("--profile-modes", default="native", help="modes to profile: native, monoload, monoload-l2, monoload-r<N> (comma list)")
     p.add_argument("--profile-cpp", action="store_true", help="C++ frames in the allocator history (shows the ATen kernel; symbolizing can take minutes)")
     p.add_argument("--top", type=int, default=25, help="rows in the profile tables")
     p.add_argument("--fp32-ref", action="store_true", help="also decode with an fp32 copy of the VAE as reference (native vs fp32, monoload vs fp32)")
@@ -824,6 +871,8 @@ def main():
             return
 
     modes = a.modes.split(",")
+    if a.stripe_rows:
+        modes += ["monoload-r{}".format(int(r)) for r in a.stripe_rows.split(",") if r.strip()]
     results = []
     accuracy = []
     outlier_info = []
@@ -834,7 +883,7 @@ def main():
             s, raw, px = run_mode(vae, lat, mode, a, label)
             results.append(s)
             if s["status"] in ("ok", "partial") and px is not None:
-                captured[mode] = (raw, px, s.get("mono", {}).get("stats"))
+                captured[mode] = (raw, px, boundary_stats(s.get("mono")))
         ref = captured.get("native")
         mono_stats = captured.get("monoload", (None, None, None))[2]
         for other in modes:
@@ -869,10 +918,9 @@ def main():
             if fp32 is None:
                 accuracy.append({"res": label, "pair": "* vs fp32", "note": "fp32 reference failed (OOM)"})
             else:
-                for other in ("native", "monoload"):
-                    if other not in captured:
-                        continue
-                    c = compare(fp32, (captured[other][0], captured[other][1]), mono_stats, a.boundary_rows)
+                for other in [m_ for m_ in modes if m_ in captured and m_ != "native2"]:
+                    bst = captured[other][2] if other.startswith("monoload") else mono_stats
+                    c = compare(fp32, (captured[other][0], captured[other][1]), bst, a.boundary_rows)
                     c.update({"res": label, "pair": "{} vs fp32 ({})".format(other, which)})
                     accuracy.append(c)
                     print_compare("{} vs fp32".format(other), label, c)
@@ -888,18 +936,25 @@ def main():
     mvae.uninstall()
 
     print("\n=== summary: time and memory (GiB; Δ = increase over the value right before the run; peaks = max over the runs) ===")
-    hdr = "{:11s} {:13s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6s}"
-    print(hdr.format("res", "mode", "status", "cold s", "warm s", "alloc pk", "alloc Δ", "resv Δ", "GTT Δ", "cg peakΔ", "cg sampΔ", "estimate", "native est", "unload"))
+    hdr = "{:11s} {:13s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6s} | {}"
+    print(hdr.format("res", "mode", "status", "cold s", "warm s", "alloc pk", "alloc Δ", "resv Δ", "GTT Δ", "cg peakΔ", "cg sampΔ", "estimate",
+                     "native est", "unload", "layer"))
     for s in results:
         m = s.get("mono") or {}
         est = (m.get("estimate") or {}).get("total")
         nat = mvae._native_estimate(vae32 if s["mode"].endswith("fp32") else vae, next(l for lb, l, _ in inputs if lb == s["res"]).shape)
-        print("{:11s} {:13s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6}".format(
+        if m.get("strategy") == "layer1":
+            layer = "L1 {}x{} rows, recompute {:.2f}x, ckpt {}".format(m["stripes"], m["rows"], m["recompute"], vae_ops.fmt_bytes(m["checkpoint_bytes"]))
+        elif m.get("strategy") == "layer2":
+            layer = "L2"
+        else:
+            layer = ""
+        print("{:11s} {:13s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6} | {}".format(
             s["res"], s["mode"], s["status"], "{:.3f}".format(s["cold"]), "{:.3f}".format(s["warm"]) if s["warm"] is not None else "n/a",
             gib(s.get("alloc_peak")), gib(s.get("alloc_delta")), gib(s.get("res_delta")), gib(s.get("gtt_delta")), gib(s.get("cg_mempeak_delta")),
-            gib(s.get("cg_delta")), gib(est) if s["mode"].startswith("monoload") else "", gib(nat), s.get("unloaded") or 0))
+            gib(s.get("cg_delta")), gib(est) if s["mode"].startswith("monoload") else "", gib(nat), s.get("unloaded") or 0, layer))
     print("\n=== summary: accuracy (raw = decoder output before process_output; pixels = clamped fp32 in [0, 1]; "
-          "bound/inter = rows near conv block boundaries of the monoload run / all other rows) ===")
+          "bound/inter = rows near the stripe (layer 1) or conv block (layer 2) boundaries of that monoload run -- of the monoload run for native -- / all other rows) ===")
     print("{:11s} {:28s} | {:>9s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>9s} {:>7s} {:>9s} | {:>9s} {:>9s} | {:>9s}".format(
         "res", "pair", "raw max", "raw mean", "raw rmse", "px max", "px mean", "px rmse", "PSNR", "px p99", "bound max", "inter max", "NaN/Inf"))
     for c in accuracy:
@@ -915,6 +970,8 @@ def main():
             "{}/{}".format(c["px_nonfinite"][1], (c.get("raw_nonfinite") or ("-", "-"))[1])))
     print("\nalloc = torch.cuda.max_memory_allocated (tensors), resv = max_memory_reserved (allocator incl. cache), GTT = amdgpu GTT used "
           "(device-wide, every process), cg = container cgroup (memory.peak reset per run where supported / sampled memory.current).")
+    print("layer: L1 = layer 1, stripe decoding (stripes x core rows, conv work relative to a whole-image decode, checkpoint size); "
+          "L2 = layer 2, op-level chunking.")
     print("estimate = what Monoload passed to load_models_gpu; native est = memory_used_decode (what native passes); "
           "unload = models unloaded by load_models_gpu during the run (here only the VAE is loaded, so 1 = the VAE itself was unloaded and loaded again).")
     print("native2 vs native = the GPU's own run-to-run difference; monoload vs native should be of that order or small (no bit-exactness promised).")

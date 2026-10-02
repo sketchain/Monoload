@@ -24,11 +24,18 @@ Everything else -- multi-frame video latents (for now), 1D/audio latents, VAEs
 with their own chunked output path (comfy_has_chunked_io), and explicit
 VAEDecodeTiled / VAE.decode_tiled -- stays native (logged).
 
-Layer 1 (stripe decoding for recognized decoders, phases 2 and 3) plugs in
-through STRIPE_ADAPTERS; it is empty in phase 1.
+Layer 1 (stripe decoding for recognized decoders) plugs in through
+STRIPE_ADAPTERS. Phase 2 ships the Wan 2.1 VAE single-frame adapter
+(monoload/vae_stripe.py): a recognized, self-tested decoder is decoded in
+stripes of output rows from a low-resolution checkpoint, with a peak budget
+(MONOLOAD_VAE_BUDGET) instead of the whole-image activations; everything else
+keeps layer 2.
 
 Switches (read at import / by the plugin entry): MONOLOAD_DISABLE_VAE=1 or
-MONOLOAD_EXACT=1 -> not installed; MONOLOAD_VAE_WORKSPACE (default 1G).
+MONOLOAD_EXACT=1 -> not installed; MONOLOAD_VAE_WORKSPACE (default 1G);
+MONOLOAD_DISABLE_VAE_STRIPE=1 -> layer 1 off; MONOLOAD_VAE_BUDGET (layer-1
+peak budget, default 3G); MONOLOAD_VAE_STRIPE_ROWS (force the stripe core
+height, for sweeps / debugging).
 """
 
 import inspect
@@ -44,12 +51,14 @@ import comfy.ops
 import comfy.sd
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
-from .errors import MonoloadVAEOOMError
+from . import vae_stripe
+from .errors import MonoloadError, MonoloadVAEOOMError
 from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
 
 _ORIG = {}
 
 DEFAULT_WORKSPACE = 1 * GIB
+DEFAULT_BUDGET = 3 * GIB   # layer-1 peak budget (DESIGN §9.13.4)
 MIN_WORKSPACE = 64 * MIB
 ACTIVATION_COPIES = 4      # live full-size activations bounded by 4x the largest one (DESIGN §9.4)
 PROBE_SIZE = 8             # latent rows/cols of the shape probe
@@ -84,7 +93,38 @@ def _workspace_from_env():
         return DEFAULT_WORKSPACE
 
 
-_SETTINGS = {"workspace": _workspace_from_env()}
+def _env_flag(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _budget_from_env():
+    raw = os.environ.get("MONOLOAD_VAE_BUDGET", "").strip()
+    if not raw:
+        return DEFAULT_BUDGET, False
+    try:
+        return parse_size(raw), True
+    except ValueError:
+        logging.warning("[Monoload] MONOLOAD_VAE_BUDGET={!r} not understood (examples: 3G, 2560M); using {}".format(raw, fmt_bytes(DEFAULT_BUDGET)))
+        return DEFAULT_BUDGET, False
+
+
+def _rows_from_env():
+    raw = os.environ.get("MONOLOAD_VAE_STRIPE_ROWS", "").strip()
+    if not raw:
+        return None
+    try:
+        v = int(raw)
+        if v < 1:
+            raise ValueError(raw)
+        return v
+    except ValueError:
+        logging.warning("[Monoload] MONOLOAD_VAE_STRIPE_ROWS={!r} is not a positive integer; ignored".format(raw))
+        return None
+
+
+_b, _b_explicit = _budget_from_env()
+_SETTINGS = {"workspace": _workspace_from_env(), "budget": _b, "budget_explicit": _b_explicit,
+             "stripe": not _env_flag("MONOLOAD_DISABLE_VAE_STRIPE"), "stripe_rows": _rows_from_env()}
 _LAST = {}
 
 
@@ -97,6 +137,36 @@ def set_workspace(n):
     _SETTINGS["workspace"] = int(n)
 
 
+def budget():
+    return _SETTINGS["budget"]
+
+
+def set_budget(n, explicit=True):
+    """Layer-1 peak budget in bytes (tests / bench); MONOLOAD_VAE_BUDGET at import.
+    explicit=False behaves like the default: raised (with a warning) when even
+    the smallest stripes do not fit; explicit: such a decode is an error."""
+    _SETTINGS["budget"] = int(n)
+    _SETTINGS["budget_explicit"] = bool(explicit)
+
+
+def stripe_enabled():
+    return _SETTINGS["stripe"]
+
+
+def set_stripe(on):
+    """Layer 1 on / off (tests / bench); MONOLOAD_DISABLE_VAE_STRIPE=1 at import."""
+    _SETTINGS["stripe"] = bool(on)
+
+
+def stripe_rows():
+    return _SETTINGS["stripe_rows"]
+
+
+def set_stripe_rows(n):
+    """Force the stripe core height (output rows), None = from the budget."""
+    _SETTINGS["stripe_rows"] = int(n) if n else None
+
+
 def last_decode():
     """What the last VAE.decode call did (strategy, estimate, budget, retries, OpStats dict)."""
     return dict(_LAST)
@@ -106,22 +176,39 @@ def last_decode():
 # layer 1 (phases 2/3): stripe decoding adapters for recognized decoders
 # ---------------------------------------------------------------------------
 
-# Each entry: an object with
-#   name                         short label for logs
-#   match(first_stage_model)     -> adapter bound to this model, or None (by real structure, never by file name)
-#   bound.self_test(vae)         first use per structure: small latent vs native; False -> layer 1 off for this VAE, loud warning
-#   bound.estimate(vae, samples, budget) -> bytes
-#   bound.decode(vae, sample, budget)    -> raw decoder output for one sample (before process_output)
-# Phase 1 ships none: every image decode goes to layer 2.
-STRIPE_ADAPTERS = []
+# Each entry: a module / object with
+#   match(vae, samples, vae_options) -> (bound, None) or (None, reason); by real structure, never by file name
+#   self_test(bound, vae)            -> (ok, detail); first use of a structure in this process, cached per
+#                                       structure; not ok -> layer 1 off for it (loud warning), layer 2
+#   bound.name, bound.key            label for logs, structure signature
+#   bound.plan(vae, samples, budget, workspace, rows=None, out_bytes=0) -> plan (estimate, stripes, recompute,
+#                                       ckpt_bytes, describe()) or None when the budget cannot be met
+#   bound.run(vae, samples, plan, workspace, stats) -> pixel_samples (process_output applied), native layout
+# Phase 2: the Wan 2.1 single-frame adapter. LDM decoders (SDXL, Flux) are phase 3 and stay on layer 2.
+STRIPE_ADAPTERS = [vae_stripe]
+
+_L1_NOTED = weakref.WeakKeyDictionary()   # first_stage_model -> last logged layer-1 reason
 
 
-def _select_layer1(vae):
+def _select_layer1(vae, samples, vae_options):
+    """(bound, None) or (None, why layer 1 is not used)."""
+    if not _SETTINGS["stripe"]:
+        return None, "layer 1 disabled (MONOLOAD_DISABLE_VAE_STRIPE)"
+    reasons = []
     for a in STRIPE_ADAPTERS:
-        bound = a.match(vae.first_stage_model)
+        bound, why = a.match(vae, samples, vae_options)
         if bound is not None:
-            return bound
-    return None
+            return bound, None
+        reasons.append(why)
+    why = "; ".join(reasons) or "no layer-1 adapter"
+    fsm = vae.first_stage_model
+    try:
+        if _L1_NOTED.get(fsm) != why:
+            _L1_NOTED[fsm] = why
+            logging.info("[Monoload] VAE layer 1 (stripes) not used for {}: {} -> layer 2".format(type(fsm).__name__, why))
+    except TypeError:
+        pass
+    return None, why
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +398,123 @@ def _managed_decode(self, samples_in, vae_options):
         samples_in = samples_in[:, :, 0]
     _sync()  # do not count work queued before this decode
     t0 = time.perf_counter()
+    with mm.cuda_device_context(self.device):
+        bound, why = _select_layer1(self, samples_in, vae_options)
+        if bound is not None:
+            ok, detail = _layer1_self_test(self, bound)
+            if ok:
+                return _decode_layer1(self, samples_in, bound, t0, detail)
+            why = "layer-1 self-test failed ({})".format(detail)
+        return _decode_layer2(self, samples_in, vae_options, t0, why)
+
+
+def _layer1_self_test(vae, bound):
+    hit = vae_stripe._SELFTEST.get(bound.key)
+    if hit is None:
+        # the self-test copies the decoder's weights: they must be loaded
+        mm.load_models_gpu([vae.patcher], memory_required=_selftest_memory(bound), force_full_load=vae.disable_offload)
+        hit = vae_stripe.self_test(bound, vae)
+        if hit[0]:
+            logging.info("[Monoload] VAE layer 1 ({}) self-test passed: {}".format(bound.name, hit[1]))
+        else:
+            logging.warning("[Monoload] !!!!!!!! VAE layer 1 ({}) SELF-TEST FAILED: {} !!!!!!!! layer 1 is disabled for this "
+                            "decoder structure in this process; decoding with layer 2 (op-level chunking) instead. Please report this.".format(
+                                bound.name, hit[1]))
+    return hit
+
+
+def _selftest_memory(bound):
+    params = sum(p.numel() for p in bound.fsm.decoder.parameters()) + bound.fsm.conv2.weight.numel()
+    return int(params * 4 + 2 * vae_stripe.SELFTEST_WORKSPACE + 256 * MIB)
+
+
+def _out_bytes(vae, samples, h_out, w_out, channels):
+    if not _same_device(vae.output_device, vae.device):
+        return 0
+    t = samples.shape[2] if samples.ndim == 5 else 1
+    return samples.shape[0] * channels * t * h_out * w_out * mm.dtype_size(vae.vae_output_dtype())
+
+
+def _decode_layer1(self, samples_in, bound, t0, selftest):
+    bud = budget()
+    explicit = _SETTINGS["budget_explicit"]
+    ws = min(workspace(), max(MIN_WORKSPACE, bud // 8))
+    floor_ws = min(MIN_WORKSPACE, ws)
+    h_out, w_out = int(samples_in.shape[-2]) * 8, int(samples_in.shape[-1]) * 8
+    outb = _out_bytes(self, samples_in, h_out, w_out, bound.units[-1].cout)
+    forced = _SETTINGS["stripe_rows"]
+    note = ""
+    if forced:
+        plan = bound.plan(self, samples_in, bud, ws, rows=forced, out_bytes=outb)
+        if plan.estimate > bud:
+            note = " (forced stripe height: estimate above the budget)"
+    else:
+        plan = bound.plan(self, samples_in, bud, ws, out_bytes=outb)
+        if plan is None:
+            smallest = bound.plan(self, samples_in, bud, ws, rows=vae_stripe.MIN_ROWS, out_bytes=outb)
+            if explicit:
+                raise MonoloadError(
+                    "[Monoload] VAE 第一层（条带解码）在峰值预算 MONOLOAD_VAE_BUDGET={} 内放不下：latent {} 即使用 {} 行的条带也需要约 {}"
+                    "（前缀 {}、条带 {}）。请调大 MONOLOAD_VAE_BUDGET，或设 MONOLOAD_DISABLE_VAE_STRIPE=1 改走第二层。".format(
+                        fmt_bytes(bud), list(samples_in.shape), vae_stripe.MIN_ROWS, fmt_bytes(smallest.estimate),
+                        fmt_bytes(smallest.prefix_bytes), fmt_bytes(smallest.stripe_bytes)))
+            # the smallest stripes set the lowest reachable peak (usually the whole-image prefix dominates it):
+            # take that as the budget and the largest stripes that stay within it
+            raised = smallest.estimate
+            plan = bound.plan(self, samples_in, raised, ws, out_bytes=outb) or smallest
+            note = " (default budget too small for this size: raised to the lowest reachable peak {})".format(fmt_bytes(raised))
+            logging.warning("[Monoload] VAE layer 1: the default peak budget {} does not fit latent {}; using {} instead, the lowest "
+                            "reachable peak (set MONOLOAD_VAE_BUDGET to choose)".format(fmt_bytes(bud), list(samples_in.shape), fmt_bytes(raised)))
+            bud = raised
+    min_rows = min(vae_stripe.MIN_ROWS, max(b - a for a, b in plan.stripes))
+    mm.load_models_gpu([self.patcher], memory_required=plan.estimate, force_full_load=self.disable_offload)
+    retries = 0
+    first_est = plan.estimate
+    while True:
+        stats = OpStats()
+        oom = False
+        try:
+            pixel_samples = bound.run(self, samples_in, plan, ws, stats)
+        except Exception as e:
+            mm.raise_non_oom(e)
+            oom = True
+        if not oom:
+            break
+        pixel_samples = None
+        mm.soft_empty_cache(True)
+        rows = max(b - a for a, b in plan.stripes)
+        if rows <= min_rows and ws <= floor_ws:
+            raise MonoloadVAEOOMError(
+                "[Monoload] VAE 解码显存不足：第一层（条带解码）的条带已缩到 {} 行、工作区 {}（共重试 {} 次）仍然 OOM。"
+                "Monoload 不会退回到 tiled 近似解码，也不会退回第二层（第二层峰值更高）。可以先释放其他模型（/free）、降低分辨率，"
+                "需要原生行为时设 MONOLOAD_DISABLE_VAE=1。latent {}，估算需要 {}。".format(
+                    rows, fmt_bytes(ws), retries, list(samples_in.shape), fmt_bytes(plan.estimate)))
+        rows = max(min_rows, rows // 2)
+        ws = max(floor_ws, ws // 2)
+        retries += 1
+        plan = bound.plan(self, samples_in, bud, ws, rows=rows, out_bytes=outb)
+        logging.warning("[Monoload] VAE decode ran out of memory; retrying layer 1 with {}-row stripes, workspace {} (retry {})".format(
+            rows, fmt_bytes(ws), retries))
+
+    pixel_samples = pixel_samples.to(self.output_device).movedim(1, -1)
+    _sync()
+    dt = time.perf_counter() - t0
+    native_est = _native_estimate(self, samples_in.shape)
+    boundaries = [(plan.h_out, a) for a, _ in plan.stripes[1:]]
+    _LAST.clear()
+    _LAST.update({"strategy": "layer1", "adapter": bound.name, "estimate": {"total": plan.estimate, "first": first_est,
+                  "prefix": plan.prefix_bytes, "stripes": plan.stripe_bytes, "checkpoint": plan.ckpt_bytes, "persistent": plan.persistent},
+                  "native_estimate": native_est, "budget": bud, "workspace": ws, "retries": retries, "seconds": dt,
+                  "stripes": len(plan.stripes), "rows": max(b - a for a, b in plan.stripes), "recompute": plan.recompute,
+                  "checkpoint_bytes": plan.ckpt_bytes, "boundaries": boundaries, "forced_rows": forced, "selftest": selftest,
+                  "stats": stats.as_dict()})
+    logging.info("[Monoload] VAE decode {} -> layer 1 ({}): {}; budget {}, workspace {}{}{}; memory estimate {} (native {}), {:.2f}s".format(
+        "x".join(str(d) for d in samples_in.shape), bound.name, plan.describe(), fmt_bytes(bud), fmt_bytes(ws), note,
+        ", {} OOM retries".format(retries) if retries else "", fmt_bytes(plan.estimate), fmt_bytes(native_est), dt))
+    return pixel_samples
+
+
+def _decode_layer2(self, samples_in, vae_options, t0, l1_note):
     budget = workspace()
     floor = min(MIN_WORKSPACE, budget)
     retries = 0
@@ -360,13 +564,13 @@ def _managed_decode(self, samples_in, vae_options):
     native_est = _native_estimate(self, samples_in.shape)
     _LAST.clear()
     _LAST.update({"strategy": "layer2", "estimate": est, "native_estimate": native_est, "workspace": budget,
-                  "retries": retries, "seconds": dt, "probe": probe is not None, "stats": stats.as_dict()})
+                  "retries": retries, "seconds": dt, "probe": probe is not None, "stats": stats.as_dict(), "layer1": l1_note})
     attn = ""
     if stats.attn_calls:
         attn = ", attention {} call(s) in query blocks of {} / {} tokens".format(stats.attn_calls, stats.attn_rows_min, stats.attn_tokens_max)
     if stats.attn_unmanaged:
         attn += ", attention left native: {}".format(", ".join(stats.attn_unmanaged[:4]))
-    logging.info("[Monoload] VAE decode {} -> op-level chunking (workspace {}{}): {} of {} conv call(s) in row blocks{}; "
+    logging.info("[Monoload] VAE decode {} -> layer 2, op-level chunking (workspace {}{}): {} of {} conv call(s) in row blocks{}; "
                  "memory estimate {} (native {}), {:.2f}s".format(
                      "x".join(str(d) for d in samples_in.shape), fmt_bytes(budget), ", {} OOM retries".format(retries) if retries else "",
                      stats.conv_chunked, stats.conv_calls, attn, fmt_bytes(est["total"]), fmt_bytes(native_est), dt))

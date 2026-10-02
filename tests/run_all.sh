@@ -22,7 +22,9 @@ step "plugin entry (MONOLOAD_DISABLE=1)";   run env MONOLOAD_DISABLE=1 $R python
 step "plugin entry (MONOLOAD_KEEP_LORA=1)"; run env MONOLOAD_KEEP_LORA=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_EXACT=1)";     run env MONOLOAD_EXACT=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_DISABLE_VAE=1)"; run env MONOLOAD_DISABLE_VAE=1 $R python tests/test_entry.py
+step "plugin entry (MONOLOAD_DISABLE_VAE_STRIPE=1)"; run env MONOLOAD_DISABLE_VAE_STRIPE=1 $R python tests/test_entry.py
 step "VAE decode: op-level chunking vs native (synthetic decoders, no model files)"; run $R python tests/test_vae.py
+step "VAE decode: layer 1, Wan 2.1 stripes vs native (synthetic decoder, no model files)"; run $R python tests/test_vae_stripe.py
 # every functional suite runs on both merge paths: bit-exact (MONOLOAD_EXACT=1)
 # and the default (fused / relaxed, checked against native within tolerance)
 for EXACT in 1 ""; do

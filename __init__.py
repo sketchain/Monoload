@@ -5,9 +5,10 @@ loaded) installs
   * the runtime LoRA merge on comfy.model_patcher.ModelPatcher,
   * the per-prompt LoRA release on execution.PromptExecutor
     (skipped when MONOLOAD_KEEP_LORA=1), and
-  * the managed VAE decode on comfy.sd.VAE.decode (op-level chunking, own
-    memory estimate, no tiled fallback; skipped when MONOLOAD_DISABLE_VAE=1
-    or MONOLOAD_EXACT=1).
+  * the managed VAE decode on comfy.sd.VAE.decode (layer 1: stripe decoding
+    of recognized decoders, MONOLOAD_DISABLE_VAE_STRIPE=1 turns it off;
+    layer 2: op-level chunking; own memory estimate, no tiled fallback;
+    skipped when MONOLOAD_DISABLE_VAE=1 or MONOLOAD_EXACT=1).
 Set MONOLOAD_DISABLE=1 to leave ComfyUI completely native, MONOLOAD_EXACT=1
 for the bit-exact merge instead of the fused default (monoload/hotpatch.py)
 and a native VAE decode.
@@ -50,5 +51,13 @@ else:
             logging.info("[Monoload] VAE decode managed: op-level chunking (conv row blocks, attention query blocks), workspace {} "
                          "(MONOLOAD_VAE_WORKSPACE), own memory estimate, OOM -> smaller blocks, never tiled; "
                          "images only (4D / 5D T=1), set MONOLOAD_DISABLE_VAE=1 for native".format(fmt_bytes(vae.workspace())))
+            if vae.stripe_enabled():
+                logging.info("[Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae single frame; "
+                             "self-tested on first use): peak budget {}{} (MONOLOAD_VAE_BUDGET){}; other decoders use layer 2; "
+                             "set MONOLOAD_DISABLE_VAE_STRIPE=1 to use layer 2 everywhere".format(
+                                 fmt_bytes(vae.budget()), "" if vae._SETTINGS["budget_explicit"] else " (default)",
+                                 ", stripe height forced to {} rows (MONOLOAD_VAE_STRIPE_ROWS)".format(vae.stripe_rows()) if vae.stripe_rows() else ""))
+            else:
+                logging.info("[Monoload] VAE layer 1 (stripe decoding) off (MONOLOAD_DISABLE_VAE_STRIPE): every managed decode uses layer 2")
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
