@@ -114,7 +114,9 @@ CT 700 实测（WAI v17 SDXL + Smooth Booster，788 层，4.77 GiB 被 patch 的
 
 每步耗时实测（`bench_sdxl_v3`）：原生约 0.64s；默认路径 1.13× / 1.10× / 叠加 1.18×；逐位一致 1.39× / 1.33× / 1.67×。
 
-**出图会有可见的细节差异。** SDXL 20 步采样会把权重上 1 个 ulp 的差异放大：最终 latent 与原生的 mean|Δ| 是 LoRA 本身作用的 4–15%，量级与 ComfyUI 自带的 bypass LoRA 相当。LoRA 的效果强度不变，但同一种子的图与原生不会一模一样。需要和原生完全一致时用 `MONOLOAD_EXACT=1`。详见 DESIGN.md §5.5。
+**出图会有可见的细节差异。** SDXL 20 步采样会把权重上 1 个 ulp 的差异放大：最终 latent 与原生的 mean|Δ| 是 LoRA 本身作用的 4–15%，量级与 ComfyUI 自带的 bypass LoRA 相当。这是采样放大造成的，已经实测确认：权重误差小 70 倍的放宽合并（A，也就是原生 lowvram 的数值），latent 差异只小 1.2–2.5 倍。
+
+同种子出图对比（Smooth Booster，seed 42）：默认路径和原生的图构图、风格一致，只是细节位置有偏移，肉眼看不出画质差别，但 97.5% 的像素不同（mean abs diff 5.29）。LoRA 的效果强度不变。需要和原生出图完全一致时用 `MONOLOAD_EXACT=1`。详见 DESIGN.md §5.5。
 
 测试里的容差（DESIGN.md §5.5）：`‖Δw‖ ≤ u·(‖W‖ + 20·‖LoRA 改动‖)`，u 是比较精度的单位舍入（fp16 为 2⁻¹¹）。上面 2.54e-3 只用掉「20·u = 9.8e-3」这一项的约四分之一。
 
@@ -297,10 +299,10 @@ docker exec comfyui python /opt/ComfyUI/custom_nodes/monoload/tools/compare_imag
 
 ## 10. 真机验收结果（CT 700，2026-10）
 
-* **9.1 基准**（WAI v17 SDXL，1344×768，20 步，CFG 6）：
-  * `monoload vs native` 的 max|Δ| 全部为 0；Monoload 的 backups 全部为 0，原生是 788 / 986 / 1052。
+* **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
+  * `monoload vs native`（逐位一致路径）的 max|Δ| 全部为 0；Monoload 的 backups 全部为 0，原生是 788 / 986 / 1052。
   * 切换组合的 patch 耗时：原生 0.43–0.65s，Monoload 0.09–0.11s。
-  * 每步耗时：原生约 0.64s，Monoload 0.85–1.06s（1.33× / 1.39× / 叠加 1.66×）。
+  * 每步耗时：原生约 0.64s，Monoload（逐位一致路径）0.85–1.06s（1.33× / 1.39× / 叠加 1.66×）。
   * GTT：原生 13.9G，Monoload 8.6G。`native2 vs native` 全部为 0，GPU 计算是确定的。
   * 那一轮 bypass 叠加组合的数据无效（只挂上了第二个 LoRA），已在脚本里修正。
 * **9.4 释放：**
@@ -315,6 +317,15 @@ docker exec comfyui python /opt/ComfyUI/custom_nodes/monoload/tools/compare_imag
   * 逐位一致路径与原生 max|Δ| 全部为 0；`native2` 与原生全部为 0。
   * layer probe：默认路径合并 0.052s（+ 拷贝 0.038s），与原生合并的权重差异 2.54e-3，在容差 0.0308 以内；关掉 fp16 GEMM 的降精度累加后耗时和误差都不变。
   * 默认路径与原生的 latent：mean|Δ| 0.556 / 0.189 / 0.519，LoRA 本身的作用 mean 3.81 / 4.71 / 4.77（见 §5.1 和 DESIGN.md §5.5）。
+* **9.1 第四轮**（`bench_sdxl_v4`，同样设置，euler + normal，模式 native / monoload / monoload-relaxed）：
+  * 可复现：默认路径与原生的 latent mean|Δ| 仍是 0.556 / 0.189 / 0.519，effect 与第三轮一位不差。
+  * 每步：默认路径（C）1.13× / 1.11× / 1.19×；只用放宽合并（A）1.23× / 1.19× / 1.38×；不打 LoRA 1.01×。GTT：Monoload 8.39G（A 8.52G），原生 13.90G。backups 全部为 0。
+  * A 与原生的 latent mean|Δ| 是 0.363 / 0.0768 / 0.438，为 C 的 65% / 41% / 84%。A 的权重误差比 C 小 70 倍，latent 差异只小 1.2–2.5 倍：出图差异主要来自采样放大，已确认（DESIGN.md §5.5）。A 的数值就是原生 lowvram 的数值。
+  * layer probe 的 `mm-add`（`torch.mm` 后 `add_`）：权重误差与 A 完全相同（3.56e-5，max 6.1e-5），合并 0.084s（C 0.052s，A 0.118s）。所以 C 多出来的权重误差来自 hipBLASLt `addmm_`（beta=1）内部的累加或 epilogue。
+* **同种子出图对比**（API 直接提交，WAI v17 + Smooth Booster 1.0/1.0，seed 42，设置同上；D = 默认路径，E = `MONOLOAD_EXACT=1`，即与原生逐位一致）：
+  * `compare_images`：97.5% 的像素不同，mean abs diff 5.29，max 255。
+  * 构图和风格一致，只是细节位置有偏移，肉眼看不出画质差别。
+* **决定：** 默认路径维持 C，`MONOLOAD_EXACT=1` 继续作为与原生逐位一致的选项；`mm-add` 不采用（每步多约 5%，出图差异只降到 A 的水平，类别不变）。
 * **9.5 fp8**（WAI 生成的 fp8 UNet）：采样时挂 LoRA 只多出 0.58G GTT，没有备份，没有报错，出图正常。
 * **9.6 日志：** 没有 traceback / 不支持 / 内部错误，没有 OOM。
 
