@@ -279,6 +279,15 @@ def _run(vae, samples_in, vae_options, budget, stats):
     return pixel_samples
 
 
+def _sync():
+    """Wait for the device, so the decode time in the log is the real one
+    (kernels run asynchronously; without this the host-side clock stops
+    long before the GPU is done)."""
+    sync = getattr(mm, "synchronize", None)
+    if sync is not None:
+        sync()
+
+
 def _native_estimate(vae, shape):
     try:
         return int(vae.memory_used_decode(shape, vae.vae_dtype))
@@ -300,6 +309,7 @@ def _managed_decode(self, samples_in, vae_options):
     self.throw_exception_if_invalid()
     if self.latent_dim == 2 and samples_in.ndim == 5:
         samples_in = samples_in[:, :, 0]
+    _sync()  # do not count work queued before this decode
     t0 = time.perf_counter()
     budget = workspace()
     floor = min(MIN_WORKSPACE, budget)
@@ -345,6 +355,7 @@ def _managed_decode(self, samples_in, vae_options):
             logging.warning("[Monoload] VAE decode ran out of memory; retrying with workspace {} (retry {})".format(fmt_bytes(budget), retries))
 
     pixel_samples = pixel_samples.to(self.output_device).movedim(1, -1)
+    _sync()
     dt = time.perf_counter() - t0
     native_est = _native_estimate(self, samples_in.shape)
     _LAST.clear()
