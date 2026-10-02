@@ -387,10 +387,18 @@ def decode_once(vae, latent, capture, sampler_interval):
 
 
 _DEFAULT_ROWS = mvae.stripe_rows()
+_DEFAULT_WS = []
 
 
 def configure(mode):
-    """Install / uninstall Monoload's VAE wrapper and set layer 1 for `mode`."""
+    """Install / uninstall Monoload's VAE wrapper and set layer 1 / the workspace for `mode`
+    (a "-w<MiB>" suffix sets MONOLOAD_VAE_WORKSPACE for that mode, e.g. monoload-w128, monoload-l2-w256)."""
+    if not _DEFAULT_WS:
+        _DEFAULT_WS.append(mvae.workspace())   # --workspace / MONOLOAD_VAE_WORKSPACE
+    w = re.search(r"-w(\d+)$", mode)
+    mvae.set_workspace(int(w.group(1)) * vae_ops.MIB if w else _DEFAULT_WS[0])
+    if w:
+        mode = mode[:w.start()]
     if not mode.startswith("monoload"):
         mvae.uninstall()
         return
@@ -813,7 +821,8 @@ def main():
     p.add_argument("--latent-std", type=float, default=1.0, help="std of the random latents")
     p.add_argument("--modes", default="native,monoload,native2",
                    help="comma list run in order per resolution: native, monoload (layer 1 where recognized, else layer 2), "
-                        "monoload-l2 (layer 2 only), monoload-r<N> (layer 1 with N-row stripes), native2")
+                        "monoload-l2 (layer 2 only), monoload-r<N> (layer 1 with N-row stripes), native2; "
+                        "a -w<MiB> suffix on a monoload mode sets the workspace for it (monoload-w128, monoload-l2-w256)")
     p.add_argument("--stripe-rows", help="comma list of layer-1 stripe core heights to sweep (adds a monoload-r<N> mode per value)")
     p.add_argument("--warm", type=int, default=3, help="warm runs after the cold one (median reported)")
     p.add_argument("--workspace", help="Monoload workspace for this run (e.g. 1G, 512M); default MONOLOAD_VAE_WORKSPACE or 1G")
