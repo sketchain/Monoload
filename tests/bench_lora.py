@@ -5,6 +5,8 @@ several modes (--modes, run in order):
   native*          native ComfyUI (Monoload uninstalled)
   monoload         Monoload, default merge path (fused fp16 addmm / relaxed)
   monoload-exact*  Monoload with the bit-exact path (= MONOLOAD_EXACT=1)
+  monoload-relaxed* diagnostic: the default path with fusion off (relaxed merge,
+                   native lowvram numerics, for every patch)
   bypass*          ComfyUI's own bypass LoRA (comfy.sd.load_bypass_lora_for_models,
                    as the LoraLoaderBypass node does; comparison data only)
 Reports per combination:
@@ -249,6 +251,8 @@ def layer_probe(model, clip, loras, reps=3):
       exact   : Monoload's bit-exact path (MONOLOAD_EXACT=1)
       default : Monoload's default path (fused addmm_ for plain LoRA/LoCon, relaxed for the rest)
       relaxed : calculate_weight in the compute dtype for every key (native lowvram numerics)
+      mm-add  : diagnostic only: plain LoRA/LoCon as torch.mm(up, down) then
+                w.add_(delta, alpha=scale) (two kernels, delta rounded once), the rest relaxed
     plus the weight difference of default / relaxed against native's merge
     (= exact), with the tolerance of docs/DESIGN.md §5.5."""
     import comfy.lora
@@ -280,6 +284,15 @@ def layer_probe(model, clip, loras, reps=3):
             return f(w)
         if kind == "relaxed":
             return comfy.lora.calculate_weight(moved, w, key, intermediate_dtype=cdt)
+        if kind == "mm-add":
+            for p in moved:
+                ff = fused_factors(p)
+                if ff is None:
+                    w = comfy.lora.calculate_weight([p], w, key, intermediate_dtype=cdt)
+                else:
+                    up, down, scale = ff
+                    w.view(w.shape[0], -1).add_(torch.mm(up.flatten(1).to(cdt), down.flatten(1).to(cdt)), alpha=scale)
+            return w
         return w
 
     def run(kind):
@@ -300,7 +313,7 @@ def layer_probe(model, clip, loras, reps=3):
             print("\n=== layer probe: no patched layers ===")
             return
         cmp = compare_dtype(items[0][1].dtype, cdt, ldt)
-        err = {k: {"d_sq": 0.0, "max": 0.0} for k in ("default", "relaxed")}
+        err = {k: {"d_sq": 0.0, "max": 0.0} for k in ("default", "relaxed", "mm-add")}
         lora_sq = w_sq = bound_sq = 0.0
         for key, param, f, moved, _fused in items:
             base = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
@@ -319,22 +332,8 @@ def layer_probe(model, clip, loras, reps=3):
 
         timings = {}
         run("exact")  # warm-up
-        for kind in ("copy", "exact", "default", "relaxed"):
+        for kind in ("copy", "exact", "default", "relaxed", "mm-add"):
             timings[kind] = run(kind)
-        if dev.type == "cuda":
-            # diagnostic: the fp16 GEMM with reduced-precision reduction off
-            flag = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
-            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
-            try:
-                timings["default-noreduce"] = run("default")
-                d_sq = 0.0
-                for key, param, f, moved, _fused in items:
-                    base = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
-                    exact = variant("exact", key, f, moved, base.clone()).to(cmp).double()
-                    d_sq += float(((variant("default", key, f, moved, base.clone()).to(cmp).double() - exact) ** 2).sum())
-                err["default-noreduce"] = {"d_sq": d_sq, "max": float("nan")}
-            finally:
-                torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = flag
     finally:
         hotpatch.set_exact(prev)
 
@@ -343,7 +342,8 @@ def layer_probe(model, clip, loras, reps=3):
     print("\n=== layer probe: {} patched layers ({} fused), {:.2f} GiB of patched weights, compute dtype {}, lora_compute_dtype {} ===".format(
         len(items), n_fused, nbytes / 2 ** 30, cdt, ldt))
     print("  per model call: temporary copy {:.3f}s | bit-exact {:.3f}s (+copy) | default (fused/relaxed) {:.3f}s (+copy) | "
-          "relaxed only {:.3f}s (+copy)".format(t_copy, timings["exact"] - t_copy, timings["default"] - t_copy, timings["relaxed"] - t_copy))
+          "relaxed only {:.3f}s (+copy) | mm-add {:.3f}s (+copy, diagnostic)".format(
+              t_copy, timings["exact"] - t_copy, timings["default"] - t_copy, timings["relaxed"] - t_copy, timings["mm-add"] - t_copy))
     tol = (bound_sq / lora_sq) ** 0.5 if lora_sq else float("nan")
     u = UNIT_ROUNDOFF[cmp]
     print("  weight difference from bit-exact (= native merge), compared in {}; ||W|| / ||ΔW_lora|| = {:.3g}; tolerance (DESIGN §5.5) {:.3g}".format(
@@ -352,14 +352,13 @@ def layer_probe(model, clip, loras, reps=3):
         rel = (e["d_sq"] / lora_sq) ** 0.5 if lora_sq else float("nan")
         print("    {:16s}: ||Δw|| / ||ΔW_lora|| = {:.3g} ({}), ||Δw|| = {:.3g} u·||W||, max |Δw| {:.3g}".format(
             kind, rel, "within tolerance" if rel <= tol else "OVER TOLERANCE", (e["d_sq"] / w_sq) ** 0.5 / u if w_sq else float("nan"), e["max"]))
-    if "default-noreduce" in timings:
-        print("    (default-noreduce = default with torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction=False: "
-              "{:.3f}s (+copy); diagnostic only)".format(timings["default-noreduce"] - t_copy))
     print("  (one sampling step = 1 model call when cond/uncond are batched; the TE is separate)")
     free_all()
 
 
 def _mode_desc(mode):
+    if mode.startswith("monoload-relaxed"):
+        return "Monoload, default path with fusion off: relaxed merge only (diagnostic)"
     if mode.startswith("monoload-exact"):
         return "Monoload, bit-exact path = MONOLOAD_EXACT=1"
     if mode.startswith("monoload"):
@@ -389,7 +388,8 @@ def main():
     p.add_argument("--repeat", type=int, default=2, help="run the combo sequence this many times per mode (first pass includes warm-up)")
     p.add_argument("--modes", default="native,monoload,monoload-exact,bypass",
                    help="comma list run in order: 'monoload' = Monoload, default path (fused/relaxed); 'monoload-exact*' = "
-                        "Monoload, bit-exact path (MONOLOAD_EXACT=1); 'bypass*' = ComfyUI's bypass LoRA "
+                        "Monoload, bit-exact path (MONOLOAD_EXACT=1); 'monoload-relaxed*' = default path without fusion (diagnostic); "
+                        "'bypass*' = ComfyUI's bypass LoRA "
                         "(load_bypass_lora_for_models, Monoload uninstalled, comparison only); anything else = native")
     p.add_argument("--prompt", default="a photo of a red fox sitting in fresh snow, golden hour, detailed fur")
     p.add_argument("--negative", default="blurry, lowres")
@@ -413,7 +413,16 @@ def main():
         set_runtime(mode.startswith("monoload"))
         hotpatch.set_exact(mode.startswith("monoload-exact"))
         print("\n=== {} ({}) ===".format(mode, _mode_desc(mode)))
-        run_sequence(model, clip, combos, a, results, mode)
+        if mode.startswith("monoload-relaxed"):
+            # diagnostic: the default path with fusion turned off (every patch through calculate_weight in the compute dtype)
+            orig_ff = hotpatch.fused_factors
+            hotpatch.fused_factors = lambda patch: None
+            try:
+                run_sequence(model, clip, combos, a, results, mode)
+            finally:
+                hotpatch.fused_factors = orig_ff
+        else:
+            run_sequence(model, clip, combos, a, results, mode)
     free_all()
 
     # summary on the last repetition: every mode against the first one

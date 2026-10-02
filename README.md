@@ -110,7 +110,11 @@ CT 700 实测（WAI v17 SDXL + Smooth Booster，788 层，4.77 GiB 被 patch 的
 | 默认路径（融合 addmm，C） | 0.040s | 2.54e-3 | 1.22e-4（1 个 fp16 ulp，量级 0.125–0.25 的权重） |
 | 仅放宽合并（A，不采用） | 0.117s | 3.56e-5 | 6.1e-5（1 个 ulp） |
 
-也就是说，合并后的权重最多在个别元素上差 1 个 fp16 ulp，总量是 LoRA 改动本身的 0.25%。预估每步开销从 +0.26s 降到 +0.08s（原生 0.64s/步：1.39× → 约 1.12×），实际数字请按 9.1 重跑基准确认。
+也就是说，合并后的权重最多在个别元素上差 1 个 fp16 ulp，总量是 LoRA 改动本身的 0.25%。
+
+每步耗时实测（`bench_sdxl_v3`）：原生约 0.64s；默认路径 1.13× / 1.10× / 叠加 1.18×；逐位一致 1.39× / 1.33× / 1.67×。
+
+**出图会有可见的细节差异。** SDXL 20 步采样会把权重上 1 个 ulp 的差异放大：最终 latent 与原生的 mean|Δ| 是 LoRA 本身作用的 4–15%，量级与 ComfyUI 自带的 bypass LoRA 相当。LoRA 的效果强度不变，但同一种子的图与原生不会一模一样。需要和原生完全一致时用 `MONOLOAD_EXACT=1`。详见 DESIGN.md §5.5。
 
 测试里的容差（DESIGN.md §5.5）：`‖Δw‖ ≤ u·(‖W‖ + 20·‖LoRA 改动‖)`，u 是比较精度的单位舍入（fp16 为 2⁻¹¹）。上面 2.54e-3 只用掉「20·u = 9.8e-3」这一项的约四分之一。
 
@@ -127,7 +131,7 @@ CT 700 实测（WAI v17 SDXL + Smooth Booster，788 层，4.77 GiB 被 patch 的
 
 ## 7. 限制
 
-* **每一步都有合并开销。** 原生是「加载时合并一次」，Monoload 是「每步、每个被 patch 的层都合并一次」。没被 patch 的层完全不受影响。CT 700 上逐位一致路径是每步 1.33–1.66×；默认路径预估约 1.1–1.25×，以 9.1 的基准实测为准。分析见 DESIGN.md §5。
+* **每一步都有合并开销。** 原生是「加载时合并一次」，Monoload 是「每步、每个被 patch 的层都合并一次」。没被 patch 的层完全不受影响。CT 700（SDXL，1344×768）实测：默认路径每步 1.10–1.18×，逐位一致路径 1.33–1.67×。分析见 DESIGN.md §5。
 * 自己实现了 `patch_weight_to_device` 的第三方 `ModelPatcher` 子类（例如 ComfyUI-GGUF）不归 Monoload 管，保持它们自己的行为；日志里会对这个类打一次警告。
 * LoRA 文件读进来后常驻 CPU 内存（原生也是这样）。另外，被用到的 LoRA 张量会在计算设备上缓存一份（只缓存比权重小的低秩因子等，模型合并带进来的整层权重不缓存），避免每步每层都做一次 H2D，模型卸载时释放。
 * 模型合并节点（`ModelMergeSimple` 等）同样走运行时合并，每一步都会重新混合一遍，开销比 LoRA 大；需要反复使用合并结果时，建议先用 `MONOLOAD_DISABLE=1` 保存成新模型。合并结果也属于「带权重 patch」，会在 prompt 结束后一起释放，下次用到时重新执行合并节点。
@@ -237,7 +241,8 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_lor
 * `seconds per step` 表：每个组合一行，各模式的每步耗时并排列出，括号里是相对 `native` 的比值。`monoload`（默认路径）和 `monoload-exact`（逐位一致）分开两列。
 * 汇总表（每种模式对 `native` 各一张）：每步耗时和比值、patch 耗时、encode 耗时、`max|Δ|` / `mean|Δ|`（最终 latent 的差异），以及两种模式下各自的 `effect`（这个组合相对同模式 `none` 的变化，也就是 LoRA 本身的作用）。差异要和 effect 对比着看。`bypass` 按设计就和合并路径的数值不同，它的差异只作参考。
 * bypass 模式下：多个 LoRA 叠加时，脚本把各个 LoRA 的 bypass 注入合并成一个（装的时候正序、卸的时候倒序）。ComfyUI 自带的 `load_bypass_lora_for_models` 连续调用时，后一个会覆盖前一个，所以不能直接用。`keys` 列显示实际挂上的 bypass hook 数（UNet / TE）。`[BypassLoRA] Adapter key not in model state_dict: clip_...` 这类警告只是挂 UNet 时遍历到 TE 的 key 打出的噪音，TE 的 adapter 会单独挂上，脚本只在最后汇总一行。
-* 最后的 layer probe：一次模型调用中，所有被 patch 层的临时拷贝、逐位一致合并、默认路径（插件实际用的融合 addmm / 放宽合并）、只用放宽合并（A，对照）各自的耗时，以及默认路径和 A 相对逐位一致结果（= 原生合并）的权重差异：`||Δw|| / ||ΔW_lora||`、换算成 `u·||W||` 的值、单元素最大差异，并标出是否在 DESIGN.md §5.5 的容差以内。GPU 上还多一行 `default-noreduce`：关掉 PyTorch 的 fp16 GEMM 降精度累加（`allow_fp16_reduced_precision_reduction=False`）后默认路径的耗时和误差，只作诊断。
+* 最后的 layer probe：一次模型调用中，所有被 patch 层的临时拷贝、逐位一致合并、默认路径（插件实际用的融合 addmm / 放宽合并）、只用放宽合并（A，对照）各自的耗时，以及默认路径和 A 相对逐位一致结果（= 原生合并）的权重差异：`||Δw|| / ||ΔW_lora||`、换算成 `u·||W||` 的值、单元素最大差异，并标出是否在 DESIGN.md §5.5 的容差以内。另有一行 `mm-add`（`torch.mm` 后 `add_`，两个 kernel 的写法），只作诊断。
+* 诊断模式 `monoload-relaxed`：默认路径关掉融合、全部走放宽合并。用来判断出图差异来自采样放大还是来自融合 addmm 的精度（DESIGN.md §5.5）。
 
 **通过标准：**
 
@@ -304,7 +309,12 @@ docker exec comfyui python /opt/ComfyUI/custom_nodes/monoload/tools/compare_imag
 * **9.1 第二轮**（`bench_sdxl_v2`，更新后的基准脚本，同样设置）：
   * 每步：原生 0.638 / 0.640 / 0.643s；Monoload（逐位一致）0.891 / 0.855 / 1.064s（1.40× / 1.34× / 1.66×），与原生 max|Δ| 全部为 0；bypass（叠加已修正）0.870 / 0.799 / 1.024s。
   * layer probe：临时拷贝 0.038s、逐位一致合并 0.221s、放宽合并 0.117s、融合 addmm 0.040s。与原生合并的权重差异：放宽 3.56e-5、融合 2.54e-3（‖Δw‖/‖LoRA 改动‖），单元素最大差 1 个 fp16 ulp。
-  * 据此决定：默认用融合 addmm（C），C 不支持的类型用放宽合并（A），`MONOLOAD_EXACT=1` 切回逐位一致（§5.1，DESIGN.md §5.4）。默认路径的每步实测待按 9.1 重跑。
+  * 据此决定：默认用融合 addmm（C），C 不支持的类型用放宽合并（A），`MONOLOAD_EXACT=1` 切回逐位一致（§5.1，DESIGN.md §5.4）。
+* **9.1 第三轮**（`bench_sdxl_v3`，默认路径已实现）：
+  * 每步：原生 0.639 / 0.645 / 0.640s；默认路径 0.723 / 0.710 / 0.758s（1.13× / 1.10× / 1.18×）；逐位一致 0.891 / 0.855 / 1.065s（1.39× / 1.33× / 1.67×）。不打 LoRA 时三者相同。
+  * 逐位一致路径与原生 max|Δ| 全部为 0；`native2` 与原生全部为 0。
+  * layer probe：默认路径合并 0.052s（+ 拷贝 0.038s），与原生合并的权重差异 2.54e-3，在容差 0.0308 以内；关掉 fp16 GEMM 的降精度累加后耗时和误差都不变。
+  * 默认路径与原生的 latent：mean|Δ| 0.556 / 0.189 / 0.519，LoRA 本身的作用 mean 3.81 / 4.71 / 4.77（见 §5.1 和 DESIGN.md §5.5）。
 * **9.5 fp8**（WAI 生成的 fp8 UNet）：采样时挂 LoRA 只多出 0.58G GTT，没有备份，没有报错，出图正常。
 * **9.6 日志：** 没有 traceback / 不支持 / 内部错误，没有 OOM。
 
