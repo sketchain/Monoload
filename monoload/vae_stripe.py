@@ -30,12 +30,14 @@ neighbouring rows, and each stripe writes only its own core rows into the
 preallocated output.
 """
 
+import gc
 import time
 
 import torch
 
 import comfy.model_management as mm
 import comfy.ldm.wan.vae as wan
+from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
 from .errors import MonoloadError
 from .vae_ops import MIB, OpChunking, OpStats, fmt_bytes
@@ -60,11 +62,12 @@ class StripeError(MonoloadError):
 class Unit:
     """One step of the stripe part: kind, halo (rows on each side a unit
     needs, at its output level), scale (output rows per input row), channels."""
-    __slots__ = ("kind", "module", "halo", "scale", "cin", "cout", "name", "macs_row")
+    __slots__ = ("kind", "module", "halo", "scale", "cin", "cout", "name", "macs_row", "shortcut")
 
-    def __init__(self, kind, module, halo, scale, cin, cout, name, macs_row=0):
+    def __init__(self, kind, module, halo, scale, cin, cout, name, macs_row=0, shortcut=False):
         self.kind, self.module, self.halo, self.scale = kind, module, halo, scale
         self.cin, self.cout, self.name, self.macs_row = cin, cout, name, macs_row
+        self.shortcut = shortcut   # ResidualBlock with a 1x1 conv shortcut
 
 
 def need_in(unit, a, b, h_in, h_out):
@@ -253,8 +256,9 @@ def build_units(fsm, first_resample):
         else:
             c1i, c1o = _conv_io(m.residual[2])
             c2i, c2o = _conv_io(m.residual[6])
-            macs = 9 * (c1i * c1o + c2i * c2o) + (c1i * c2o if not isinstance(m.shortcut, torch.nn.Identity) else 0)
-            units.append(Unit(RES, m, 2, 1, c1i, c2o, name, macs))
+            sc = not isinstance(m.shortcut, torch.nn.Identity)
+            macs = 9 * (c1i * c1o + c2i * c2o) + (c1i * c2o if sc else 0)
+            units.append(Unit(RES, m, 2, 1, c1i, c2o, name, macs, sc))
     rms, silu, conv = list(dec.head)
     c = int(rms.gamma.shape[0])
     cin, cout = _conv_io(conv)
@@ -274,58 +278,96 @@ def signature(fsm, units):
 # ---------------------------------------------------------------------------
 # memory model (bytes), conv work model
 # ---------------------------------------------------------------------------
-# Live tensors while a unit runs on r input rows of width w (e = element size),
-# counted from the 62b3c94 code (DESIGN §9.13.3):
-#   ResidualBlock  old_x (Cin) + RMS's two temporaries / SiLU / conv in+out + shortcut + sum  <= 2*Cin + 4*Cout
-#   Resample       input (Cin) + a contiguous copy (Cin) + upsampled (4*Cin) + conv out (4*Cout)  = 6*Cin + 4*Cout
-#   3x3 conv       input + contiguous copy + output (+ slack)                                     = 2*Cin + 2*Cout
-#   RMS / SiLU     input + two temporaries + output                                                = 4*C
-#   AttentionBlock identity + norm temporaries + qkv + attention out + proj (prefix only)        = 10*C
-# The im2col columns / attention scores are bounded by the workspace (and by
-# what the largest conv / attention of the plan would want); with the block
-# copies around them that is 2 x min(workspace, largest block).
+# Live tensors, counted from the 62b3c94 forward code (DESIGN §9.13.4). S is
+# the storage of a module's input (held by the caller during the call: in the
+# stripes the previous unit's whole output, of which the input is a row
+# slice), A / B one plane of input / output channels on the rows the module
+# runs on, e = element size.
+#   RMS_norm       F.normalize(x) * scale * gamma + 0: two temporaries at a time   S + 2A
+#   ResidualBlock  RMS 2A | SiLU out + conv1 out + conv1 extra | RMS on conv1 out 3B
+#                  | conv2 in + out + extra | x + shortcut(old_x) 2B (3B and the
+#                  1x1 conv's input copy + columns with a shortcut conv)        S + max(...)
+#   Resample       contiguous copy A + upsampled 4A | 4A + conv out 4B + extra   S + max(...)
+#   head conv      output + extra (its input is a row slice: copied)            S + B + extra
+#   AttentionBlock (prefix) norm out P + qkv 3P + attention out P + scores
+#                  (split attention; q/k/v/out copies of SDPA / xformers: +3P)  S + 5P + scores
+# "extra" of a conv: the im2col / vol2col columns (bounded by the workspace when
+# the conv runs in layer-2 row blocks), the block input copy and block output,
+# the weight copy. Phase peaks get the caching allocator's slack on top
+# (ALLOC_SLACK_DIV / ALLOC_SLACK; the stripe phase starts from an emptied cache).
 
-def _live_unit(kind, cin, cout, r, w, e):
-    if kind == RES:
-        return r * w * e * (2 * cin + 4 * cout)
-    if kind == UP:
-        return r * w * e * (6 * cin + 4 * cout)
-    if kind == CONV:
-        return r * w * e * (2 * cin + 2 * cout)
-    return r * w * e * 4 * max(cin, cout)
-
-
-def _cols_unit(kind, cin, cout, r, w, e):
-    """Largest im2col block a unit's convs would want on r input rows (bounded by the workspace when used)."""
-    if kind == RES:
-        return 9 * max(cin, cout) * r * w * e
-    if kind == UP:
-        return 9 * cin * (2 * r) * (2 * w) * e
-    if kind == CONV:
-        return 9 * cin * r * w * e
-    return 0
+ALLOC_SLACK_DIV = 6          # reserved <= live + live / 6 + 64 MiB per phase (measured +12..16 %, DESIGN §9.13.4)
+ALLOC_SLACK = 64 * MIB
 
 
-def _cols_prefix_module(m, h, w, e):
-    if isinstance(m, wan.AttentionBlock):
-        return 2 * (h * w) ** 2 * e          # scores + softmax of all queries
-    if isinstance(m, wan.ResidualBlock):
-        ci, co = _conv_io(m.residual[2])[0], _conv_io(m.residual[6])[1]
-        return _cols_unit(RES, ci, co, h, w, e)
-    ci, _ = _conv_io(m)
-    k = int(m.kernel_size[-1])
-    return 0 if k == 1 else k * k * ci * h * w * e
+def conv_extra(cin, cout, k, r_in, r_out, w_in, w_out, e, ws, contiguous=True):
+    """Bytes a stride-1 k x k conv needs besides its input and output, as the
+    layer-2 conv wrapper runs it: unblocked (columns <= ws) the columns and a
+    contiguous copy of a sliced input; in row blocks one block of columns, the
+    block's input copy and output."""
+    per_row = k * k * cin * w_out * e
+    full = per_row * r_out
+    wcopy = cout * cin * k * k * e
+    if full <= ws:
+        return full + (0 if contiguous else r_in * w_in * cin * e) + wcopy
+    rb = max(1, ws // per_row)
+    return rb * per_row + (rb + k - 1) * w_in * cin * e + rb * w_out * cout * e + wcopy
 
 
-def _live_prefix_module(m, h, w, e):
+def res_peak(cin, cout, shortcut, r, w, e, ws, s):
+    a, b = r * w * cin * e, r * w * cout * e
+    phases = [2 * a,
+              a + b + conv_extra(cin, cout, 3, r, r, w, w, e, ws),
+              3 * b,
+              2 * b + conv_extra(cout, cout, 3, r, r, w, w, e, ws),
+              2 * b]
+    if shortcut:
+        phases += [2 * b + conv_extra(cin, cout, 1, r, r, w, w, e, ws, contiguous=False), 3 * b]
+    return s + max(phases)
+
+
+def up_peak(cin, cout, r, w, e, ws, s):
+    a = r * w * cin * e
+    return s + max(5 * a, 4 * a + 4 * r * w * cout * e + conv_extra(cin, cout, 3, 2 * r, 2 * r, 2 * w, 2 * w, e, ws))
+
+
+def unit_peak(u, r, w, e, ws, s):
+    """Peak bytes while unit u runs on r input rows of width w, input storage s."""
+    if u.kind == RES:
+        return res_peak(u.cin, u.cout, u.shortcut, r, w, e, ws, s)
+    if u.kind == UP:
+        return up_peak(u.cin, u.cout, r, w, e, ws, s)
+    if u.kind == CONV:
+        return s + r * w * u.cout * e + conv_extra(u.cin, u.cout, 3, r, r, w, w, e, ws, contiguous=False)
+    return s + 2 * r * w * u.cin * e
+
+
+def _attn_split(m):
+    return m.__dict__.get("optimized_attention") is ldm_model.normal_attention
+
+
+def prefix_peak(m, h, w, e, ws, s):
+    """Peak bytes while prefix module m runs on the whole h x w image, input storage s."""
     if isinstance(m, wan.AttentionBlock):
         c = int(m.norm.gamma.shape[0])
-        return h * w * e * 10 * c
+        p, n = h * w * c * e, h * w
+        rows = min(n, max(1, ws // (2 * n * e)))
+        scores = 2 * rows * n * e + 2 * rows * c * e
+        return s + (5 if _attn_split(m) else 8) * p + scores
     if isinstance(m, wan.ResidualBlock):
         ci, co = _conv_io(m.residual[2])[0], _conv_io(m.residual[6])[1]
-        return _live_unit(RES, ci, co, h, w, e)
+        return res_peak(ci, co, not isinstance(m.shortcut, torch.nn.Identity), h, w, e, ws, s)
     ci, co = _conv_io(m)
-    return _live_unit(CONV, ci, co, h, w, e)
+    k = int(m.kernel_size[-1])
+    return s + h * w * co * e + conv_extra(ci, co, k, h, h, w, w, e, ws)
+
+
+def prefix_out_channels(m):
+    if isinstance(m, wan.AttentionBlock):
+        return int(m.norm.gamma.shape[0])
+    if isinstance(m, wan.ResidualBlock):
+        return _conv_io(m.residual[6])[1]
+    return _conv_io(m)[1]
 
 
 def _macs_prefix_module(m):
@@ -338,6 +380,10 @@ def _macs_prefix_module(m):
     ci, co = _conv_io(m)
     k = int(m.kernel_size[-1])
     return k * k * ci * co
+
+
+def with_slack(live):
+    return int(live + live // ALLOC_SLACK_DIV + ALLOC_SLACK)
 
 
 class Plan:
@@ -356,21 +402,27 @@ class Plan:
         self.h_out, self.w_out = heights[-1], widths[-1]
         self.stripes = split_rows(self.h_out, rows)
         self.needs = [stripe_needs(units, heights, a, b) for a, b in self.stripes]
-        ck_c = bound.ckpt_channels
-        self.ckpt_bytes = ck_c * h8 * w8 * elem
-        prefix_live = max(_live_prefix_module(m, h8, w8, elem) for _, m in bound.prefix)
-        prefix_cols = max(_cols_prefix_module(m, h8, w8, elem) for _, m in bound.prefix)
-        strip_live = strip_cols = 0
+        # the stripe with the largest slices runs first: the blocks it leaves in the allocator's cache fit every later stripe
+        size = [sum(n[1] - n[0] for n in needs) for needs in self.needs]
+        first = max(range(len(size)), key=lambda i: (size[i], -i))
+        self.order = [first] + [i for i in range(len(size)) if i != first]
+        self.ckpt_bytes = bound.ckpt_channels * h8 * w8 * elem
+        prefix_live = s = 0
+        for _, m in bound.prefix:
+            prefix_live = max(prefix_live, prefix_peak(m, h8, w8, elem, ws, s))
+            s = prefix_out_channels(m) * h8 * w8 * elem
+        strip_live = 0
         work_stripes = 0
         for needs in self.needs:
+            s = 0   # the first unit reads a slice of the checkpoint (counted on its own)
             for i, u in enumerate(units):
                 r = needs[i][1] - needs[i][0]
-                strip_live = max(strip_live, _live_unit(u.kind, u.cin, u.cout, r, widths[i], elem))
-                strip_cols = max(strip_cols, _cols_unit(u.kind, u.cin, u.cout, r, widths[i], elem))
+                strip_live = max(strip_live, unit_peak(u, r, widths[i], elem, ws, s))
+                s = r * u.scale * widths[i + 1] * u.cout * elem
                 work_stripes += r * u.scale * widths[i + 1] * u.macs_row
-        # the workspace bounds the im2col / score blocks; x2 for the block copies around them (as in layer 2)
-        self.prefix_bytes = prefix_live + 2 * min(ws, prefix_cols)
-        self.stripe_bytes = self.ckpt_bytes + strip_live + 2 * min(ws, strip_cols)
+        self.prefix_live, self.stripe_live = prefix_live, strip_live
+        self.prefix_bytes = with_slack(prefix_live)
+        self.stripe_bytes = self.ckpt_bytes + with_slack(strip_live)
         self.persistent = out_bytes + lat_bytes
         self.estimate = int(self.persistent + max(self.prefix_bytes, self.stripe_bytes))
         work_prefix = sum(_macs_prefix_module(m) for _, m in bound.prefix) * h8 * w8
@@ -397,7 +449,8 @@ def run_stripes(units, plan, ckpt, write):
     """Run every stripe from the checkpoint; write(o0, o1, rows) receives the
     stripe's core rows [B, C, T, o1-o0, W]."""
     heights = plan.heights
-    for (o0, o1), needs in zip(plan.stripes, plan.needs):
+    for k in plan.order:
+        (o0, o1), needs = plan.stripes[k], plan.needs[k]
         xa, xb = needs[0]
         x = ckpt.narrow(HDIM, xa, xb - xa)
         for i, u in enumerate(units):
@@ -464,6 +517,10 @@ class WanStripe:
                 z = samples_in[i:i + 1].to(device=vae.device, dtype=vae.vae_dtype)
                 ckpt = run_prefix(self.prefix, z)
                 del z
+                # give the prefix's freed blocks (attention scores, qkv, columns of whole-image convs) back: the
+                # stripes allocate other sizes and would otherwise stack their blocks on top of them (DESIGN §9.13.4)
+                mm.soft_empty_cache(True)
+                stats.cache_releases += 1
                 if pixel_samples is None:
                     shape = (n, self.units[-1].cout, ckpt.shape[2], plan.h_out, plan.w_out)
                     pixel_samples = torch.empty(shape, device=vae.output_device, dtype=vae.vae_output_dtype())
@@ -522,47 +579,58 @@ def self_test(bound, vae):
     forced small stripes (several inner boundaries, layer-2 conv blocks inside)
     and with the whole-image WanVAE.decode, both on an fp32 copy of the decoder;
     pass if they agree to SELFTEST_TOL. Cached per structure; the RNG state is
-    preserved. Returns (ok, detail)."""
+    preserved. Afterwards the fp32 copy and every tensor of the test are freed
+    and the allocator's cache is emptied, so the decode that follows starts
+    from the same memory state as any later one. Returns (ok, detail)."""
     hit = _SELFTEST.get(bound.key)
     if hit is not None:
         return hit
+    oom = False
+    try:
+        ok, detail = _self_test_run(bound, vae)
+    except Exception as e:
+        if not mm.is_oom(e):
+            ok, detail = False, "{}: {}".format(type(e).__name__, str(e).splitlines()[0] if str(e) else "")
+        else:
+            oom = True
+    # out of the except block: the traceback (and the tensors its frames hold) is gone
+    gc.collect()
+    mm.soft_empty_cache(True)
+    if oom:
+        raise mm.OOM_EXCEPTION("[Monoload] out of memory in the VAE layer-1 self-test")
+    _SELFTEST[bound.key] = (ok, detail)
+    return ok, detail
+
+
+def _self_test_run(bound, vae):
     t0 = time.perf_counter()
     dev = vae.device
     devs = [dev.index or 0] if dev.type == "cuda" else []
-    holder = None
-    try:
-        with torch.inference_mode(), torch.random.fork_rng(devices=devs):
-            holder = _fp32_copy(bound.fsm, dev)
-            reason, info = wan_structure(_Shim(holder))
-            if reason:
-                raise StripeError("fp32 copy does not match: " + reason)
-            tb = WanStripe(_Shim(holder), info["first_resample"])
-            if tb.key != bound.key:
-                raise StripeError("fp32 copy has structure {} instead of {}".format(tb.key, bound.key))
-            g = torch.Generator().manual_seed(0)
-            z = torch.randn(1, int(holder.conv2.weight.shape[1]), 1, SELFTEST_LATENT, SELFTEST_LATENT, generator=g).to(dev)
-            ref = wan.WanVAE.decode(holder, z)
-            plan = Plan(tb, SELFTEST_LATENT, SELFTEST_LATENT, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0)
-            out = torch.empty_like(ref)
-            stats = OpStats()
+    with torch.inference_mode(), torch.random.fork_rng(devices=devs):
+        holder = _fp32_copy(bound.fsm, dev)
+        reason, info = wan_structure(_Shim(holder))
+        if reason:
+            raise StripeError("fp32 copy does not match: " + reason)
+        tb = WanStripe(_Shim(holder), info["first_resample"])
+        if tb.key != bound.key:
+            raise StripeError("fp32 copy has structure {} instead of {}".format(tb.key, bound.key))
+        g = torch.Generator().manual_seed(0)
+        z = torch.randn(1, int(holder.conv2.weight.shape[1]), 1, SELFTEST_LATENT, SELFTEST_LATENT, generator=g).to(dev)
+        ref = wan.WanVAE.decode(holder, z)
+        plan = Plan(tb, SELFTEST_LATENT, SELFTEST_LATENT, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0)
+        out = torch.empty_like(ref)
+        stats = OpStats()
 
-            def write(o0, o1, rows):
-                out.narrow(HDIM, o0, o1 - o0).copy_(rows)
-            with OpChunking(holder, SELFTEST_WORKSPACE, stats):
-                ckpt = run_prefix(tb.prefix, z)
-                run_stripes(tb.units, plan, ckpt, write)
-            scale = max(1.0, float(ref.abs().max()))
-            err = float((out - ref).abs().max()) / scale
-            ok = bool(torch.isfinite(out).all()) and err <= SELFTEST_TOL
-            detail = "max|stripes - whole| / max(1, max|whole|) = {:.2g} (tolerance {:g}), {} stripes, {} conv calls in row blocks, {:.2f}s".format(
-                err, SELFTEST_TOL, len(plan.stripes), stats.conv_chunked, time.perf_counter() - t0)
-    except Exception as e:
-        if mm.is_oom(e):
-            raise
-        ok, detail = False, "{}: {}".format(type(e).__name__, str(e).splitlines()[0] if str(e) else "")
-    finally:
-        del holder
-    _SELFTEST[bound.key] = (ok, detail)
+        def write(o0, o1, rows):
+            out.narrow(HDIM, o0, o1 - o0).copy_(rows)
+        with OpChunking(holder, SELFTEST_WORKSPACE, stats):
+            ckpt = run_prefix(tb.prefix, z)
+            run_stripes(tb.units, plan, ckpt, write)
+        scale = max(1.0, float(ref.abs().max()))
+        err = float((out - ref).abs().max()) / scale
+        ok = bool(torch.isfinite(out).all()) and err <= SELFTEST_TOL
+        detail = "max|stripes - whole| / max(1, max|whole|) = {:.2g} (tolerance {:g}), {} stripes, {} conv calls in row blocks, {:.2f}s".format(
+            err, SELFTEST_TOL, len(plan.stripes), stats.conv_chunked, time.perf_counter() - t0)
     return ok, detail
 
 

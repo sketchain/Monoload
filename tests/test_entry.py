@@ -63,8 +63,8 @@ else:
         check("VAE layer 1 (stripes) {}".format("off (MONOLOAD_DISABLE_VAE_STRIPE=1)" if no_stripe else "on (Wan 2.1 adapter registered)"),
               vae.stripe_enabled() == (not no_stripe) and len(vae.STRIPE_ADAPTERS) == 1)
         want = os.environ.get("MONOLOAD_VAE_BUDGET", "")
-        check("layer-1 budget {} ({})".format(vae.budget(), "MONOLOAD_VAE_BUDGET={}".format(want) if want else "default 3 GiB"),
-              vae.budget() == (vae.parse_size(want) if want else 3 << 30) and vae._SETTINGS["budget_explicit"] == bool(want))
+        check("layer-1 budget {} ({})".format(vae.budget(), "MONOLOAD_VAE_BUDGET={}".format(want) if want else "unset: default stripe policy"),
+              vae.budget() == (vae.parse_size(want) if want else None))
         want = os.environ.get("MONOLOAD_VAE_STRIPE_ROWS", "")
-        check("stripe height {}".format("forced to {}".format(want) if want else "from the budget"), vae.stripe_rows() == (int(want) if want else None))
+        check("stripe height {}".format("forced to {}".format(want) if want else "from the policy / budget"), vae.stripe_rows() == (int(want) if want else None))
 finish()

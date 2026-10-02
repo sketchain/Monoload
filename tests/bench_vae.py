@@ -411,11 +411,12 @@ def mono_line(m):
     """One line on what Monoload did in a run."""
     if m.get("strategy") == "layer1":
         e = m["estimate"]
-        return ("layer 1 ({}): {} stripes of {} rows, recompute {:.2f}x, checkpoint {}, budget {}, workspace {}, {} OOM retries; "
-                "estimate {} GiB (prefix {} / stripes {} / persistent {}; native {})").format(
-            m.get("adapter"), m["stripes"], m["rows"], m["recompute"], vae_ops.fmt_bytes(m["checkpoint_bytes"]), vae_ops.fmt_bytes(m["budget"]),
+        st = m.get("stats", {})
+        return ("layer 1 ({}): {} stripes of {} rows, recompute {:.2f}x, checkpoint {}, {} (target {}), workspace {}, {} OOM retries; "
+                "estimate {} GiB (prefix {} / stripes {} / persistent {}; native {}); {} Conv3d calls as conv2d, cache emptied {}x").format(
+            m.get("adapter"), m["stripes"], m["rows"], m["recompute"], vae_ops.fmt_bytes(m["checkpoint_bytes"]), m.get("policy"), vae_ops.fmt_bytes(m["budget"]),
             vae_ops.fmt_bytes(m["workspace"]), m["retries"], gib(e["total"]).strip(), vae_ops.fmt_bytes(e["prefix"]), vae_ops.fmt_bytes(e["stripes"]),
-            vae_ops.fmt_bytes(e["persistent"]), gib(m.get("native_estimate")).strip())
+            vae_ops.fmt_bytes(e["persistent"]), gib(m.get("native_estimate")).strip(), st.get("conv3d_as_2d"), st.get("cache_releases"))
     st = m.get("stats", {})
     return ("layer 2 ({}): estimate {} GiB (native {}), workspace {}, {} OOM retries; conv {} of {} calls in {} row blocks "
             "(largest block workspace {}, largest whole-conv workspace {}); attention {} call(s), query block {} of {} tokens").format(

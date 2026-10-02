@@ -6,7 +6,7 @@
 
 为 Strix Halo（gfx1151，统一内存，显存走 GTT）+ ROCm、`--gpu-only` 的配置设计。在这种配置下，原生 ComfyUI 打 LoRA 时会把被改动的原权重在 GTT 里再备份一份，LoRA 改到的权重越多，备份就越大。
 
-**另一项功能：VAE 解码降峰值（§12）。** 接管 `VAE.decode`。认得的结构（目前是 `qwen_image_vae` / Wan 2.1 VAE 的单帧解码）走第一层：从低分辨率存档按输出行条带倒推重算，峰值按预算控制（默认 3 GiB）；其余 VAE 走第二层：卷积按输出行分块、注意力按 query 分块，限制 im2col 展开缓冲和注意力分数矩阵；自己给 `load_models_gpu` 报真实的内存需求，不再用原生约 92 GiB（SDXL 4K）的估算去卸载别的模型；OOM 时只缩小分块重试，绝不退回 tiled 近似解码。结果与整图解码数学等价（只差浮点误差）。与 LoRA 部分相互独立，可以单独关掉。
+**另一项功能：VAE 解码降峰值（§12）。** 接管 `VAE.decode`。认得的结构（目前是 `qwen_image_vae` / Wan 2.1 VAE 的单帧解码）走第一层：从低分辨率存档按输出行条带倒推重算，默认在不明显变慢的前提下取最低的峰值（4K 约 1.1 GiB，原生约 59 GiB）；其余 VAE 走第二层：卷积按输出行分块、注意力按 query 分块，限制 im2col 展开缓冲和注意力分数矩阵；自己给 `load_models_gpu` 报真实的内存需求，不再用原生约 92 GiB（SDXL 4K）的估算去卸载别的模型；OOM 时只缩小分块重试，绝不退回 tiled 近似解码。结果与整图解码数学等价（只差浮点误差）。与 LoRA 部分相互独立，可以单独关掉。
 
 设计细节见 [docs/DESIGN.md](docs/DESIGN.md)。v1（离线转换 + pread 直读）已经废弃，代码保留在 tag `v1-converter`（远端归档分支 `archive/v1-converter`）。
 
@@ -42,7 +42,7 @@ services:
       # - MONOLOAD_KEEP_LORA=1                # 不在每个 prompt 结束后释放 LoRA
       # - MONOLOAD_DISABLE_VAE=1              # 只关掉 VAE 解码管理（§12），LoRA 部分照常
       # - MONOLOAD_VAE_WORKSPACE=1G           # VAE 分块的工作区预算（默认 1G）
-      # - MONOLOAD_VAE_BUDGET=3G              # VAE 第一层（条带解码）的峰值预算（默认 3G）
+      # - MONOLOAD_VAE_BUDGET=2G              # VAE 第一层（条带解码）的峰值预算（默认不设：128 行条带的峰值内最高的条带）
       # - MONOLOAD_DISABLE_VAE_STRIPE=1       # 关掉第一层，所有 VAE 都走第二层
       # - MONOLOAD_DISABLE=1                  # 需要完全原生的行为时打开
     volumes:
@@ -79,7 +79,7 @@ docker logs comfyui 2>&1 | grep -i monoload
 #   [Monoload] runtime LoRA merge installed on ModelPatcher (no in-place LoRA, no weight backups), merge: fused fp16 addmm / relaxed (set MONOLOAD_EXACT=1 for bit-exact)
 #   [Monoload] LoRA is released after every prompt (base models stay loaded)
 #   [Monoload] VAE decode managed: op-level chunking (conv row blocks, attention query blocks), workspace 1.00 GiB ...
-#   [Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae single frame; ...): peak budget 3.00 GiB (default) ...
+#   [Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae single frame; ...): default stripe policy: the peak of 128-row stripes, tallest stripes within it ...
 ```
 
 没有额外依赖，不注册新节点（节点列表里不会出现 Monoload）。以只读方式挂载即可。
@@ -93,9 +93,9 @@ docker logs comfyui 2>&1 | grep -i monoload
 | `MONOLOAD_KEEP_LORA=1` | 运行时合并照常，但 prompt 结束后不释放 LoRA（LoRA 节点缓存和挂着 LoRA 的 clone 保留，重复跑同一个 LoRA 工作流时省掉读 LoRA 文件） |
 | `MONOLOAD_DISABLE_VAE=1` | 只关掉 VAE 解码管理（§12），`VAE.decode` 保持原生；LoRA 部分不受影响 |
 | `MONOLOAD_VAE_WORKSPACE` | VAE 分块的工作区预算，默认 `1G`；写法 `1G`、`512M`、`768`（纯数字按 MiB）。决定卷积每块的行数和注意力每块的 query 数（§12） |
-| `MONOLOAD_VAE_BUDGET` | VAE 第一层（条带解码，§12.7）的峰值预算，默认 `3G`，写法同上。按它自动选条带高度；显式设了而放不下就报错 |
+| `MONOLOAD_VAE_BUDGET` | VAE 第一层（条带解码，§12.7）的峰值预算，写法同上。不设时用默认策略（在不明显变慢的前提下尽量低峰值，§12.7）；设了就取预算内最高的条带，放不下就报错 |
 | `MONOLOAD_DISABLE_VAE_STRIPE=1` | 只关掉第一层，所有受管理的 VAE 解码都走第二层 |
-| `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（输出行数），用于扫参和调试；不设则按预算自动选 |
+| `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（输出行数），用于扫参和调试，优先于默认策略和预算 |
 | `MONOLOAD_DISABLE=1` | 插件不做任何事，行为与原生完全一致（LoRA 和 VAE 都不接管）；日志里是 `MONOLOAD_DISABLE is set: ... NOT installed` |
 
 开关都接受 `1` / `true` / `yes` / `on`。
@@ -183,7 +183,7 @@ MODELS=/path/to/models tests/run_all.sh
 | `tests/test_lora_hot.py` | 两条管线：`CheckpointLoaderSimple`；`UNETLoader` + `CLIPLoader`。同一串 LoRA 组合先用原生跑、再装上 Monoload 连续切换着跑。`EXACT=1`：TE 输出和采样结果与原生逐位一致。默认路径：UNet 和 TE 所有被 patch 的权重与原生合并的差异在容差以内（DESIGN.md §5.5），同样的 key 上重算逐位一致路径与原生逐位一致；latent 差异只报告。两种模式都检查无备份、权重不变、撤掉 LoRA 后逐位一致，加上 Hook LoRA、模型合并和报错场景 |
 | `tests/test_quant.py` | fp8 scaled UNet + LoRA：与「先反量化被改到的层 + 同一合并路径」逐位一致、无备份、fp8 权重不变；与原生的误差只报告 |
 | `tests/test_vae.py` | VAE 解码管理（§12），不需要模型文件：分块卷积 / 分块注意力与不分块的结果一致（含各种 kernel、stride、dilation、groups、padding、cast 路径 + weight_function、Wan CausalConv3d）；用 ComfyUI 自己的 LDM `Decoder` / `WanVAE`（小通道、随机权重）构造 SDXL 式、Flux 式、Qwen 式 VAE，受管理的解码与原生 `VAE.decode` 比较；多帧交给原生、OOM 缩小分块重试、下限时报错、绝不调用 tiled |
-| `tests/test_vae_stripe.py` | VAE 第一层（§12.7），不需要模型文件：区间倒推对照暴力依赖展开；每个单元（残差块、上采样、head 卷积）在任意切片上「有效行」与整图逐行一致、紧邻的下一行不一致；用 ComfyUI 的 `WanVAE`（小通道、随机权重）在 fp32 下比较第一层与原生整图解码（条带 1 行、不整除、等于整图、按预算自动、奇数尺寸、很小的 latent、batch 2、条带内再分块、bf16），块边界附近的误差不比其他区域大；识别（Dropout 训练态、forward hook、开关）；故意少算一行 halo 时自检能抓到并回退第二层；预算报错 / 默认预算放宽；OOM 缩小条带、到下限报错、不退回 tiled 也不退回第二层；SDXL / Flux 结构继续走第二层 |
+| `tests/test_vae_stripe.py` | VAE 第一层（§12.7），不需要模型文件：区间倒推对照暴力依赖展开；每个单元（残差块、上采样、head 卷积）在任意切片上「有效行」与整图逐行一致、紧邻的下一行不一致；用 ComfyUI 的 `WanVAE`（小通道、随机权重）在 fp32 下比较第一层与原生整图解码（条带 1 行、不整除、等于整图、按预算自动、默认策略、奇数尺寸、很小的 latent、batch 2、条带内再分块、bf16），块边界附近的误差不比其他区域大；识别（Dropout 训练态、forward hook、开关）；故意少算一行 halo 时自检能抓到并回退第二层；预算报错；OOM 缩小条带、到下限报错、不退回 tiled 也不退回第二层；SDXL / Flux 结构继续走第二层；默认策略（128 行条带的估算为目标）和开关的优先级；内存模型单调、最大的条带先跑；自检后和前缀 / 条带之间清空缓存；单帧 Conv3d 改走 conv2d 与模块原样一致、只在该改的时候改 |
 | `tests/test_release.py` | 用真正的 `PromptExecutor` 连续跑 LoRA → 无 LoRA → 只改 UNet 的 LoRA → 无 LoRA → Hook LoRA → 无 LoRA → bypass LoRA → 无 LoRA → LoRA（换种子）：弱引用确认 LoRA 全部释放、底模不重新加载、结果与从没见过 LoRA 的进程逐位一致；RAM pressure / classic / LRU 三种缓存各一遍，外加 `MONOLOAD_KEEP_LORA=1` |
 
 **实测结果**（`--cpu --fp16-unet`，SD1.5，每个组合采样 2 步，hook 3 步）。以下逐位一致的结论都是 `MONOLOAD_EXACT=1` 下的：
@@ -204,7 +204,7 @@ MODELS=/path/to/models tests/run_all.sh
   * 在同样的 key 上重算逐位一致路径，与原生全部逐位一致。
   * 备份、权重不变、撤掉 LoRA、报错、fp8、自动释放（三种缓存 + KEEP）这些检查与逐位一致路径完全相同，全部通过。
 * VAE 解码管理（`tests/test_vae.py`，131 项，0 失败）：分块卷积 53 项、分块注意力 18 项与不分块一致（卷积相对误差最大 4.6e-7，注意力 3.5e-7，多数为 0）；SDXL 式 / Flux 式 / Qwen 式 decoder 在 16 KiB 和 256 KiB 预算下（绝大多数卷积被分块）与原生 `VAE.decode` 的 raw 输出差 ≤ 7.2e-6、像素差 ≤ 3.2e-6（fp32；bf16 为 0）；预算足够大时与原生逐位一致；多帧交给原生；OOM 缩小分块重试、下限报错，tiled 从未被调用。加上 VAE 之后 LoRA 部分的 `test_dtype_paths.py`（198 / 108 项）和入口测试照旧全部通过。下面 826 项的合计是加入 VAE 之前的完整运行。
-* VAE 第一层（`tests/test_vae_stripe.py`，38 项，0 失败）：区间倒推与暴力展开 993 条条带全部一致；5 种单元在每个切片上的精确行与整图一致（≤ 3.6e-7）、halo 不多不少；整个 Wan decoder 在条带高度 1 / 7 / 40 / 整图 / 按预算、奇数和很小的 latent、batch 2、条带内再分块下，与原生整图解码的 raw 差 ≤ 2.1e-6（fp32），条带边界附近不比其他区域差；halo 少算一行时自检两种方式都能抓到并回退第二层；SDXL / Flux 继续走第二层。
+* VAE 第一层（`tests/test_vae_stripe.py`，54 项，0 失败）：区间倒推与暴力展开 993 条条带全部一致；5 种单元在每个切片上的精确行与整图一致（≤ 3.6e-7）、halo 不多不少；整个 Wan decoder 在条带高度 1 / 7 / 40 / 整图 / 按预算 / 默认策略、奇数和很小的 latent、batch 2、条带内再分块下，与原生整图解码的 raw 差 ≤ 2.1e-6（fp32），条带边界附近不比其他区域差；halo 少算一行时自检两种方式都能抓到并回退第二层；SDXL / Flux 继续走第二层；默认策略选出「128 行条带的估算」之内最高的条带（320 行的图 3 条 107 行，再高一档就超过目标），`MONOLOAD_VAE_STRIPE_ROWS` / `MONOLOAD_VAE_BUDGET` 能覆盖它；估算随条带高度单调、最大的条带先跑；自检后清空 1 次缓存、batch 2 在前缀和条带之间清空 2 次；单帧 Conv3d 改走 conv2d 时与模块原样输出一致（≤ 4.8e-7），T=3 和已被别人替换过 `_conv_forward` 的模块不改走。
 * `tests/run_all.sh` 合计 826 项检查（入口 18；`MONOLOAD_EXACT=1`：dtype 108、LoRA 80、fp8 8、释放 2 + 42×3 + 22；默认路径：dtype 198、LoRA 106、fp8 8、释放 2 + 42×3 + 22），0 失败。
 
 **CPU 上的基准参考**（`tests/bench_lora.py`，SD1.5，256×256，3 步，只能看相对比例，不代表 GPU）：
@@ -413,6 +413,26 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 
 看什么：A 的 monoload 行写的是 `layer 1`，4K 的 alloc / GTT 增量在 2–4 GiB 量级并且不超过估算，`monoload vs fp32` 与 `native vs fp32` 相当，条带边界附近的误差不比其余行大，`monoload-l2` 与第一阶段的数字一致；第一次解码前日志里有 `VAE layer 1 (Wan 2.1 stripes) self-test passed`。B 看峰值、耗时、重算比例随条带高度的变化（选默认预算的依据）。C 看峰值时刻剩下的分配是什么（前缀的注意力、条带内的卷积、存档）。D 的 monoload 行写的是 `layer 2 (first-stage model is AutoencoderKL, not ...)`，数字与第一阶段一致。
 
+上面 A–D 已在 4e54d20 上测完（§10.2）。
+
+**第二阶段调整后的复测**（默认策略、内存模型、缓存处理、单帧 Conv3d 改走 conv2d；每条命令前都先 `/free`）：
+
+```bash
+# E. Qwen 三档：原生 / 第一层（新默认策略）/ 只用第二层，带 fp32 参照
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae qwen_image_vae.safetensors --modes native,monoload,monoload-l2 --warm 2 --fp32-ref \
+  --json /opt/ComfyUI/output/bench_vae_l1b_qwen.json 2>&1 | tee bench_vae_l1b_qwen.txt
+# F. 4K 条带高度扫参复核（monoload = 默认策略，155 行就是它在 4K 选的高度）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae qwen_image_vae.safetensors --res 3840x2160 --modes native,monoload --stripe-rows 32,64,128,155,256,512 --warm 2 \
+  --json /opt/ComfyUI/output/bench_vae_l1b_sweep.json 2>&1 | tee bench_vae_l1b_sweep.txt
+# G. 4K 第一层的 profile：aten::fill_ 次数、峰值构成
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae qwen_image_vae.safetensors --res 3840x2160 --profile-only --profile-modes monoload 2>&1 | tee bench_vae_l1b_profile.txt
+```
+
+看什么：E 的 monoload 行是 `layer 1`，计划为 1344 → 6 条 128 行、2688 → 12 条 128 行、4K → 14 条 155 行，行尾写着 `default: peak of 128-row stripes`、`N Conv3d calls as conv2d`（N > 0）、`cache emptied 1x`；**每一行（冷启动也算）的 reserved / GTT 增量都不超过估算**（1344 估 0.74 GiB、2688 估 0.95、4K 估 1.25），4K 的 reserved 约 1.07；耗时与第一版（0.67 / 3.16 / 8.12 s）相比不明显变慢；`monoload vs fp32` 仍与 `native vs fp32` 相当。F 看 reserved 是否不再随条带高度叠加（512 行时第一版是 2.66，现在应接近 alloc 1.70 加余量），以及估算是否覆盖每个高度的 reserved。G 里 `aten::fill_` 应从 15.9 万次降到几百次。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
@@ -499,6 +519,39 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 * 日志计时：第一轮发现插件日志里的解码秒数没有等 GPU 同步、比实际短（4K 显示 0.84 s，实际 10.2 s），已修复：计时前后各同步一次设备。
 * **结论：第一阶段验收通过。** 峰值主因确认；4K 峰值降到原来的 1/4～1/6；速度不降反升；没有接缝；估算是有效上界；精度与原生同为 bf16 的水平，分块在 fp32 下与整图等价。
 
+### 10.2 VAE 解码第二阶段：第一层条带解码（`bench_vae_l1_*`，2026-10，4e54d20）
+
+设置同 §10.1（`--gpu-only --bf16-vae`，`cudnn.enabled = False`，split 注意力，随机 latent 种子 0，1 次冷启动 + 2 次热启动，先 `/free`）。这一轮测的是第一版的默认策略（3 GiB 预算内取最高条带）；之后按这些数据调整了默认策略和内存模型（见下面「调整」和 §12.7）。
+
+* **显存（`qwen_image_vae`，GiB，热启动；原生 → 第一层 → 只用第二层）：**
+
+| 输出 | 第一层计划 | alloc 增量 | reserved / GTT 增量 | 第一层估算 | 耗时 (s) |
+|---|---|---|---|---|---|
+| 1344×768 | 1 条 768 行 | 4.06 → 1.11 → 1.82 | 6.10 → 1.27 → 2.12 | 1.88 | 0.655 → 0.671 → 0.657 |
+| 2688×1536 | 3 条 512 行，1.05× | 15.92 → 1.42 → 3.80 | 29.39 → 2.17 → 5.07 | 2.36 | 3.39 → 3.16 → 2.96 |
+| 3840×2160 | 5 条 432 行，1.07× | 31.99 → 1.70 → 6.45 | 59.16 → 2.68 → 9.61 | 2.78 | 7.87 → 8.12 → 7.14 |
+
+  4K 的 GTT 从 59.2 GiB 降到 2.7 GiB（第二层是 9.6），耗时与原生相同（第二层快 10%）。估算在热启动下都大于实测 reserved；冷启动的第一次解码 reserved 是 +3.04 GiB（4K），超过估算 2.78：自检的 fp32 副本和中间量留在了缓存里。fp32 解码（`monoload-fp32`，10 条 216 行）reserved 3.22，也超过了估算 2.93。
+* **精度：** 第一层 vs fp32 与原生 vs fp32 相同（4K：RMSE 9.73e-4 对 9.71e-4，PSNR 60.2 对 60.3，p99 0.00287 对 0.00286）；fp32 下条带解码与整图只差 7e-6～8e-6（PSNR 136 dB）。|monoload − native| > 0.01 的像素里，monoload 更接近 fp32 的占一半多（4K 299 对 269），在这些点上 monoload 对 fp32 的平均误差更小（0.0069 对 0.0075）。**没有接缝：** 条带边界附近的 RMSE 与其余行相同（4K 9.69e-4 对 9.72e-4），最大误差也不在边界上。自检通过，误差 2.6e-6～3e-6，0.47 s。
+* **4K 条带高度扫参（热启动；顺序 / 温度带来约 8% 的噪声）：**
+
+| 核心行数 | 32 | 64 | 128 | 240 | 432 |
+|---|---|---|---|---|---|
+| 耗时 (s) | 11.7 | 9.8 | 8.8 | 9.2 | 8.1–8.9 |
+| alloc / reserved 增量 (GiB) | 0.94 / 1.07 | 0.94 / 1.07 | 0.97 / 1.07 | 1.24 / 1.44 | 1.70 / 2.66 |
+| 当时的估算 (GiB) | 1.77 | 1.77 | 1.77 | 1.99 | 2.78 |
+| 重算 | 2.09× | 1.54× | 1.26× | 1.13× | 1.07× |
+
+  约 128 行时峰值就到了下限（整图前缀决定），速度与 432 行相同；64 行起明显变慢。
+* **峰值构成（profile，432 行）：** 最后一个 Resample 的上采样结果 630 MiB、它的卷积输出 315 MiB、im2col columns 384 MiB（工作区）、块拷贝 43 + 21 MiB、输入 160 MiB、存档 95 MiB、输出 95 MiB，合计 1.70 GiB。另有 `aten::fill_` 被调用 159308 次（GPU 时间不受影响）。
+* **SDXL 回归：** 仍走第二层，4K alloc 11.17 GiB、GTT 14.86 GiB、9.88 s，与第一阶段一致。
+* 日志里的解码秒数与 bench 一致（计时修正生效）。
+* **结论：第二阶段验收通过**，并按数据做了以下调整（见 §12.7、DESIGN.md §9.13.4，真机复测命令见 9.7）：
+  1. 默认策略改成「在不明显变慢的前提下尽量低峰值」：以 128 行条带的估算为目标，取不超过它的最高条带。4K 选 14 条 155 行，估算 1.25 GiB（第一版 2.78）。
+  2. 自检结束后释放它的全部张量并清空缓存；前缀算完、条带开始前也清空一次缓存，先跑最大的条带。reserved 偏高的原因是前缀留在缓存里的块与条带要的块尺寸不同，条带阶段只能另外分配，两者叠加（432 行：前缀约 1.0 + 条带 1.6 ≈ 2.66）。
+  3. `aten::fill_`：来自 PyTorch 的 SlowDilated3d 后端（CUDA/HIP 上关掉 cuDNN 后 Conv3d 走它），每次调用按输出通道逐个 `fill_(bias[n])`。单帧的 Conv3d 改用 conv2d（Slow2d：一次 `copy_` 设 bias，columns 和 GEMM 与 3D 路径相同）。
+  4. 内存模型按 forward 代码重新数了一遍，与实测 alloc 逐项吻合（±5 MiB）；每个阶段加 `x/6 + 64 MiB` 的分配器余量。短条带时 4K 估算 1.25 GiB（第一版 1.77，实测 reserved 1.07）。
+
 ## 11. 仓库结构
 
 ```
@@ -548,14 +601,14 @@ docs/DESIGN.md              设计说明
 |---|---|
 | 默认 | 启用，预算 1 GiB |
 | `MONOLOAD_VAE_WORKSPACE=512M` | 预算（卷积每块的展开缓冲、注意力每块的分数矩阵 + softmax 结果）。写法 `1G`、`512M`、`768`（纯数字按 MiB）。越小峰值越低、块越多 |
-| `MONOLOAD_VAE_BUDGET=3G` | 第一层的峰值预算（§12.7） |
+| `MONOLOAD_VAE_BUDGET=2G` | 第一层的峰值预算（§12.7）；不设时用默认策略 |
 | `MONOLOAD_DISABLE_VAE_STRIPE=1` | 关掉第一层，所有受管理的解码都走第二层 |
 | `MONOLOAD_VAE_STRIPE_ROWS=128` | 强制第一层的条带核心高度（扫参、调试） |
 | `MONOLOAD_DISABLE_VAE=1` | 只关 VAE 部分，LoRA 部分不受影响 |
 | `MONOLOAD_EXACT=1` | VAE 走原生（分块会改变 GEMM 形状，不保证逐位一致） |
 | `MONOLOAD_DISABLE=1` | 什么都不装 |
 
-启动日志写明状态和预算：`[Monoload] VAE decode managed: ... workspace 1.00 GiB ...` 加上 `[Monoload] VAE layer 1 (stripe decoding) on ...: peak budget 3.00 GiB ...`（或 `... off`），或 `[Monoload] VAE decode: native (...)`。每次解码的日志写明用了哪一层：`-> layer 1 (Wan 2.1 stripes): 5 stripes of 432 rows (core), recompute 1.07x, checkpoint 95 MiB; budget 3.00 GiB, ...` 或 `-> layer 2, op-level chunking ...`。
+启动日志写明状态和策略：`[Monoload] VAE decode managed: ... workspace 1.00 GiB ...` 加上 `[Monoload] VAE layer 1 (stripe decoding) on ...: default stripe policy: the peak of 128-row stripes, tallest stripes within it ...`（设了预算时是 `peak budget ... (MONOLOAD_VAE_BUDGET)`；或 `... off`），或 `[Monoload] VAE decode: native (...)`。每次解码的日志写明用了哪一层：`-> layer 1 (Wan 2.1 stripes): 14 stripes of 155 rows (core), recompute 1.21x, checkpoint 95 MiB; default: peak of 128-row stripes, workspace 384 MiB; memory estimate 1.25 GiB ...` 或 `-> layer 2, op-level chunking ...`。
 
 ### 12.4 覆盖范围
 
@@ -576,7 +629,7 @@ docs/DESIGN.md              设计说明
 * 已完成：管理入口、第二层（卷积行分块 + 注意力 query 分块）、OOM 策略、开关、CPU 测试（`tests/test_vae.py`）、真机测量脚本（`tests/bench_vae.py`，9.7）。
 * 已在 CT 700 上测完（§10.1）：峰值主因是 im2col 展开缓冲；4K 峰值降到原来的 1/4～1/6（SDXL / Flux alloc 45.6 → 11.2 GiB，Qwen 32.0 → 6.5 GiB）；高分辨率反而更快；PSNR ≥ 60 dB，没有接缝；估算是有效上界。
 * 精度已用 fp32 参照确认：max|Δ| 离群点是 bf16 固有噪声，分块在 fp32 下与整图等价（§10.1）。**第一阶段验收通过。**
-* 第二阶段（Qwen 的第一层）已实现，见 §12.7；真机测试按 9.7 的「第二阶段」命令进行。
+* 第二阶段（Qwen 的第一层）已实现并通过真机验收（§10.2），之后调整了默认策略，见 §12.7。
 * 实现细节、行区间推导和第三阶段计划见 DESIGN.md §9。
 
 ### 12.7 第二阶段：第一层条带解码（`qwen_image_vae` / Wan 2.1 VAE 单帧）
@@ -586,12 +639,23 @@ docs/DESIGN.md              设计说明
 * **前缀整图算，存一个低分辨率存档：** `conv2`、`conv1`、middle（注意力继续用第二层的 query 分块）和最低分辨率的 3 个残差块都在 H/8 上整图计算，结果就是存档（H/8，384 通道，4K 时约 95 MiB）。
 * **之后按输出条带倒推重算：** 对每条输出条带 `[o0, o1)`，从 head 往回逐个单元推出需要的输入行：3×3 卷积两侧各多 1 行，残差块（两个 3×3 卷积）各多 2 行，nearest×2 上采样 `[⌊a/2⌋, ⌈b/2⌉)`，逐点运算不变，与图像边界求交（4K 时存档上每侧约 7 行）。然后从存档上取这些行，依次调用**原模型里的模块实例**（comfy.ops 的 cast / weight_function 照常，条带内的大卷积照样受第二层工作区约束），每个单元只保留需要且精确的那些行，最后只把核心行写进预先分配的输出。
 * **zero padding 只在真实边缘起作用：** 模块对切片照常补零，但凡是受切片内部边界补零影响的输出行（每侧恰好 halo 行），都按全局坐标算出来并丢掉，不会进入后续计算；每个单元都检查「需要的行 ⊆ 精确的行」，不满足就是内部错误。图像真正的上下边缘处补零与整图完全一样。
-* **峰值预算：** 按形状事先估算前缀峰值、存档、输出缓冲和每条带的工作集，自动选出满足 `MONOLOAD_VAE_BUDGET`（默认 3 GiB）的最高条带。条带内的工作区取 `min(MONOLOAD_VAE_WORKSPACE, 预算/8)`。估算交给 `load_models_gpu`，是上界。4K 时默认预算选出 5 条 432 行的条带，卷积重算约 1.07 倍，估算 2.78 GiB；1344×768 一条带就放得下（不重算）。
+* **内存估算：** 按形状事先算出前缀峰值、存档、输出缓冲和每条带每个单元的峰值（按 forward 代码逐个数同时存活的张量，与真机实测 alloc 吻合到 ±5 MiB），每个阶段再加缓存分配器的余量（`x/6 + 64 MiB`），交给 `load_models_gpu`。前缀算完、条带开始前清空一次缓存，并先跑最大的条带，让条带阶段的块不叠在前缀留下的缓存上；自检结束后也释放它的全部张量并清空缓存。
+* **默认条带高度：在不明显变慢的前提下尽量低峰值。** 以 128 行条带的估算为目标，取估算不超过它的最高条带（真机扫参：4K 时 128 行已经到了峰值下限、速度与 432 行相同，64 行起明显变慢）。条带阶段的峰值低于整图前缀时（大图），条带可以更高而不多占内存；小图就是 128 行；不足 128 行的图一条整图。条带内的工作区 384 MiB（`MONOLOAD_VAE_WORKSPACE` 更小时取它）。按全尺寸 Qwen 结构算出的计划（bf16）：
+
+| 输出 | 默认规则选出 | 重算 | 估算 | 第一版（3 GiB 预算） |
+|---|---|---|---|---|
+| 1344×768 | 6 条 128 行 | 1.23× | 754 MiB | 1 条 768 行，估 1.88 GiB |
+| 2688×1536 | 12 条 128 行 | 1.25× | 973 MiB | 3 条 512 行，估 2.36 GiB |
+| 3840×2160 | 14 条 155 行 | 1.21× | 1.25 GiB | 5 条 432 行，估 2.78 GiB |
+| 7680×4320 | 12 条 360 行 | 1.09× | 3.48 GiB | 放宽到约 4.8 GiB 的预算 |
+
+  4K 预期实测峰值就是前缀（alloc 约 0.94、reserved 约 1.07 GiB）。`MONOLOAD_VAE_BUDGET` 设了就改为「预算内最高的条带」（工作区 = 预算/8，至少 64 MiB），`MONOLOAD_VAE_STRIPE_ROWS` 强制条带高度，两者都优先于默认规则。
+* **单帧 Conv3d 改走 conv2d：** 关掉 cuDNN/MIOpen 后，PyTorch 在 GPU 上用 SlowDilated3d 跑 Conv3d，每次调用按输出通道逐个 `fill_(bias)`（真机 profile 里 15.9 万次 `aten::fill_`）。单帧、时间 kernel 实际为 1 的 Conv3d 调用改成在第 0 帧上调 `F.conv2d`（Slow2d：一次 `copy_` 设 bias，im2col 和 GEMM 与 3D 路径相同），只在 GPU + cuDNN 关闭时生效，第二层的单帧 Wan 解码也一样。
 * **自检：** 每种结构在本进程第一次使用时，用 fp32 副本（只复制 conv2 和 decoder，测完释放）、24×24 的 latent、强制 40 行的条带（5 条，最后一条较短，条带内的大卷积再分块），和原生 `WanVAE.decode` 整图对比，相对误差 ≤ 1e-4 才启用第一层。结果按结构缓存，不改变随机数状态。不通过就对这种结构禁用第一层，改走第二层，日志里醒目地警告。
 * **识别（按真实结构，不看文件名）：** `first_stage_model` 是 `comfy.ldm.wan.vae.WanVAE`、decoder 是 `Decoder3d`；upsamples 里只有 ResidualBlock 和 Resample（upsample2d / upsample3d，nearest(-exact)×2 + 3×3 卷积），没有 AttentionBlock；归一化都是 RMS_norm；卷积 stride 1、kernel 3 或 1、padding 符合预期；Dropout 处于 eval 或 p=0；模块上没有 forward hook 或实例级 forward 替换；latent 是 T=1、通道数对得上；没有 vae_options。任何一项不符就走第二层，并对这个 VAE 打一条日志说明哪里不符。Wan 2.2（48 通道）等其他结构都不匹配。
 * **OOM：** 条带高度和工作区一起减半重试，到 8 行 / 64 MiB 仍不行就抛 `MonoloadVAEOOMError`。不退回 tiled，也不退回第二层（第二层的峰值更高）。
-* **预算放不下：** 显式设了 `MONOLOAD_VAE_BUDGET` 时直接报错，写明需要多少。用默认预算时（例如 8K，整图前缀本身就要约 4.5 GiB），把预算放宽到能达到的最低峰值，在它之内用最高的条带，并打警告。
+* **预算放不下：** 设了 `MONOLOAD_VAE_BUDGET` 而 8 行的条带也放不下时直接报错，写明需要多少。默认规则没有这个问题：它的目标本身就是能达到的峰值（不低于整图前缀）。
 
-**限制：** 只覆盖 Wan 2.1 VAE 的单帧解码；SDXL / Flux 等 LDM decoder 是第三阶段（需要 GroupNorm 的全局统计调度），目前继续走第二层，行为不变。前缀仍然整图计算，4K 时它（主要是全局注意力的 q/k/v 和分数块）决定了约 1.8 GiB 的峰值下限。条带越矮重算越多（4K：128 行约 1.26 倍，32 行约 2.1 倍）。
+**限制：** 只覆盖 Wan 2.1 VAE 的单帧解码；SDXL / Flux 等 LDM decoder 是第三阶段（需要 GroupNorm 的全局统计调度），目前继续走第二层，行为不变。前缀仍然整图计算，4K 时它（全局注意力的 q/k/v、注意力输出和分数块）决定了约 0.94 GiB（alloc）/ 1.07 GiB（reserved）的峰值下限，8K 约 2.6 GiB。条带越矮重算越多（4K：128 行约 1.26 倍，32 行约 2.1 倍）。分配器余量是按实测标定的，不是证明出来的上界。
 
-**状态：** CPU 测试通过（`tests/test_vae_stripe.py`），真机测试待做（9.7 的「第二阶段」命令）。细节见 DESIGN.md §9.13。
+**状态：** 第一版（4e54d20）真机验收通过（§10.2）：4K GTT 59.2 → 2.7 GiB，速度与原生相同，精度与原生同为 bf16 水平，没有接缝。之后按实测调整了默认策略、内存模型和缓存处理（上面几条），CPU 测试通过；调整后的真机复测按 9.7 的「第二阶段调整后的复测」命令。细节见 DESIGN.md §9.13。
