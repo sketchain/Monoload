@@ -8,8 +8,9 @@ v1（tag `v1-converter`，远端归档分支 `archive/v1-converter`）做的是�
 
 v2 只做一件事：**在 ComfyUI 原生加载出来的模型上打 LoRA 时，不改原权重、不做任何备份，而是在每一层计算的那一刻临时合并。** 对工作流透明：原生 `UNETLoader`、`CheckpointLoaderSimple`、`CLIPLoader`、`LoraLoader`、`LoraLoaderModelOnly`、Hook LoRA 节点照常使用。
 
-在此基础上还有三点：
+在此基础上还有四点：
 
+* **VAE 解码降峰值（§9，第一阶段）。** 接管 `comfy.sd.VAE.decode`：自己估算内存、batch 逐张、卷积按输出行分块、注意力按 query 分块，结果与整图解码数学等价；OOM 只缩小分块重试，绝不退回 tiled 近似解码。与 LoRA 部分相互独立。
 * **合并有两条路径（§3.1）。** 默认路径：普通 LoRA / LoCon 用一次融合的 `addmm_` 直接加进计算 dtype 的临时权重（方案 C），其他类型在计算 dtype 下走 `calculate_weight`（方案 A，与原生 lowvram 的数值相同）。这条路径与原生合并不逐位一致，误差界见 §5.5。设 `MONOLOAD_EXACT=1` 时走逐位一致路径，结果与原生完全相同。
 * 量化层（fp8 scaled 等）上的 LoRA 合并在反量化出来的临时权重上，不再重新量化（§3.3）。
 * 每个 prompt 结束后释放 LoRA，底模继续常驻（§7）。
@@ -361,3 +362,186 @@ CPU 上计算 dtype 是 fp32，默认路径在 fp32 下合并、不舍入回 fp1
 * LoRA 文件由原生 `LoraLoader` 读取，在一个 prompt 执行期间常驻 CPU 内存；计算设备上另有一份被用到的 LoRA 张量缓存。prompt 结束后两者都会释放（§7），设了 `MONOLOAD_KEEP_LORA=1` 则保留，和原生一样。
 * 量化层上的 LoRA 与原生不逐位一致（§3.3，有意为之）。
 * 本仓库的测试都在无 GPU 的机器上用 `--cpu` 跑；GPU 上的数值一致性和耗时要按 README 的真机验收步骤确认。
+* VAE 部分的限制见 §9.9。
+
+## 9. VAE 解码降峰值（第一阶段：解码管理入口 + 逐算子分块 + 测量工具）
+
+依据：《ComfyUI VAE 条带解码调研报告》（2026-10-02，源码基线同上）。报告和需求冲突的地方以需求为准；报告里的峰值是推导值，要用 `tests/bench_vae.py` 在 CT 700 上确认（§9.10）。
+
+### 9.1 问题
+
+**调用链**（按 62b3c94 核实）：`VAEDecode.decode` → `comfy.sd.VAE.decode(samples)`：2D VAE 收到 5D 输入时取第一帧；`memory_used = memory_used_decode(shape, vae_dtype)`；`load_models_gpu([patcher], memory_required=memory_used)`；`batch_number = int(free / memory_used)`；逐批 `first_stage_model.decode(samples)` → `.to(output_device, intermediate_dtype, copy=True)` → 写进 `pixel_samples` → `process_output`（`(x+1)/2` 再 clamp 到 [0,1]，原地）；最后 `movedim(1,-1)` 成 NHWC。SDXL 是 `AutoencoderKL`（先 `post_quant_conv`），Flux `ae` 是 `AutoencodingEngine`，两者的 decoder 都是 `comfy.ldm.modules.diffusionmodules.model.Decoder`；`qwen_image_vae` 是 `comfy.ldm.wan.vae.WanVAE`，先 `conv2` 再 `Decoder3d`，单帧时 `feat_map=None`。
+
+**峰值从哪来**（报告 C、E 节的推导，未实测）：
+
+* 禁用 MIOpen 后（`torch.backends.cudnn.enabled = False`，在 `model_management.py` 的 AMD 分支，`COMFYUI_ENABLE_MIOPEN=1` 可跳过），普通 3×3 卷积走 Slow2d：先 im2col 展开成 `[Cin·k·k, Hout·Wout]` 的 columns，再 GEMM。bf16 下 columns 是 `18·Cin·Hout·Wout` 字节。4K 输出时最后一层 Conv256→256 的 columns 约 35.6 GiB，加上输入输出，SDXL 原版 4K 解码峰值约 45 GiB；Qwen 最大的是全尺寸 Resample Conv192→96，约 31 GiB。**峰值主要来自展开缓冲，而不是激活本身**（同一层的激活只有 2–4 GiB）。
+* 全局注意力只在最低分辨率（H/8）的 mid block，但 4K 时 N ≈ 13 万，一张 bf16 分数矩阵约 31 GiB。原生 `slice_attention` 按当前空闲内存选切片数，峰值不固定。AMD 上 `pytorch_attention_enabled_vae()` 返回 False，所以实际走 split（`normal_attention`）。
+* `memory_used_decode`：AMD 上 `VAE_KL_MEM_RATIO = 2.73`，SDXL 4K 估约 92 GiB，Wan/Qwen 约 34 GiB。`load_models_gpu` 按这个值腾内存，`--gpu-only` 下也会走卸载流程（`free_memory` 没有「HIGH_VRAM 不卸载」的保护），batch 也按它切。
+* 真 OOM 后原生退回 `decode_tiled_`：每个 tile 各自做 GroupNorm、各自做注意力，靠重叠融合。正确的全局方差是 `Σ p_i·[var_i + (mean_i − mean)²]`，tile 内统计漏了组间项，任何固定 halo 也恢复不了全局注意力，所以**结果和整图不等价**。这违反 Monoload 的原则：不悄悄退回近似路径，也不悄悄退回高占用路径。
+
+### 9.2 三层设计
+
+目标：结果和原版整图解码**数学等价**（只差浮点误差，不要求逐位一致），峰值尽量低，允许多花算量换显存。
+
+| 层 | 适用 | 做法 | 状态 |
+|---|---|---|---|
+| 第一层：条带解码 | 认得的结构（LDM `Decoder`、Wan `Decoder3d` 单帧） | 低分辨率前缀（含 mid 全局注意力）整图算；只在每个分辨率阶段末尾存档；按输出条带倒推每层所需的输入行区间并重算；GroupNorm 的全局统计逐层空跑求得（条带内 fp32 Welford，跨条带 Chan 合并）；按峰值预算自动选条带高度和存档方案，满足不了就报错 | 第二阶段（Qwen）、第三阶段（LDM） |
+| 第二层：逐算子分块 | 不认识结构也能用 | 原 forward 原样运行，只在受管理的解码过程中替换重算子：卷积按输出行分块，限制 im2col 工作区；注意力按 query 分块，K/V 完整，每个 query 仍对全图做 softmax。整图语义不变，算量约 1 倍 | **本阶段实现** |
+| 兜底 | 前两层都处理不了 | 原生整图解码（结果本身正确），打一条日志 | 本阶段实现 |
+
+第二层不减少激活本身（每层的完整输入输出仍然存在），只去掉 columns 和分数矩阵这两类「临时大块」；第一层再去掉高分辨率激活。报告 E.1 的建议也是先做第二层这个 baseline：如果它已经满足 62.5G GTT 的目标，第一层可以按需推进。
+
+### 9.3 接入点
+
+**VAE.decode（管理入口，`monoload/vae.py`）。** 与 hotpatch 相同的做法：`install()` 保存 `comfy.sd.VAE.__dict__["decode"]`，在类上换成 Monoload 的版本，`uninstall()` 恢复。安装前检查签名和依赖的接口：`VAE.decode(self, samples_in, vae_options)`、comfy Conv3d / torch Conv2d 的 `_conv_forward(self, input, weight, bias, ...)`、`load_models_gpu(memory_required=...)`、三个注意力函数、`raise_non_oom` 等；任何一项不符就打警告、不安装，VAE 保持原生。选这个入口的理由（报告 B.5）：只有它能同时控制内存估算、batch、输出和 OOM；只换 `Decoder.forward` 会被原生的整图估算和自动 tiled 回退包住；替换 `first_stage_model` 要重建模型树，容易破坏 state_dict 前缀和 patcher 引用。
+
+**卷积。** 在 62b3c94 上核实的调用链：
+
+```
+comfy.ops.disable_weight_init.Conv2d.forward
+  ├─ comfy_cast_weights 或有 weight_function / bias_function（manual_cast、lowvram、Monoload 的运行时 LoRA）:
+  │    forward_comfy_cast_weights(input)
+  │      with CastBiasWeightContext(self, input, offloadable=True) as (weight, bias):   # cast_bias_weight：dtype/设备转换、weight_function
+  │          return self._conv_forward(input, weight, bias)
+  └─ 否则: torch.nn.Conv2d.forward(input) → self._conv_forward(input, self.weight, self.bias)
+comfy Conv3d 多一个 autopad 参数，并重写了 _conv_forward：
+  _conv_forward(input, weight, bias, autopad=None): autopad == "causal_zero" 时 weight = weight[:, :, -T:]；
+  NVIDIA 的 cudnn workaround；否则 super()._conv_forward → F.conv3d(input, weight, bias, stride, self.padding, dilation, groups)
+```
+
+两条路径最后都落在 `self._conv_forward(input, 最终权重, bias, ...)`。所以接入点选它：受管理的解码开始时，给 VAE 模型里每个 `torch.nn.Conv2d` / `Conv3d` 实例（comfy.ops 的各个变体都是它们的子类）设一个**实例属性** `_conv_forward`，解码结束（含异常）时删掉。实例属性优先于类方法，所以：
+
+* 覆盖 cast 路径和非 cast 路径，拿到的是 `cast_bias_weight` 处理完的权重，不绕过 weight_function（实测一次卷积调用只调用一次 weight_function，而不是每块一次）；
+* 每块仍然调用**原来的** `_conv_forward`（autopad 截断、后端 workaround、`padding_mode` 处理都照旧），只是 H 方向的 padding 临时设为 0，由 Monoload 在真实边缘补零（§9.5）；
+* 只作用于这一个 VAE 的模块，只在受管理的解码期间存在，UNet / CLIP 完全不受影响；不改类，也不改全局函数。
+
+**注意力。** `AttnBlock`（LDM）和 Wan 的 `AttentionBlock` 都在 `__init__` 里把 `vae_attention()` 的结果存成实例属性 `optimized_attention`。受管理期间，若它是 ComfyUI 的三个 VAE 注意力函数之一（`normal_attention` / `pytorch_attention` / `xformers_attention`），就换成对应的分块版本，结束时还原；不认识的实现（第三方替换过的）保持原样，并在日志里列出。
+
+### 9.4 内存估算
+
+管理入口给 `load_models_gpu` 报的是这个上界（`vae.estimate()`）：
+
+```
+estimate = 4 × A_max + 2 × workspace + 输出缓冲 + 一个 latent 样本
+  A_max     ：一个样本解码过程中最大的单个激活张量（字节）
+  workspace ：MONOLOAD_VAE_WORKSPACE（默认 1 GiB）
+  输出缓冲  ：整个 batch 的输出（intermediate dtype，fp32），仅当输出设备就是 VAE 所在设备时（--gpu-only）计入
+```
+
+* **A_max 怎么得到。** 每个 VAE（按 latent 通道数和维数）第一次受管理解码时，先用 8×8 的零 latent 跑一次小解码，用 forward hook 记录所有模块输入输出里最大的张量，换算成「每个 latent 像素多少字节」并缓存；这几种 decoder 都是全卷积、尺度因子固定，激活大小与 latent 面积成正比。小解码期间保存并恢复全局 RNG 状态。小解码失败时退回静态上界：最宽的卷积通道数 × 完整输出分辨率。
+* **为什么是 4 × A_max。** 第二层不改 forward，峰值时刻同时存活的大张量是：残差块的输入 x（留给 shortcut）、norm 的输出、正在写的卷积输出；上采样处是上采样前的输入、上采样后的张量、卷积输出。按 62b3c94 的代码逐块数下来，LDM 约 2.5 × A_max（全尺寸 256→128 的残差块：x 256 通道 + norm1 输出 256 + conv1 输出 128），Wan 约 2 × A_max（RMS_norm 的 `F.normalize(x) * scale * gamma` 会多出两个临时量）。取 4 倍给分配器碎片留余量。
+* **为什么是 2 × workspace。** columns 本身 ≤ workspace；每块还有输入块的连续拷贝（约 columns / k²）、输出块（拷进预分配输出前）和 GEMM 内部工作区。注意力的预算已经包括分数矩阵和 softmax 结果两份（§9.6）。
+* **数字**（用真实宽度、随机权重的模型跑小解码得到，bf16）：
+
+| 输出 | SDXL / Flux：A_max | Monoload 估算 | 原生（AMD，×2.73） | Qwen：A_max | Monoload 估算 | 原生（AMD） |
+|---|---|---|---|---|---|---|
+| 1344×768 | 0.49 GiB | 3.98 GiB | 11.43 GiB | 0.37 GiB | 3.49 GiB | 4.23 GiB |
+| 2688×1536 | 1.97 GiB | 9.92 GiB | 45.73 GiB | 1.48 GiB | 7.95 GiB | 16.92 GiB |
+| 3840×2160 | 3.96 GiB | 17.91 GiB | 91.86 GiB | 2.97 GiB | 13.96 GiB | 33.99 GiB |
+
+  A_max 与报告 E.2 的推导一致（SDXL 是全尺寸 256 通道那张图：上采样后、送进 up0 第一个残差块之前；Qwen 是全尺寸 192 通道）。这些都是上界，真实峰值要看 bench（§9.10）；bench 会把估算值和实测的 `max_memory_allocated` 增量并排列出。
+* 第一次解码某个 VAE 时要先加载权重才能跑小解码，所以那一次会调用两次 `load_models_gpu`（第一次只报 8×8 的小估算，第二次报真实估算）；之后用缓存，只调用一次。
+
+### 9.5 卷积分块：行区间推导
+
+记 H 方向的 kernel、stride、dilation 为 k、s、d，上下 zero padding 为 p_lo、p_hi，输入行数 H，则输出行数 `Hout = ⌊(H + p_lo + p_hi − d(k−1) − 1) / s⌋ + 1`。输出第 o 行读 padding 后的第 `s·o … s·o + d(k−1)` 行，即输入的第 `s·o − p_lo … s·o − p_lo + d(k−1)` 行。对输出行块 `[o0, o1)`：
+
+```
+lo = s·o0 − p_lo
+hi = s·(o1 − 1) + d·(k − 1) − p_lo + 1        # 不含
+真实输入行 [max(lo, 0), min(hi, H))，上方补 max(0, −lo) 行零，下方补 max(0, hi − H) 行零
+```
+
+可以证明 `hi ≤ H + p_hi`，所以补零只会出现在真实的上下边缘：块与块之间用的都是真实的相邻行，内部块一行零都不补。每块交给原来的 `_conv_forward`，H 方向 padding 临时设为 0，其他维度：
+
+* zero padding 对称的维度（W，以及 Conv3d 的 T）照常交给卷积自己处理；
+* `padding="same"` 且 kernel 为偶数时两侧不对称（torch 把多出的一格放在高端）：H 方向按上式处理，其他维度对每块显式 `F.pad`；`padding="valid"` 就是 0；
+* `padding_mode` 为 reflect / replicate / circular：与 torch 自己的做法相同，先对整个输入按该模式 `F.pad`，再对 pad 好的输入按 padding = 0 分块（这时整张 pad 出来的副本与原生一样存在）；
+* stride、dilation、groups、任意 kernel 都按上式处理（groups 只影响 Cin/groups）。测试覆盖：3×3/5×5 dil2/4×4 s3/3×1/1×3/2×5 s(2,1) dil(1,2)、groups 2 和 depthwise、same / valid、三种非零 padding_mode、Conv3d（含 stride 和 replicate）。
+
+**Conv3d autopad="causal_zero" 与 Wan CausalConv3d。** 62b3c94 里 `CausalConv3d.forward` 在 T=1、没有 cache 时直接 `super().forward(x, autopad="causal_zero")`：comfy Conv3d 把时间 kernel 截成最后 T 帧，padding 为 (0, p, p)，**不做任何整张拷贝**；T>1 时只在时间维 `torch.cat` 零帧（整张拷贝一次），空间 padding 仍交给卷积。这两种情况分块都只动 H，与时间维无关。（需求里写的「先对整个张量做 F.pad，再以 padding=0 调卷积」是 Wan 官方仓库的写法，不是这个版本；这个版本的单帧路径没有整张 pad 的副本。）
+
+**预算。** 每块的 columns 估算为 `(Cin/groups) × ∏k × 块输出行数 × Wout（Conv3d 再乘 Tout）× batch × dtype 字节`（causal_zero 时 kT 取截断后的值）。整层的估算不超过预算就直接调用原 `_conv_forward`，与原生完全相同；超过时每块行数 = `⌊预算 / 每行 columns⌋`，至少 1 行。1×1、stride 1、无 padding 的 Conv2d 在 Slow2d 里不做 im2col（直接 GEMM），工作区按 0 计，不分块。
+
+输出按完整形状预分配一次（dtype、设备取第一块的结果），逐块 `copy_` 进去。每块的输入是原张量在 H 上的一个视图，卷积内部会拷成连续的块（只有块那么大）。
+
+### 9.6 注意力分块
+
+每块 query 数 = `⌊预算 / (2 × B × N × 元素字节)⌋`（至少 1），即一块的分数矩阵和它的 softmax 结果两份合计不超过预算。4K、bf16、1 GiB 时 N = 129600，每块 2071 个 query，约 63 块。
+
+* split（AMD 上实际用的）：复刻 `normal_attention` + `slice_attention`：`r1 = zeros_like(k)`；每块 `s1 = bmm(q[:, i:end], k) * scale`，`softmax(s1, dim=2)`（输入 dtype），`r1[:, :, i:end] = bmm(v, s2)`。与原生唯一的区别是块大小固定由预算决定（原生按空闲内存选 steps，且要求整除）。
+* pytorch：与 `pytorch_attention` 相同的 reshape，SDPA 对 q 分块、K/V 完整；块数为 1 时与原生是同一次调用。
+* xformers：`memory_efficient_attention` 对 q 分块；遇到 NotImplementedError 时改走分块的 split（原生在这里退回 `slice_attention`）。
+
+每个 query 的 softmax 仍然覆盖全图，没有引入局部注意力。
+
+### 9.7 OOM 策略
+
+```
+workspace = MONOLOAD_VAE_WORKSPACE
+loop:
+    try: 解码（逐张，OpChunking 生效）
+    except e: raise_non_oom(e)（非 OOM 原样抛出）；标记 OOM
+    离开 except 块后（异常和它引用的张量都已释放）：soft_empty_cache(True)
+    workspace 已到下限 min(64 MiB, 设置值) → 抛 MonoloadVAEOOMError（写明下限、重试次数、latent 形状、估算值）
+    否则 workspace 减半，打警告，重试
+```
+
+`decode_tiled_` 等 tiled 路径**从不调用**（测试里替换成计数器确认）。所有实例属性在 `OpChunking.__exit__` 里还原，异常时也一样；与 prompt 结束后的 LoRA 释放没有共享状态。
+
+### 9.8 覆盖范围与兜底
+
+| 情况 | 处理 |
+|---|---|
+| 4D latent（2D VAE：SDXL、Flux `ae` 等） | 第二层 |
+| 5D latent 给 2D VAE | 与原生一样取第一帧，第二层 |
+| 5D、T=1 给 3D VAE（Wan 2.1 / `qwen_image_vae` 等） | 第二层 |
+| 多帧视频（5D、T>1） | **暂时**交给原生，打日志。这是第一阶段暂时不做，不是永远不做：多帧需要按时空分别规划（时间 cache、首帧特例），留到第一层之后 |
+| 1D / 音频 latent、`comfy_has_chunked_io` 的 VAE（LTX、MiniMax：自己往预分配输出里写） | 原生，打日志 |
+| 用户显式用 `VAEDecodeTiled` 节点或 `VAE.decode_tiled` | 不经过 `VAE.decode`，保持原生（用户自己选择了 tiled 的语义） |
+| 直接调用 `first_stage_model.decode` 的第三方代码 | 不经过 `VAE.decode`，原生 |
+
+第二层对结构没有要求：只要卷积是 `torch.nn.Conv2d/Conv3d`（含 comfy.ops），注意力是 ComfyUI 的三个 VAE 注意力函数之一，就会被分块；其他算子照原样运行（不会出错，只是峰值不一定降下来）。
+
+### 9.9 开关与限制
+
+| 设置 | 效果 |
+|---|---|
+| 默认 | 安装管理入口，预算 1 GiB |
+| `MONOLOAD_VAE_WORKSPACE` | 预算：`1G`、`512M`、`768`（纯数字按 MiB）等 |
+| `MONOLOAD_DISABLE_VAE=1` | 只关 VAE 部分，LoRA 部分照常 |
+| `MONOLOAD_EXACT=1` | VAE 走原生：分块改变 GEMM 形状，不保证逐位一致 |
+| `MONOLOAD_DISABLE=1` | 什么都不装 |
+
+命名：需求里举例的是 `MONOLOAD_VAE=0`；现有开关都是「设为 1 时改变默认行为」（`MONOLOAD_DISABLE`、`MONOLOAD_EXACT`、`MONOLOAD_KEEP_LORA`），所以关闭开关取名 `MONOLOAD_DISABLE_VAE=1`，与 `MONOLOAD_DISABLE=1` 对应。
+
+限制：
+
+* 不逐位一致：块的 GEMM 形状不同，累加顺序可能不同。CPU fp32 上整个 decoder 的差异在 1e-6 量级，bf16 在 CPU 上恰好为 0；GPU 上要看 bench 里 `monoload vs native` 与 `native2 vs native` 的对比。
+* 第二层不减少激活本身：4K 时 SDXL 的全尺寸激活仍有约 4 GiB 一张，峰值预计在 10–15 GiB 量级（待实测）。再往下要靠第一层。
+* 速度：算量约 1 倍，但块多了以后有额外的启动和拷贝开销；每块的形状不同，第一次运行可能有额外的 kernel 选择开销（hipBLASLt）。冷/热分开看 bench。
+* 不认识的注意力实现、非 `torch.nn.ConvNd` 的卷积不分块。
+
+### 9.10 测试与待真机确认的问题
+
+**CPU 测试**（`tests/test_vae.py`，锁定镜像，`--cpu`，不需要模型文件）：
+
+* 卷积 53 项（§9.5 列出的 27 种配置，多数在 1 字节预算——每块 1 行——和 64 KiB 预算下各一次）：与不分块的结果比，相对误差最大 4.6e-7（多数为 0；判定阈值 fp32 1e-5）；cast 路径（fp16 权重、fp32 输入）带 weight_function 时，17 块只调用一次 weight_function；1×1 / stride 1 不分块。
+* 注意力：split / pytorch 在 fp32、bf16 下，块大小 1、5、N、超过 N，与原生相同（fp32 相对误差 ≤ 3.5e-7，bf16 为 0）；`AttnBlock` 的实例替换与还原；不认识的实现保持原样。
+* 整个 decoder：用 ComfyUI 自己的类、小通道配置、随机权重构造 state dict，交给 `comfy.sd.VAE` 识别：SDXL 式（`AutoencoderKL`，z=4）、Flux 式（`AutoencodingEngine`，z=16）、Wan/Qwen 式（`WanVAE`，5D T=1）。16 KiB 和 256 KiB 预算（绝大多数卷积被分块，16 KiB 时每块 1 行），与原生 `VAE.decode` 比较：raw 输出 max|Δ| ≤ 7.2e-6，像素 ≤ 3.2e-6（fp32）；bf16 VAE 为 0；batch 2、5D 给 2D VAE、7×13 的奇数尺寸同样通过；输出形状、dtype、设备、NHWC 与原生相同；`load_models_gpu` 收到的是 Monoload 的估算；RNG 状态不变；预算足够大时不分块、与原生逐位一致。
+* 兜底与 OOM：多帧 latent 交给原生且结果相同；模拟「预算高于 128 MiB 就 OOM」时从 512 MiB 两次减半到 128 MiB 后成功；始终 OOM 时在 64 MiB 抛 `MonoloadVAEOOMError`；两种情况都没有调用 `decode_tiled_`，异常后模块上没有残留的实例属性；非 OOM 异常原样抛出。
+* 合计 130 项检查，0 失败。`tests/test_entry.py`：默认、`MONOLOAD_DISABLE=1`、`MONOLOAD_KEEP_LORA=1`、`MONOLOAD_EXACT=1`、`MONOLOAD_DISABLE_VAE=1`、`MONOLOAD_VAE_WORKSPACE=512M` 六种组合下的安装状态全部正确；LoRA 部分的 `test_dtype_paths.py` 两种模式（198 / 108 项）照旧全部通过。
+
+**真机要回答的问题**（`tests/bench_vae.py`，用法见 README §9.7）：
+
+1. 原生峰值的主因是不是 im2col / Slow2d 的 columns（`--profile` 的算子表和峰值时刻的存活分配）。
+2. 第二层把峰值降到多少，与 §9.4 的估算差多少；GTT / cgroup 是否同步下降。
+3. 精度：`monoload vs native` 与 `native2 vs native` 的量级对比，块边界附近有没有系统性误差。
+4. 速度：冷/热耗时与原生相比。
+
+### 9.11 后两阶段计划
+
+* **共同部分。** 结构识别按真实模块（类型、通道、kernel、stride、padding、norm、注意力）而不是文件名；每种结构第一次使用时用小 latent 和原生对比自检，不通过就对这个 VAE 禁用第一层、醒目警告，退回第二层。适配按积木写：残差块（GN 版、RMS 版）、nearest 上采样 + 卷积、低分辨率注意力块、头尾。接口已在 `vae.STRIPE_ADAPTERS` 留好（`match` / `self_test` / `estimate` / `decode`），第一阶段为空。
+* **第二阶段：Qwen（Wan `Decoder3d` 单帧）。** RMS 逐位置归一化，没有全局统计：conv1 + middle（含全局注意力，用第二层的 query 分块）整图算，存档放在每个分辨率阶段末尾；之后按输出条带倒推每层的输入行区间（§9.5 的公式逐层递推，nearest 2× 为 `[⌊a/2⌋, ⌈b/2⌉)`，残差两支取并集），条带高度和存档方案按预算自动选择。
+* **第三阶段：LDM（SDXL / Flux `ae`）。** 30 个 GroupNorm 需要全局统计：每个 GN 的 (n, mean, M2) 在生成其输入时按条带用 fp32 Welford 累计，跨条带 Chan 合并，冻结后再算下游；残差块边界 + 上采样边界滚动存档（报告 C.5 的 pass A / pass B），旧存档直到所有消费者完成才释放。
+* 两个阶段都要求：预算满足不了就报错；OOM 只缩小条带；误差验收照 §9.10 的指标，另加逐 GN 统计对照。

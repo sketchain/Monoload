@@ -2,11 +2,15 @@
 
 Importing this package (ComfyUI does so at startup, before any model is
 loaded) installs
-  * the runtime LoRA merge on comfy.model_patcher.ModelPatcher, and
+  * the runtime LoRA merge on comfy.model_patcher.ModelPatcher,
   * the per-prompt LoRA release on execution.PromptExecutor
-    (skipped when MONOLOAD_KEEP_LORA=1).
+    (skipped when MONOLOAD_KEEP_LORA=1), and
+  * the managed VAE decode on comfy.sd.VAE.decode (op-level chunking, own
+    memory estimate, no tiled fallback; skipped when MONOLOAD_DISABLE_VAE=1
+    or MONOLOAD_EXACT=1).
 Set MONOLOAD_DISABLE=1 to leave ComfyUI completely native, MONOLOAD_EXACT=1
-for the bit-exact merge instead of the fused default (monoload/hotpatch.py).
+for the bit-exact merge instead of the fused default (monoload/hotpatch.py)
+and a native VAE decode.
 """
 
 import logging
@@ -21,7 +25,7 @@ def _flag(name):
 
 
 if _flag("MONOLOAD_DISABLE"):
-    logging.info("[Monoload] MONOLOAD_DISABLE is set: runtime LoRA merge NOT installed, ComfyUI stays native")
+    logging.info("[Monoload] MONOLOAD_DISABLE is set: runtime LoRA merge and VAE decode management NOT installed, ComfyUI stays native")
 else:
     from .monoload import hotpatch, release
 
@@ -33,5 +37,18 @@ else:
     else:
         release.install()
         logging.info("[Monoload] LoRA is released after every prompt (base models stay loaded)")
+
+    if _flag("MONOLOAD_DISABLE_VAE"):
+        logging.info("[Monoload] VAE decode: native (MONOLOAD_DISABLE_VAE is set)")
+    elif hotpatch.is_exact():
+        logging.info("[Monoload] VAE decode: native (MONOLOAD_EXACT=1; chunking changes GEMM shapes, so it is not bit-exact)")
+    else:
+        from .monoload import vae
+        from .monoload.vae_ops import fmt_bytes
+
+        if vae.install():
+            logging.info("[Monoload] VAE decode managed: op-level chunking (conv row blocks, attention query blocks), workspace {} "
+                         "(MONOLOAD_VAE_WORKSPACE), own memory estimate, OOM -> smaller blocks, never tiled; "
+                         "images only (4D / 5D T=1), set MONOLOAD_DISABLE_VAE=1 for native".format(fmt_bytes(vae.workspace())))
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

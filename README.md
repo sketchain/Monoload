@@ -6,6 +6,8 @@
 
 为 Strix Halo（gfx1151，统一内存，显存走 GTT）+ ROCm、`--gpu-only` 的配置设计。在这种配置下，原生 ComfyUI 打 LoRA 时会把被改动的原权重在 GTT 里再备份一份，LoRA 改到的权重越多，备份就越大。
 
+**另一项功能：VAE 解码降峰值（第一阶段，§12）。** 接管 `VAE.decode`：卷积按输出行分块、注意力按 query 分块，限制 im2col 展开缓冲和注意力分数矩阵；自己给 `load_models_gpu` 报真实的内存需求，不再用原生约 92 GiB（SDXL 4K）的估算去卸载别的模型；OOM 时只缩小分块重试，绝不退回 tiled 近似解码。结果与整图解码数学等价（只差浮点误差）。与 LoRA 部分相互独立，可以单独关掉。
+
 设计细节见 [docs/DESIGN.md](docs/DESIGN.md)。v1（离线转换 + pread 直读）已经废弃，代码保留在 tag `v1-converter`（远端归档分支 `archive/v1-converter`）。
 
 参考环境：`docker.io/kyuz0/amd-strix-halo-comfyui@sha256:384aa1fecef6a841832e0d5552949977330308d8c25e212a94f5e8dfcc061cae`（ComfyUI 0.31.0，commit `62b3c94b`）。
@@ -38,6 +40,8 @@ services:
       - GPU_PINNED_MIN_XFER_SIZE=65536        # 新增，见下
       # - MONOLOAD_EXACT=1                    # 与原生逐位一致的合并（每步更慢），默认是融合 fp16 addmm
       # - MONOLOAD_KEEP_LORA=1                # 不在每个 prompt 结束后释放 LoRA
+      # - MONOLOAD_DISABLE_VAE=1              # 只关掉 VAE 解码管理（§12），LoRA 部分照常
+      # - MONOLOAD_VAE_WORKSPACE=1G           # VAE 分块的工作区预算（默认 1G）
       # - MONOLOAD_DISABLE=1                  # 需要完全原生的行为时打开
     volumes:
       - /models/comfy:/opt/ComfyUI/models
@@ -72,6 +76,7 @@ docker logs comfyui 2>&1 | grep -i monoload
 # 应看到：
 #   [Monoload] runtime LoRA merge installed on ModelPatcher (no in-place LoRA, no weight backups), merge: fused fp16 addmm / relaxed (set MONOLOAD_EXACT=1 for bit-exact)
 #   [Monoload] LoRA is released after every prompt (base models stay loaded)
+#   [Monoload] VAE decode managed: op-level chunking (conv row blocks, attention query blocks), workspace 1.00 GiB ...
 ```
 
 没有额外依赖，不注册新节点（节点列表里不会出现 Monoload）。以只读方式挂载即可。
@@ -81,9 +86,11 @@ docker logs comfyui 2>&1 | grep -i monoload
 | 设置 | 效果 |
 |---|---|
 | 默认（装上即生效） | 所有 `ModelPatcher` 走运行时合并，合并用快速路径（普通 LoRA/LoCon 融合 fp16 `addmm_`，其他类型在计算 dtype 下合并）；每个 prompt 结束后释放 LoRA，日志里有 `[Monoload] released LoRA after prompt: ...` |
-| `MONOLOAD_EXACT=1` | 合并改走逐位一致路径：结果与原生 ComfyUI 完全相同，每步多出的合并开销更大（CT 700 上约是默认路径的 3 倍：0.26s 对 0.08s，见 §5.1）。用于验收、对比，或需要和原生出图完全一致的时候 |
+| `MONOLOAD_EXACT=1` | 合并改走逐位一致路径：结果与原生 ComfyUI 完全相同，每步多出的合并开销更大（CT 700 上约是默认路径的 3 倍：0.26s 对 0.08s，见 §5.1）。用于验收、对比，或需要和原生出图完全一致的时候。VAE 解码也走原生（分块会改变 GEMM 形状，不保证逐位一致） |
 | `MONOLOAD_KEEP_LORA=1` | 运行时合并照常，但 prompt 结束后不释放 LoRA（LoRA 节点缓存和挂着 LoRA 的 clone 保留，重复跑同一个 LoRA 工作流时省掉读 LoRA 文件） |
-| `MONOLOAD_DISABLE=1` | 插件不做任何事，行为与原生完全一致；日志里是 `MONOLOAD_DISABLE is set: ... NOT installed` |
+| `MONOLOAD_DISABLE_VAE=1` | 只关掉 VAE 解码管理（§12），`VAE.decode` 保持原生；LoRA 部分不受影响 |
+| `MONOLOAD_VAE_WORKSPACE` | VAE 分块的工作区预算，默认 `1G`；写法 `1G`、`512M`、`768`（纯数字按 MiB）。决定卷积每块的行数和注意力每块的 query 数（§12） |
+| `MONOLOAD_DISABLE=1` | 插件不做任何事，行为与原生完全一致（LoRA 和 VAE 都不接管）；日志里是 `MONOLOAD_DISABLE is set: ... NOT installed` |
 
 开关都接受 `1` / `true` / `yes` / `on`。
 
@@ -141,6 +148,7 @@ CT 700 实测（WAI v17 SDXL + Smooth Booster，788 层，4.77 GiB 被 patch 的
 * 非 `--gpu-only`、模型处于部分加载状态时，释放 LoRA 改走原生卸载（权重回到 offload 设备，下次采样再搬回来）。目标配置 `--gpu-only` 下是就地释放，不搬任何权重。
 * 默认路径与原生合并不逐位一致（§5.1）。需要和原生出图完全一致时设 `MONOLOAD_EXACT=1`。
 * 本仓库的测试都在无 GPU 的机器上用 `--cpu` 跑；GPU 上的一致性和性能要按第 9 节在 CT 700 上确认。
+* VAE 解码管理的限制见 §12.5。
 
 ## 8. 测试（CPU，锁定镜像）
 
@@ -160,14 +168,15 @@ CT 700 实测（WAI v17 SDXL + Smooth Booster，788 层，4.77 GiB 被 patch 的
 MODELS=/path/to/models tests/run_all.sh
 ```
 
-`run_all.sh` 先跑 4 遍入口测试，然后把下面每个功能测试在两种合并路径下各跑一遍：先 `MONOLOAD_EXACT=1`（逐位一致），再默认路径。
+`run_all.sh` 先跑 5 遍入口测试和 VAE 测试，然后把下面每个 LoRA 功能测试在两种合并路径下各跑一遍：先 `MONOLOAD_EXACT=1`（逐位一致），再默认路径。只想跑 VAE 部分时：`MODELS=/path/to/models tests/docker_run.sh python tests/test_vae.py`（不需要任何模型文件，`$MODELS` 可以是空目录）。
 
 | 脚本 | 内容 |
 |---|---|
-| `tests/test_entry.py` | 按 ComfyUI 的方式加载插件：默认替换 `ModelPatcher` 的方法（`CoreModelPatcher` 也覆盖到）并包装 `PromptExecutor.execute_async`；`MONOLOAD_KEEP_LORA=1` 时不包装执行器；`MONOLOAD_DISABLE=1` 时两者都不动；合并路径与 `MONOLOAD_EXACT` 一致 |
+| `tests/test_entry.py` | 按 ComfyUI 的方式加载插件：默认替换 `ModelPatcher` 的方法（`CoreModelPatcher` 也覆盖到）、包装 `PromptExecutor.execute_async` 和 `VAE.decode`；`MONOLOAD_KEEP_LORA=1` 时不包装执行器；`MONOLOAD_DISABLE_VAE=1` 或 `MONOLOAD_EXACT=1` 时 `VAE.decode` 保持原生；`MONOLOAD_DISABLE=1` 时都不动；合并路径与 `MONOLOAD_EXACT` 一致；`decode_tiled` 从不被替换 |
 | `tests/test_dtype_paths.py` | `EXACT=1`：参数 dtype × 计算 dtype × lora dtype（含 gfx1151 上的 fp16）× {基础 LoRA、hook、两者都有}，54 种组合逐位对比原生合并的数值。默认路径：同样的 dtype 组合 × 8 种 patch 组合（LoRA、两个 LoRA、strength_model ≠ 1、LoHa、LoRA+LoHa、diff、hook、LoRA+hook），共 144 项；每项要求与独立实现的参照（`addmm_` / 原生 `LowVramPatch`）逐位一致，并且与原生合并的差异在容差以内。两种模式都再加 fp8 参数的 54 种组合，对比「先反量化 + 同一路径」 |
 | `tests/test_lora_hot.py` | 两条管线：`CheckpointLoaderSimple`；`UNETLoader` + `CLIPLoader`。同一串 LoRA 组合先用原生跑、再装上 Monoload 连续切换着跑。`EXACT=1`：TE 输出和采样结果与原生逐位一致。默认路径：UNet 和 TE 所有被 patch 的权重与原生合并的差异在容差以内（DESIGN.md §5.5），同样的 key 上重算逐位一致路径与原生逐位一致；latent 差异只报告。两种模式都检查无备份、权重不变、撤掉 LoRA 后逐位一致，加上 Hook LoRA、模型合并和报错场景 |
 | `tests/test_quant.py` | fp8 scaled UNet + LoRA：与「先反量化被改到的层 + 同一合并路径」逐位一致、无备份、fp8 权重不变；与原生的误差只报告 |
+| `tests/test_vae.py` | VAE 解码管理（§12），不需要模型文件：分块卷积 / 分块注意力与不分块的结果一致（含各种 kernel、stride、dilation、groups、padding、cast 路径 + weight_function、Wan CausalConv3d）；用 ComfyUI 自己的 LDM `Decoder` / `WanVAE`（小通道、随机权重）构造 SDXL 式、Flux 式、Qwen 式 VAE，受管理的解码与原生 `VAE.decode` 比较；多帧交给原生、OOM 缩小分块重试、下限时报错、绝不调用 tiled |
 | `tests/test_release.py` | 用真正的 `PromptExecutor` 连续跑 LoRA → 无 LoRA → 只改 UNet 的 LoRA → 无 LoRA → Hook LoRA → 无 LoRA → bypass LoRA → 无 LoRA → LoRA（换种子）：弱引用确认 LoRA 全部释放、底模不重新加载、结果与从没见过 LoRA 的进程逐位一致；RAM pressure / classic / LRU 三种缓存各一遍，外加 `MONOLOAD_KEEP_LORA=1` |
 
 **实测结果**（`--cpu --fp16-unet`，SD1.5，每个组合采样 2 步，hook 3 步）。以下逐位一致的结论都是 `MONOLOAD_EXACT=1` 下的：
@@ -187,6 +196,7 @@ MODELS=/path/to/models tests/run_all.sh
   * 两条管线、8 个组合：UNet 和 TE 的权重与原生合并比较，‖Δw‖/‖LoRA 改动‖ 最大 2.8e-4（容差 0.03–0.27）；LoKr、LoHa、模型合并按 fp16 比较是 0。latent 与原生的 mean|Δ| 是 0.005–0.012，LoRA 本身的作用是 4.9–7.3（LoHa 0.39），hook 是 0.024 对 7.51。数字见 DESIGN.md §5.5。
   * 在同样的 key 上重算逐位一致路径，与原生全部逐位一致。
   * 备份、权重不变、撤掉 LoRA、报错、fp8、自动释放（三种缓存 + KEEP）这些检查与逐位一致路径完全相同，全部通过。
+* VAE 解码管理（`tests/test_vae.py`，130 项，0 失败）：分块卷积 53 项、分块注意力 18 项与不分块一致（卷积相对误差最大 4.6e-7，注意力 3.5e-7，多数为 0）；SDXL 式 / Flux 式 / Qwen 式 decoder 在 16 KiB 和 256 KiB 预算下（绝大多数卷积被分块）与原生 `VAE.decode` 的 raw 输出差 ≤ 7.2e-6、像素差 ≤ 3.2e-6（fp32；bf16 为 0）；预算足够大时与原生逐位一致；多帧交给原生；OOM 缩小分块重试、下限报错，tiled 从未被调用。加上 VAE 之后 LoRA 部分的 `test_dtype_paths.py`（198 / 108 项）和入口测试照旧全部通过。下面 826 项的合计是加入 VAE 之前的完整运行。
 * `tests/run_all.sh` 合计 826 项检查（入口 18；`MONOLOAD_EXACT=1`：dtype 108、LoRA 80、fp8 8、释放 2 + 42×3 + 22；默认路径：dtype 198、LoRA 106、fp8 8、释放 2 + 42×3 + 22），0 失败。
 
 **CPU 上的基准参考**（`tests/bench_lora.py`，SD1.5，256×256，3 步，只能看相对比例，不代表 GPU）：
@@ -297,6 +307,59 @@ docker exec comfyui python /opt/ComfyUI/custom_nodes/monoload/tools/compare_imag
 
 `docker logs comfyui 2>&1 | grep -iE "monoload|traceback"`，以及 `dmesg | grep -iE "oom|killed process|amdgpu.*(fault|timeout)"`：不应出现 `不支持`、`内部错误`、OOM、amdgpu fault。
 
+VAE 解码管理（§12）每次解码打一行，形如 `[Monoload] VAE decode 1x4x270x480 -> op-level chunking (workspace 1.00 GiB): 23 of 40 conv call(s) in row blocks, attention 1 call(s) in query blocks of 2071 / 129600 tokens; memory estimate 17.91 GiB (native 91.86 GiB), 12.3s`；交给原生时是 `[Monoload] VAE decode left native: <原因>`。不应出现 `Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding`（那是原生的 tiled 回退，受管理的解码不会走到）。
+
+### 9.7 VAE 解码：峰值、耗时、精度（`tests/bench_vae.py`）
+
+在服务所在的容器里另起一个进程运行，自动沿用 PID 1 的 ComfyUI 启动参数。先让服务把模型卸掉（`/free`，同 9.1），否则服务进程占着的 GTT 会算进 GTT 和 cgroup 的读数里，原生解码也更容易 OOM。
+
+```bash
+curl -X POST http://127.0.0.1:8188/free -H 'Content-Type: application/json' -d '{"unload_models":true,"free_memory":true}'
+# SDXL：取 checkpoint 内置的 VAE（只加载 VAE，不加载 UNet / CLIP）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --profile --json /opt/ComfyUI/output/bench_vae_sdxl.json 2>&1 | tee bench_vae_sdxl.txt
+# Flux ae / qwen_image_vae：models/vae 下的文件，走 VAELoader
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae ae.safetensors --profile --json /opt/ComfyUI/output/bench_vae_flux.json 2>&1 | tee bench_vae_flux.txt
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae qwen_image_vae.safetensors --profile --json /opt/ComfyUI/output/bench_vae_qwen.json 2>&1 | tee bench_vae_qwen.txt
+```
+
+参数：
+
+| 参数 | 含义 |
+|---|---|
+| `--checkpoint X` / `--vae X` | VAE 来源：checkpoint 内置的 VAE（`models/checkpoints`），或 `VAELoader` 加载的文件（`models/vae`）。二选一 |
+| `--res` | 输出分辨率列表 `宽x高`，默认 `1344x768,2688x1536,3840x2160`；latent 是固定种子的随机数（`--seed`，默认 0；`--latent-std`，默认 1） |
+| `--latent F` | 改用 ComfyUI `SaveLatent` 节点存下的 `.latent` 文件（路径，或 `input/`、`output/` 下的文件名；可重复），缩放与 `LoadLatent` 节点相同；这时 `--res` 不用。耗时和显存与 latent 内容无关，精度用真实 latent 更有代表性 |
+| `--modes` | 默认 `native,monoload,native2`，每个分辨率按这个顺序跑：`native` 原生 `VAE.decode`（Monoload 的 VAE 部分卸下）；`monoload` 第二层（逐算子分块）；`native2` 原生再跑一次，作为 GPU 自身不确定性的基线 |
+| `--warm N` | 冷启动（该模式、该分辨率的第一次）之后再跑 N 次热启动，取中位数，默认 3 |
+| `--workspace` | 这次运行用的 Monoload 预算（如 `512M`），默认取 `MONOLOAD_VAE_WORKSPACE` 或 1G |
+| `--sample-ms` | GTT / VRAM / cgroup 采样间隔，默认 10 ms |
+| `--boundary-rows` | 块边界上下各多少行算「边界附近」，默认 4 |
+| `--profile` | 先对每个分辨率（或 `--profile-res` 指定的）跑一次 torch.profiler + 分配器历史，见下 |
+| `--profile-modes` | 要 profile 的模式，默认 `native`；加上 `monoload` 可以看分块后峰值时刻剩下的是什么 |
+| `--profile-cpp` | 分配器历史里带 C++ 栈（能直接看到 `slow_conv2d` / `im2col` 这类 ATen 函数），符号化可能要几分钟 |
+| `--profile-only` | 只做 profile，不跑基准 |
+| `--json F` | 全部结果另存一份 JSON |
+
+**原生 OOM 的处理：** 原生解码真 OOM 时会退回 tiled，脚本把 tiled 路径换成「立即中止」，这一行标为 `OOM(tiled)`，不当作原生结果，也不参与精度比较；直接抛出的 OOM 标为 `OOM`；monoload 在最小预算下仍 OOM 时（`MonoloadVAEOOMError`）同样标为 `OOM`。脚本不会因此退出，后面的模式和分辨率照常跑。
+
+**输出：**
+
+* 逐行：每个模式、每个分辨率、每次运行一行：耗时；`alloc peak (+Δ)` = `torch.cuda.max_memory_allocated`（运行前 reset）及相对运行前的增量；`reserved` 同理（含分配器缓存，每次运行前 `empty_cache`）；`GTT peak +` = 后台线程每 10 ms 读 `mem_info_gtt_used`（所有 card，不写死卡号）得到的峰值增量，`VRAM +` 同理；`cgroup peak +` = `memory.peak`（内核支持时每次运行前 reset），括号里是采样 `memory.current` 得到的峰值增量；`models unloaded` = 这次运行里 `load_models_gpu` 卸载了几个模型（脚本进程里只有 VAE，所以 1 表示原生的大估算把 VAE 自己卸掉又重新加载）。monoload 行下面还有一行：Monoload 给 `load_models_gpu` 的估算（和原生 `memory_used_decode` 对比）、实际预算、OOM 重试次数、被分块的卷积调用数和总块数、最大的块工作区和最大的整层工作区、注意力每块 query 数。
+* 精度（两边都成功时）：`monoload vs native`、`native2 vs native` 各一组。`raw` 是 `process_output` 之前的 decoder 原始输出，`pixels` 是 clamp 后的 fp32 像素；指标是 max|Δ|、mean|Δ|、RMSE、PSNR（像素按 [0,1] 取 20·log10(1/RMSE)，raw 按范围 2）、p99|Δ|。另外：卷积块边界映射到输出行、上下各 4 行的「边界附近」与其余行分开统计（第二层的块边界在每层分辨率上都不同，所以这一块可能覆盖相当多的行）；每个通道的均值偏移；两边的 NaN/Inf 个数。
+* 最后两张汇总表：时间和内存（每个分辨率 × 模式；峰值取各次运行的最大值；`estimate` 是 Monoload 的估算，`native est` 是原生的估算）；精度。
+* `--profile`：① torch.profiler（`profile_memory=True`、`record_shapes`、`with_stack`）跑一次原生解码：按自身显存分配排序的算子表，以及分配最大的单次算子调用（名字、输入形状、Python 调用栈），用来看 `aten::slow_conv2d_forward` / `im2col` 这类展开操作占多少；② 打开 CUDA 分配器的内存历史再跑一次：回放分配/释放事件，找到这次解码中已分配张量总量最大的时刻，列出那一刻存活的最大分配和各自的调用栈（只统计解码期间分配的，权重等事先存在的不算）。
+
+**通过标准 / 看什么：**
+
+* 峰值主因：原生的 profile 里，峰值时刻最大的存活分配是否是卷积的展开缓冲（栈落在 `conv.py:_conv_forward`，算子表里 `slow_conv2d` / `im2col` 一类分配最大）。
+* `monoload` 不出现 `OOM`；`alloc Δ` 明显低于原生（4K 原生预计数十 GiB），并且不超过 `estimate`；GTT 和 cgroup 的增量同步下降。
+* 精度：`monoload vs native` 没有 NaN/Inf；PSNR 足够高（初步目标：像素 RMSE ≤ 1e-3，即 PSNR ≥ 60 dB，max|Δ| ≤ 1e-2）；边界附近与其余行的误差同一量级（没有系统性的边界误差）；通道均值偏移接近 0。`native2 vs native` 是 GPU 本身的基线。
+* 耗时：monoload 的热启动与原生相比慢多少（算量约 1 倍，多出来的是块的启动和拷贝开销）。
+* **把三份完整输出（`bench_vae_*.txt`）和 JSON 发给我。**
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
@@ -332,14 +395,73 @@ docker exec comfyui python /opt/ComfyUI/custom_nodes/monoload/tools/compare_imag
 ## 11. 仓库结构
 
 ```
-__init__.py                 ComfyUI 入口：按 MONOLOAD_DISABLE / MONOLOAD_KEEP_LORA 调用 hotpatch.install()、release.install()
+__init__.py                 ComfyUI 入口：按 MONOLOAD_DISABLE / MONOLOAD_KEEP_LORA / MONOLOAD_DISABLE_VAE / MONOLOAD_EXACT
+                            调用 hotpatch.install()、release.install()、vae.install()
 monoload/hotpatch.py        运行时合并的全部实现（MonoloadRuntimePatch + ModelPatcher 方法替换；默认的融合 addmm / 放宽合并、
                             MONOLOAD_EXACT=1 的逐位一致路径、量化层在反量化临时权重上的合并）
 monoload/release.py         每个 prompt 结束后释放 LoRA（包装 PromptExecutor.execute_async）
 monoload/errors.py          报错类型
 monoload/comfy_env.py       在独立进程里按指定参数启动 ComfyUI 环境（测试、基准用）
-tests/                      测试和基准脚本（见第 8、9 节）
+monoload/vae.py             VAE 解码管理入口（包装 VAE.decode：内存估算、逐张、OOM 缩小分块重试、覆盖范围；第一层的接口 STRIPE_ADAPTERS）
+monoload/vae_ops.py         逐算子分块（卷积按输出行、注意力按 query；受管理期间的实例属性替换）
+tests/                      测试和基准脚本（见第 8、9 节；VAE：test_vae.py、bench_vae.py、make_synthetic_vaes.py）
 tools/watch_mem.sh          GTT / cgroup 内存监视
 tools/compare_images.py     两张图逐像素比较
 docs/DESIGN.md              设计说明
 ```
+
+## 12. VAE 解码降峰值（第一阶段）
+
+### 12.1 要解决的问题
+
+调研（DESIGN.md §9.1）的结论，待真机数据确认：
+
+* 禁用 MIOpen（ComfyUI 在 AMD 上设 `torch.backends.cudnn.enabled = False`）后，3×3 卷积走 Slow2d：先 im2col 展开再 GEMM。4K 输出时最后一层 Conv256→256 的展开缓冲约 35.6 GiB，SDXL 原版 4K 解码峰值估计约 45 GiB，Qwen 约 31 GiB。**峰值主要来自展开缓冲，不是激活本身。**
+* mid block 的全局注意力在 4K 时 N ≈ 13 万，一张 bf16 分数矩阵约 31 GiB；原生按空闲内存自动切片，峰值不固定。
+* 原生用 `memory_used_decode` 估算显存：AMD 上 SDXL 4K 估约 92 GiB，并按它调用 `load_models_gpu`（`--gpu-only` 下也可能卸载别的模型）、切分 batch。
+* 真 OOM 后原生自动退回 tiled 解码：每个 tile 各自做 GroupNorm 和注意力，结果和整图不等价。
+
+### 12.2 原理
+
+三层设计（DESIGN.md §9.2），本阶段实现第二层和兜底：
+
+* **第二层：逐算子分块。** decoder 自己的 forward 原样运行，只在受管理的解码期间、只在这个 VAE 的模块上替换两类重算子：
+  * 卷积（Conv2d、Conv3d，含 comfy.ops 各变体）：整层的 im2col 展开估算超过预算时，按输出行分块，每块只取它需要的输入行（含上下 halo），块与块之间用真实的相邻行，zero padding 只出现在图像真实的上下边缘；输出预先分配好，逐块写入。接在 `_conv_forward` 上，所以 `cast_bias_weight` / weight_function（包括 Monoload 的运行时 LoRA）照常生效。
+  * 注意力：按 query 分块，K/V 保持完整，每个 query 仍对全图做 softmax；每块的运算与原生实现相同。
+  * GroupNorm、上采样等其余算子保持原生。整图语义不变，算量约 1 倍。
+* **管理入口（包装 `VAE.decode`）：** 自己按形状估算内存上界交给 `load_models_gpu`（SDXL 4K 约 17.9 GiB，原生约 92 GiB，估算方法见 DESIGN.md §9.4）；batch 逐张；输出的设备、dtype、`process_output`、NHWC 与原生完全一致。
+* **OOM：** 只缩小分块（预算减半）重试，降到 64 MiB 仍 OOM 就抛 `MonoloadVAEOOMError`，**绝不调用 tiled 解码**。
+* **兜底：** 不在覆盖范围内的解码走原生整图解码，打一条日志。
+* **第一层（条带解码，后两阶段）：** 认得的结构按输出条带倒推重算、GroupNorm 全局统计逐层求得，进一步去掉高分辨率激活。第二阶段做 Qwen，第三阶段做 SDXL / Flux。
+
+### 12.3 开关
+
+| 设置 | 效果 |
+|---|---|
+| 默认 | 启用，预算 1 GiB |
+| `MONOLOAD_VAE_WORKSPACE=512M` | 预算（卷积每块的展开缓冲、注意力每块的分数矩阵 + softmax 结果）。写法 `1G`、`512M`、`768`（纯数字按 MiB）。越小峰值越低、块越多 |
+| `MONOLOAD_DISABLE_VAE=1` | 只关 VAE 部分，LoRA 部分不受影响 |
+| `MONOLOAD_EXACT=1` | VAE 走原生（分块会改变 GEMM 形状，不保证逐位一致） |
+| `MONOLOAD_DISABLE=1` | 什么都不装 |
+
+启动日志写明状态和预算：`[Monoload] VAE decode managed: ... workspace 1.00 GiB ...`，或 `[Monoload] VAE decode: native (...)`。
+
+### 12.4 覆盖范围
+
+* 接管：图像解码，即 4D latent（SDXL、Flux `ae` 等 2D VAE；给 2D VAE 的 5D latent 与原生一样取第一帧），以及 T=1 的 5D latent（`qwen_image_vae` / Wan 2.1 VAE 等）。
+* 交给原生（打日志）：多帧视频 latent——**这只是第一阶段暂时不做，不是永远不做**；1D / 音频 latent；自己往预分配输出里写的 VAE（`comfy_has_chunked_io`，如 LTX）。
+* 不经过 `VAE.decode` 的路径保持原生：用户显式使用的 `VAEDecodeTiled` 节点 / `VAE.decode_tiled`（用户自己选了 tiled 的语义），以及直接调用 `first_stage_model.decode` 的第三方代码。
+* 第二层不挑结构：任何 VAE 的 `torch.nn.Conv2d/Conv3d` 和 ComfyUI 自带的三种 VAE 注意力（split / pytorch / xformers）都会被分块；不认识的注意力实现保持原样（日志里列出）。
+
+### 12.5 限制
+
+* 与原生不逐位一致（块的 GEMM 形状不同）。CPU fp32 测试中整个 decoder 的差异在 1e-6 量级；GPU 上看 9.7 的 `monoload vs native` 对比 `native2 vs native`。
+* 第二层只去掉展开缓冲和分数矩阵，不减少激活本身：4K 时 SDXL 全尺寸的一张激活约 4 GiB，峰值预计在 10–15 GiB 量级（待实测）。
+* 块多了会有额外的启动和拷贝开销；每种块形状第一次出现时可能有额外的 kernel 选择开销。
+* 每个 VAE 第一次受管理解码时，会先用 8×8 的 latent 跑一次小解码来量激活大小（结果缓存，RNG 状态不变）。
+
+### 12.6 第一阶段的状态
+
+* 已完成：管理入口、第二层（卷积行分块 + 注意力 query 分块）、OOM 策略、开关、CPU 测试（`tests/test_vae.py`）、真机测量脚本（`tests/bench_vae.py`，9.7）。
+* 待真机确认：原生峰值的主因（`--profile`）、第二层实际降到多少、精度和耗时。据此决定第二、三阶段（第一层条带解码）的优先级和预算。
+* 实现细节、行区间推导和后两阶段计划见 DESIGN.md §9。

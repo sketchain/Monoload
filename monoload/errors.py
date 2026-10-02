@@ -16,3 +16,8 @@ class MonoloadUnsupportedError(MonoloadError):
         if key is not None:
             head += " key={}".format(key)
         super().__init__("{}: {}".format(head, message))
+
+
+class MonoloadVAEOOMError(MonoloadError):
+    """A managed VAE decode ran out of memory with the smallest workspace.
+    Monoload never falls back to the approximate tiled decode."""
