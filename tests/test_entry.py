@@ -7,6 +7,8 @@ MONOLOAD_DISABLE=1 leaves ComfyUI native.
     MONOLOAD_KEEP_LORA=1 python tests/test_entry.py
     MONOLOAD_EXACT=1 python tests/test_entry.py       # VAE decode native
     MONOLOAD_DISABLE_VAE=1 python tests/test_entry.py # VAE decode native, LoRA part as usual
+    MONOLOAD_DISABLE_VAE_STRIPE=1 python tests/test_entry.py  # VAE layer 1 off, layer 2 on
+    MONOLOAD_VAE_BUDGET=2G MONOLOAD_VAE_STRIPE_ROWS=64 python tests/test_entry.py
 """
 
 import asyncio
@@ -57,4 +59,12 @@ else:
         want = os.environ.get("MONOLOAD_VAE_WORKSPACE", "")
         if want:
             check("MONOLOAD_VAE_WORKSPACE={} honoured".format(want), vae.workspace() == vae.parse_size(want))
+        no_stripe = flag("MONOLOAD_DISABLE_VAE_STRIPE")
+        check("VAE layer 1 (stripes) {}".format("off (MONOLOAD_DISABLE_VAE_STRIPE=1)" if no_stripe else "on (Wan 2.1 adapter registered)"),
+              vae.stripe_enabled() == (not no_stripe) and len(vae.STRIPE_ADAPTERS) == 1)
+        want = os.environ.get("MONOLOAD_VAE_BUDGET", "")
+        check("layer-1 budget {} ({})".format(vae.budget(), "MONOLOAD_VAE_BUDGET={}".format(want) if want else "default 3 GiB"),
+              vae.budget() == (vae.parse_size(want) if want else 3 << 30) and vae._SETTINGS["budget_explicit"] == bool(want))
+        want = os.environ.get("MONOLOAD_VAE_STRIPE_ROWS", "")
+        check("stripe height {}".format("forced to {}".format(want) if want else "from the budget"), vae.stripe_rows() == (int(want) if want else None))
 finish()
