@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full CPU test suite in the locked image. Needs, under $MODELS:
+# Full CPU test suite in the locked image (tests/test_vae.py needs no model files). Needs, under $MODELS:
 #   checkpoints/v1-5-pruned-emaonly-fp16.safetensors        (CheckpointLoaderSimple)
 #   diffusion_models/v1-5-pruned-emaonly-fp16.safetensors   (UNETLoader; same file, a hard link is fine)
 #   diffusion_models/sd15_unet_fp8_scaled.safetensors       (tests/make_fp8_unet.py)
@@ -21,6 +21,8 @@ step "plugin entry (installed)";            run $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_DISABLE=1)";   run env MONOLOAD_DISABLE=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_KEEP_LORA=1)"; run env MONOLOAD_KEEP_LORA=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_EXACT=1)";     run env MONOLOAD_EXACT=1 $R python tests/test_entry.py
+step "plugin entry (MONOLOAD_DISABLE_VAE=1)"; run env MONOLOAD_DISABLE_VAE=1 $R python tests/test_entry.py
+step "VAE decode: op-level chunking vs native (synthetic decoders, no model files)"; run $R python tests/test_vae.py
 # every functional suite runs on both merge paths: bit-exact (MONOLOAD_EXACT=1)
 # and the default (fused / relaxed, checked against native within tolerance)
 for EXACT in 1 ""; do
