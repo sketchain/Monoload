@@ -204,7 +204,7 @@ MODELS=/path/to/models tests/run_all.sh
   * 在同样的 key 上重算逐位一致路径，与原生全部逐位一致。
   * 备份、权重不变、撤掉 LoRA、报错、fp8、自动释放（三种缓存 + KEEP）这些检查与逐位一致路径完全相同，全部通过。
 * VAE 解码管理（`tests/test_vae.py`，131 项，0 失败）：分块卷积 53 项、分块注意力 18 项与不分块一致（卷积相对误差最大 4.6e-7，注意力 3.5e-7，多数为 0）；SDXL 式 / Flux 式 / Qwen 式 decoder 在 16 KiB 和 256 KiB 预算下（绝大多数卷积被分块）与原生 `VAE.decode` 的 raw 输出差 ≤ 7.2e-6、像素差 ≤ 3.2e-6（fp32；bf16 为 0）；预算足够大时与原生逐位一致；多帧交给原生；OOM 缩小分块重试、下限报错，tiled 从未被调用。加上 VAE 之后 LoRA 部分的 `test_dtype_paths.py`（198 / 108 项）和入口测试照旧全部通过。下面 826 项的合计是加入 VAE 之前的完整运行。
-* VAE 第一层（`tests/test_vae_stripe.py`，54 项，0 失败）：区间倒推与暴力展开 993 条条带全部一致；5 种单元在每个切片上的精确行与整图一致（≤ 3.6e-7）、halo 不多不少；整个 Wan decoder 在条带高度 1 / 7 / 40 / 整图 / 按预算 / 默认策略、奇数和很小的 latent、batch 2、条带内再分块下，与原生整图解码的 raw 差 ≤ 2.1e-6（fp32），条带边界附近不比其他区域差；halo 少算一行时自检两种方式都能抓到并回退第二层；SDXL / Flux 继续走第二层；默认策略选出「128 行条带的估算」之内最高的条带（320 行的图 3 条 107 行，再高一档就超过目标），`MONOLOAD_VAE_STRIPE_ROWS` / `MONOLOAD_VAE_BUDGET` 能覆盖它；估算随条带高度单调、最大的条带先跑；自检后清空 1 次缓存、batch 2 在前缀和条带之间清空 2 次；单帧 Conv3d 改走 conv2d 时与模块原样输出一致（≤ 4.8e-7），T=3 和已被别人替换过 `_conv_forward` 的模块不改走。
+* VAE 第一层（`tests/test_vae_stripe.py`，69 项，0 失败）：区间倒推与暴力展开 993 条条带全部一致；5 种单元在每个切片上的精确行与整图一致（≤ 3.6e-7）、halo 不多不少；整个 Wan decoder 在条带高度 1 / 7 / 40 / 整图 / 按预算 / 默认策略、奇数和很小的 latent、batch 2、条带内再分块下，与原生整图解码的 raw 差 ≤ 2.1e-6（fp32），条带边界附近不比其他区域差；halo 少算一行时自检两种方式都能抓到并回退第二层；SDXL / Flux 继续走第二层；默认策略选出「128 行条带的估算」之内最高的条带（320 行的图 3 条 107 行，再高一档就超过目标），`MONOLOAD_VAE_STRIPE_ROWS` / `MONOLOAD_VAE_BUDGET` 能覆盖它；估算随条带高度单调、最大的条带先跑；自检后清空 1 次缓存、batch 2 在前缀和条带之间清空 2 次；单帧 Conv3d 改走 conv2d 时与模块原样输出一致（≤ 4.8e-7），T=3 和已被别人替换过 `_conv_forward` 的模块不改走；arena 每次解码只分配一次、CPU 和非默认分配器配置下不用；分配器模拟器复现 5 个真机读数（误差 ≤ 0.03 GiB），本版 9 个计划（1344 … 8K、bf16 / fp32）的模拟 reserved ≤ 估算。
 * `tests/run_all.sh` 合计 826 项检查（入口 18；`MONOLOAD_EXACT=1`：dtype 108、LoRA 80、fp8 8、释放 2 + 42×3 + 22；默认路径：dtype 198、LoRA 106、fp8 8、释放 2 + 42×3 + 22），0 失败。
 
 **CPU 上的基准参考**（`tests/bench_lora.py`，SD1.5，256×256，3 步，只能看相对比例，不代表 GPU）：
@@ -433,6 +433,29 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 
 看什么：E 的 monoload 行是 `layer 1`，计划为 1344 → 6 条 128 行、2688 → 12 条 128 行、4K → 14 条 155 行，行尾写着 `default: peak of 128-row stripes`、`N Conv3d calls as conv2d`（N > 0）、`cache emptied 1x`；**每一行（冷启动也算）的 reserved / GTT 增量都不超过估算**（1344 估 0.74 GiB、2688 估 0.95、4K 估 1.25），4K 的 reserved 约 1.07；耗时与第一版（0.67 / 3.16 / 8.12 s）相比不明显变慢；`monoload vs fp32` 仍与 `native vs fp32` 相当。F 看 reserved 是否不再随条带高度叠加（512 行时第一版是 2.66，现在应接近 alloc 1.70 加余量），以及估算是否覆盖每个高度的 reserved。G 里 `aten::fill_` 应从 15.9 万次降到几百次。
 
+上面 E–G 已在 725a010 上测完（§10.2）。
+
+**第二阶段第三轮复测**（arena、分块卷积先分配输出、估算 = arena + largest；每条命令前都先 `/free`）：
+
+```bash
+# H. Qwen 三档：原生 / 第一层（默认）/ 只用第二层；--fp32-ref 可选（加上它多跑三档 fp32，4K 的原生 fp32 约 55 s）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae qwen_image_vae.safetensors --modes native,monoload,monoload-l2 --warm 2 --fp32-ref \
+  --json /opt/ComfyUI/output/bench_vae_l1c_qwen.json 2>&1 | tee bench_vae_l1c_qwen.txt
+# I. 4K 条带高度扫参（monoload = 默认，144 行就是它在 4K 选的高度）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae qwen_image_vae.safetensors --res 3840x2160 --modes native,monoload --stripe-rows 32,64,128,144,256,512 --warm 2 \
+  --json /opt/ComfyUI/output/bench_vae_l1c_sweep.json 2>&1 | tee bench_vae_l1c_sweep.txt
+```
+
+看什么：
+
+* H 的 monoload 行：计划 1344 → 6 条 128 行、2688 → 12 条 128 行、4K → 15 条 144 行（fp32 4K → 14 条 155 行），行尾写着 `arena ...`（不再有 `cache emptied`）。
+* **每一行（冷启动也算）的 reserved / GTT 增量 ≤ 估算。** 按模拟，bf16 的 reserved 约 0.66 / 0.86 / 1.13 GiB（估算 1.05 / 1.25 / 1.52）；fp32 约 0.80 / 1.16 / 1.70 GiB（估算 1.19 / 1.55 / 2.27）。
+* alloc 列现在约等于 arena（arena 这个块本身算作一次分配），张量本身的峰值要加 `--no-arena` 才看得到（那时 reserved 不代表插件的行为）。
+* 耗时与 725a010 相同（4K 约 8.2 s）；精度数字不变。
+* I：r32 / r64 / r128 / r144 的 reserved 都约 1.13 GiB，r256 约 1.35，r512 约 1.82；每个高度 reserved ≤ 估算。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
@@ -548,9 +571,26 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 * 日志里的解码秒数与 bench 一致（计时修正生效）。
 * **结论：第二阶段验收通过**，并按数据做了以下调整（见 §12.7、DESIGN.md §9.13.4，真机复测命令见 9.7）：
   1. 默认策略改成「在不明显变慢的前提下尽量低峰值」：以 128 行条带的估算为目标，取不超过它的最高条带。4K 选 14 条 155 行，估算 1.25 GiB（第一版 2.78）。
-  2. 自检结束后释放它的全部张量并清空缓存；前缀算完、条带开始前也清空一次缓存，先跑最大的条带。reserved 偏高的原因是前缀留在缓存里的块与条带要的块尺寸不同，条带阶段只能另外分配，两者叠加（432 行：前缀约 1.0 + 条带 1.6 ≈ 2.66）。
+  2. 自检结束后释放它的全部张量并清空缓存；前缀算完、条带开始前也清空一次缓存（第三轮去掉了，见下），先跑最大的条带。reserved 偏高的原因是前缀留在缓存里的块与条带要的块尺寸不同，条带阶段只能另外分配，两者叠加（432 行：前缀约 1.0 + 条带 1.6 ≈ 2.66）。
   3. `aten::fill_`：来自 PyTorch 的 SlowDilated3d 后端（CUDA/HIP 上关掉 cuDNN 后 Conv3d 走它），每次调用按输出通道逐个 `fill_(bias[n])`。单帧的 Conv3d 改用 conv2d（Slow2d：一次 `copy_` 设 bias，columns 和 GEMM 与 3D 路径相同）。
-  4. 内存模型按 forward 代码重新数了一遍，与实测 alloc 逐项吻合（±5 MiB）；每个阶段加 `x/6 + 64 MiB` 的分配器余量。短条带时 4K 估算 1.25 GiB（第一版 1.77，实测 reserved 1.07）。
+  4. 内存模型按 forward 代码重新数了一遍，与实测 alloc 逐项吻合（±5 MiB）；每个阶段加 `x/6 + 64 MiB` 的分配器余量（第三轮改成 arena，见下）。短条带时 4K 估算 1.25 GiB（第一版 1.77，实测 reserved 1.07）。
+
+**725a010 复测（`bench_vae_l1b_*`，2026-10）：** 设置同上。
+
+* **计划和功能：** 与预期一致：1344 → 6 条 128 行、2688 → 12 条 128 行、4K → 14 条 155 行；日志里有 `default`、`Conv3d as conv2d`（132 / 346 / 604 次）、`cache emptied 1x`。
+* **显存（GTT 增量，GiB；原生 / 4e54d20 / 725a010）：** 1344 6.10 / 1.27 / 0.69，2688 29.4 / 2.17 / 1.02，4K 59.2 / 2.68 / 1.44。
+* **速度（热启动，s）：** 第一层 0.67 / 3.24 / 8.25（原生 0.66 / 3.39 / 7.86）。4K 扫参 r32 10.65、r64 9.16、r128 8.38、r155 8.26、r256 8.00、r512 7.78，各高度都比 4e54d20 快 5–12%；第二层 4K 7.14 → 6.91、2688 2.96 → 2.85。`aten::fill_` 159308 → 9396 次（CUDA 合计约 57 ms）。
+* **精度：** fp32 下第一层与整图差 7.3e-6 / 8.1e-6；第二层的精度数字与 4e54d20 逐位相同（conv2d 改道不改变结果）；对 fp32 真值 monoload 与原生相同（4K RMSE 9.73e-4 对 9.71e-4），离群点上更接近 fp32 的 monoload / native 为 17/12、207/139、302/231。
+* **profile（4K 默认，alloc 1.04 GiB）：** columns 384 MiB、上采样结果 242、卷积输出 121、存档 95、输出 95，其余 63 + 43 + 21。
+* **问题 1：估算不再是 reserved 的上界**（alloc 都在估算之内）：bf16 2688 估 0.95 / reserved 1.02，4K 1.25 / 1.44；fp32 1344 0.89 / 0.96，2688 1.27 / 1.41，4K 1.90 / 2.07；4K 扫参 r128 1.25 / 1.36、r155 1.25 / 1.44、r512 2.02 / 2.09。
+* **问题 2：前缀后清缓存对矮条带有害**：4K reserved（4e54d20 → 725a010）r32 1.07 → 1.07、r64 1.07 → 1.14、r128 1.07 → 1.36、r256 1.44 → 1.46、r512 2.66 → 2.09。默认 4K 实测 1.44，而预期是约 1.07。
+
+**第三轮调整（原因用分配器模拟器查清，见 DESIGN.md §9.13.4 / §9.13.10）：**
+
+* 写了 `tests/alloc_sim.py`：在 meta 设备上跑全尺寸的 Wan decoder，记下每一次分配 / 释放（含卷积内核内部的 columns、输入拷贝），按 PyTorch 缓存分配器的规则重放。它复现了上面 24 个真机读数（两版的 4K 扫参、三档、fp32、第二层），alloc 和 reserved 的误差都 ≤ 0.02 GiB。
+* 查清的原因：缓存分配器只能在同一个 segment 内合并空闲块。4e54d20 不清缓存，矮条带能从前缀留下的 384 / 96 MiB segment 里切出所有块，所以停在 1.07；高条带要的块（上采样结果 630 MiB 等）放不进去，只能叠加新 segment（2.66）。725a010 清缓存后条带阶段从零开 segment，而分块卷积的输出缓冲是在第一块之后才分配的，正好落进第一块 columns 释放的洞里，下一块的 384 MiB columns 放不下，只能再开一个 segment（r128：1.36）。
+* **改法：** (1) 解码开始时先在缓存里占出一个 arena（分配一个大块后立刻释放），前缀和条带的所有张量都在这一个 segment 里分配和合并，不再清缓存。arena = 张量存活峰值 + 1/32 + 64 MiB（一条条带时 1/8），也就是实际的 reserved。(2) 分块卷积在第一块之前就分配好输出（结果不变）。(3) 传给上采样单元的行切片先做连续拷贝，免得它在内部再拷一份。(4) 估算 = arena + 这次解码最大的单个分配 + 16 MiB：模拟里会溢出 arena 的高条带计划，每次都只是一个请求（一块 columns 或一张全分辨率平面）找不到连续的洞，单独开了一个 segment。384 个计划（512² … 8K、bf16 / fp32、工作区 384 / 192 / 128 MiB、默认和 32 … 整图的强制高度）里 reserved 全部 ≤ 估算。
+* 默认规则不变（128 行条带的峰值为目标，取不超过它的最高条带），只是「峰值」改用 arena 来比；模拟结果（bf16）：1344 6 条 128 行 0.66 GiB、2688 12 条 128 行 0.86 GiB、4K 15 条 144 行 1.13 GiB（估算 1.05 / 1.25 / 1.52）；4K r32 / r64 / r128 都是 1.13，r512 1.82（725a010 实测 2.09）。复测命令见 9.7「第二阶段第三轮复测」。
 
 ## 11. 仓库结构
 
@@ -565,7 +605,8 @@ monoload/comfy_env.py       在独立进程里按指定参数启动 ComfyUI 环�
 monoload/vae.py             VAE 解码管理入口（包装 VAE.decode：内存估算、逐张、OOM 缩小分块重试、覆盖范围；第一层的接口 STRIPE_ADAPTERS）
 monoload/vae_ops.py         逐算子分块（卷积按输出行、注意力按 query；受管理期间的实例属性替换）
 monoload/vae_stripe.py      第一层：Wan 2.1 VAE 单帧的条带解码（结构识别、区间倒推、执行计划和内存模型、自检）
-tests/                      测试和基准脚本（见第 8、9 节；VAE：test_vae.py、test_vae_stripe.py、bench_vae.py、make_synthetic_vaes.py）
+tests/                      测试和基准脚本（见第 8、9 节；VAE：test_vae.py、test_vae_stripe.py、bench_vae.py、make_synthetic_vaes.py、
+                            alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10）
 tools/watch_mem.sh          GTT / cgroup 内存监视
 tools/compare_images.py     两张图逐像素比较
 docs/DESIGN.md              设计说明
@@ -608,7 +649,7 @@ docs/DESIGN.md              设计说明
 | `MONOLOAD_EXACT=1` | VAE 走原生（分块会改变 GEMM 形状，不保证逐位一致） |
 | `MONOLOAD_DISABLE=1` | 什么都不装 |
 
-启动日志写明状态和策略：`[Monoload] VAE decode managed: ... workspace 1.00 GiB ...` 加上 `[Monoload] VAE layer 1 (stripe decoding) on ...: default stripe policy: the peak of 128-row stripes, tallest stripes within it ...`（设了预算时是 `peak budget ... (MONOLOAD_VAE_BUDGET)`；或 `... off`），或 `[Monoload] VAE decode: native (...)`。每次解码的日志写明用了哪一层：`-> layer 1 (Wan 2.1 stripes): 14 stripes of 155 rows (core), recompute 1.21x, checkpoint 95 MiB; default: peak of 128-row stripes, workspace 384 MiB; memory estimate 1.25 GiB ...` 或 `-> layer 2, op-level chunking ...`。
+启动日志写明状态和策略：`[Monoload] VAE decode managed: ... workspace 1.00 GiB ...` 加上 `[Monoload] VAE layer 1 (stripe decoding) on ...: default stripe policy: the peak of 128-row stripes, tallest stripes within it ...`（设了预算时是 `peak budget ... (MONOLOAD_VAE_BUDGET)`；或 `... off`），或 `[Monoload] VAE decode: native (...)`。每次解码的日志写明用了哪一层：`-> layer 1 (Wan 2.1 stripes): 15 stripes of 144 rows (core), recompute 1.22x, checkpoint 95 MiB; default: peak of 128-row stripes, workspace 384 MiB; arena 1.12 GiB, memory estimate 1.52 GiB ...` 或 `-> layer 2, op-level chunking ...`。
 
 ### 12.4 覆盖范围
 
@@ -639,23 +680,23 @@ docs/DESIGN.md              设计说明
 * **前缀整图算，存一个低分辨率存档：** `conv2`、`conv1`、middle（注意力继续用第二层的 query 分块）和最低分辨率的 3 个残差块都在 H/8 上整图计算，结果就是存档（H/8，384 通道，4K 时约 95 MiB）。
 * **之后按输出条带倒推重算：** 对每条输出条带 `[o0, o1)`，从 head 往回逐个单元推出需要的输入行：3×3 卷积两侧各多 1 行，残差块（两个 3×3 卷积）各多 2 行，nearest×2 上采样 `[⌊a/2⌋, ⌈b/2⌉)`，逐点运算不变，与图像边界求交（4K 时存档上每侧约 7 行）。然后从存档上取这些行，依次调用**原模型里的模块实例**（comfy.ops 的 cast / weight_function 照常，条带内的大卷积照样受第二层工作区约束），每个单元只保留需要且精确的那些行，最后只把核心行写进预先分配的输出。
 * **zero padding 只在真实边缘起作用：** 模块对切片照常补零，但凡是受切片内部边界补零影响的输出行（每侧恰好 halo 行），都按全局坐标算出来并丢掉，不会进入后续计算；每个单元都检查「需要的行 ⊆ 精确的行」，不满足就是内部错误。图像真正的上下边缘处补零与整图完全一样。
-* **内存估算：** 按形状事先算出前缀峰值、存档、输出缓冲和每条带每个单元的峰值（按 forward 代码逐个数同时存活的张量，与真机实测 alloc 吻合到 ±5 MiB），每个阶段再加缓存分配器的余量（`x/6 + 64 MiB`），交给 `load_models_gpu`。前缀算完、条带开始前清空一次缓存，并先跑最大的条带，让条带阶段的块不叠在前缀留下的缓存上；自检结束后也释放它的全部张量并清空缓存。
-* **默认条带高度：在不明显变慢的前提下尽量低峰值。** 以 128 行条带的估算为目标，取估算不超过它的最高条带（真机扫参：4K 时 128 行已经到了峰值下限、速度与 432 行相同，64 行起明显变慢）。条带阶段的峰值低于整图前缀时（大图），条带可以更高而不多占内存；小图就是 128 行；不足 128 行的图一条整图。条带内的工作区 384 MiB（`MONOLOAD_VAE_WORKSPACE` 更小时取它）。按全尺寸 Qwen 结构算出的计划（bf16）：
+* **内存：arena + 估算。** 按形状事先算出张量的存活峰值（前缀、存档、输出缓冲、每条带每个单元；按 forward 代码逐个数同时存活的张量，与真机 alloc 吻合到 ±5 MiB）。解码开始时在 PyTorch 的缓存分配器里先占出一个 arena（存活峰值 + 1/32 + 64 MiB；只有一条条带时 + 1/8）：分配一个这么大的块再立刻释放，之后所有张量都从这一个 segment 里切出、释放后在里面合并，所以实际占用（reserved / GTT）就是 arena。交给 `load_models_gpu` 的估算 = arena + 这次解码里最大的单个分配 + 16 MiB：高条带时偶尔会有一个请求（一块 columns 或一张全分辨率平面）被碎片挤出 arena、单独开一个 segment，估算把它算进去。分块卷积在第一块之前就分配好输出、传给上采样的切片先连续化，都是为了让 arena 里少出碎片。arena 的大小和估算用分配器模拟器（`tests/alloc_sim.py`，复现了 24 个真机读数）在 384 个计划上验证过：reserved 全部 ≤ 估算。自检结束后释放它的全部张量并清空缓存。
+* **默认条带高度：在不明显变慢的前提下尽量低峰值。** 以 128 行条带的峰值（arena）为目标，取不超过它的最高条带（真机扫参：4K 时 128 行已经到了峰值下限、速度与 432 行相同，64 行起明显变慢）。条带阶段的峰值低于整图前缀时（大图），条带可以更高而不多占内存；小图就是 128 行；不足 128 行的图一条整图。条带内的工作区 384 MiB（`MONOLOAD_VAE_WORKSPACE` 更小时取它）。按全尺寸 Qwen 结构模拟的默认计划（bf16）：
 
-| 输出 | 默认规则选出 | 重算 | 估算 | 第一版（3 GiB 预算） |
-|---|---|---|---|---|
-| 1344×768 | 6 条 128 行 | 1.23× | 754 MiB | 1 条 768 行，估 1.88 GiB |
-| 2688×1536 | 12 条 128 行 | 1.25× | 973 MiB | 3 条 512 行，估 2.36 GiB |
-| 3840×2160 | 14 条 155 行 | 1.21× | 1.25 GiB | 5 条 432 行，估 2.78 GiB |
-| 7680×4320 | 12 条 360 行 | 1.09× | 3.48 GiB | 放宽到约 4.8 GiB 的预算 |
+| 输出 | 默认计划 | 重算 | 实际占用（arena） | 估算 | 725a010 实测 reserved |
+|---|---|---|---|---|---|
+| 1344×768 | 6 条 128 行 | 1.23× | 0.66 GiB | 1.05 GiB | 0.70 |
+| 2688×1536 | 12 条 128 行 | 1.25× | 0.86 GiB | 1.25 GiB | 1.02 |
+| 3840×2160 | 15 条 144 行 | 1.22× | 1.13 GiB | 1.52 GiB | 1.44 |
+| 7680×4320 | 13 条 333 行 | 1.10× | 3.14 GiB | 4.27 GiB | — |
 
-  4K 预期实测峰值就是前缀（alloc 约 0.94、reserved 约 1.07 GiB）。`MONOLOAD_VAE_BUDGET` 设了就改为「预算内最高的条带」（工作区 = 预算/8，至少 64 MiB），`MONOLOAD_VAE_STRIPE_ROWS` 强制条带高度，两者都优先于默认规则。
+  `MONOLOAD_VAE_BUDGET` 设了就改为「估算不超过预算的最高条带」（工作区 = 预算/8，至少 64 MiB），`MONOLOAD_VAE_STRIPE_ROWS` 强制条带高度，两者都优先于默认规则。
 * **单帧 Conv3d 改走 conv2d：** 关掉 cuDNN/MIOpen 后，PyTorch 在 GPU 上用 SlowDilated3d 跑 Conv3d，每次调用按输出通道逐个 `fill_(bias)`（真机 profile 里 15.9 万次 `aten::fill_`）。单帧、时间 kernel 实际为 1 的 Conv3d 调用改成在第 0 帧上调 `F.conv2d`（Slow2d：一次 `copy_` 设 bias，im2col 和 GEMM 与 3D 路径相同），只在 GPU + cuDNN 关闭时生效，第二层的单帧 Wan 解码也一样。
 * **自检：** 每种结构在本进程第一次使用时，用 fp32 副本（只复制 conv2 和 decoder，测完释放）、24×24 的 latent、强制 40 行的条带（5 条，最后一条较短，条带内的大卷积再分块），和原生 `WanVAE.decode` 整图对比，相对误差 ≤ 1e-4 才启用第一层。结果按结构缓存，不改变随机数状态。不通过就对这种结构禁用第一层，改走第二层，日志里醒目地警告。
 * **识别（按真实结构，不看文件名）：** `first_stage_model` 是 `comfy.ldm.wan.vae.WanVAE`、decoder 是 `Decoder3d`；upsamples 里只有 ResidualBlock 和 Resample（upsample2d / upsample3d，nearest(-exact)×2 + 3×3 卷积），没有 AttentionBlock；归一化都是 RMS_norm；卷积 stride 1、kernel 3 或 1、padding 符合预期；Dropout 处于 eval 或 p=0；模块上没有 forward hook 或实例级 forward 替换；latent 是 T=1、通道数对得上；没有 vae_options。任何一项不符就走第二层，并对这个 VAE 打一条日志说明哪里不符。Wan 2.2（48 通道）等其他结构都不匹配。
 * **OOM：** 条带高度和工作区一起减半重试，到 8 行 / 64 MiB 仍不行就抛 `MonoloadVAEOOMError`。不退回 tiled，也不退回第二层（第二层的峰值更高）。
 * **预算放不下：** 设了 `MONOLOAD_VAE_BUDGET` 而 8 行的条带也放不下时直接报错，写明需要多少。默认规则没有这个问题：它的目标本身就是能达到的峰值（不低于整图前缀）。
 
-**限制：** 只覆盖 Wan 2.1 VAE 的单帧解码；SDXL / Flux 等 LDM decoder 是第三阶段（需要 GroupNorm 的全局统计调度），目前继续走第二层，行为不变。前缀仍然整图计算，4K 时它（全局注意力的 q/k/v、注意力输出和分数块）决定了约 0.94 GiB（alloc）/ 1.07 GiB（reserved）的峰值下限，8K 约 2.6 GiB。条带越矮重算越多（4K：128 行约 1.26 倍，32 行约 2.1 倍）。分配器余量是按实测标定的，不是证明出来的上界。
+**限制：** 只覆盖 Wan 2.1 VAE 的单帧解码；SDXL / Flux 等 LDM decoder 是第三阶段（需要 GroupNorm 的全局统计调度），目前继续走第二层，行为不变。前缀仍然整图计算，4K 时它（全局注意力的 q/k/v、注意力输出和分数块）决定了约 1.03 GiB（存活）/ 1.13 GiB（arena）的峰值下限，8K 约 3 GiB。条带越矮重算越多（4K：128 行约 1.26 倍，32 行约 2.1 倍）。arena 和估算是用模拟器验证的，不是数学证明；估算比实际占用高一个「最大的单个分配」（默认计划约 0.39 GiB），只影响交给 `load_models_gpu` 的数。配置了 `max_split_size_mb` / `expandable_segments` 时不用 arena。
 
-**状态：** 第一版（4e54d20）真机验收通过（§10.2）：4K GTT 59.2 → 2.7 GiB，速度与原生相同，精度与原生同为 bf16 水平，没有接缝。之后按实测调整了默认策略、内存模型和缓存处理（上面几条），CPU 测试通过；调整后的真机复测按 9.7 的「第二阶段调整后的复测」命令。细节见 DESIGN.md §9.13。
+**状态：** 第一版（4e54d20）真机验收通过（§10.2）：4K GTT 59.2 → 2.7 GiB，速度与原生相同，精度与原生同为 bf16 水平，没有接缝。725a010（默认策略、conv2d 改道）复测：功能、精度、速度通过，4K GTT 1.44 GiB，但估算低于 reserved、矮条带被清缓存反而变差。本版（arena）CPU 测试和分配器模拟通过，真机复测按 9.7 的「第二阶段第三轮复测」命令。细节见 DESIGN.md §9.13。

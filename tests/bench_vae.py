@@ -91,7 +91,7 @@ import comfy.sd  # noqa: E402
 import comfy.utils  # noqa: E402
 import folder_paths  # noqa: E402
 import nodes  # noqa: E402
-from monoload import comfy_env, vae as mvae, vae_ops  # noqa: E402
+from monoload import comfy_env, vae as mvae, vae_ops, vae_stripe  # noqa: E402
 from monoload.errors import MonoloadVAEOOMError  # noqa: E402
 
 GIB = 1024 ** 3
@@ -413,10 +413,10 @@ def mono_line(m):
         e = m["estimate"]
         st = m.get("stats", {})
         return ("layer 1 ({}): {} stripes of {} rows, recompute {:.2f}x, checkpoint {}, {} (target {}), workspace {}, {} OOM retries; "
-                "estimate {} GiB (prefix {} / stripes {} / persistent {}; native {}); {} Conv3d calls as conv2d, cache emptied {}x").format(
+                "estimate {} GiB (live peak {}: prefix {} / checkpoint + stripes {} / persistent {}; native {}); {} Conv3d calls as conv2d, arena {}").format(
             m.get("adapter"), m["stripes"], m["rows"], m["recompute"], vae_ops.fmt_bytes(m["checkpoint_bytes"]), m.get("policy"), vae_ops.fmt_bytes(m["budget"]),
-            vae_ops.fmt_bytes(m["workspace"]), m["retries"], gib(e["total"]).strip(), vae_ops.fmt_bytes(e["prefix"]), vae_ops.fmt_bytes(e["stripes"]),
-            vae_ops.fmt_bytes(e["persistent"]), gib(m.get("native_estimate")).strip(), st.get("conv3d_as_2d"), st.get("cache_releases"))
+            vae_ops.fmt_bytes(m["workspace"]), m["retries"], gib(e["total"]).strip(), vae_ops.fmt_bytes(e.get("live")), vae_ops.fmt_bytes(e["prefix"]), vae_ops.fmt_bytes(e["stripes"]),
+            vae_ops.fmt_bytes(e["persistent"]), gib(m.get("native_estimate")).strip(), st.get("conv3d_as_2d"), vae_ops.fmt_bytes(st.get("arena")) if st.get("arena") else "none")
     st = m.get("stats", {})
     return ("layer 2 ({}): estimate {} GiB (native {}), workspace {}, {} OOM retries; conv {} of {} calls in {} row blocks "
             "(largest block workspace {}, largest whole-conv workspace {}); attention {} call(s), query block {} of {} tokens").format(
@@ -831,7 +831,11 @@ def main():
     p.add_argument("--outliers", type=int, default=10, help="pixels listed where monoload and native differ most")
     p.add_argument("--outlier-threshold", type=float, default=0.01, help="|monoload - native| above which a pixel value counts as an outlier")
     p.add_argument("--json", help="also write all results to this JSON file")
+    p.add_argument("--no-arena", action="store_true",
+                   help="layer 1 without its arena reservation (alloc then shows the tensors' own peak; reserved is not representative)")
     a = p.parse_args()
+    if a.no_arena:
+        vae_stripe.ARENA_ENABLED = False
     logging.getLogger().setLevel(logging.INFO)
     if a.workspace:
         mvae.set_workspace(mvae.parse_size(a.workspace))
@@ -972,7 +976,8 @@ def main():
     print("\nalloc = torch.cuda.max_memory_allocated (tensors), resv = max_memory_reserved (allocator incl. cache), GTT = amdgpu GTT used "
           "(device-wide, every process), cg = container cgroup (memory.peak reset per run where supported / sampled memory.current).")
     print("layer: L1 = layer 1, stripe decoding (stripes x core rows, conv work relative to a whole-image decode, checkpoint size); "
-          "L2 = layer 2, op-level chunking.")
+          "L2 = layer 2, op-level chunking. Layer 1 reserves its arena as one block first, so its alloc peak includes the arena "
+          "(~= reserved); --no-arena shows the tensors' own peak.")
     print("estimate = what Monoload passed to load_models_gpu; native est = memory_used_decode (what native passes); "
           "unload = models unloaded by load_models_gpu during the run (here only the VAE is loaded, so 1 = the VAE itself was unloaded and loaded again).")
     print("native2 vs native = the GPU's own run-to-run difference; monoload vs native should be of that order or small (no bit-exactness promised).")

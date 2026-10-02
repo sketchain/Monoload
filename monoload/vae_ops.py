@@ -65,7 +65,7 @@ class OpStats:
         self.attn_tokens_max = 0      # largest N (keys = queries)
         self.attn_rows_min = None     # smallest query-block size used
         self.attn_score_max = 0       # largest per-block score bytes (x2: scores + softmax)
-        self.cache_releases = 0       # allocator cache emptied between the layer-1 prefix and its stripes
+        self.arena = 0                # bytes reserved as one allocator segment for a layer-1 decode (0: none)
         self.conv3d_as_2d = 0         # single-frame Conv3d calls run as conv2d (no per-channel bias fill)
 
     def as_dict(self):
@@ -140,6 +140,9 @@ def slow_dilated3d(x):
 
 # Conv3d classes whose _conv_forward is known: torch's, and comfy.ops' (causal_zero autopad = weight[:, :, -T:])
 _CONV3D_FORWARDS = (torch.nn.Conv3d._conv_forward, comfy.ops.disable_weight_init.Conv3d._conv_forward)
+
+
+OUT_FIRST = True   # False: the output after the first block, as up to 725a010 (only for tests/alloc_sim.py to replay those versions)
 
 
 class _ConvChunker:
@@ -243,7 +246,9 @@ class _ConvChunker:
 
         saved_padding = mod.padding
         saved_mode = mod.padding_mode
-        out = None
+        # the output exists before the first block's columns: the columns of every block then reuse the same
+        # cached block instead of the output landing in the hole the first block's columns left (DESIGN §9.13.4)
+        out = torch.empty([input.shape[0], weight.shape[0]] + outs, dtype=input.dtype, device=input.device) if OUT_FIRST else None
         try:
             mod.padding = tuple(mod_pad)
             mod.padding_mode = "zeros"
@@ -267,10 +272,12 @@ class _ConvChunker:
                 del xc
                 if yc.shape[hdim] != o1 - o0:
                     raise RuntimeError("[Monoload] internal error: conv row block produced {} rows, expected {}".format(yc.shape[hdim], o1 - o0))
-                if out is None:
+                if out is None or yc.dtype != out.dtype or yc.shape[:hdim] != out.shape[:hdim] or yc.shape[hdim + 1:] != out.shape[hdim + 1:]:
+                    if o0 > 0:
+                        raise RuntimeError("[Monoload] internal error: conv row blocks of different shape / dtype")
                     shape = list(yc.shape)
                     shape[hdim] = h_out
-                    out = torch.empty(shape, dtype=yc.dtype, device=yc.device)
+                    out = torch.empty(shape, dtype=yc.dtype, device=yc.device)   # e.g. autocast: allocated as the conv returns it
                 out.narrow(hdim, o0, o1 - o0).copy_(yc)
                 del yc
                 st.conv_blocks += 1

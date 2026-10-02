@@ -31,6 +31,7 @@ preallocated output.
 """
 
 import gc
+import os
 import time
 
 import torch
@@ -293,11 +294,20 @@ def signature(fsm, units):
 #                  (split attention; q/k/v/out copies of SDPA / xformers: +3P)  S + 5P + scores
 # "extra" of a conv: the im2col / vol2col columns (bounded by the workspace when
 # the conv runs in layer-2 row blocks), the block input copy and block output,
-# the weight copy. Phase peaks get the caching allocator's slack on top
-# (ALLOC_SLACK_DIV / ALLOC_SLACK; the stripe phase starts from an emptied cache).
+# the weight copy.
+#
+# The caching allocator then decides what is reserved: the decode runs in one
+# arena (reserve_arena) of the live peak plus room for fragmentation, sized with
+# tests/alloc_sim.py (DESIGN §9.13.4: stripes needed at most live + 2.2 %, a
+# single whole-image stripe up to live + 12 %); the estimate is the arena plus
+# ESTIMATE_PAD for the small-block pool.
 
-ALLOC_SLACK_DIV = 6          # reserved <= live + live / 6 + 64 MiB per phase (measured +12..16 %, DESIGN §9.13.4)
-ALLOC_SLACK = 64 * MIB
+ARENA_DIV = 32               # arena = live peak + live peak / ARENA_DIV + ARENA_PAD, rounded up to 2 MiB
+ARENA_DIV_SINGLE = 8         # ... with one stripe (whole-image planes of 1-2 GiB fragment more)
+ARENA_PAD = 64 * MIB
+ESTIMATE_PAD = 16 * MIB      # small-block pool (<= 1 MiB requests come from their own 2 MiB segments; 2-6 MiB seen)
+CONTIGUOUS_INPUT = (UP,)     # units whose row slice is made contiguous before the call
+ARENA_ENABLED = True         # bench --no-arena: off, to measure the tensors' own peak (the arena block counts as allocated)
 
 
 def conv_extra(cin, cout, k, r_in, r_out, w_in, w_out, e, ws, contiguous=True):
@@ -342,6 +352,29 @@ def unit_peak(u, r, w, e, ws, s):
     return s + 2 * r * w * u.cin * e
 
 
+def unit_largest(u, r, w, e, ws):
+    """Largest single allocation while unit u runs on r input rows of width w."""
+    a, b = r * w * u.cin * e, r * w * u.cout * e
+    if u.kind == RES:
+        return max(a, b, min(ws, 9 * max(u.cin, u.cout) * r * w * e))
+    if u.kind == UP:
+        return max(4 * a, 4 * b, min(ws, 9 * u.cin * 4 * r * w * e))
+    if u.kind == CONV:
+        return max(a, b, min(ws, 9 * u.cin * r * w * e))
+    return a
+
+
+def prefix_largest(m, h, w, e, ws):
+    if isinstance(m, wan.AttentionBlock):
+        return 3 * h * w * int(m.norm.gamma.shape[0]) * e      # qkv (score blocks are <= ws / 2 each)
+    if isinstance(m, wan.ResidualBlock):
+        ci, co = _conv_io(m.residual[2])[0], _conv_io(m.residual[6])[1]
+        return max(h * w * e * max(ci, co), min(ws, 9 * max(ci, co) * h * w * e))
+    ci, co = _conv_io(m)
+    k = int(m.kernel_size[-1])
+    return max(h * w * co * e, min(ws, k * k * ci * h * w * e))
+
+
 def _attn_split(m):
     return m.__dict__.get("optimized_attention") is ldm_model.normal_attention
 
@@ -382,8 +415,9 @@ def _macs_prefix_module(m):
     return k * k * ci * co
 
 
-def with_slack(live):
-    return int(live + live // ALLOC_SLACK_DIV + ALLOC_SLACK)
+def arena_bytes(live, stripes=2):
+    a = live + live // (ARENA_DIV if stripes > 1 else ARENA_DIV_SINGLE) + ARENA_PAD
+    return -(-a // (2 * MIB)) * (2 * MIB)
 
 
 class Plan:
@@ -408,8 +442,10 @@ class Plan:
         self.order = [first] + [i for i in range(len(size)) if i != first]
         self.ckpt_bytes = bound.ckpt_channels * h8 * w8 * elem
         prefix_live = s = 0
+        largest = max(out_bytes, lat_bytes)
         for _, m in bound.prefix:
             prefix_live = max(prefix_live, prefix_peak(m, h8, w8, elem, ws, s))
+            largest = max(largest, prefix_largest(m, h8, w8, elem, ws))
             s = prefix_out_channels(m) * h8 * w8 * elem
         strip_live = 0
         work_stripes = 0
@@ -418,13 +454,18 @@ class Plan:
             for i, u in enumerate(units):
                 r = needs[i][1] - needs[i][0]
                 strip_live = max(strip_live, unit_peak(u, r, widths[i], elem, ws, s))
+                largest = max(largest, unit_largest(u, r, widths[i], elem, ws))
                 s = r * u.scale * widths[i + 1] * u.cout * elem
                 work_stripes += r * u.scale * widths[i + 1] * u.macs_row
         self.prefix_live, self.stripe_live = prefix_live, strip_live
-        self.prefix_bytes = with_slack(prefix_live)
-        self.stripe_bytes = self.ckpt_bytes + with_slack(strip_live)
+        self.prefix_bytes = prefix_live
+        self.stripe_bytes = self.ckpt_bytes + strip_live
         self.persistent = out_bytes + lat_bytes
-        self.estimate = int(self.persistent + max(self.prefix_bytes, self.stripe_bytes))
+        self.live_peak = int(self.persistent + max(self.prefix_bytes, self.stripe_bytes))
+        self.arena = arena_bytes(self.live_peak, len(self.stripes))
+        self.largest = int(largest)
+        # reserved = the arena, unless fragmentation strands one request outside it (then that request's own segment)
+        self.estimate = self.arena + self.largest + ESTIMATE_PAD
         work_prefix = sum(_macs_prefix_module(m) for _, m in bound.prefix) * h8 * w8
         work_whole = work_prefix + sum(heights[i + 1] * widths[i + 1] * u.macs_row for i, u in enumerate(units))
         self.recompute = (work_prefix + work_stripes) / max(1, work_whole)
@@ -466,9 +507,38 @@ def run_stripes(units, plan, ckpt, write):
                     o0, o1, ta, tb, u.name, va, vb))
             x = y.narrow(HDIM, ta - oa, tb - ta)
             del y
+            if i + 1 < len(units) and units[i + 1].kind in CONTIGUOUS_INPUT and not x.is_contiguous():
+                x = x.contiguous()   # the slice's own copy instead of the one upsampling would make inside (DESIGN §9.13.4)
             xa, xb = ta, tb
         write(o0, o1, x)
         del x
+
+
+def arena_supported(device):
+    """True when the decode can run in one reserved segment of the caching
+    allocator (DESIGN §9.13.4): a CUDA / HIP device with PyTorch's native
+    allocator in its default mode -- blocks of a segment are split and merged,
+    no max_split_size_mb (that would keep the arena from being split), no
+    expandable segments (they do not fragment like this in the first place)."""
+    if not ARENA_ENABLED or device.type != "cuda":
+        return False
+    try:
+        if torch.cuda.memory.get_allocator_backend() != "native":
+            return False
+    except Exception:
+        return False
+    conf = ",".join(os.environ.get(k, "") for k in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF"))
+    conf = conf.replace(" ", "").lower()
+    return "max_split_size_mb" not in conf and "expandable_segments:true" not in conf
+
+
+def reserve_arena(device, nbytes):
+    """Allocate nbytes in one block and free it at once: the caching allocator
+    keeps it as one free segment, and the decode's tensors are then carved
+    out of it (best fit, split, merged again when freed) instead of each new
+    size getting a segment of its own that only that size can reuse."""
+    t = torch.empty(int(nbytes), dtype=torch.uint8, device=device)
+    del t
 
 
 class WanStripe:
@@ -484,9 +554,10 @@ class WanStripe:
             int(last.norm.gamma.shape[0]) if isinstance(last, wan.AttentionBlock) else _conv_io(last)[1])
         self.key = signature(fsm, self.units)
 
-    def plan(self, vae, samples, budget, ws, rows=None, out_bytes=0):
-        """rows=None: the largest stripe height whose estimate fits the budget
-        (None if even MIN_ROWS does not fit); else exactly `rows`."""
+    def plan(self, vae, samples, budget, ws, rows=None, out_bytes=0, measure="estimate"):
+        """rows=None: the largest stripe height whose `measure` ("estimate", the
+        bound handed to load_models_gpu, or "arena", what is reserved) fits the
+        budget (None if even MIN_ROWS does not fit); else exactly `rows`."""
         h8, w8 = int(samples.shape[-2]), int(samples.shape[-1])
         elem = mm.dtype_size(vae.vae_dtype)
         lat = samples[0:1].numel() * elem
@@ -495,12 +566,12 @@ class WanStripe:
         h_out = h8 * 8
         best = None
         lo, hi = min(MIN_ROWS, h_out), h_out
-        if Plan(self, h8, w8, lo, ws, elem, out_bytes, lat).estimate > budget:
+        if getattr(Plan(self, h8, w8, lo, ws, elem, out_bytes, lat), measure) > budget:
             return None
         while lo <= hi:
             mid = (lo + hi) // 2
             p = Plan(self, h8, w8, mid, ws, elem, out_bytes, lat)
-            if p.estimate <= budget:
+            if getattr(p, measure) <= budget:
                 best, lo = p, mid + 1
             else:
                 hi = mid - 1
@@ -512,15 +583,14 @@ class WanStripe:
         fsm = self.fsm
         n = samples_in.shape[0]
         pixel_samples = None
+        if plan.arena and arena_supported(vae.device):
+            reserve_arena(vae.device, plan.arena)
+            stats.arena = plan.arena
         with OpChunking(fsm, budget_ws, stats):
             for i in range(n):
                 z = samples_in[i:i + 1].to(device=vae.device, dtype=vae.vae_dtype)
                 ckpt = run_prefix(self.prefix, z)
                 del z
-                # give the prefix's freed blocks (attention scores, qkv, columns of whole-image convs) back: the
-                # stripes allocate other sizes and would otherwise stack their blocks on top of them (DESIGN §9.13.4)
-                mm.soft_empty_cache(True)
-                stats.cache_releases += 1
                 if pixel_samples is None:
                     shape = (n, self.units[-1].cout, ckpt.shape[2], plan.h_out, plan.w_out)
                     pixel_samples = torch.empty(shape, device=vae.output_device, dtype=vae.vae_output_dtype())
