@@ -24,10 +24,14 @@ random weights, fp32 on the CPU.
   6. default policy (the peak of 128-row stripes, tallest stripes within it),
      memory model (estimate = persistent + max(prefix, stripes), monotone in
      the stripe height, the largest stripe runs first), the allocator cache is
-     emptied after the self-test and between prefix and stripes;
+     emptied after the self-test (not during a decode), the arena;
   7. single-frame Conv3d as conv2d (forced on the CPU): same result as the
      module, only where the 3D call is single-frame with an effective kT=1 and
-     a known _conv_forward.
+     a known _conv_forward;
+  8. caching allocator (tests/alloc_sim.py, the full-size Wan decoder on the
+     meta device): the simulator reproduces CT 700 readings of the earlier
+     versions, and the estimate is >= the simulated reserved peak of the
+     current code (arena) for 1344 .. 8K, bf16 / fp32, several stripe heights.
 
     python tests/test_vae_stripe.py
 """
@@ -354,10 +358,10 @@ def policy_memory_tests(v):
     mvae.set_budget(None)
     ref = bound.plan(v, lat, 0, ws, rows=mvae.DEFAULT_POLICY_ROWS, out_bytes=outb)
     last = compare_layer1("320-row image, default policy", v, lat, expect_stripes=3)
-    check("default policy: target = estimate of {}-row stripes ({}), tallest stripes within it: {} x {} rows, estimate {} ({})".format(
-        mvae.DEFAULT_POLICY_ROWS, vae_ops.fmt_bytes(ref.estimate), last["stripes"], last["rows"], vae_ops.fmt_bytes(last["estimate"]["total"]), last["policy"]),
-        last["policy"].startswith("default") and last["budget"] == ref.estimate and last["estimate"]["total"] <= ref.estimate
-        and bound.plan(v, lat, 0, ws, rows=160, out_bytes=outb).estimate > ref.estimate)
+    check("default policy: target = arena (peak) of {}-row stripes ({}), tallest stripes within it: {} x {} rows, arena {} ({})".format(
+        mvae.DEFAULT_POLICY_ROWS, vae_ops.fmt_bytes(ref.arena), last["stripes"], last["rows"], vae_ops.fmt_bytes(last["estimate"]["arena"]), last["policy"]),
+        last["policy"].startswith("default") and last["budget"] == ref.arena and last["estimate"]["arena"] <= ref.arena
+        and bound.plan(v, lat, 0, ws, rows=160, out_bytes=outb).arena > ref.arena)
     mvae.set_stripe_rows(64)
     p, bud, _, policy = mvae.choose_plan(v, lat, bound, outb)
     mvae.set_budget(ref.estimate)
@@ -372,31 +376,58 @@ def policy_memory_tests(v):
     for w in (16 * 1024, 1 << 20, 384 << 20):
         plans = [bound.plan(v, lat, 0, w, rows=r, out_bytes=outb) for r in (1, 8, 16, 40, 64, 107, 160, 320)]
         mono = all(a.estimate <= b.estimate for a, b in zip(plans, plans[1:]))
-        parts = all(q.estimate == q.persistent + max(q.prefix_bytes, q.stripe_bytes)
-                    and q.prefix_bytes == vs.with_slack(q.prefix_live) and q.stripe_bytes == q.ckpt_bytes + vs.with_slack(q.stripe_live) for q in plans)
+        parts = all(q.live_peak == q.persistent + max(q.prefix_bytes, q.stripe_bytes) and q.prefix_bytes == q.prefix_live
+                    and q.stripe_bytes == q.ckpt_bytes + q.stripe_live and q.arena == vs.arena_bytes(q.live_peak, len(q.stripes))
+                    and q.estimate == q.arena + q.largest + vs.ESTIMATE_PAD for q in plans)
         order = True
         for q in plans:
             size = [sum(n[1] - n[0] for n in needs) for needs in q.needs]
             order = order and sorted(q.order) == list(range(len(q.stripes))) and size[q.order[0]] == max(size)
-        check("workspace {}: estimate monotone in the stripe height ({} .. {}), = persistent + max(prefix, stripes) with the allocator slack, "
-              "largest stripe first".format(vae_ops.fmt_bytes(w), vae_ops.fmt_bytes(plans[0].estimate), vae_ops.fmt_bytes(plans[-1].estimate)),
+        check("workspace {}: estimate monotone in the stripe height ({} .. {}), live peak = persistent + max(prefix, stripes), "
+              "estimate = arena + largest allocation + small-pool pad, largest stripe first".format(vae_ops.fmt_bytes(w), vae_ops.fmt_bytes(plans[0].estimate), vae_ops.fmt_bytes(plans[-1].estimate)),
               mono and parts and order)
-    # allocator cache: emptied after the self-test and between prefix and stripes
-    calls = []
+    # allocator: cache emptied after the self-test, not during the decode; the arena is reserved where supported
+    calls, arenas = [], []
     orig = comfy.model_management.soft_empty_cache
+    orig_sup, orig_res = vs.arena_supported, vs.reserve_arena
     comfy.model_management.soft_empty_cache = lambda force=False: calls.append(force)
     try:
         vs._SELFTEST.clear()
         ok, _ = vs.self_test(bound, v)
         n_selftest = len(calls)
         mvae.set_stripe_rows(40)
-        managed_decode(v, torch.randn(2, 16, 1, 12, 10, generator=g))
-        mvae.set_stripe_rows(None)
+        lat2 = torch.randn(2, 16, 1, 12, 10, generator=g)
+        managed_decode(v, lat2)
+        last_cpu = mvae.last_decode()
+        vs.arena_supported = lambda device: True
+        vs.reserve_arena = lambda device, n: (arenas.append(n), orig_res(device, n))
+        out = managed_decode(v, lat2, raw=True)
         last = mvae.last_decode()
+        mvae.set_stripe_rows(None)
     finally:
         comfy.model_management.soft_empty_cache = orig
-    check("allocator cache emptied after the self-test ({} call) and once per sample between prefix and stripes ({} for batch 2)".format(
-        n_selftest, last["stats"]["cache_releases"]), ok and n_selftest == 1 and last["stats"]["cache_releases"] == 2 and all(calls))
+        vs.arena_supported, vs.reserve_arena = orig_sup, orig_res
+    ref = native_decode(v, lat2, raw=True)
+    check("allocator: cache emptied once after the self-test ({} call), never during a decode; arena {} reserved once for a batch of 2 where "
+          "supported (CPU: none), result unchanged (max|Δ| {:.2g})".format(n_selftest, vae_ops.fmt_bytes(last["stats"]["arena"]), float((out - ref).abs().max())),
+          ok and n_selftest == 1 and len(calls) == 1 and all(calls) and last_cpu["stats"]["arena"] == 0
+          and arenas == [last["stats"]["arena"]] and last["stats"]["arena"] == last["estimate"]["arena"]
+          and float((out - ref).abs().max()) <= 1e-5)
+    import os
+    saved = {k: os.environ.get(k) for k in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF")}
+    try:
+        os.environ["PYTORCH_HIP_ALLOC_CONF"] = "max_split_size_mb:512"
+        no_split = vs.arena_supported(torch.device("cuda")) if torch.cuda.is_available() else False
+        os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
+        no_exp = vs.arena_supported(torch.device("cuda")) if torch.cuda.is_available() else False
+    finally:
+        for k, val in saved.items():
+            if val is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = val
+    check("arena only with the default allocator config: not on the CPU, not with max_split_size_mb / expandable_segments",
+          not vs.arena_supported(torch.device("cpu")) and not no_split and not no_exp)
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +472,31 @@ def conv2d_route_tests(v, lat):
     check("CPU tensor: SlowDilated3d gate off ({}), Conv3d left as is".format(vae_ops.slow_dilated3d(torch.zeros(1))), st.conv3d_as_2d == 0)
 
 
+# ---------------------------------------------------------------------------
+# 8. caching allocator: simulator fidelity, estimate >= reserved
+# ---------------------------------------------------------------------------
+
+def allocator_tests():
+    import alloc_sim
+    G = float(1 << 30)
+    for label, kw, mres in (
+            ("4e54d20, 4K, 128-row stripes", dict(w=3840, h=2160, rows=128, **alloc_sim._version("v1")), 1.07),
+            ("4e54d20, 4K, 5 x 432 rows", dict(w=3840, h=2160, rows=512, **alloc_sim._version("v1")), 2.66),
+            ("725a010, 4K, 14 x 155 rows", dict(w=3840, h=2160, rows=155, **alloc_sim._version("v2")), 1.44),
+            ("725a010, 4K, 5 x 432 rows", dict(w=3840, h=2160, rows=512, **alloc_sim._version("v2")), 2.09),
+            ("725a010, fp32 2688, 12 x 128 rows", dict(w=2688, h=1536, dtype="fp32", rows=128, **alloc_sim._version("v2")), 1.41)):
+        i = alloc_sim.decode_trace(**kw)
+        check("allocator simulator reproduces CT 700: {}: reserved {:.2f} GiB (measured {:.2f})".format(label, i["reserved"] / G, mres),
+              abs(i["reserved"] / G - mres) <= 0.03)
+    for w, h, dt, rows in ((1344, 768, "bf16", None), (1344, 768, "bf16", 768), (1920, 1088, "bf16", None), (2688, 1536, "bf16", None),
+                           (3840, 2160, "bf16", None), (3840, 2160, "bf16", 32), (3840, 2160, "bf16", 512), (3840, 2160, "fp32", None),
+                           (7680, 4320, "bf16", None)):
+        i = alloc_sim.decode_trace(w, h, dt, rows)
+        check("{}x{} {} {}: {} x {} rows, simulated reserved {:.3f} GiB <= estimate {:.3f} GiB (arena {:.3f}, live peak {:.3f})".format(
+            w, h, dt, "default" if rows is None else "{} rows".format(rows), i["stripes"], i["rows"], i["reserved"] / G, i["estimate"] / G,
+            i["arena"] / G, i["live_peak"] / G), i["reserved"] <= i["estimate"])
+
+
 def main():
     if not mvae.is_installed():
         check("vae.install() on this ComfyUI", mvae.install())
@@ -452,6 +508,7 @@ def main():
     budget_oom_tests(v, lat)
     policy_memory_tests(v)
     conv2d_route_tests(v, lat)
+    allocator_tests()
     finish()
 
 

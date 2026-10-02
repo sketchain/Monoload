@@ -448,11 +448,11 @@ def choose_plan(vae, samples_in, bound, out_bytes):
     forced rows   MONOLOAD_VAE_STRIPE_ROWS: exactly that core height.
     budget        MONOLOAD_VAE_BUDGET: the tallest stripes whose estimate fits
                   it; MonoloadError when even MIN_ROWS-row stripes do not.
-    default       the lowest peak that does not cost speed: the estimate of
-                  DEFAULT_POLICY_ROWS-row stripes is the target (shorter stripes
-                  were clearly slower on the hardware, 128 rows as fast as the
-                  tallest), and the tallest stripes whose estimate stays at that
-                  target are used. Where the whole-image prefix sets the peak
+    default       the lowest peak that does not cost speed: the peak (the arena,
+                  what is reserved) of DEFAULT_POLICY_ROWS-row stripes is the
+                  target (shorter stripes were clearly slower on the hardware,
+                  128 rows as fast as the tallest), and the tallest stripes whose
+                  arena stays at that target are used. Where the whole-image prefix sets the peak
                   (large images) that is taller than DEFAULT_POLICY_ROWS at no
                   extra memory; a small image may become a single stripe.
     """
@@ -474,8 +474,8 @@ def choose_plan(vae, samples_in, bound, out_bytes):
                     fmt_bytes(smallest.prefix_bytes), fmt_bytes(smallest.stripe_bytes)))
         return plan, bud, ws, "MONOLOAD_VAE_BUDGET"
     ref = bound.plan(vae, samples_in, 0, ws, rows=DEFAULT_POLICY_ROWS, out_bytes=out_bytes)
-    target = ref.estimate
-    plan = bound.plan(vae, samples_in, target, ws, out_bytes=out_bytes) or ref
+    target = ref.arena
+    plan = bound.plan(vae, samples_in, target, ws, out_bytes=out_bytes, measure="arena") or ref
     return plan, target, ws, "default: peak of {}-row stripes".format(DEFAULT_POLICY_ROWS)
 
 
@@ -522,14 +522,16 @@ def _decode_layer1(self, samples_in, bound, t0, selftest):
     boundaries = [(plan.h_out, a) for a, _ in plan.stripes[1:]]
     _LAST.clear()
     _LAST.update({"strategy": "layer1", "adapter": bound.name, "estimate": {"total": plan.estimate, "first": first_est,
-                  "prefix": plan.prefix_bytes, "stripes": plan.stripe_bytes, "checkpoint": plan.ckpt_bytes, "persistent": plan.persistent},
+                  "prefix": plan.prefix_bytes, "stripes": plan.stripe_bytes, "checkpoint": plan.ckpt_bytes, "persistent": plan.persistent,
+                  "live": plan.live_peak, "arena": plan.arena},
                   "native_estimate": native_est, "budget": bud, "policy": policy, "workspace": ws, "retries": retries, "seconds": dt,
                   "stripes": len(plan.stripes), "rows": max(b - a for a, b in plan.stripes), "recompute": plan.recompute,
                   "checkpoint_bytes": plan.ckpt_bytes, "boundaries": boundaries, "forced_rows": forced, "selftest": selftest,
                   "stats": stats.as_dict()})
-    logging.info("[Monoload] VAE decode {} -> layer 1 ({}): {}; {}, workspace {}{}; memory estimate {} (native {}), {:.2f}s".format(
+    logging.info("[Monoload] VAE decode {} -> layer 1 ({}): {}; {}, workspace {}{}; arena {}, memory estimate {} (native {}), {:.2f}s".format(
         "x".join(str(d) for d in samples_in.shape), bound.name, plan.describe(), policy, fmt_bytes(ws),
-        ", {} OOM retries".format(retries) if retries else "", fmt_bytes(plan.estimate), fmt_bytes(native_est), dt))
+        ", {} OOM retries".format(retries) if retries else "", fmt_bytes(stats.arena) if stats.arena else "none",
+        fmt_bytes(plan.estimate), fmt_bytes(native_est), dt))
     return pixel_samples
 
 
