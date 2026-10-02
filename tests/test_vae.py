@@ -414,6 +414,20 @@ def misc_tests():
     check("MONOLOAD_VAE_WORKSPACE parsing (1G, 512M, 768 = MiB, 1.5GiB, 4096K, 2048b)", ok)
 
 
+def timing_sync_test(v):
+    """The decode time in the log is measured between two device syncs (kernels
+    run asynchronously; an unsynchronized host clock stops too early)."""
+    calls = []
+    orig = comfy.model_management.synchronize
+    comfy.model_management.synchronize = lambda: calls.append(1)
+    try:
+        mvae.set_workspace(16 * 1024)
+        comfy.sd.VAE.decode(v, torch.randn(1, 4, 12, 10, generator=torch.Generator().manual_seed(5)))
+    finally:
+        comfy.model_management.synchronize = orig
+    check("managed decode synchronizes the device before starting and before stopping the clock ({} calls)".format(len(calls)), len(calls) == 2)
+
+
 def main():
     if not mvae.is_installed():
         check("vae.install() on this ComfyUI", mvae.install())
@@ -421,6 +435,7 @@ def main():
     attention_tests()
     sdxl, wan = decoder_tests()
     fallback_and_oom_tests(sdxl, wan)
+    timing_sync_test(sdxl)
     misc_tests()
     finish()
 
