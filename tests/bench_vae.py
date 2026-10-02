@@ -23,6 +23,19 @@ and reports per run (printed as it happens) and in summary tables:
             output rows next to row-block boundaries (±--boundary-rows around
             every conv block boundary, mapped to output rows) vs all other
             rows; per-channel mean shift; NaN/Inf counts.
+--fp32-ref: the same VAE loaded a second time in fp32 (same loader, vae_dtype
+forced to fp32) is decoded once per resolution after the bf16 modes, as the
+"true" value: native (bf16) vs fp32 and monoload (bf16) vs fp32 with the same
+metrics (and the same block-boundary rows), so outliers of monoload vs native
+can be told apart: bf16 noise (both equally far from fp32) or added by the
+chunking (monoload farther). The fp32 decode is tried natively and with
+Monoload's chunking (--fp32-impl); native fp32 needs about twice the bf16
+memory (~90 GiB at 4K) and is skipped when it runs out of memory, the chunked
+fp32 decode is then the reference; when both succeed, their difference is
+printed as a sanity check. Also printed: the --outliers pixels where monoload
+and native differ most (batch/row/column/channel) with the fp32, native and
+monoload values there, and, over all pixels with |monoload - native| >
+--outlier-threshold, how often monoload or native is closer to fp32.
 --profile: one native decode (--profile-modes) per --profile-res under torch.profiler
 (profile_memory=True, record_shapes, with_stack): the operators allocating the
 most device memory and the largest single allocations with their shapes and
@@ -37,6 +50,7 @@ models first:
   python tests/bench_vae.py --checkpoint waiIllustriousSDXL_v170.safetensors
   python tests/bench_vae.py --vae ae.safetensors --profile
   python tests/bench_vae.py --vae qwen_image_vae.safetensors --res 1344x768,2688x1536
+  python tests/bench_vae.py --checkpoint waiIllustriousSDXL_v170.safetensors --modes native,monoload --warm 0 --fp32-ref
 
 ComfyUI launch args: $COMFY_ARGS if set, otherwise those of the container's
 main process (PID 1), otherwise "--cpu".
@@ -200,6 +214,20 @@ def load_vae(a):
             raise SystemExit("checkpoint {} has no VAE".format(a.checkpoint))
         return v, "checkpoint " + a.checkpoint
     return nodes.VAELoader().load_vae(a.vae)[0], "VAELoader " + a.vae
+
+
+def load_vae_fp32(a):
+    """The same VAE through the same loader, with vae_dtype forced to fp32
+    (VAE.__init__ asks model_management.vae_dtype when no dtype is given)."""
+    orig = mm.vae_dtype
+    mm.vae_dtype = lambda *args, **kwargs: torch.float32
+    try:
+        v, _ = load_vae(a)
+    finally:
+        mm.vae_dtype = orig
+    if v.vae_dtype != torch.float32:
+        raise SystemExit("could not load an fp32 copy of the VAE (got {})".format(v.vae_dtype))
+    return v
 
 
 def find_latent_file(name):
@@ -369,7 +397,7 @@ def run_mode(vae, latent, mode, a, label):
             last = mvae.last_decode()
             row["mono"] = last
         runs.append(row)
-        print("{:9s} {:>11s} {:5s} {:10s} {:8.3f}s | alloc peak {} (+{}) reserved {} (+{}) | GTT peak +{} | VRAM +{} | cgroup peak +{} (sampled +{}) GiB | "
+        print("{:13s} {:>11s} {:5s} {:10s} {:8.3f}s | alloc peak {} (+{}) reserved {} (+{}) | GTT peak +{} | VRAM +{} | cgroup peak +{} (sampled +{}) GiB | "
               "models unloaded {}{}".format(
             mode, label, row["run"], row["status"], row["seconds"], gib(row.get("alloc_peak")), gib(row.get("alloc_delta")).strip(),
             gib(row.get("res_peak")), gib(row.get("res_delta")).strip(), gib(row.get("gtt_delta")).strip(), gib(row.get("vram_delta")).strip(),
@@ -378,7 +406,7 @@ def run_mode(vae, latent, mode, a, label):
         if mode.startswith("monoload") and row["status"] == "ok":
             m = row["mono"]
             st = m.get("stats", {})
-            print("{:9s} {:>11s}       estimate {} GiB (native {}), workspace {}, {} OOM retries; conv {} of {} calls in {} row blocks "
+            print("{:13s} {:>11s}       estimate {} GiB (native {}), workspace {}, {} OOM retries; conv {} of {} calls in {} row blocks "
                   "(largest block workspace {}, largest whole-conv workspace {}); attention {} call(s), query block {} of {} tokens".format(
                       "", "", gib(m["estimate"]["total"]).strip(), gib(m.get("native_estimate")).strip(), vae_ops.fmt_bytes(m["workspace"]),
                       m["retries"], st.get("conv_chunked"), st.get("conv_calls"), st.get("conv_blocks"), vae_ops.fmt_bytes(st.get("conv_ws_max_block")),
@@ -461,6 +489,88 @@ def compare(ref, other, mono_stats, width):
                 res["raw_boundary"] = err_stats(raw_o[:, mask], raw_r[:, mask], 2.0)
                 res["raw_interior"] = err_stats(raw_o[:, ~mask], raw_r[:, ~mask], 2.0) if (~mask).any() else None
     return res
+
+
+def boundary_centers(stats, h_out):
+    """Block boundaries of all chunked convs, mapped to output rows."""
+    if not stats:
+        return []
+    return sorted({int(round(o0 * h_out / h_l)) for h_l, o0 in stats.get("conv_boundaries", [])})
+
+
+def outliers(native, mono, ref, mono_stats, k, thr):
+    """native / mono / ref: (raw, px) on CPU; ref = fp32 or None. The k pixels
+    where monoload and native differ most, with the three values there, and
+    over every pixel with |mono - native| > thr: how often each bf16 result is
+    closer to the reference."""
+    def nhwc(t):
+        return None if t is None else t.reshape(-1, t.shape[-3], t.shape[-2], t.shape[-1])
+    raw_n, px_n = map(nhwc, native)
+    raw_m, px_m = map(nhwc, mono)
+    raw_f, px_f = map(nhwc, ref) if ref is not None else (None, None)
+    d = (px_m - px_n).abs()
+    flat = d.flatten()
+    vals, idx = torch.topk(flat, min(k, flat.numel()))
+    N, H, W, C = px_n.shape
+    centers = boundary_centers(mono_stats, H)
+    rows = []
+    for v, i in zip(vals.tolist(), idx.tolist()):
+        b, rem = divmod(i, H * W * C)
+        y, rem = divmod(rem, W * C)
+        x, c = divmod(rem, C)
+        row = {"b": b, "y": y, "x": x, "c": c, "diff": v, "native": float(px_n[b, y, x, c]), "mono": float(px_m[b, y, x, c])}
+        if raw_n is not None and raw_m is not None:
+            row["raw_native"], row["raw_mono"] = float(raw_n[b, y, x, c]), float(raw_m[b, y, x, c])
+        if px_f is not None:
+            row["fp32"] = float(px_f[b, y, x, c])
+            if raw_f is not None:
+                row["raw_fp32"] = float(raw_f[b, y, x, c])
+        row["boundary_dist"] = min((abs(y - r) for r in centers), default=None)
+        rows.append(row)
+    res = {"top": rows, "threshold": thr, "count": int((d > thr).sum())}
+    if px_f is not None and res["count"]:
+        m = d > thr
+        en = (px_n - px_f).abs()[m]
+        em = (px_m - px_f).abs()[m]
+        res["mono_closer"] = int((em < en).sum())
+        res["native_closer"] = int((en < em).sum())
+        res["mean_err_native"] = float(en.double().mean())
+        res["mean_err_mono"] = float(em.double().mean())
+    return res
+
+
+def print_outliers(o, label, has_ref):
+    print("{:26s} {:>11s} the {} pixels where monoload and native differ most (pixel values in [0, 1]; raw in brackets){}".format(
+        "outliers", label, len(o["top"]), "" if has_ref else " -- add --fp32-ref for the fp32 values"))
+    print("{:26s} {:>11s}   {:>3s} {:>5s} {:>5s} {:>2s} | {:>8s} | {:>18s} {:>18s} {:>18s} | {:>8s} {:>8s} | {:>6s}".format(
+        "", "", "b", "row", "col", "c", "|m-n|", "fp32", "native", "monoload", "|n-fp32|", "|m-fp32|", "bdist"))
+    for r in o["top"]:
+        def v(px, raw):
+            if px is None:
+                return "{:>18s}".format("n/a")
+            return "{:>18s}".format("{:.4f} [{:+.4f}]".format(px, raw) if raw is not None else "{:.4f}".format(px))
+        f = r.get("fp32")
+        print("{:26s} {:>11s}   {:3d} {:5d} {:5d} {:2d} | {:8.4f} | {} {} {} | {:>8s} {:>8s} | {:>6s}".format(
+            "", "", r["b"], r["y"], r["x"], r["c"], r["diff"], v(f, r.get("raw_fp32")), v(r["native"], r.get("raw_native")),
+            v(r["mono"], r.get("raw_mono")), "{:.4f}".format(abs(r["native"] - f)) if f is not None else "n/a",
+            "{:.4f}".format(abs(r["mono"] - f)) if f is not None else "n/a",
+            str(r["boundary_dist"]) if r["boundary_dist"] is not None else "n/a"))
+    line = "{:26s} {:>11s} {} pixel values with |monoload - native| > {}".format("", "", o["count"], o["threshold"])
+    if "mono_closer" in o:
+        line += ": monoload closer to fp32 in {}, native closer in {}; mean |error vs fp32| there: native {:.4g}, monoload {:.4g}".format(
+            o["mono_closer"], o["native_closer"], o["mean_err_native"], o["mean_err_mono"])
+    print(line)
+    print("{:26s} {:>11s} (bdist = rows to the nearest conv block boundary mapped to the output)".format("", ""))
+
+
+def print_compare(pair, label, c):
+    print("{:26s} {:>11s} raw    {}".format(pair, label, fmt_err(c.get("raw"))))
+    print("{:26s} {:>11s} pixels {}".format("", "", fmt_err(c.get("px"))))
+    if "px_boundary" in c:
+        print("{:26s} {:>11s} pixels near block boundaries ({} rows): {}".format("", "", c["boundary_rows"], fmt_err(c["px_boundary"])))
+        print("{:26s} {:>11s} pixels elsewhere: {}".format("", "", fmt_err(c.get("px_interior"))))
+    print("{:26s} {:>11s} channel mean shift (pixels) {} ; NaN/Inf ref/other: raw {} pixels {}".format(
+        "", "", ["{:.2g}".format(x) for x in c["px_ch_shift"]], c.get("raw_nonfinite"), c["px_nonfinite"]))
 
 
 def fmt_err(e):
@@ -667,6 +777,11 @@ def main():
     p.add_argument("--profile-modes", default="native", help="modes to profile: native and/or monoload (comma list)")
     p.add_argument("--profile-cpp", action="store_true", help="C++ frames in the allocator history (shows the ATen kernel; symbolizing can take minutes)")
     p.add_argument("--top", type=int, default=25, help="rows in the profile tables")
+    p.add_argument("--fp32-ref", action="store_true", help="also decode with an fp32 copy of the VAE as reference (native vs fp32, monoload vs fp32)")
+    p.add_argument("--fp32-impl", default="both", choices=("both", "monoload", "native"),
+                   help="how the fp32 reference is decoded: native fp32 (falls back to chunked when it runs out of memory), Monoload-chunked fp32, or both (default)")
+    p.add_argument("--outliers", type=int, default=10, help="pixels listed where monoload and native differ most")
+    p.add_argument("--outlier-threshold", type=float, default=0.01, help="|monoload - native| above which a pixel value counts as an outlier")
     p.add_argument("--json", help="also write all results to this JSON file")
     a = p.parse_args()
     logging.getLogger().setLevel(logging.INFO)
@@ -676,6 +791,13 @@ def main():
     vae, source = load_vae(a)
     env_header(vae, source, a)
     mm.load_models_gpu([vae.patcher])
+    vae32 = None
+    if a.fp32_ref:
+        vae32 = load_vae_fp32(a)
+        print("fp32 reference: same VAE loaded again with dtype {} ({}), decoded {}".format(
+            vae32.vae_dtype, type(vae32.first_stage_model).__name__,
+            {"both": "natively and chunked (native skipped if it runs out of memory)", "native": "natively (chunked if native runs out of memory)",
+             "monoload": "with Monoload's chunking"}[a.fp32_impl]))
 
     inputs = []
     if a.latent:
@@ -704,6 +826,7 @@ def main():
     modes = a.modes.split(",")
     results = []
     accuracy = []
+    outlier_info = []
     for label, lat, _ in inputs:
         print("\n=== {} ===".format(label), flush=True)
         captured = {}
@@ -713,6 +836,7 @@ def main():
             if s["status"] in ("ok", "partial") and px is not None:
                 captured[mode] = (raw, px, s.get("mono", {}).get("stats"))
         ref = captured.get("native")
+        mono_stats = captured.get("monoload", (None, None, None))[2]
         for other in modes:
             if other == "native" or other not in captured:
                 continue
@@ -722,39 +846,70 @@ def main():
             c = compare((ref[0], ref[1]), (captured[other][0], captured[other][1]), captured[other][2], a.boundary_rows)
             c.update({"res": label, "pair": other + " vs native"})
             accuracy.append(c)
-            print("{:20s} {:>11s} raw    {}".format(other + " vs native", label, fmt_err(c.get("raw"))))
-            print("{:20s} {:>11s} pixels {}".format("", "", fmt_err(c.get("px"))))
-            if "px_boundary" in c:
-                print("{:20s} {:>11s} pixels near block boundaries ({} rows): {}".format("", "", c["boundary_rows"], fmt_err(c["px_boundary"])))
-                print("{:20s} {:>11s} pixels elsewhere: {}".format("", "", fmt_err(c.get("px_interior"))))
-            print("{:20s} {:>11s} channel mean shift (pixels) {} ; NaN/Inf native/other: raw {} pixels {}".format(
-                "", "", ["{:.2g}".format(x) for x in c["px_ch_shift"]], c.get("raw_nonfinite"), c["px_nonfinite"]))
+            print_compare(other + " vs native", label, c)
+
+        fp32 = None
+        if vae32 is not None:
+            a0 = argparse.Namespace(**dict(vars(a), warm=0))
+            got = {}
+            for mode, want in (("native-fp32", a.fp32_impl in ("both", "native")), ("monoload-fp32", True)):
+                if not want or (mode == "monoload-fp32" and a.fp32_impl == "native" and "native-fp32" in got):
+                    continue
+                s32, raw, px = run_mode(vae32, lat, mode, a0, label)
+                results.append(s32)
+                if s32["status"] == "ok" and px is not None:
+                    got[mode] = (raw, px)
+            if "native-fp32" in got and "monoload-fp32" in got:
+                c = compare(got["native-fp32"], got["monoload-fp32"], mono_stats, a.boundary_rows)
+                c.update({"res": label, "pair": "fp32 chunked vs fp32 native"})
+                accuracy.append(c)
+                print_compare("fp32 chunked vs fp32 nat.", label, c)
+            fp32 = got.get("native-fp32") or got.get("monoload-fp32")
+            which = "native" if "native-fp32" in got else ("chunked" if fp32 is not None else None)
+            if fp32 is None:
+                accuracy.append({"res": label, "pair": "* vs fp32", "note": "fp32 reference failed (OOM)"})
+            else:
+                for other in ("native", "monoload"):
+                    if other not in captured:
+                        continue
+                    c = compare(fp32, (captured[other][0], captured[other][1]), mono_stats, a.boundary_rows)
+                    c.update({"res": label, "pair": "{} vs fp32 ({})".format(other, which)})
+                    accuracy.append(c)
+                    print_compare("{} vs fp32".format(other), label, c)
+            del got
+        if "native" in captured and "monoload" in captured and a.outliers > 0:
+            o = outliers(captured["native"][:2], captured["monoload"][:2], fp32, mono_stats, a.outliers, a.outlier_threshold)
+            o["res"] = label
+            outlier_info.append(o)
+            print_outliers(o, label, fp32 is not None)
+        del fp32
         del captured
         gc.collect()
     mvae.uninstall()
 
     print("\n=== summary: time and memory (GiB; Δ = increase over the value right before the run; peaks = max over the runs) ===")
-    hdr = "{:11s} {:9s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6s}"
+    hdr = "{:11s} {:13s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6s}"
     print(hdr.format("res", "mode", "status", "cold s", "warm s", "alloc pk", "alloc Δ", "resv Δ", "GTT Δ", "cg peakΔ", "cg sampΔ", "estimate", "native est", "unload"))
     for s in results:
         m = s.get("mono") or {}
         est = (m.get("estimate") or {}).get("total")
-        nat = mvae._native_estimate(vae, next(l for lb, l, _ in inputs if lb == s["res"]).shape)
-        print("{:11s} {:9s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6}".format(
+        nat = mvae._native_estimate(vae32 if s["mode"].endswith("fp32") else vae, next(l for lb, l, _ in inputs if lb == s["res"]).shape)
+        print("{:11s} {:13s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6}".format(
             s["res"], s["mode"], s["status"], "{:.3f}".format(s["cold"]), "{:.3f}".format(s["warm"]) if s["warm"] is not None else "n/a",
             gib(s.get("alloc_peak")), gib(s.get("alloc_delta")), gib(s.get("res_delta")), gib(s.get("gtt_delta")), gib(s.get("cg_mempeak_delta")),
             gib(s.get("cg_delta")), gib(est) if s["mode"].startswith("monoload") else "", gib(nat), s.get("unloaded") or 0))
-    print("\n=== summary: accuracy against native (raw = decoder output before process_output; pixels = clamped fp32 in [0, 1]) ===")
-    print("{:11s} {:20s} | {:>9s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>9s} {:>7s} {:>9s} | {:>9s} {:>9s} | {:>9s}".format(
+    print("\n=== summary: accuracy (raw = decoder output before process_output; pixels = clamped fp32 in [0, 1]; "
+          "bound/inter = rows near conv block boundaries of the monoload run / all other rows) ===")
+    print("{:11s} {:28s} | {:>9s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>9s} {:>7s} {:>9s} | {:>9s} {:>9s} | {:>9s}".format(
         "res", "pair", "raw max", "raw mean", "raw rmse", "px max", "px mean", "px rmse", "PSNR", "px p99", "bound max", "inter max", "NaN/Inf"))
     for c in accuracy:
         if "note" in c:
-            print("{:11s} {:20s} | {}".format(c["res"], c["pair"], c["note"]))
+            print("{:11s} {:28s} | {}".format(c["res"], c["pair"], c["note"]))
             continue
         r = c.get("raw") or {}
         x = c["px"]
         f = lambda v: "{:9.3g}".format(v) if v is not None else "      n/a"
-        print("{:11s} {:20s} | {} {} {} | {} {} {} {:7.1f} {} | {} {} | {:>9s}".format(
+        print("{:11s} {:28s} | {} {} {} | {} {} {} {:7.1f} {} | {} {} | {:>9s}".format(
             c["res"], c["pair"], f(r.get("max")), f(r.get("mean")), f(r.get("rmse")), f(x["max"]), f(x["mean"]), f(x["rmse"]), x["psnr"], f(x["p99"]),
             f((c.get("px_boundary") or {}).get("max")), f((c.get("px_interior") or {}).get("max")),
             "{}/{}".format(c["px_nonfinite"][1], (c.get("raw_nonfinite") or ("-", "-"))[1])))
@@ -763,6 +918,17 @@ def main():
     print("estimate = what Monoload passed to load_models_gpu; native est = memory_used_decode (what native passes); "
           "unload = models unloaded by load_models_gpu during the run (here only the VAE is loaded, so 1 = the VAE itself was unloaded and loaded again).")
     print("native2 vs native = the GPU's own run-to-run difference; monoload vs native should be of that order or small (no bit-exactness promised).")
+    if outlier_info:
+        print("\n=== summary: outliers (|monoload - native| > threshold) ===")
+        for o in outlier_info:
+            line = "{:11s} {} pixel values above {}, largest {:.4f}".format(o["res"], o["count"], o["threshold"], o["top"][0]["diff"] if o["top"] else 0.0)
+            if "mono_closer" in o:
+                line += "; closer to fp32: monoload {}, native {}; mean |error vs fp32| there: native {:.4g}, monoload {:.4g}".format(
+                    o["mono_closer"], o["native_closer"], o["mean_err_native"], o["mean_err_mono"])
+            print(line)
+    if vae32 is not None:
+        print("X vs fp32 = error of the bf16 result X against the fp32 decode of the same VAE (native fp32 if it fit, otherwise chunked fp32). "
+              "If monoload vs fp32 is about as large as native vs fp32, the monoload/native outliers are bf16 noise, not chunking.")
     if a.json:
         def clean(o):
             if isinstance(o, dict):
@@ -773,7 +939,7 @@ def main():
                 return str(o)
             return o
         with open(a.json, "w") as f:
-            json.dump(clean({"results": results, "accuracy": accuracy}), f, indent=1, default=str)
+            json.dump(clean({"results": results, "accuracy": accuracy, "outliers": outlier_info}), f, indent=1, default=str)
         print("results written to {}".format(a.json))
 
 

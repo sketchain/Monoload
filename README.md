@@ -341,6 +341,10 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 | `--profile-modes` | 要 profile 的模式，默认 `native`；加上 `monoload` 可以看分块后峰值时刻剩下的是什么 |
 | `--profile-cpp` | 分配器历史里带 C++ 栈（能直接看到 `slow_conv2d` / `im2col` 这类 ATen 函数），符号化可能要几分钟 |
 | `--profile-only` | 只做 profile，不跑基准 |
+| `--fp32-ref` | fp32 参照：同一个 VAE 用同一个加载方式再加载一份 fp32 的（把 `vae_dtype` 强制为 fp32），每个分辨率在 bf16 各模式之后解码一次作为「真值」，输出 `native vs fp32`、`monoload vs fp32` 两组与上面相同的误差指标（块边界行用同一次 monoload 运行的） |
+| `--fp32-impl` | fp32 参照怎么解码：`both`（默认：原生 fp32 和分块 fp32 都跑；原生 fp32 显存约为 bf16 的两倍，4K 约 90 GiB，OOM 时跳过，改用分块的结果作参照；两者都成功时另外输出两者之差，作为分块在 fp32 下是否精确的旁证）、`native`（原生，OOM 时退到分块）、`monoload`（只用分块） |
+| `--outliers N` | 列出 monoload 与 native 差得最多的 N 个像素（默认 10）：batch、行、列、通道，三方（fp32、native、monoload）在这些点上的像素值和 raw 值，各自离 fp32 多远，离最近的块边界几行 |
+| `--outlier-threshold` | 统计 \|monoload − native\| 超过这个值（默认 0.01）的所有像素值：其中 monoload 和 native 各有多少个更接近 fp32，以及两者在这些点上对 fp32 的平均误差 |
 | `--json F` | 全部结果另存一份 JSON |
 
 **原生 OOM 的处理：** 原生解码真 OOM 时会退回 tiled，脚本把 tiled 路径换成「立即中止」，这一行标为 `OOM(tiled)`，不当作原生结果，也不参与精度比较；直接抛出的 OOM 标为 `OOM`；monoload 在最小预算下仍 OOM 时（`MonoloadVAEOOMError`）同样标为 `OOM`。脚本不会因此退出，后面的模式和分辨率照常跑。
@@ -359,6 +363,23 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 * 精度：`monoload vs native` 没有 NaN/Inf；PSNR 足够高（初步目标：像素 RMSE ≤ 1e-3，即 PSNR ≥ 60 dB，max|Δ| ≤ 1e-2）；边界附近与其余行的误差同一量级（没有系统性的边界误差）；通道均值偏移接近 0。`native2 vs native` 是 GPU 本身的基线。
 * 耗时：monoload 的热启动与原生相比慢多少（算量约 1 倍，多出来的是块的启动和拷贝开销）。
 * **把三份完整输出（`bench_vae_*.txt`）和 JSON 发给我。**
+
+**fp32 参照（判断 monoload 的 max|Δ| 离群点是 bf16 固有噪声，还是分块额外引入的）：** 峰值和耗时第一轮已经测过，这一轮只看精度，所以去掉 `native2`、不跑热启动：
+
+```bash
+curl -X POST http://127.0.0.1:8188/free -H 'Content-Type: application/json' -d '{"unload_models":true,"free_memory":true}'
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --modes native,monoload --warm 0 --fp32-ref \
+  --json /opt/ComfyUI/output/bench_vae_fp32_sdxl.json 2>&1 | tee bench_vae_fp32_sdxl.txt
+# Flux / Qwen：把 --checkpoint ... 换成 --vae ae.safetensors / --vae qwen_image_vae.safetensors，输出文件名相应改成 _flux / _qwen
+```
+
+看什么：
+
+* `native vs fp32` 和 `monoload vs fp32` 两行（PSNR、RMSE、max、p99）是否相当。相当，就说明 monoload 和 native 只是各自带着 bf16 的舍入噪声，离群点是噪声在两个结果里落到了不同位置；monoload 明显更差，才说明分块额外引入了误差。
+* `outliers` 表：前 10 个点上 `|n-fp32|` 和 `|m-fp32|` 哪个大，`bdist` 是否集中在 0（块边界上）；下面一行统计里 monoload 和 native 各有多少个点更接近 fp32。
+* `fp32 chunked vs fp32 native`（只有原生 fp32 放得下的分辨率才有，通常只有 1344×768）：分块在 fp32 下应当只差 1e-6 量级。
+* 同样把三份输出和 JSON 发给我。
 
 ## 10. 真机验收结果（CT 700，2026-10）
 
@@ -391,6 +412,41 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 * **决定：** 默认路径维持 C，`MONOLOAD_EXACT=1` 继续作为与原生逐位一致的选项；`mm-add` 不采用（每步多约 5%，出图差异只降到 A 的水平，类别不变）。
 * **9.5 fp8**（WAI 生成的 fp8 UNet）：采样时挂 LoRA 只多出 0.58G GTT，没有备份，没有报错，出图正常。
 * **9.6 日志：** 没有 traceback / 不支持 / 内部错误，没有 OOM。
+
+### 10.1 VAE 解码第一阶段（`bench_vae_*`，2026-10，af9abc6）
+
+设置：`--gpu-only --bf16-vae`，`cudnn.enabled = False`，split 注意力；随机 latent（种子 0）；每档 1 次冷启动 + 3 次热启动；先 `/free`，脚本进程里只有这一个 VAE。完整分析见 DESIGN.md §9.12。
+
+* **峰值主因已确认：Slow2d 的 im2col 展开缓冲。** 原生解码峰值时刻最大的存活分配是最后几层 3×3 卷积的 columns：SDXL / Flux 依次 4.43 / 17.72 / 35.60 GiB（占峰值 5.68 / 22.70 / 45.61 GiB 的 78%），Qwen 3.32 / 13.29 / 26.70 GiB（峰值 3.98 / 15.92 / 31.99 GiB），与调研估算一致。原生 4K 每次都先在 HIPCachingAllocator 报 OOM（申请 38.2 GB，free 只有 11.8 GB），清空缓存重试后才成功，已经在边缘。
+* **显存（GiB；原生 → monoload；1344×768 / 2688×1536 / 3840×2160）：**
+
+| VAE | alloc 增量 | GTT 峰值增量 | monoload 估算 | 原生估算 |
+|---|---|---|---|---|
+| SDXL | 5.68→2.41 / 22.70→6.15 / 45.61→11.17 | 8.36→3.72 / 42.84→9.25 / 52.48→14.86 | 3.98 / 9.92 / 17.91 | 11.43 / 45.73 / 91.86 |
+| Flux `ae` | 5.68→2.41 / 22.71→6.15 / 45.61→11.18 | 8.36→3.72 / 42.84→9.24 / 52.50→14.89 | 3.98 / 9.92 / 17.92 | 11.43 / 45.73 / 91.86 |
+| `qwen_image_vae` | 3.98→1.82 / 15.92→3.80 / 31.99→6.46 | 6.10→2.12 / 29.37→5.05 / 59.14→9.59 | 3.49 / 7.95 / 13.96 | 4.23 / 16.92 / 33.99 |
+
+  4K 峰值降到原来的 1/4～1/6。**估算是有效上界：** 9 个场景里 monoload 的估算都大于实测的 reserved / GTT 增量（例如 SDXL 4K 估 17.9、实测 14.9）。`unload` 全为 0，cgroup 采样增量 ≤ 0.1 GiB（GTT 不计入容器 cgroup）。
+* **耗时（热启动中位数，秒；原生 → monoload）：**
+
+| VAE | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| SDXL | 0.878 → 0.908 | 4.720 → 4.106 | 12.157 → 10.184 |
+| Flux `ae` | 0.872 → 0.906 | 4.741 → 4.102 | 12.142 → 10.108 |
+| `qwen_image_vae` | 0.664 → 0.670 | 3.436 → 3.036 | 8.064 → 7.338 |
+
+  低分辨率慢 1–4%，高分辨率反而快 9–17%：原生要现场 hipMalloc 几十 GiB 的大块（Flux 4K 的 profile 里 hipMalloc 占 4.25 s CPU 时间，4K 还多一次 OOM → 清缓存 → 重试），分块后每块 ≤ 1 GiB，可以复用缓存。注意 bench 每次运行前都 `empty_cache`，原生的这部分开销在服务里会因缓存状态而不同（缓存留着时又会多占几十 GiB GTT）。
+* **精度（monoload vs native，clamp 后的像素）：** `native2 vs native` 全部为 0，GPU 是确定的。
+
+| VAE | PSNR (dB) | RMSE | p99 | max\|Δ\|（块边界附近 / 其余行） |
+|---|---|---|---|---|
+| SDXL | 68.3 / 62.5 / 61.2 | 3.8e-4 / 7.5e-4 / 8.7e-4 | 0.00098 / 0.0024 / 0.0025 | 0.0024 / 0.0386；0.0108 / 0.0959；0.0362 / 0.0528 |
+| Flux `ae` | 67.5 / 64.9 / 61.5 | 4.2e-4 / 5.7e-4 / 8.4e-4 | 0.0020 / 0.0020 / 0.0024 | 0.0039 / 0.0083；0.0083 / 0.0208；0.0283 / 0.0464 |
+| `qwen_image_vae` | 63.5 / 60.5 / 60.3 | 6.7e-4 / 9.4e-4 / 9.6e-4 | 0.0020 / 0.0024 / 0.0024 | 0.0059 / 0.0107；0.0217 / 0.0337；0.0176 / 0.0547 |
+
+  RMSE 全部 ≤ 9.6e-4（PSNR ≥ 60 dB），通道均值偏移 ≤ 2e-4，没有 NaN/Inf。**没有接缝：** 块边界附近的 RMSE 与其余行相同（例如 SDXL 4K 8.6e-4 对 8.7e-4），最大误差也不在边界上。**max|Δ| 待确认：** 像素 max|Δ| 是零星单点，为 0.008–0.096，超过调研里 max ≤ 1e-2 的研发目标；p99 只有 1–2.5 个 bf16 ulp 的量级。这些离群点是 bf16 固有噪声还是分块额外引入的，要用 9.7 的 `--fp32-ref` 判断（待测）。
+* 已知小问题：插件每次解码打的那行日志里的秒数是主机侧计时，没有等 GPU 同步，比实际短（例如 4K 显示 0.84 s，实际 10.2 s）；bench 的计时是同步过的，以 bench 为准。
+* **结论：** 第一阶段的目标达到：峰值主因确认，4K 峰值降到原来的 1/4～1/6，速度不降反升，没有接缝，估算是有效上界。
 
 ## 11. 仓库结构
 
@@ -455,13 +511,15 @@ docs/DESIGN.md              设计说明
 
 ### 12.5 限制
 
-* 与原生不逐位一致（块的 GEMM 形状不同）。CPU fp32 测试中整个 decoder 的差异在 1e-6 量级；GPU 上看 9.7 的 `monoload vs native` 对比 `native2 vs native`。
-* 第二层只去掉展开缓冲和分数矩阵，不减少激活本身：4K 时 SDXL 全尺寸的一张激活约 4 GiB，峰值预计在 10–15 GiB 量级（待实测）。
-* 块多了会有额外的启动和拷贝开销；每种块形状第一次出现时可能有额外的 kernel 选择开销。
+* 与原生不逐位一致（块的 GEMM 形状不同）。CPU fp32 测试中整个 decoder 的差异在 1e-6 量级；CT 700（bf16）上像素 RMSE ≤ 9.6e-4、PSNR ≥ 60 dB，零星单点的 max|Δ| 到 0.096，是否只是 bf16 噪声待 fp32 参照确认（§10.1）。
+* 第二层只去掉展开缓冲和分数矩阵，不减少激活本身：4K 时 SDXL 全尺寸的一张激活约 4 GiB，实测峰值 alloc 11.2 GiB、GTT 14.9 GiB（§10.1）。
+* 日志里每次解码的秒数没有等 GPU 同步，比实际短；以 bench 为准。
+* 块多了会有额外的启动和拷贝开销（实测 1344×768 慢 1–4%，更高分辨率反而快 9–17%，见 §10.1）。
 * 每个 VAE 第一次受管理解码时，会先用 8×8 的 latent 跑一次小解码来量激活大小（结果缓存，RNG 状态不变）。
 
 ### 12.6 第一阶段的状态
 
 * 已完成：管理入口、第二层（卷积行分块 + 注意力 query 分块）、OOM 策略、开关、CPU 测试（`tests/test_vae.py`）、真机测量脚本（`tests/bench_vae.py`，9.7）。
-* 待真机确认：原生峰值的主因（`--profile`）、第二层实际降到多少、精度和耗时。据此决定第二、三阶段（第一层条带解码）的优先级和预算。
+* 已在 CT 700 上测完（§10.1）：峰值主因是 im2col 展开缓冲；4K 峰值降到原来的 1/4～1/6（SDXL / Flux alloc 45.6 → 11.2 GiB，Qwen 32.0 → 6.5 GiB）；高分辨率反而更快；PSNR ≥ 60 dB，没有接缝；估算是有效上界。
+* 待确认：像素 max|Δ| 的离群点（0.008–0.096）是否只是 bf16 噪声，用 `--fp32-ref` 测（9.7）。之后再定第二、三阶段（第一层条带解码）的优先级和预算。
 * 实现细节、行区间推导和后两阶段计划见 DESIGN.md §9。
