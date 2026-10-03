@@ -19,11 +19,14 @@ run() { "$@" 2>&1 | grep -vE "agent.cpp|sysfs nodes|comfy_kitchen backend|it/s\]
 
 step "plugin entry (installed)";            run $R python tests/test_entry.py
 step "plugin entry (MONOLOAD=0)";          run env MONOLOAD=0 $R python tests/test_entry.py
+step "plugin entry (MONOLOAD_LANG=zh)";   run env MONOLOAD_LANG=zh $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_DISABLE=1)";   run env MONOLOAD_DISABLE=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_KEEP_LORA=1)"; run env MONOLOAD_KEEP_LORA=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_EXACT=1)";     run env MONOLOAD_EXACT=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_DISABLE_VAE=1)"; run env MONOLOAD_DISABLE_VAE=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_DISABLE_VAE_STRIPE=1)"; run env MONOLOAD_DISABLE_VAE_STRIPE=1 $R python tests/test_entry.py
+step "messages and translations (no model files)"; run $R python tests/test_messages.py
+step "Info node (no model files)"; run $R python tests/test_info_node.py
 step "master switch: MONOLOAD=0 == native bit for bit, priorities (no model files)"; run $R python tests/test_master_switch.py
 step "LoRA Settings node (synthetic SD1.5: python tests/make_synthetic_checkpoint.py \$MODELS)"
 if [ -f "$MODELS/checkpoints/synthetic_sd15.safetensors" ]; then run $R python tests/test_lora_node.py; else echo "skipped: no synthetic checkpoint"; fi

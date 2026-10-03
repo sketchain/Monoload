@@ -392,7 +392,7 @@ def fallback_and_oom_tests(sdxl, wan):
     try:
         with Spy() as spy:
             expect_raises("OOM even at the smallest workspace: MonoloadVAEOOMError (no tiled fallback)", MonoloadVAEOOMError,
-                          lambda: comfy.sd.VAE.decode(sdxl, lat), "不会退回到 tiled", "64 MiB")
+                          lambda: comfy.sd.VAE.decode(sdxl, lat), "never falls back to the approximate tiled", "64 MiB")
     finally:
         vae_ops._ConvChunker.__call__ = orig_call
     check("after the failed decode: decode_tiled_ not called, no override left", spy.tiled == 0 and no_overrides(sdxl.first_stage_model))

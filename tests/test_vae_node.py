@@ -161,7 +161,7 @@ def semantics_tests(cls, sd, lat):
     before = snapshot()
     tiny = node_apply(cls, sd, budget="custom", budget_gib=0.001)
     expect_raises("node budget too small -> MonoloadError naming what each candidate needs", MonoloadError,
-                  lambda: managed_decode(tiny, lat), "MONOLOAD_VAE_BUDGET", "第二层需要约", "方案 B")
+                  lambda: managed_decode(tiny, lat), "MONOLOAD_VAE_BUDGET", "layer 2 needs about", "scheme B")
     check("... the global settings are restored after the error", snapshot() == before and mvae.last_decode()["settings_source"]["budget"] == "node")
     forced = node_apply(cls, sd, gn_scheme="D", stripe_rows=24)
     out = managed_decode(forced, lat, raw=True)

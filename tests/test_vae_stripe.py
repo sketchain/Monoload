@@ -328,7 +328,7 @@ def selftest_tests(v, lat):
 def budget_oom_tests(v, lat):
     mvae.set_budget(1 << 20)
     expect_raises("budget too small (MONOLOAD_VAE_BUDGET) -> MonoloadError naming what is needed", MonoloadError,
-                  lambda: managed_decode(v, lat), "MONOLOAD_VAE_BUDGET", "需要")
+                  lambda: managed_decode(v, lat), "MONOLOAD_VAE_BUDGET", "needs")
     mvae.set_budget(None)
 
     orig_run = eng.run_stripes

@@ -13,6 +13,7 @@ runtime.
     MONOLOAD_DISABLE_VAE_STRIPE=1 python tests/test_entry.py  # VAE layer 1 off, layer 2 on
     MONOLOAD_VAE_BUDGET=2G MONOLOAD_VAE_STRIPE_ROWS=64 python tests/test_entry.py
     MONOLOAD_VAE_GN_SCHEME=D python tests/test_entry.py   # LDM layer-1 GroupNorm scheme
+    MONOLOAD_LANG=zh python tests/test_entry.py           # log and error messages in Chinese
 The Monoload nodes (LoRA Settings, VAE Settings, Info) and the web directory are registered in every combination.
 """
 
@@ -40,6 +41,9 @@ want_nodes = {"MonoloadLoRASettings": "Monoload LoRA Settings", "MonoloadVAESett
 got_nodes = {k: (nodes.NODE_DISPLAY_NAME_MAPPINGS.get(k), getattr(nodes.NODE_CLASS_MAPPINGS.get(k), "CATEGORY", None)) for k in want_nodes}
 check("nodes registered by ComfyUI's loader in every switch combination: {}".format(got_nodes),
       all(got_nodes[k] == (want_nodes[k], "Monoload") for k in want_nodes))
+from monoload import messages
+want_lang = "zh" if os.environ.get("MONOLOAD_LANG", "").strip().lower().replace("_", "-") in ("zh", "zh-cn") else "en"
+check("messages in {} (MONOLOAD_LANG={!r})".format(want_lang, os.environ.get("MONOLOAD_LANG", "")), messages.lang() == want_lang)
 web = [d for d in nodes.EXTENSION_WEB_DIRS.values() if os.path.exists(os.path.join(d, "monoload_info.js"))]
 check("web directory registered (Monoload Info's text widget): {}".format(web), len(web) == 1)
 flag = lambda n: os.environ.get(n, "").strip().lower() in ("1", "true", "yes", "on")
