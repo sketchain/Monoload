@@ -187,7 +187,7 @@ Load LoRA ─MODEL─> Monoload LoRA Settings ─MODEL─┬─> KSampler       
 
 * 解码记录按 VAE 对象分开：节点做的副本和原 VAE 是两个对象，各记各的，不会混。
 * LoRA 名字来自 `LoraLoader` 的包装（只在克隆出的 patcher 的 `model_options` 里记下文件名和强度，不改 patch、uuid 和数值）。别的插件的 LoRA 加载器打的 patch 只显示「被改动的权重数」。
-* 实测峰值只在 GPU 上有（CPU 上写 `n/a`）：reserved 是 PyTorch 的 `max_memory_reserved` 相对解码前的增量；GTT 是解码期间每 20 ms 读一次 amdgpu 的 `mem_info_gtt_used` 得到的峰值增量。
+* 实测峰值只在 GPU 上有（CPU 上写 `n/a`）：reserved 是 PyTorch 的 `max_memory_reserved` 相对解码前的增量（起点之前先清一次分配器缓存，否则采样留下的缓存块会被解码复用，增量偏低）；这个结构在本进程里第一次解码时含首次自检的时间和内存，Info 会注明「含首次自检」；GTT 是解码期间每 20 ms 读一次 amdgpu 的 `mem_info_gtt_used` 得到的峰值增量。
 * 显示方式：插件带一个前端扩展 `web/monoload_info.js`，用 ComfyUI 前端自带的文字预览控件（核心节点「Preview as Text」用的那个，`window.comfyAPI.textPreviewWidgets`）。锁定版本（ComfyUI 0.31.0，前端 1.48.7）上用浏览器实测过；前端没有这个控件时退回一个只读的文本控件。
 
 ## 5. 支持的范围

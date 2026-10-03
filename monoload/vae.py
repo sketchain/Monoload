@@ -375,16 +375,25 @@ class _MemProbe:
     """Measured memory of one managed decode: the increase of torch's peak
     reserved memory on the VAE's CUDA / ROCm device, and the peak increase of
     amdgpu GTT used (sampled every 20 ms by a thread, where the sysfs file
-    exists). Nothing is measured on the CPU."""
+    exists). Nothing is measured on the CPU.
+
+    The allocator's cache is emptied first (soft_empty_cache): blocks left
+    cached by earlier work (e.g. the sampler's activations) would otherwise
+    count in the starting point and be reused by the decode, so the increase
+    understated its footprint (CT 700: +1.25 GiB measured on a first decode
+    whose arena alone is 1.97 GiB). selftest: whether the first-use layer-1
+    self-test ran inside this decode (its time and memory are included)."""
 
     def __init__(self, device):
         self.device = device
-        self.result = {"reserved_peak": None, "gtt_peak": None}
+        self.result = {"reserved_peak": None, "gtt_peak": None, "selftest": False}
 
     def __enter__(self):
         dev = self.device
         self.cuda = getattr(dev, "type", None) == "cuda" and torch.cuda.is_available()
+        self.selftests = len(vae_engine._SELFTEST)
         if self.cuda:
+            mm.soft_empty_cache()
             self.base_res = torch.cuda.memory_reserved(dev)
             torch.cuda.reset_peak_memory_stats(dev)
         self.files = _gtt_files() if self.cuda else []
@@ -413,6 +422,7 @@ class _MemProbe:
                 self.result["gtt_peak"] = self.peak_gtt - self.base_gtt
         if self.cuda:
             self.result["reserved_peak"] = torch.cuda.max_memory_reserved(self.device) - self.base_res
+        self.result["selftest"] = len(vae_engine._SELFTEST) > self.selftests
         return False
 
 

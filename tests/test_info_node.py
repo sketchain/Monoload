@@ -128,8 +128,11 @@ def vae_tests():
     t_copy = text(vae=copy_)
     check("after decoding the original only: the original shows its layer-1 decode, the copy still 'not decoded yet' "
           "(records belong to the VAE object)", "layer 1 (LDM stripes" in t_orig and "not decoded yet" in t_copy)
+    check("the first decode of this structure in the process says it includes the first-use self-test",
+          "(includes the first-use self-test)" in t_orig)
     comfy.sd.VAE.decode(copy_, lat)
     t_copy = text(vae=copy_)
+    check("... a later decode does not", "self-test" not in t_copy)
     t_orig2 = text(vae=sd)
     last = next(l for l in t_copy.splitlines() if "last decode" in l)
     check("after decoding the copy: copy -> layer 2 with budget 1024 GiB [node]; the original still shows its own layer-1 decode\n  "
@@ -156,6 +159,35 @@ def vae_tests():
     t2 = text(vae=nat)
     check("refreshed on every run (the age of the record moves)", t2 != t)
     return sd
+
+
+def probe_tests():
+    """_MemProbe on a GPU (simulated here): the allocator's cache is emptied
+    before the starting point is taken, so blocks cached by earlier work (the
+    sampler) do not hide the decode's footprint."""
+    names = ("is_available", "memory_reserved", "reset_peak_memory_stats", "max_memory_reserved")
+    saved = {n: getattr(torch.cuda, n) for n in names}
+    saved_empty, saved_files = mvae.mm.soft_empty_cache, mvae._gtt_files
+    reserved, order = [5 << 30], []      # 5 GiB reserved, 4 of them cached free blocks left by the sampler
+
+    def empty(*a, **k):
+        order.append("empty")
+        reserved[0] = 1 << 30
+    torch.cuda.is_available = lambda: True
+    torch.cuda.memory_reserved = lambda d=None: reserved[0]
+    torch.cuda.reset_peak_memory_stats = lambda d=None: order.append("reset")
+    torch.cuda.max_memory_reserved = lambda d=None: 3 << 30   # the decode's peak
+    mvae.mm.soft_empty_cache = empty
+    mvae._gtt_files = lambda: []
+    try:
+        with mvae._MemProbe(torch.device("cuda")) as p:
+            pass
+    finally:
+        for n, f in saved.items():
+            setattr(torch.cuda, n, f)
+        mvae.mm.soft_empty_cache, mvae._gtt_files = saved_empty, saved_files
+    check("memory probe: cache emptied before the starting point ({}), increase = peak - live memory at the start = {} GiB "
+          "(not 3 - 5)".format(order, p.result["reserved_peak"] / (1 << 30)), order == ["empty", "reset"] and p.result["reserved_peak"] == 2 << 30)
 
 
 def model_tests(sd):
@@ -221,6 +253,7 @@ def main():
     interface_tests()
     global_tests()
     sd = vae_tests()
+    probe_tests()
     m = model_tests(sd)
     combo_tests(sd, m)
     finish()

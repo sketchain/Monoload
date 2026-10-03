@@ -147,6 +147,8 @@ def describe_decode(r):
         measured.append("reserved +{}".format(_gib(mem["reserved_peak"])))
     if mem.get("gtt_peak") is not None:
         measured.append("GTT +{}".format(_gib(mem["gtt_peak"])))
+    if mem.get("selftest"):
+        t += msg("info.selftest_note")
     return head + msg("info.decode_line", what=what, ws=_gib(r.get("workspace")), est=_gib(est), measured=", ".join(measured) or msg("info.no_gpu"),
                       t=t, retries=r.get("retries", 0))
 

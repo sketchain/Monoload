@@ -332,6 +332,7 @@ M = {
     "info.decode_l2": ("layer 2 (op-level chunking)", "第二层（逐算子分块）"),
     "info.decode_line": ("{what}, workspace {ws}, estimate {est}, measured peak {measured}{t}, OOM retries {retries}",
                          "{what}，工作区 {ws}，估算 {est}，实测峰值 {measured}{t}，OOM 重试 {retries} 次"),
+    "info.selftest_note": (" (includes the first-use self-test)", "（含首次自检）"),
     "info.secs": (", {secs:.2f} s", "，{secs:.2f} s"),
     "info.no_gpu": ("n/a (no GPU)", "无（没有 GPU）"),
     "info.vae_head": ("VAE ({model}{copy}):", "VAE（{model}{copy}）："),
