@@ -18,6 +18,11 @@ Two merge paths (switch: MONOLOAD_EXACT, read at import; set_exact() at runtime)
                   a native (baked) merge; see docs/DESIGN.md for the error.
   MONOLOAD_EXACT=1  bit-identical to native ComfyUI.
 
+Master switch (monoload/settings.py): with MONOLOAD=0 every replaced method
+passes the call straight to ComfyUI's original (_active() is False), so
+patchers behave exactly as native; the installed methods only cost one
+check per call.
+
 uninstall() restores the original methods (models should be unloaded first).
 """
 
@@ -36,6 +41,7 @@ import comfy.utils
 import comfy.weight_adapter
 from comfy.model_patcher import LowVramPatch, ModelPatcher, get_key_weight
 
+from . import settings
 from .errors import MonoloadError, MonoloadUnsupportedError
 
 _ORIG = {}
@@ -317,10 +323,18 @@ def _is_runtime_patch(f):
 # helpers on a patcher
 # ---------------------------------------------------------------------------
 
+def _enabled(patcher):
+    """Monoload drives this patcher's LoRA: the master switch (MONOLOAD)."""
+    return settings.master()
+
+
 def _active(patcher):
-    """Monoload only drives patchers whose class still uses ModelPatcher's own
-    patch_weight_to_device. Subclasses with their own weight patching (e.g.
-    ComfyUI-GGUF) keep their native behaviour."""
+    """Monoload drives this patcher: it is enabled (_enabled) and its class
+    still uses ModelPatcher's own patch_weight_to_device. Subclasses with
+    their own weight patching (e.g. ComfyUI-GGUF) keep their native
+    behaviour. Not active -> every replaced method is the native one."""
+    if not _enabled(patcher):
+        return False
     cls = type(patcher)
     if cls.patch_weight_to_device is _patch_weight_to_device:
         return True
@@ -358,6 +372,7 @@ def _module_for_key(patcher, key):
 
 def _install_runtime_patch(patcher, key):
     st = _state(patcher)
+    patcher.model.__dict__["_monoload_runtime"] = True   # runtime patches may live on this model's modules
     module, attr = _module_for_key(patcher, key)
     if not hasattr(module, "comfy_cast_weights") or attr not in ("weight", "bias"):
         raise MonoloadUnsupportedError(
@@ -402,6 +417,8 @@ def _remove_runtime_patches(patcher, keep=None):
                 touched = True
         if touched and hasattr(m, "comfy_patched_weights"):
             del m.comfy_patched_weights
+    if keep is None:
+        patcher.model.__dict__.pop("_monoload_runtime", None)
 
 
 def _drop_shadowed_runtime_patches(patcher):
@@ -431,7 +448,7 @@ def _assert_no_backup(patcher):
 # ---------------------------------------------------------------------------
 
 def _patch_weight_to_device(self, key, device_to=None, inplace_update=False, return_weight=False, force_cast=False):
-    if key not in self.patches or return_weight:
+    if key not in self.patches or return_weight or not _enabled(self):
         # Unpatched keys are a no-op natively; return_weight only computes a
         # temporary merged tensor and never writes or backs up.
         return _ORIG["patch_weight_to_device"](self, key, device_to=device_to, inplace_update=inplace_update,
@@ -481,9 +498,14 @@ def _partially_unload(self, device_to, memory_to_free=0, force_patch_weights=Fal
 
 def _unpatch_model(self, device_to=None, unpatch_weights=True):
     r = _ORIG["unpatch_model"](self, device_to=device_to, unpatch_weights=unpatch_weights)
-    if unpatch_weights and _active(self):
+    # runtime patches are removed whoever installed them (the model's flag:
+    # e.g. the switch changed while it was loaded); without any, nothing to do
+    if unpatch_weights and self.model.__dict__.get("_monoload_runtime", False):
         _remove_runtime_patches(self)
-        _state(self).device_cache.clear()
+    if unpatch_weights:
+        st = self.__dict__.get("_monoload_state")
+        if st is not None:
+            st.device_cache.clear()
     return r
 
 
@@ -543,7 +565,8 @@ def _patch_cached_hook_weights(self, cached_weights, key, memory_counter):
 
 
 def _dynamic_load(self, *args, **kwargs):
-    _check_dynamic(self)
+    if _enabled(self):
+        _check_dynamic(self)
     return _ORIG_DYNAMIC["load"](self, *args, **kwargs)
 
 
