@@ -46,14 +46,17 @@ save_file({k: v.contiguous() for k, v in sd.items()}, os.path.join(out, "checkpo
 g = torch.Generator().manual_seed(4)
 lora = {}
 km = comfy.lora.model_lora_keys_unet(model, {})
-km = comfy.lora.model_lora_keys_clip(clip, km)
-states = {**{"diffusion_model." + k: v for k, v in model.diffusion_model.state_dict().items()},
-          **{"transformer." + k: v for k, v in clip.transformer.state_dict().items()}}
+states = {"diffusion_model." + k: v for k, v in model.diffusion_model.state_dict().items()}
+for k, v in clip.transformer.state_dict().items():   # text encoder: kohya names of the CLIP-L Linear layers
+    if k.startswith("text_model.encoder.layers.") and k.endswith(".weight") and v.ndim == 2:
+        lk = "lora_te_" + k[:-len(".weight")].replace(".", "_")
+        km[lk] = "te." + k
+        states["te." + k] = v
 n = 0
 for lk, mk in km.items():
     if not (lk.startswith("lora_unet_") or lk.startswith("lora_te_")) or not isinstance(mk, str):
         continue
-    w = states.get(mk.replace("clip_l.", "")) if mk not in states else states[mk]
+    w = states.get(mk)
     if w is None or w.ndim != 2:
         continue
     o, i = w.shape
