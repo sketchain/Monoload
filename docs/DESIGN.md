@@ -46,7 +46,7 @@ v2 只做一件事：**在 ComfyUI 原生加载出来的模型上打 LoRA 时，
 * **覆盖面正好。** ComfyUI 里所有模型包装都是 `ModelPatcher` 的实例：`UNETLoader`、`CheckpointLoaderSimple` 的 MODEL、`CLIP.patcher`（文本编码器）、VAE、ControlNet 等。`CoreModelPatcher` 在没开 DynamicVRAM 时就是 `ModelPatcher` 本身。方法在类上查找，所以装上之前已经建好的实例、以及没有重写这些方法的子类也都生效。
 * **侵入小。** 不替换加载函数，不换类，不包装节点，不改 `comfy.ops` 和 `cast_bias_weight`，也不修改 ComfyUI 源码。工作流里的节点都不用换。
 * **时机确定。** ComfyUI 在启动时（`init_extra_nodes`）导入 custom node，这时还没有执行任何 prompt，也就没有加载任何模型。
-* **可以关。** 设了 `MONOLOAD_DISABLE=1`，插件不调用 `install()`，行为与原生完全一致。`uninstall()` 恢复原方法（测试里用来在同一进程中对比原生和 Monoload；调用前要先卸载所有模型）。
+* **可以关。** `MONOLOAD=0`（总开关，§10）：方法照装，但每个替换的方法先判断 `_active()`，不启用就原样调用原方法，行为与原生逐位一致。`MONOLOAD_DISABLE=1`：插件不调用 `install()`，什么都不装。`uninstall()` 恢复原方法（测试里用来在同一进程中对比原生和 Monoload；调用前要先卸载所有模型）。
 
 子类的处理：
 
@@ -509,11 +509,12 @@ loop:
 |---|---|
 | 默认 | 安装管理入口，预算 1 GiB |
 | `MONOLOAD_VAE_WORKSPACE` | 工作区：`1G`、`512M`、`768`（纯数字按 MiB）等。第二层直接用它；第一层用 `min(它, 128 MiB)`（设了 `MONOLOAD_VAE_BUDGET` 时 `min(它, max(64 MiB, 预算/8))`），见 §9.13.11 |
-| `MONOLOAD_DISABLE_VAE=1` | 只关 VAE 部分，LoRA 部分照常 |
+| `MONOLOAD_DISABLE_VAE=1` | VAE 解码的全局默认改成原生（包装照装，§10），LoRA 部分照常；节点 `mode auto` 的 VAE 仍管理 |
 | `MONOLOAD_DISABLE_VAE_STRIPE=1` | 只关第一层（§9.13），所有受管理的解码走第二层 |
 | `MONOLOAD_VAE_BUDGET` | 第一层的峰值预算；不设时用默认策略（128 行条带的峰值内最高的条带，§9.13.4） |
 | `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（扫参、调试） |
-| `MONOLOAD_EXACT=1` | VAE 走原生：分块改变 GEMM 形状，不保证逐位一致 |
+| `MONOLOAD_EXACT=1` | VAE 的全局默认是原生：分块改变 GEMM 形状，不保证逐位一致（节点 `mode auto` 的 VAE 仍管理） |
+| `MONOLOAD=0` | VAE 的全局默认是原生（总开关，§10） |
 | `MONOLOAD_DISABLE=1` | 什么都不装 |
 
 命名：需求里举例的是 `MONOLOAD_VAE=0`；现有开关都是「设为 1 时改变默认行为」（`MONOLOAD_DISABLE`、`MONOLOAD_EXACT`、`MONOLOAD_KEEP_LORA`），所以关闭开关取名 `MONOLOAD_DISABLE_VAE=1`，与 `MONOLOAD_DISABLE=1` 对应。
@@ -1112,8 +1113,35 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 **怎么生效：** `_decode`（`VAE.decode` 的包装）先取这次的设置，再在 `_Applied` 里把它们换进全局的 `_SETTINGS` 和 `vae_ldm` 的方案，解码完（包括报错）换回来。解码路径的其余代码不用改，任何调用 `vae.decode` 的节点都生效；`decode_tiled` 不经过包装，按现有规则保持原生。ComfyUI 一次执行一个 prompt，解码不会并发，这样换是安全的（测试确认三个副本交替解码各用各的设置，报错后全局设置复原）。
 
-**全局开关最高：** `MONOLOAD_DISABLE`、`MONOLOAD_DISABLE_VAE`、`MONOLOAD_EXACT` 时包装没装上，`_decode` 不会被调用，副本的设置自然不生效；节点照常返回副本，日志里说明一次（每种原因一次）。
+**全局开关（9b30154 时）最高，§10 之后不再是：** 起初 `MONOLOAD_DISABLE`、`MONOLOAD_DISABLE_VAE`、`MONOLOAD_EXACT` 时包装不装，节点不能把功能打开。总开关分支（§10）之后包装总是装上，这些变量只是全局默认值，节点上明确选的模式压过它们；只有 `MONOLOAD_DISABLE=1` 什么都不装，节点原样透传输入。
 
 **日志：** 每次受管理的解码，那一行末尾是 `settings: budget 3.00 GiB (node), GroupNorm scheme chosen by the budget (default), stripe rows auto (default), mode auto (default)`（来源 `node` / `env` / `default`）；按预算选的那一行也带上；`mode native` 时是 `VAE decode left native: mode native (Monoload VAE Settings node); settings: ...`。`last_decode()` 里有 `settings` 和 `settings_source`。
 
 **测试：** `tests/test_vae_node.py`（README §8）；ComfyUI 加载器的注册在 `tests/test_entry.py` 的 8 种开关组合里检查。真机验证：`tests/check_vae_node.py`（README §9.7 的 U）。
+
+## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
+
+**规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
+
+**总开关（`monoload/settings.py`，不导入 torch / ComfyUI）：** `MONOLOAD` 不设或 `1`（`true` / `yes` / `on`）= 开启，所有模型和 VAE 用默认策略；`0`（`false` / `no` / `off`）= 全局原生；其他值警告后按开启处理。启动时读一次（`master()`；测试用 `set_master()`，切换前要先卸载模型）。`MONOLOAD_DISABLE=1` 仍是「什么都不装」。
+
+**钩子总是装上，关闭时直通：**
+
+* `hotpatch`：`_active(patcher)` 先看 `_enabled(patcher)`（这一版就是总开关；LoRA 节点分支会改成逐个 patcher 判断），不启用就返回 False，所有替换的方法调用原方法。`patch_weight_to_device` 和 `ModelPatcherDynamic.load` 以前不看 `_active`，现在也看。于是 `MONOLOAD=0` 时整体加载走原生的「原地合并 + 备份」，lowvram 走原生的 `LowVramPatch`，hook 走原生的 `patch_hook_weight_to_device`，撤掉时按备份还原——全是原生代码，结果逐位一致（`tests/test_master_switch.py`）。
+* `unpatch_model` 以前在 `_active` 时去掉运行时 patch；现在改成看模型上的标记 `_monoload_runtime`（装运行时 patch 时设，全部去掉时清）：不论开关怎么变，模型上都不会残留运行时 patch，没有运行时 patch 的模型也不用遍历模块。
+* `release`：总是包装 `execute_async`，每个 prompt 结束时判断 `enabled()` = 总开关开 且 不是 `MONOLOAD_KEEP_LORA`（全局默认「保留」，`keep()` / `set_keep()`）。
+* `vae`：总是包装 `VAE.decode`（ComfyUI 接口不符时除外）。没有自己模式的 VAE 按 `global_mode()` 决定：`MONOLOAD=0` → 原生；`MONOLOAD_DISABLE_VAE=1` / `MONOLOAD_EXACT=1`（`set_native()`）→ 原生；`MONOLOAD_DISABLE_VAE_STRIPE=1` → 只用第二层；否则 `auto`。来源记成 `env`，日志写明是哪个变量（`mode native (env MONOLOAD=0)`）。全局原生的解码直接调用原 `decode`，只在 DEBUG 级别记一行，避免每次解码都刷日志。
+
+**开销（`MONOLOAD=0`，CPU，把原方法换成空函数只量包装本身）：** `patch_weight_to_device` 每次 +0.2 µs（每次加载每个被 patch 的权重调用一次）；`VAE.decode` 包装每次约 3.4 µs（每次解码一次，`resolve_settings` + 记录）；其他方法多一次函数调用和一次判断。相对一次加载或解码可以忽略。
+
+**VAE 节点的变化：**
+
+* `mode` 的 `default` = 跟随全局；`auto` = 为这个 VAE 打开管理（全局关着、包括 `MONOLOAD=0` 也打开）。
+* 预算改成下拉框 `budget`：`default`（跟随全局 `MONOLOAD_VAE_BUDGET`）/ `unlimited`（这个 VAE 不限预算，覆盖全局预算；存成 `budget: None`，来源 `node`，日志 `budget unlimited (node)`）/ `custom`（用 `budget_gib`，必须 > 0）。`budget_gib` 只在 `custom` 时生效，选别的时填了大于 0 的值会在日志里说明没用上。
+* 存进工作流的取值都是英文、不变（`default` 等）。ComfyUI 的控件值按位置存（`widgets_values`），所以新下拉框排在最后：旧工作流（`budget_gib`, `gn_scheme`, `stripe_rows`, `mode`）照常加载、各控件值对得上；代价是界面上 `budget` 在 `budget_gib` 下面隔了三项，以及旧工作流里 `budget_gib > 0` 的预算不再生效（`budget` 默认是 `default`），要手动改成 `custom`（README §4.1）。
+* `MONOLOAD_DISABLE=1`：节点原样返回输入的 VAE（不是副本），日志说明一次。
+
+**高级变量的新含义：** `MONOLOAD_EXACT`（合并的全局默认是逐位一致；VAE 全局默认原生）、`MONOLOAD_KEEP_LORA`（全局默认保留）、`MONOLOAD_DISABLE_VAE`（VAE 全局默认原生）、`MONOLOAD_DISABLE_VAE_STRIPE`、`MONOLOAD_VAE_BUDGET`、`MONOLOAD_VAE_GN_SCHEME`、`MONOLOAD_VAE_STRIPE_ROWS`、`MONOLOAD_VAE_WORKSPACE` 都是全局默认值，节点上有对应项的可以逐项覆盖（`MONOLOAD_VAE_WORKSPACE` 节点上没有）。LoRA 的逐模型设置在 LoRA 节点分支里加。
+
+**测试（`tests/test_master_switch.py`，18 项）：** 解析；`MONOLOAD=0` 且没有节点时，带 LoRA 的两层 `comfy.ops` 模型在整体加载、lowvram 加载（`lowvram_model_memory=1`）、Hook LoRA、撤掉 hook 四种情况下的输出与卸掉钩子的原版逐位相同，备份数相同，撤掉后权重逐位还原、没有残留的 weight function；VAE 解码逐位相同、没有 INFO 日志；释放只在开启且不保留时运行；包装开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `auto` 打开、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 透传。`tests/test_entry.py` 加了 `MONOLOAD=0` 组合，并改成检查每种组合下都装上、全局默认对得上。
+
