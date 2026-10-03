@@ -62,7 +62,7 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 **流程：**
 
 * 从 `dev` 开 feature 分支，做完合回 `dev`（`git merge --no-ff`），push `dev`。不碰 `main`，不开 PR（除非用户要求）。
-* **只跑小测试，不跑 `tests/run_all.sh`。** VAE 相关的小测试：`tests/test_vae_ldm.py`、`tests/test_vae_stripe.py`、`tests/test_vae.py`、`tests/test_entry.py`（几种开关组合）、`tests/test_dtype_paths.py`（默认和 `MONOLOAD_EXACT=1`）。
+* **只跑小测试，不跑 `tests/run_all.sh`。** VAE 相关的小测试：`tests/test_vae_ldm.py`、`tests/test_vae_stripe.py`、`tests/test_vae.py`、`tests/test_entry.py`（8 种开关组合，见文件头）、`tests/test_dtype_paths.py`（默认和 `MONOLOAD_EXACT=1`）。
 * **CT 700 上的 bench 代码由我们写，容器操作（拉代码、重建镜像、`/free`、跑命令、切开关）由用户做。** 报告里不写容器层面的步骤，只给 `docker exec ... python tests/bench_vae.py ...` 命令和要看的指标。
 * 文档和报告用中文。报告写明合并提交、小测试结果、与要求不同之处及原因。冲突时以用户的最新要求为准。
 * 提交信息结尾加 Co-Authored-By / Claude-Session 两行（见会话里的 attribution 提示）。
@@ -82,7 +82,7 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 * `monoload/vae_engine.py`：第一层的引擎，与 decoder 无关。适配器接口写在模块注释里。区间（`Unit`、`need_in`、`valid_out`、`stripe_needs`、`split_rows`）；`Plan`（最后一遍的条带、统计遍 `Pass`、存档布局「分开 / 池」、存活量 → arena → 估算、重算倍数）；执行（`run_prefix`、`run_chain`、`run_stripes`、`run_passes`）；GroupNorm（`NormRef`、`Moments`、`group_norm_frozen`、`GlobalNorms`）；arena；`StripeAdapter` 基类；自检流程。
 * `monoload/vae_wan.py`：Wan 2.1 单帧适配器（没有需要整图统计的归一化，所以没有统计遍；数字与第二阶段相同）。
 * `monoload/vae_ldm.py`：LDM 适配器：识别（`ldm_structure`）、单元（残差块带 norm1 / norm2 的 `NormRef`，norm2 的「部分单元」）、方案的存档位置（`scheme_positions`）、按 forward 数的内存模型、fp32 副本（按配置重建 `Decoder` + `post_quant_conv`）。
-* 测试：`tests/test_vae_ldm.py`、`tests/test_vae_stripe.py`（73 项）、`tests/test_vae.py`（131 项）、`tests/alloc_sim.py`、`tests/bench_vae.py`、`tests/make_synthetic_vaes.py`。
+* 测试：`tests/test_vae_ldm.py`（77 项）、`tests/test_vae_stripe.py`（73 项）、`tests/test_vae.py`（131 项）、`tests/alloc_sim.py`、`tests/bench_vae.py`、`tests/make_synthetic_vaes.py`。
 
 **以后加一种新 VAE**：写一个适配器（`match`，以及 `StripeAdapter` 的子类：结构、单元、代价模型、fp32 副本 / 参照解码），注册到 `STRIPE_ADAPTERS`；有需要整图统计的 GroupNorm 就在单元上挂 `NormRef`，引擎自动安排统计遍；先用 `alloc_sim` 加一个 meta 构造，验证 reserved ≤ 估算，再上真机。
 

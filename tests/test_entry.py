@@ -9,6 +9,7 @@ MONOLOAD_DISABLE=1 leaves ComfyUI native.
     MONOLOAD_DISABLE_VAE=1 python tests/test_entry.py # VAE decode native, LoRA part as usual
     MONOLOAD_DISABLE_VAE_STRIPE=1 python tests/test_entry.py  # VAE layer 1 off, layer 2 on
     MONOLOAD_VAE_BUDGET=2G MONOLOAD_VAE_STRIPE_ROWS=64 python tests/test_entry.py
+    MONOLOAD_VAE_GN_SCHEME=D python tests/test_entry.py   # LDM layer-1 GroupNorm scheme
 """
 
 import asyncio
@@ -60,8 +61,12 @@ else:
         if want:
             check("MONOLOAD_VAE_WORKSPACE={} honoured".format(want), vae.workspace() == vae.parse_size(want))
         no_stripe = flag("MONOLOAD_DISABLE_VAE_STRIPE")
-        check("VAE layer 1 (stripes) {}".format("off (MONOLOAD_DISABLE_VAE_STRIPE=1)" if no_stripe else "on (Wan 2.1 adapter registered)"),
-              vae.stripe_enabled() == (not no_stripe) and len(vae.STRIPE_ADAPTERS) == 1)
+        names = [a.__name__.rsplit(".", 1)[-1] for a in vae.STRIPE_ADAPTERS]
+        check("VAE layer 1 (stripes) {}, adapters {}".format("off (MONOLOAD_DISABLE_VAE_STRIPE=1)" if no_stripe else "on", names),
+              vae.stripe_enabled() == (not no_stripe) and names == ["vae_wan", "vae_ldm"])
+        want = os.environ.get("MONOLOAD_VAE_GN_SCHEME", "").strip().upper()
+        check("LDM GroupNorm scheme {} ({})".format(vae.gn_scheme(), "MONOLOAD_VAE_GN_SCHEME={}".format(want) if want else "unset: default"),
+              vae.gn_scheme() == (want or "A"))
         want = os.environ.get("MONOLOAD_VAE_BUDGET", "")
         check("layer-1 budget {} ({})".format(vae.budget(), "MONOLOAD_VAE_BUDGET={}".format(want) if want else "unset: default stripe policy"),
               vae.budget() == (vae.parse_size(want) if want else None))
