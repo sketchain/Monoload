@@ -772,6 +772,18 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_lor
    * `text` 输出接到一个显示文本的节点：内容与节点框里相同。
 5. **`MONOLOAD_LANG=zh`**（compose 里加上并重启）：启动日志、解码日志、报错（例如把 VAE 节点的预算设成 `custom` 0.5 解码 4K）都是中文；Info 节点的文字是中文。
 
+### 9.10 UI 实测之后的修正：复测（只测改动到的地方）
+
+拉代码、重启容器、浏览器强制刷新一次。
+
+1. **VAE 设置节点的控件**：新放一个 Monoload VAE Settings：控件顺序是 `budget`、`budget_gib`、`gn_scheme`、`stripe_rows`、`mode`；`budget_gib` 填 `0.25`，保存 / 导出工作流，JSON 里是 `0.25`（不是 0.3）。鼠标停在 `gn_scheme` 上：提示里有 A / D / B / C 各存什么、SDXL 4K 的内存和耗时、`default` 的含义（中文界面是中文）；下拉显示带简短说明（如「B（内置默认）」）。
+2. **预算来源的措辞**：用你上次的工作流（VAE 设置节点 `custom` 0.3）解码，报错应是 `does not fit the peak budget 307 MiB (from the Monoload VAE Settings node; ...)`，最后的建议是「在节点上调大预算，或改成 default / unlimited」，**不再出现 `MONOLOAD_VAE_BUDGET`**。`MONOLOAD_LANG=zh` 时是「预算 307 MiB（来源：Monoload VAE 设置节点）」。把预算改成 `custom` 3 正常解码，日志那一行是 `VAE budget 3.00 GiB (from the Monoload VAE Settings node) -> ...`。
+3. **泄漏警告**：同一个工作流（Checkpoint → LoraLoader → Monoload LoRA Settings（接 CLIP）→ CLIPTextEncode ×2 / KSampler → VAE 设置 custom 0.3 → VAEDecode → PreviewImage / Monoload Info），先跑一次（解码报错），紧接着再跑一次：日志里**不应再有** `Potential memory leak` / `WARNING, memory leak with model SDXLClipModel`。第一次的 release 日志末尾应有 `1 orphaned loaded model(s) re-pointed`。再把预算改成 3 正常跑两次，也没有这个警告。
+4. **Info 节点**：接上 vae / model / images 运行：VAE 段和 MODEL 段之后，最后还有全局默认值表；VAE 段里有一行 `GroupNorm scheme B: keeps the H/4 and H/2 level outputs ...`。把 VAE 设置节点的 `mode` 改成 `native`：预算、方案、条带高度后面标 `(not used in native mode)`。LoRA 设置节点 `mode` 改成 `native`：merge 后面标同样的话。
+5. **第一次解码的测量**：重启后第一次 1024×1024、预算 3G 的解码（一条带），Info 的 `measured peak reserved` 应在 arena（约 1.97 GiB）上下或略高，并写着 `(includes the first-use self-test)`；第二次约 1.97 GiB，不再有这句注明。
+
+把第 2、3、5 步的日志 / Info 文字发给我。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
