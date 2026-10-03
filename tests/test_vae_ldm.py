@@ -360,8 +360,9 @@ def plan_tests(sd, lat4):
                                                          plan.arena / G, plan.estimate / G, plan.recompute),
               len(plan.passes) == 19 and len(plan.saves) == {"A": 0, "D": 1, "B": 2, "C": 5}[scheme] and floor_ok and parts
               and plan.estimate == plan.arena + plan.largest + eng.ESTIMATE_PAD)
-    check("schemes: recompute A > D > B > C, arena A < D < B < C",
-          res["A"].recompute > res["D"].recompute > res["B"].recompute > res["C"].recompute
+    check("schemes: arena A < D < B < C; recompute A > D > B, A > D > C (C's saves share one pool, B's are separate: {} / {})".format(
+          res["C"].save_layout, res["B"].save_layout),
+          res["A"].recompute > res["D"].recompute > res["B"].recompute and res["D"].recompute > res["C"].recompute
           and res["A"].arena < res["D"].arena < res["B"].arena < res["C"].arena)
     mvae.set_gn_scheme("A")
     # OOM
