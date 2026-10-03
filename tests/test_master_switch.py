@@ -12,7 +12,7 @@ SDXL-like VAE with random weights (tests/test_vae_ldm.py), fp32 on the CPU.
      bit-exactly on unpatch); with the switch on the same model runs through
      Monoload (no backups) as a control;
   3. MONOLOAD=0: VAE.decode == native bit for bit, nothing logged at INFO;
-     the per-prompt LoRA release does not run; the wrappers' own cost per
+     the per-prompt LoRA release returns at once (no LoRA node used); the wrappers' own cost per
      call (measured against a stub) is microseconds;
   4. priority, item by item, node > global > built-in: under MONOLOAD=0, or
      with MONOLOAD_DISABLE_VAE / MONOLOAD_EXACT as the global default, a VAE
@@ -201,7 +201,7 @@ def vae_native_tests(sd, lat):
 def release_tests():
     import execution
     calls = []
-    real = release.release_after_prompt
+    real = release._release_loaded_models
     saved = execution.PromptExecutor.execute_async
 
     async def fake_execute(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
@@ -210,7 +210,7 @@ def release_tests():
     release.uninstall()
     execution.PromptExecutor.execute_async = fake_execute
     release.install()
-    release.release_after_prompt = lambda executor: calls.append(executor)
+    release._release_loaded_models = lambda: calls.append(1) or 0
     try:
         runs = []
         for master, keep in ((True, False), (False, False), (True, True)):
@@ -222,12 +222,12 @@ def release_tests():
     finally:
         settings.set_master(True)
         release.set_keep(False)
-        release.release_after_prompt = real
+        release._release_loaded_models = real
         release.uninstall()
         execution.PromptExecutor.execute_async = saved
         release.install()
-    check("per-prompt LoRA release: runs with the switch on; not with MONOLOAD=0, not with MONOLOAD_KEEP_LORA ({})".format(
-          ", ".join("master {} keep {} -> {} call(s)".format(m, k, n) for m, k, n, _ in runs)),
+    check("per-prompt LoRA release: looks at the loaded models with the switch on; returns at once with MONOLOAD=0 and with "
+          "MONOLOAD_KEEP_LORA, no LoRA node used ({})".format(", ".join("master {} keep {} -> {} scan(s)".format(m, k, n) for m, k, n, _ in runs)),
           [n for _, _, n, _ in runs] == [1, 0, 0] and all(r == "done" for *_, r in runs))
 
 
