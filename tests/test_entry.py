@@ -65,8 +65,8 @@ else:
         check("VAE layer 1 (stripes) {}, adapters {}".format("off (MONOLOAD_DISABLE_VAE_STRIPE=1)" if no_stripe else "on", names),
               vae.stripe_enabled() == (not no_stripe) and names == ["vae_wan", "vae_ldm"])
         want = os.environ.get("MONOLOAD_VAE_GN_SCHEME", "").strip().upper()
-        check("LDM GroupNorm scheme {} ({})".format(vae.gn_scheme(), "MONOLOAD_VAE_GN_SCHEME={}".format(want) if want else "unset: default"),
-              vae.gn_scheme() == (want or "A"))
+        check("LDM GroupNorm scheme {} ({})".format(vae.gn_scheme(), "MONOLOAD_VAE_GN_SCHEME={}: forced".format(want) if want else "unset: default, not forced"),
+              vae.gn_scheme() == (want or "B") and vae.gn_scheme_forced() == bool(want))
         want = os.environ.get("MONOLOAD_VAE_BUDGET", "")
         check("layer-1 budget {} ({})".format(vae.budget(), "MONOLOAD_VAE_BUDGET={}".format(want) if want else "unset: default stripe policy"),
               vae.budget() == (vae.parse_size(want) if want else None))

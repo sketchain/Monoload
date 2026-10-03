@@ -182,15 +182,37 @@ def decoder_tests():
     mvae.set_budget(None)
     for rows, n in ((1, 96), (7, 14), (40, 3), (96, 1)):
         compare_layer1("12x10 latent, stripe height {}".format(rows), v, lat, rows=rows, expect_stripes=n)
-    # budget-chosen height with several stripes (tiny workspace, so the activations decide)
+    # budget-chosen height with several stripes (tiny workspace, so the activations decide). This decoder is so
+    # small that layer 2 fits any budget a layer-1 plan fits (the arena has a fixed pad): with a budget, layer 2
+    # is chosen when it fits (the fastest, DESIGN §9.14.10), so its estimate is made huge for the stripe checks
     mvae.set_workspace(16 * 1024)
     bound, _ = vw.match(v, lat, {})
     p24 = bound.plan(v, lat, 0, 16 * 1024, rows=24, out_bytes=bound.output_bytes(v, lat))
     mvae.set_budget(p24.estimate)
-    last = compare_layer1("12x10 latent, height from a budget that fits 24-row stripes", v, lat)
-    check("budget-chosen plan: estimate {} <= budget {}, {} stripes of {} rows (24 rows fit, the whole image does not)".format(
-        vae_ops.fmt_bytes(last["estimate"]["total"]), vae_ops.fmt_bytes(last["budget"]), last["stripes"], last["rows"]),
-        last["estimate"]["total"] <= last["budget"] and 1 < last["stripes"] <= 4 and last["rows"] >= 24)
+    l2 = mvae._layer2_estimate(v, lat, {}, mvae.workspace())[0]["total"]
+    ref = native_decode(v, lat, raw=True)
+    out = managed_decode(v, lat, raw=True)
+    last = mvae.last_decode()
+    check("budget {} >= layer 2's estimate {}: layer 2 (it fits and is the fastest), == native (max|Δ| {:.2g}); {}".format(
+        vae_ops.fmt_bytes(p24.estimate), vae_ops.fmt_bytes(l2), float((out - ref).abs().max()), last.get("policy")),
+        l2 <= p24.estimate and last.get("strategy") == "layer2" and [c["layer"] for c in last.get("candidates") or []] == [2]
+        and float((out - ref).abs().max()) <= 1e-4)
+    orig_l2 = mvae._layer2_estimate
+
+    def big_l2(*a, **kw):
+        est, probe = orig_l2(*a, **kw)
+        return dict(est, total=1 << 40), probe
+    mvae._layer2_estimate = big_l2
+    try:
+        last = compare_layer1("12x10 latent, height from a budget that fits 24-row stripes (layer 2 stubbed out)", v, lat)
+    finally:
+        mvae._layer2_estimate = orig_l2
+    cands = last.get("candidates") or []
+    check("budget-chosen plan: estimate {} <= budget {}, {} stripes of {} rows (24 rows fit, the whole image does not); candidates: {}".format(
+        vae_ops.fmt_bytes(last["estimate"]["total"]), vae_ops.fmt_bytes(last["budget"]), last.get("stripes"), last.get("rows"),
+        ", ".join("layer {} {}".format(c["layer"], vae_ops.fmt_bytes(c["estimate"])) for c in cands)),
+        last.get("strategy") == "layer1" and last["estimate"]["total"] <= last["budget"] and 1 < last["stripes"] <= 4 and last["rows"] >= 24
+        and [c["layer"] for c in cands] == [2, 1] and cands[1].get("seconds") is None)
     mvae.set_workspace(mvae.DEFAULT_WORKSPACE)
     mvae.set_budget(None)
     compare_layer1("12x10 latent, default policy (96 rows, shorter than {} rows: 1 stripe)".format(mvae.DEFAULT_POLICY_ROWS), v, lat, expect_stripes=1)
