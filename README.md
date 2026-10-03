@@ -154,6 +154,29 @@ Load Checkpoint ──> Load LoRA（可以串好几个）──MODEL/CLIP──>
 * `MONOLOAD_DISABLE=1` 时节点原样输出输入的 MODEL / CLIP，日志说明一次。
 * 不在范围内的照旧：bypass LoRA（`LoraLoaderBypass`）不经过运行时合并；`force_patch_weights`（保存合并后的模型）在走 Monoload 的模型上照旧报错——这时把那个模型的 `mode` 设成 `native` 即可，不用重启（§6）。
 
+### 4.3 节点用法：Monoload Info（看 Monoload 在做什么）
+
+**Monoload Info**（分类 `Monoload`）把当前状态写成文字，**显示在节点框里**，同时从 `text` 输出同样的 STRING（可以接到保存文本之类的节点）。三个输入都可选，什么都不接也不报错；每次运行都重新生成（不走缓存）；它是输出节点，`text` 不接也会运行。
+
+| 接了什么 | 显示什么 |
+|---|---|
+| 什么都不接（或只接 `images`） | Monoload 版本和 commit、总开关状态、装上了哪些钩子，以及每一项全局默认值和来源（`env 变量=值` / `built-in` / `set at runtime`） |
+| `vae` | 这个 VAE 实际用的解码设置（逐项，带来源：`node` / `env ...` / `built-in`），以及**这个 VAE 对象**上一次解码的记录：第几层、方案、条带数和行数、工作区、估算、实测峰值（reserved 和 GTT 的增量）、耗时、OOM 重试次数；还没解码过就写 `not decoded yet` |
+| `model` | 挂在这个模型上的 LoRA（文件名 × 强度，按 `LoraLoader` / `LoraLoaderModelOnly` 加载的顺序）、被改动的权重数、mode / merge / after prompt 三项设置和来源、当前内存里的状态（Monoload 运行时合并 / 原生烘焙 + 备份数 / 没加载） |
+| `images` | 不读内容，只用来**排顺序**：把 VAE Decode 的 IMAGE 接过来，Info 就在这次解码之后运行，显示的就是这次解码 |
+
+```
+Load Checkpoint ─VAE─> Monoload VAE Settings ─VAE─┬─> VAE Decode ─IMAGE─┬─> Save Image
+                                                  └──────────vae──────┐ └─images─┐
+Load LoRA ─MODEL─> Monoload LoRA Settings ─MODEL─┬─> KSampler          │          │
+                                                 └──────model──────> Monoload Info <┘
+```
+
+* 解码记录按 VAE 对象分开：节点做的副本和原 VAE 是两个对象，各记各的，不会混。
+* LoRA 名字来自 `LoraLoader` 的包装（只在克隆出的 patcher 的 `model_options` 里记下文件名和强度，不改 patch、uuid 和数值）。别的插件的 LoRA 加载器打的 patch 只显示「被改动的权重数」。
+* 实测峰值只在 GPU 上有（CPU 上写 `n/a`）：reserved 是 PyTorch 的 `max_memory_reserved` 相对解码前的增量；GTT 是解码期间每 20 ms 读一次 amdgpu 的 `mem_info_gtt_used` 得到的峰值增量。
+* 显示方式：插件带一个前端扩展 `web/monoload_info.js`，用 ComfyUI 前端自带的文字预览控件（核心节点「Preview as Text」用的那个，`window.comfyAPI.textPreviewWidgets`）。锁定版本（ComfyUI 0.31.0，前端 1.48.7）上用浏览器实测过；前端没有这个控件时退回一个只读的文本控件。
+
 ## 5. 支持的范围
 
 * **加载入口**：`UNETLoader`、`CheckpointLoaderSimple`（MODEL 和 CLIP）、`CLIPLoader` / `DualCLIPLoader` 等（文本编码器的 `CLIP.patcher`）；凡是 ComfyUI 原生的 `ModelPatcher` 都覆盖。
@@ -238,6 +261,7 @@ MODELS=/path/to/models tests/run_all.sh
 | `tests/test_vae_stripe.py` | VAE 第一层（§12.7），不需要模型文件：区间倒推对照暴力依赖展开；每个单元（残差块、上采样、head 卷积）在任意切片上「有效行」与整图逐行一致、紧邻的下一行不一致；用 ComfyUI 的 `WanVAE`（小通道、随机权重）在 fp32 下比较第一层与原生整图解码（条带 1 行、不整除、等于整图、按预算自动、默认策略、奇数尺寸、很小的 latent、batch 2、条带内再分块、bf16），块边界附近的误差不比其他区域大；识别（Dropout 训练态、forward hook、开关）；故意少算一行 halo 时自检能抓到并回退第二层；预算报错；OOM 缩小条带、到下限报错、不退回 tiled 也不退回第二层；默认策略（128 行条带的估算为目标）和开关的优先级；内存模型单调、最大的条带先跑；自检后和前缀 / 条带之间清空缓存；SDXL / Flux 结构不归 Wan 适配器（归 LDM 适配器）；单帧 Conv3d 改走 conv2d 与模块原样一致、只在该改的时候改 |
 | `tests/test_master_switch.py` | 总开关和全局默认（§4），不需要模型文件：`MONOLOAD` 的解析；`MONOLOAD=0` 且没有节点时，挂 LoRA 的模型（整体加载、lowvram 部分加载、Hook LoRA）和 VAE 解码与卸掉钩子的原版 ComfyUI 逐位一致，备份也和原生一样；释放不运行；包装每次调用的开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `mode auto` 打开管理、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 时节点原样透传 |
 | `tests/test_lora_node.py` | Monoload LoRA Settings 节点（§4.2），需要 `tests/make_synthetic_checkpoint.py $MODELS` 生成的随机权重 SD1.5 checkpoint 和 LoRA（约 2 GiB）：接口；逐项优先级和来源；clone 共享权重、输入不变、设置不同时换 uuid；节点放在 `LoraLoader` 前面设置也保留；串联；`LoraLoader` / `LoraLoaderModelOnly`（不接 CLIP）/ 两个串联的 `LoraLoader`：`exact` 和 `native` 与卸掉钩子的原版逐位一致（`native` 的备份数也一样），`fused` = 不加节点的默认路径；同一底模的不同设置交替加载各得各的结果、底模权重逐位还原；`MONOLOAD=0` 下 `enable`；prompt 结束后的释放 / 保留；`MONOLOAD_DISABLE` 透传 |
+| `tests/test_info_node.py` | Monoload Info 节点（§4.3），不需要模型文件：接口（输出节点、输入都可选、不缓存、界面文字 = STRING 输出）；不接输入时的版本 / 总开关 / 全局默认和来源；VAE 的设置来源、`not decoded yet`、解码记录归属（副本和原 VAE 不混）、原生解码也有记录、每次刷新；模型的 LoRA 名字和强度（串联、只接 MODEL、强度 0）、设置来源、加载后的状态；各种输入组合和 `MONOLOAD_DISABLE` 不报错 |
 | `tests/test_vae_node.py` | Monoload VAE Settings 节点（§4.1），不需要模型文件：注册表和接口；按 ComfyUI 的方式调用节点；预算（下拉框 + `budget_gib`）/ 方案 / 条带高度 / 模式逐项判断「节点 > 环境变量 > 默认值」；副本共享权重和 patcher、输入的 VAE 不变、ComfyUI 的模型管理里只有一个已加载模型、串联、encode 一致；预算报错、强制方案和高度、只用第二层、原生；解码后（包括报错后）全局设置复原；多个副本交替解码互不干扰；日志写明来源；包装没装上时副本走原生；总开关和全局默认下的节点行为在 `test_master_switch.py`。ComfyUI 加载器注册节点的检查在 `test_entry.py`（各种开关组合） |
 | `tests/test_vae_ldm.py` | VAE 第一层的 LDM decoder（§12.8），不需要模型文件：GroupNorm 统计量（Moments 对 fp64，含均值远大于标准差；冻结统计量的 GroupNorm 对 `F.group_norm`；实例替换走 weight_function、退出复原）；识别（11 种不认的结构走第二层、与原生一致）；整个 decoder（SDXL 式 / Flux 式，四种方案，不同条带高度、奇数 / 很小的 latent、batch 2、宽组、很小的工作区）与原生整图解码比；bf16 对 fp32 真值与原生同一水平；自检抓住注入的错误（条带局部统计量、丢一条带、halo 少一行）；全尺寸 SDXL 4K 的计划；OOM；开关；分配器模拟 |
 | `tests/test_release.py` | 用真正的 `PromptExecutor` 连续跑 LoRA → 无 LoRA → 只改 UNet 的 LoRA → 无 LoRA → Hook LoRA → 无 LoRA → bypass LoRA → 无 LoRA → LoRA（换种子）：弱引用确认 LoRA 全部释放、底模不重新加载、结果与从没见过 LoRA 的进程逐位一致；RAM pressure / classic / LRU 三种缓存各一遍，外加 `MONOLOAD_KEEP_LORA=1` |
@@ -924,9 +948,11 @@ monoload/vae_engine.py      第一层的引擎（与 decoder 无关）：区间�
 monoload/vae_wan.py         第一层的 Wan 2.1 VAE 单帧适配器（结构识别、单元、按 forward 数的内存模型、fp32 副本）
 monoload/vae_ldm.py         第一层的 LDM decoder 适配器（SD1.5 / SDXL / SD3 / Flux ae；结构识别、单元、GroupNorm 方案、内存模型、fp32 副本）
 monoload/settings.py        总开关 MONOLOAD、MONOLOAD_DISABLE（不导入 torch / ComfyUI）
-monoload/lora_overrides.py  单个模型的 LoRA 设置（存在 model_options 里，逐项取值和来源；不导入 torch / ComfyUI）
+monoload/lora_overrides.py  单个模型的 LoRA 设置（存在 model_options 里，逐项取值和来源；LoraLoader 的包装记下 LoRA 文件名；不导入 torch / ComfyUI）
+monoload/info.py            Monoload Info 节点的文字（版本、全局默认、VAE 设置和解码记录、模型的 LoRA）
+web/monoload_info.js        前端扩展：把 Monoload Info 的文字显示在节点框里
 monoload/vae_overrides.py   单个 VAE 的设置（节点做的副本带的设置；不导入 torch / ComfyUI）
-monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），lora_settings.py = Monoload LoRA Settings，vae_settings.py = Monoload VAE Settings
+monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），lora_settings.py = Monoload LoRA Settings，vae_settings.py = Monoload VAE Settings，info.py = Monoload Info
 tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
                             bench_vae.py、check_vae_node.py、make_synthetic_vaes.py、alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10）
 tools/watch_mem.sh          GTT / cgroup 内存监视
