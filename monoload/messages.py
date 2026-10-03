@@ -111,9 +111,9 @@ M = {
         "[Monoload] 内部错误：hook 不应走缓存权重的路径（key={key}）"),
     "release.done": (
         "[Monoload] released LoRA after prompt: {models} loaded model(s) back to base, {outputs} cached output(s), {objects} node LoRA "
-        "cache(s), {synced} clean clone(s) re-synced ({seconds:.2f}s)",
+        "cache(s), {synced} clean clone(s) re-synced, {repointed} orphaned loaded model(s) re-pointed ({seconds:.2f}s)",
         "[Monoload] prompt 结束后释放 LoRA：{models} 个已加载模型回到底模，{outputs} 个缓存输出，{objects} 个节点的 LoRA 缓存，"
-        "{synced} 个干净 clone 重新同步（{seconds:.2f}s）"),
+        "{synced} 个干净 clone 重新同步，{repointed} 个失去 patcher 的已加载模型重新指向（{seconds:.2f}s）"),
     "release.failed": ("[Monoload] releasing LoRA after the prompt failed", "[Monoload] prompt 结束后释放 LoRA 失败"),
     "node.lora_disabled": (
         "[Monoload] Monoload LoRA Settings: MONOLOAD_DISABLE is set, so the node passes MODEL and CLIP through unchanged",
