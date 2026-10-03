@@ -650,7 +650,8 @@ monoload/errors.py          报错类型
 monoload/comfy_env.py       在独立进程里按指定参数启动 ComfyUI 环境（测试、基准用）
 monoload/vae.py             VAE 解码管理入口（包装 VAE.decode：内存估算、逐张、OOM 缩小分块重试、覆盖范围；第一层的接口 STRIPE_ADAPTERS）
 monoload/vae_ops.py         逐算子分块（卷积按输出行、注意力按 query；受管理期间的实例属性替换）
-monoload/vae_stripe.py      第一层：Wan 2.1 VAE 单帧的条带解码（结构识别、区间倒推、执行计划和内存模型、自检）
+monoload/vae_engine.py      第一层的引擎（与 decoder 无关）：区间倒推、执行计划和估算、条带执行、arena、自检流程、适配器基类
+monoload/vae_wan.py         第一层的 Wan 2.1 VAE 单帧适配器（结构识别、单元、按 forward 数的内存模型、fp32 副本）
 tests/                      测试和基准脚本（见第 8、9 节；VAE：test_vae.py、test_vae_stripe.py、bench_vae.py、make_synthetic_vaes.py、
                             alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10）
 tools/watch_mem.sh          GTT / cgroup 内存监视

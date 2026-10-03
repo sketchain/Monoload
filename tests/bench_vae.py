@@ -91,7 +91,7 @@ import comfy.sd  # noqa: E402
 import comfy.utils  # noqa: E402
 import folder_paths  # noqa: E402
 import nodes  # noqa: E402
-from monoload import comfy_env, vae as mvae, vae_ops, vae_stripe  # noqa: E402
+from monoload import comfy_env, vae as mvae, vae_ops, vae_engine  # noqa: E402
 from monoload.errors import MonoloadVAEOOMError  # noqa: E402
 
 GIB = 1024 ** 3
@@ -844,7 +844,7 @@ def main():
                    help="layer 1 without its arena reservation (alloc then shows the tensors' own peak; reserved is not representative)")
     a = p.parse_args()
     if a.no_arena:
-        vae_stripe.ARENA_ENABLED = False
+        vae_engine.ARENA_ENABLED = False
     logging.getLogger().setLevel(logging.INFO)
     if a.workspace:
         mvae.set_workspace(mvae.parse_size(a.workspace))

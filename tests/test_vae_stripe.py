@@ -1,4 +1,4 @@
-"""Layer 1: stripe decoding of the Wan 2.1 VAE (monoload/vae_stripe.py).
+"""Layer 1: stripe decoding of the Wan 2.1 VAE (monoload/vae_engine.py, monoload/vae_wan.py).
 
 No model files needed: ComfyUI's own WanVAE class with small channels and
 random weights, fp32 on the CPU.
@@ -45,7 +45,8 @@ import comfy.model_management
 import comfy.sd
 import comfy.ldm.wan.vae as wan
 from monoload import vae as mvae
-from monoload import vae_stripe as vs
+from monoload import vae_engine as eng
+from monoload import vae_wan as vw
 from monoload import vae_ops
 from monoload.errors import MonoloadError, MonoloadVAEOOMError
 from test_vae import Spy, init_conv, init_random, ldm_vae, managed_decode, native_decode, no_overrides, wan_vae_model
@@ -67,7 +68,7 @@ def brute_needs(units, heights, o0, o1):
         new = set()
         for y in rows:
             for c in range(y - u.halo, y + u.halo + 1):
-                if u.kind == vs.UP:
+                if u.kind == eng.UP:
                     if 0 <= c < h_out:
                         new.add(c // 2)
                 elif 0 <= c < h_in:
@@ -81,11 +82,11 @@ def brute_needs(units, heights, o0, o1):
 
 def interval_tests():
     rng = random.Random(1)
-    kinds = [(vs.POINT, 0, 1), (vs.CONV, 1, 1), (vs.RES, 2, 1), (vs.UP, 1, 2)]
+    kinds = [(eng.POINT, 0, 1), (eng.CONV, 1, 1), (eng.RES, 2, 1), (eng.UP, 1, 2)]
     bad = 0
     n = 0
     for _ in range(300):
-        chain = [vs.Unit(*rng.choice(kinds)[:1], None, 0, 1, 1, 1, "u") for _ in range(rng.randint(1, 9))]
+        chain = [eng.Unit(*rng.choice(kinds)[:1], None, 0, 1, 1, 1, "u") for _ in range(rng.randint(1, 9))]
         for u in chain:
             k = next(k for k in kinds if k[0] == u.kind)
             u.halo, u.scale = k[1], k[2]
@@ -93,13 +94,13 @@ def interval_tests():
         heights = [h0]
         for u in chain:
             heights.append(heights[-1] * u.scale)
-        for o0, o1 in vs.split_rows(heights[-1], rng.randint(1, heights[-1])):
+        for o0, o1 in eng.split_rows(heights[-1], rng.randint(1, heights[-1])):
             n += 1
-            if vs.stripe_needs(chain, heights, o0, o1) != brute_needs(chain, heights, o0, o1):
+            if eng.stripe_needs(chain, heights, o0, o1) != brute_needs(chain, heights, o0, o1):
                 bad += 1
     check("need_in / stripe_needs == brute-force dependency walk ({} stripes over 300 random unit chains)".format(n), bad == 0, "{} mismatches".format(bad))
-    ok = all(sum(b - a for a, b in vs.split_rows(h, r)) == h and max(b - a for a, b in vs.split_rows(h, r)) <= r
-             and max(b - a for a, b in vs.split_rows(h, r)) - min(b - a for a, b in vs.split_rows(h, r)) <= 1
+    ok = all(sum(b - a for a, b in eng.split_rows(h, r)) == h and max(b - a for a, b in eng.split_rows(h, r)) <= r
+             and max(b - a for a, b in eng.split_rows(h, r)) - min(b - a for a, b in eng.split_rows(h, r)) <= 1
              for h in range(1, 60) for r in range(1, 70))
     check("split_rows: balanced stripes covering the image, none above the requested height", ok)
 
@@ -112,11 +113,11 @@ def interval_tests():
     def rb(ci, co):
         m = init_random(wan.ResidualBlock(ci, co))
         return m.eval()
-    mods = [("ResidualBlock 8->8", vs.Unit(vs.RES, rb(8, 8), 2, 1, 8, 8, "rb")),
-            ("ResidualBlock 6->8 (1x1 shortcut)", vs.Unit(vs.RES, rb(6, 8), 2, 1, 6, 8, "rb2")),
-            ("Resample upsample2d 8->4", vs.Unit(vs.UP, init_random(wan.Resample(8, "upsample2d")), 1, 2, 8, 4, "up")),
-            ("Resample upsample3d 8->4", vs.Unit(vs.UP, init_random(wan.Resample(8, "upsample3d")), 1, 2, 8, 4, "up3")),
-            ("head CausalConv3d 3x3", vs.Unit(vs.CONV, init_conv(wan.CausalConv3d(8, 3, 3, padding=1)), 1, 1, 8, 3, "conv"))]
+    mods = [("ResidualBlock 8->8", eng.Unit(eng.RES, rb(8, 8), 2, 1, 8, 8, "rb")),
+            ("ResidualBlock 6->8 (1x1 shortcut)", eng.Unit(eng.RES, rb(6, 8), 2, 1, 6, 8, "rb2")),
+            ("Resample upsample2d 8->4", eng.Unit(eng.UP, init_random(wan.Resample(8, "upsample2d")), 1, 2, 8, 4, "up")),
+            ("Resample upsample3d 8->4", eng.Unit(eng.UP, init_random(wan.Resample(8, "upsample3d")), 1, 2, 8, 4, "up3")),
+            ("head CausalConv3d 3x3", eng.Unit(eng.CONV, init_conv(wan.CausalConv3d(8, 3, 3, padding=1)), 1, 1, 8, 3, "conv"))]
     for label, u in mods:
         cin = u.cin
         H, W = 17, 9
@@ -127,7 +128,7 @@ def interval_tests():
         for xa in range(0, H):
             for xb in range(xa + 1, H + 1):
                 y = u.module(x[:, :, :, xa:xb])
-                va, vb = vs.valid_out(u, xa, xb, h_out)
+                va, vb = eng.valid_out(u, xa, xb, h_out)
                 if vb <= va:
                     continue
                 cases += 1
@@ -183,8 +184,8 @@ def decoder_tests():
         compare_layer1("12x10 latent, stripe height {}".format(rows), v, lat, rows=rows, expect_stripes=n)
     # budget-chosen height with several stripes (tiny workspace, so the activations decide)
     mvae.set_workspace(16 * 1024)
-    bound, _ = vs.match(v, lat, {})
-    p24 = bound.plan(v, lat, 0, 16 * 1024, rows=24, out_bytes=mvae._out_bytes(v, lat, 96, 80, 3))
+    bound, _ = vw.match(v, lat, {})
+    p24 = bound.plan(v, lat, 0, 16 * 1024, rows=24, out_bytes=bound.output_bytes(v, lat))
     mvae.set_budget(p24.estimate)
     last = compare_layer1("12x10 latent, height from a budget that fits 24-row stripes", v, lat)
     check("budget-chosen plan: estimate {} <= budget {}, {} stripes of {} rows (24 rows fit, the whole image does not)".format(
@@ -219,7 +220,7 @@ def decoder_tests():
 # ---------------------------------------------------------------------------
 
 def recognition_tests(v, lat):
-    vs._SELFTEST.clear()
+    eng._SELFTEST.clear()
     mvae.set_stripe(False)
     managed_decode(v, lat)
     last = mvae.last_decode()
@@ -239,7 +240,7 @@ def recognition_tests(v, lat):
     check("forward hook on a module -> not recognized, layer 2 ({})".format(last.get("layer1")),
           last.get("strategy") == "layer2" and "hook" in (last.get("layer1") or ""))
     check("4D latent / multi-frame / vae_options -> no match",
-          vs.match(v, lat[:, :, 0], {})[0] is None and vs.match(v, torch.cat([lat, lat], 2), {})[0] is None and vs.match(v, lat, {"x": 1})[0] is None)
+          vw.match(v, lat[:, :, 0], {})[0] is None and vw.match(v, torch.cat([lat, lat], 2), {})[0] is None and vw.match(v, lat, {"x": 1})[0] is None)
     g = torch.Generator().manual_seed(3)
     for label, vv, l4 in (("SDXL-like", ldm_vae(4, True), torch.randn(1, 4, 12, 10, generator=g)),
                           ("Flux-like", ldm_vae(16, False), torch.randn(1, 16, 12, 10, generator=g))):
@@ -259,42 +260,42 @@ def recognition_tests(v, lat):
 # ---------------------------------------------------------------------------
 
 def selftest_tests(v, lat):
-    vs._SELFTEST.clear()
-    bound, _ = vs.match(v, lat, {})
-    ok, detail = vs.self_test(bound, v)
+    eng._SELFTEST.clear()
+    bound, _ = vw.match(v, lat, {})
+    ok, detail = eng.self_test(bound, v)
     check("self-test of the real structure passes: {}".format(detail), ok)
-    orig_need, orig_valid = vs.need_in, vs.valid_out
+    orig_need, orig_valid = eng.need_in, eng.valid_out
 
     def short_need(unit, a, b, h_in, h_out):
-        if unit.kind == vs.RES:
+        if unit.kind == eng.RES:
             return max(0, a - 1), min(h_in, b + 1)
         return orig_need(unit, a, b, h_in, h_out)
 
     def short_valid(unit, xa, xb, h_out):
-        if unit.kind == vs.RES:
+        if unit.kind == eng.RES:
             return xa + (1 if xa > 0 else 0), xb - (1 if xb < h_out else 0)
         return orig_valid(unit, xa, xb, h_out)
 
     for label, patches in (("halo one row short (validity check)", {"need_in": short_need}),
                            ("halo one row short + matching wrong validity rule (numeric comparison)", {"need_in": short_need, "valid_out": short_valid})):
-        vs._SELFTEST.clear()
+        eng._SELFTEST.clear()
         for k, f in patches.items():
-            setattr(vs, k, f)
+            setattr(eng, k, f)
         try:
             out = managed_decode(v, lat, raw=True)
             last = mvae.last_decode()
         finally:
-            vs.need_in, vs.valid_out = orig_need, orig_valid
+            eng.need_in, eng.valid_out = orig_need, orig_valid
         ref = native_decode(v, lat, raw=True)
         note = last.get("layer1") or ""
         check("injected bug: {} -> self-test fails, decode falls back to layer 2, result == native (max|Δ| {:.2g}): {}".format(
             label, float((out - ref).abs().max()), note[:160]),
             last.get("strategy") == "layer2" and "self-test failed" in note and float((out - ref).abs().max()) <= 1e-4)
-    vs._SELFTEST.clear()
+    eng._SELFTEST.clear()
     rng = torch.get_rng_state()
-    vs.self_test(bound, v)
+    eng.self_test(bound, v)
     check("self-test leaves the RNG state unchanged and is cached per structure",
-          torch.equal(rng, torch.get_rng_state()) and bound.key in vs._SELFTEST)
+          torch.equal(rng, torch.get_rng_state()) and bound.key in eng._SELFTEST)
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +308,7 @@ def budget_oom_tests(v, lat):
                   lambda: managed_decode(v, lat), "MONOLOAD_VAE_BUDGET", "需要")
     mvae.set_budget(None)
 
-    orig_run = vs.run_stripes
+    orig_run = eng.run_stripes
     calls_l2 = [0]
     orig_l2 = mvae._run
 
@@ -324,7 +325,7 @@ def budget_oom_tests(v, lat):
 
     mvae._run = l2
     try:
-        vs.run_stripes = oom_above(24)
+        eng.run_stripes = oom_above(24)
         mvae.set_stripe_rows(96)
         with Spy() as spy:
             out = managed_decode(v, lat, raw=True)
@@ -334,13 +335,13 @@ def budget_oom_tests(v, lat):
             last.get("rows"), last.get("retries"), float((out - ref).abs().max())),
             last.get("strategy") == "layer1" and last.get("rows") <= 24 and last.get("retries") == 2
             and float((out - ref).abs().max()) <= 1e-5 and spy.tiled == 0 and calls_l2[0] == 0)
-        vs.run_stripes = oom_above(0)
+        eng.run_stripes = oom_above(0)
         with Spy() as spy:
             expect_raises("OOM even with the smallest stripes -> MonoloadVAEOOMError", MonoloadVAEOOMError,
                           lambda: managed_decode(v, lat), "不会退回到 tiled", "第二层")
         check("... neither tiled nor layer 2 was called, no override left", spy.tiled == 0 and calls_l2[0] == 0 and no_overrides(v.first_stage_model))
     finally:
-        vs.run_stripes = orig_run
+        eng.run_stripes = orig_run
         mvae._run = orig_l2
         mvae.set_stripe_rows(None)
 
@@ -352,8 +353,8 @@ def budget_oom_tests(v, lat):
 def policy_memory_tests(v):
     g = torch.Generator().manual_seed(5)
     lat = torch.randn(1, 16, 1, 40, 6, generator=g)   # 320 output rows
-    bound, _ = vs.match(v, lat, {})
-    outb = mvae._out_bytes(v, lat, 320, 48, 3)
+    bound, _ = vw.match(v, lat, {})
+    outb = bound.output_bytes(v, lat)
     ws = mvae.layer1_workspace()
     mvae.set_budget(None)
     ref = bound.plan(v, lat, 0, ws, rows=mvae.DEFAULT_POLICY_ROWS, out_bytes=outb)
@@ -377,8 +378,8 @@ def policy_memory_tests(v):
         plans = [bound.plan(v, lat, 0, w, rows=r, out_bytes=outb) for r in (1, 8, 16, 40, 64, 107, 160, 320)]
         mono = all(a.estimate <= b.estimate for a, b in zip(plans, plans[1:]))
         parts = all(q.live_peak == q.persistent + max(q.prefix_bytes, q.stripe_bytes) and q.prefix_bytes == q.prefix_live
-                    and q.stripe_bytes == q.ckpt_bytes + q.stripe_live and q.arena == vs.arena_bytes(q.live_peak, len(q.stripes))
-                    and q.estimate == q.arena + q.largest + vs.ESTIMATE_PAD for q in plans)
+                    and q.stripe_bytes == q.ckpt_bytes + q.stripe_live and q.arena == eng.arena_bytes(q.live_peak, len(q.stripes))
+                    and q.estimate == q.arena + q.largest + eng.ESTIMATE_PAD for q in plans)
         order = True
         for q in plans:
             size = [sum(n[1] - n[0] for n in needs) for needs in q.needs]
@@ -389,24 +390,24 @@ def policy_memory_tests(v):
     # allocator: cache emptied after the self-test, not during the decode; the arena is reserved where supported
     calls, arenas = [], []
     orig = comfy.model_management.soft_empty_cache
-    orig_sup, orig_res = vs.arena_supported, vs.reserve_arena
+    orig_sup, orig_res = eng.arena_supported, eng.reserve_arena
     comfy.model_management.soft_empty_cache = lambda force=False: calls.append(force)
     try:
-        vs._SELFTEST.clear()
-        ok, _ = vs.self_test(bound, v)
+        eng._SELFTEST.clear()
+        ok, _ = eng.self_test(bound, v)
         n_selftest = len(calls)
         mvae.set_stripe_rows(40)
         lat2 = torch.randn(2, 16, 1, 12, 10, generator=g)
         managed_decode(v, lat2)
         last_cpu = mvae.last_decode()
-        vs.arena_supported = lambda device: True
-        vs.reserve_arena = lambda device, n: (arenas.append(n), orig_res(device, n))
+        eng.arena_supported = lambda device: True
+        eng.reserve_arena = lambda device, n: (arenas.append(n), orig_res(device, n))
         out = managed_decode(v, lat2, raw=True)
         last = mvae.last_decode()
         mvae.set_stripe_rows(None)
     finally:
         comfy.model_management.soft_empty_cache = orig
-        vs.arena_supported, vs.reserve_arena = orig_sup, orig_res
+        eng.arena_supported, eng.reserve_arena = orig_sup, orig_res
     ref = native_decode(v, lat2, raw=True)
     check("allocator: cache emptied once after the self-test ({} call), never during a decode; arena {} reserved once for a batch of 2 where "
           "supported (CPU: none), result unchanged (max|Δ| {:.2g})".format(n_selftest, vae_ops.fmt_bytes(last["stats"]["arena"]), float((out - ref).abs().max())),
@@ -417,9 +418,9 @@ def policy_memory_tests(v):
     saved = {k: os.environ.get(k) for k in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF")}
     try:
         os.environ["PYTORCH_HIP_ALLOC_CONF"] = "max_split_size_mb:512"
-        no_split = vs.arena_supported(torch.device("cuda")) if torch.cuda.is_available() else False
+        no_split = eng.arena_supported(torch.device("cuda")) if torch.cuda.is_available() else False
         os.environ["PYTORCH_HIP_ALLOC_CONF"] = "expandable_segments:True"
-        no_exp = vs.arena_supported(torch.device("cuda")) if torch.cuda.is_available() else False
+        no_exp = eng.arena_supported(torch.device("cuda")) if torch.cuda.is_available() else False
     finally:
         for k, val in saved.items():
             if val is None:
@@ -427,7 +428,7 @@ def policy_memory_tests(v):
             else:
                 os.environ[k] = val
     check("arena only with the default allocator config: not on the CPU, not with max_split_size_mb / expandable_segments",
-          not vs.arena_supported(torch.device("cpu")) and not no_split and not no_exp)
+          not eng.arena_supported(torch.device("cpu")) and not no_split and not no_exp)
 
 
 # ---------------------------------------------------------------------------

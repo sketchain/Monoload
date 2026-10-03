@@ -333,7 +333,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     """
     import torch
     import comfy.model_management as mm
-    from monoload import vae as mvae, vae_ops, vae_stripe as vs
+    from monoload import vae as mvae, vae_ops, vae_engine as eng
 
     dt = {"bf16": torch.bfloat16, "fp32": torch.float32, "fp16": torch.float16}[dtype] if isinstance(dtype, str) else dtype
     v = meta_vae(dt)
@@ -358,7 +358,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
         sim.empty_cache()
 
     info = {}
-    orig_prefix = vs.run_prefix
+    orig_prefix = eng.run_prefix
 
     def run_prefix_clear(prefix, z):
         ckpt = orig_prefix(prefix, z)
@@ -369,15 +369,15 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
         es.enter_context(_patched(vae_ops, "slow_dilated3d", lambda x: conv2d))
         es.enter_context(_patched(vae_ops, "OUT_FIRST", out_first))
         es.enter_context(_patched(mm, "soft_empty_cache", soft_empty_cache))
-        es.enter_context(_patched(vs, "arena_supported", lambda device: True))
+        es.enter_context(_patched(eng, "arena_supported", lambda device: True))
         if layer1_ws:
             es.enter_context(_patched(mvae, "LAYER1_WORKSPACE", layer1_ws))
         if not contiguous:
-            es.enter_context(_patched(vs, "CONTIGUOUS_INPUT", ()))
+            es.enter_context(_patched(eng, "CONTIGUOUS_INPUT", ()))
         if clear:
-            es.enter_context(_patched(vs, "run_prefix", run_prefix_clear))
+            es.enter_context(_patched(eng, "run_prefix", run_prefix_clear))
         if layer == 1:
-            bound, why = vs.match(v, lat, {})
+            bound, why = mvae._select_layer1(v, lat, {})
             assert bound is not None, why
             outb = batch * 3 * h * w * 4
             if rows:

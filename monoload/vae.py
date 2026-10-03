@@ -25,8 +25,9 @@ with their own chunked output path (comfy_has_chunked_io), and explicit
 VAEDecodeTiled / VAE.decode_tiled -- stays native (logged).
 
 Layer 1 (stripe decoding for recognized decoders) plugs in through
-STRIPE_ADAPTERS. Phase 2 ships the Wan 2.1 VAE single-frame adapter
-(monoload/vae_stripe.py): a recognized, self-tested decoder is decoded in
+STRIPE_ADAPTERS: the engine (monoload/vae_engine.py) plus one adapter per
+decoder structure (monoload/vae_wan.py: the Wan 2.1 VAE single frame). A
+recognized, self-tested decoder is decoded in
 stripes of output rows from a low-resolution checkpoint instead of the
 whole-image activations; everything else keeps layer 2. Default stripe height:
 the lowest peak that does not cost speed (DEFAULT_POLICY_ROWS, DESIGN
@@ -53,7 +54,7 @@ import comfy.ops
 import comfy.sd
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
-from . import vae_stripe
+from . import vae_engine, vae_wan
 from .errors import MonoloadError, MonoloadVAEOOMError
 from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
 
@@ -186,14 +187,14 @@ def last_decode():
 
 # Each entry: a module / object with
 #   match(vae, samples, vae_options) -> (bound, None) or (None, reason); by real structure, never by file name
-#   self_test(bound, vae)            -> (ok, detail); first use of a structure in this process, cached per
-#                                       structure; not ok -> layer 1 off for it (loud warning), layer 2
+# where bound is a vae_engine.StripeAdapter (the interface is in vae_engine's docstring):
 #   bound.name, bound.key            label for logs, structure signature
+#   vae_engine.self_test(bound, vae) -> (ok, detail); first use of a structure in this process, cached per
+#                                       structure; not ok -> layer 1 off for it (loud warning), layer 2
 #   bound.plan(vae, samples, budget, workspace, rows=None, out_bytes=0) -> plan (estimate, stripes, recompute,
 #                                       ckpt_bytes, describe()) or None when the budget cannot be met
 #   bound.run(vae, samples, plan, workspace, stats) -> pixel_samples (process_output applied), native layout
-# Phase 2: the Wan 2.1 single-frame adapter. LDM decoders (SDXL, Flux) are phase 3 and stay on layer 2.
-STRIPE_ADAPTERS = [vae_stripe]
+STRIPE_ADAPTERS = [vae_wan]
 
 _L1_NOTED = weakref.WeakKeyDictionary()   # first_stage_model -> last logged layer-1 reason
 
@@ -417,11 +418,11 @@ def _managed_decode(self, samples_in, vae_options):
 
 
 def _layer1_self_test(vae, bound):
-    hit = vae_stripe._SELFTEST.get(bound.key)
+    hit = vae_engine._SELFTEST.get(bound.key)
     if hit is None:
         # the self-test copies the decoder's weights: they must be loaded
-        mm.load_models_gpu([vae.patcher], memory_required=_selftest_memory(bound), force_full_load=vae.disable_offload)
-        hit = vae_stripe.self_test(bound, vae)
+        mm.load_models_gpu([vae.patcher], memory_required=bound.selftest_memory(), force_full_load=vae.disable_offload)
+        hit = vae_engine.self_test(bound, vae)
         if hit[0]:
             logging.info("[Monoload] VAE layer 1 ({}) self-test passed: {}".format(bound.name, hit[1]))
         else:
@@ -429,18 +430,6 @@ def _layer1_self_test(vae, bound):
                             "decoder structure in this process; decoding with layer 2 (op-level chunking) instead. Please report this.".format(
                                 bound.name, hit[1]))
     return hit
-
-
-def _selftest_memory(bound):
-    params = sum(p.numel() for p in bound.fsm.decoder.parameters()) + bound.fsm.conv2.weight.numel()
-    return int(params * 4 + 2 * vae_stripe.SELFTEST_WORKSPACE + 256 * MIB)
-
-
-def _out_bytes(vae, samples, h_out, w_out, channels):
-    if not _same_device(vae.output_device, vae.device):
-        return 0
-    t = samples.shape[2] if samples.ndim == 5 else 1
-    return samples.shape[0] * channels * t * h_out * w_out * mm.dtype_size(vae.vae_output_dtype())
 
 
 def choose_plan(vae, samples_in, bound, out_bytes):
@@ -467,11 +456,11 @@ def choose_plan(vae, samples_in, bound, out_bytes):
     if bud:
         plan = bound.plan(vae, samples_in, bud, ws, out_bytes=out_bytes)
         if plan is None:
-            smallest = bound.plan(vae, samples_in, bud, ws, rows=vae_stripe.MIN_ROWS, out_bytes=out_bytes)
+            smallest = bound.plan(vae, samples_in, bud, ws, rows=vae_engine.MIN_ROWS, out_bytes=out_bytes)
             raise MonoloadError(
                 "[Monoload] VAE 第一层（条带解码）在峰值预算 MONOLOAD_VAE_BUDGET={} 内放不下：latent {} 即使用 {} 行的条带也需要约 {}"
                 "（前缀 {}、条带 {}）。请调大 MONOLOAD_VAE_BUDGET 或去掉它（用默认策略），或设 MONOLOAD_DISABLE_VAE_STRIPE=1 改走第二层。".format(
-                    fmt_bytes(bud), list(samples_in.shape), vae_stripe.MIN_ROWS, fmt_bytes(smallest.estimate),
+                    fmt_bytes(bud), list(samples_in.shape), vae_engine.MIN_ROWS, fmt_bytes(smallest.estimate),
                     fmt_bytes(smallest.prefix_bytes), fmt_bytes(smallest.stripe_bytes)))
         return plan, bud, ws, "MONOLOAD_VAE_BUDGET"
     ref = bound.plan(vae, samples_in, 0, ws, rows=DEFAULT_POLICY_ROWS, out_bytes=out_bytes)
@@ -481,12 +470,11 @@ def choose_plan(vae, samples_in, bound, out_bytes):
 
 
 def _decode_layer1(self, samples_in, bound, t0, selftest):
-    h_out, w_out = int(samples_in.shape[-2]) * 8, int(samples_in.shape[-1]) * 8
-    outb = _out_bytes(self, samples_in, h_out, w_out, bound.units[-1].cout)
+    outb = bound.output_bytes(self, samples_in)
     forced = _SETTINGS["stripe_rows"]
     plan, bud, ws, policy = choose_plan(self, samples_in, bound, outb)
     floor_ws = min(MIN_WORKSPACE, ws)
-    min_rows = min(vae_stripe.MIN_ROWS, max(b - a for a, b in plan.stripes))
+    min_rows = min(vae_engine.MIN_ROWS, max(b - a for a, b in plan.stripes))
     mm.load_models_gpu([self.patcher], memory_required=plan.estimate, force_full_load=self.disable_offload)
     retries = 0
     first_est = plan.estimate

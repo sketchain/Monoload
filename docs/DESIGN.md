@@ -626,7 +626,7 @@ columns 的大小与 §9.1 / 调研 E.2 的推导吻合（`18·Cin·Hout·Wout` 
 
 ### 9.13 第一层：Wan 2.1 VAE 单帧的条带解码（第二阶段）
 
-实现：`monoload/vae_stripe.py`（结构识别、区间倒推、执行计划和内存模型、自检），接入在 `monoload/vae.py` 的 `_decode_layer1`。测试：`tests/test_vae_stripe.py`。
+实现：`monoload/vae_engine.py`（引擎：区间倒推、执行计划和估算、条带执行、arena、自检流程）和 `monoload/vae_wan.py`（Wan 适配器：结构识别、单元、内存模型、fp32 副本），接入在 `monoload/vae.py` 的 `_decode_layer1`。测试：`tests/test_vae_stripe.py`。（第二阶段时这些都在一个文件 `monoload/vae_stripe.py` 里，第三阶段 3a 拆开，行为和数字不变，见 §9.14.1。）
 
 第二阶段结束时的状态、提交记录、规矩和第三阶段（LDM decoder）的入口分析见 docs/HANDOFF.md。
 
@@ -891,3 +891,17 @@ reserved（GTT）由 PyTorch 的缓存分配器决定，不能只靠存活量模
 * 第一层默认工作区 384 → **128 MiB**（`LAYER1_WORKSPACE`）。峰值优先、多算可以接受：峰值降 23–45%，耗时多 2–7%。不选 64 MiB，是为了给 OOM 重试留一档可以缩（重试下限仍是 `MIN_WORKSPACE` = 64 MiB）。预算路径 `max(64 MiB, 预算/8)` 不变。
 * 第二层保持 1 GiB。SDXL / Flux 在第三阶段改走第一层。
 * 新默认就是实测过的 `-w128` 配置。用 `alloc_sim` 复核：384 个计划的网格里工作区 128 MiB 的 124 个计划 reserved 全部 ≤ 估算（最小余量 140 MiB）；默认计划 1344 / 2688 / 4K 的模拟 reserved 0.36 / 0.56 / 0.87 GiB 与实测相同，估算 0.50 / 0.71 / 1.16 GiB。工作区小了以后，高条带（例如强制 512 行）和 8K 默认计划更常有一个请求被挤出 arena（8K：arena 2.88、reserved 3.36 GiB），都在估算以内。
+### 9.14 第三阶段：LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae`）走第一层
+
+第三阶段的入口分析在 docs/HANDOFF.md 第 6 节；这一节记录实际的做法。
+
+#### 9.14.1 3a：拆出引擎和适配器（不改行为）
+
+`monoload/vae_stripe.py` 拆成两个文件：
+
+* `monoload/vae_engine.py`：与 decoder 无关的部分。区间（`Unit`、`need_in`、`valid_out`、`stripe_needs`、`split_rows`）、`conv_extra`（第二层包装下一次卷积的额外内存）、`arena_bytes`、`Plan`（条带、倒推、顺序、存活量 → arena → 估算的公式；每个模块的峰值由适配器给）、`run_prefix` / `run_stripes`（行维 `hdim` 由 `Plan` 带着，不再是模块常量）、`arena_supported` / `reserve_arena`、`StripeAdapter`（`plan()`、`run()`、`output_bytes()`、`selftest_memory()` 的通用实现）、自检的流程（`self_test`：fp32 副本、固定种子的小 latent、强制 40 行条带、8 MiB 工作区、与整图比、按结构缓存、`fork_rng`、结束后清缓存）。
+* `monoload/vae_wan.py`：Wan 2.1 单帧适配器 `WanStripe`：结构识别（`wan_structure`）、`build_units`、签名、按 forward 数的内存模型（`res_peak` / `up_peak` / `unit_peak` / `unit_largest` / `prefix_peak` / `prefix_largest` / `prefix_macs`）、`hdim = 3`、输出形状、`fp32_copy()`（返回绑定在 fp32 副本上的适配器）和 `reference_decode()`（`WanVAE.decode`）。
+
+适配器接口写在 `vae_engine.py` 的模块注释里。`vae.py` 只经过接口：`_layer1_self_test` 调 `vae_engine.self_test`，自检的显存是 `bound.selftest_memory()`，输出缓冲是 `bound.output_bytes()`（原来的 `_out_bytes` / `_selftest_memory` 去掉了）。`tests/alloc_sim.py` 经过 `vae._select_layer1` 选适配器，不再直接调用某个适配器的 `match`。
+
+执行顺序与原来逐行相同（前缀 → 释放 latent 副本 → 第一次分配输出缓冲 → 条带），所以分配顺序不变。验证：`tests/alloc_sim.py` 的 33 行校验表与拆分前逐字相同；`tests/test_vae_stripe.py` 73 项全过，每一行输出（含误差数字）与拆分前相同（只差计时）；`test_vae.py` 131 项、`test_entry.py` 7 种开关组合、`test_dtype_paths.py` 两种模式全过。
