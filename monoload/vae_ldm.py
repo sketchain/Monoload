@@ -41,7 +41,17 @@ from .vae_wan import attention_peak, attn_split, no_dropout
 PART = "part"   # the start of a ResnetBlock up to norm2's input (norm1 -> swish -> conv1): a statistics pass's last step
 
 SCHEMES = ("A", "B", "C", "D")
-DEFAULT_SCHEME = "A"
+DEFAULT_SCHEME = "B"     # A up to 7059bdd; B after the CT 700 measurements (DESIGN §9.14.10): 4K 2.17 GiB / 42 s vs A 1.10 / 75 s
+
+# Time model of the budget policy (DESIGN §9.14.10): seconds per 1e12 conv MACs by
+# resolution level (output width / latent width: 1 = the prefix at H/8, then H/4,
+# H/2, H), fitted to the 12 CT 700 bf16 SDXL decodes of 7059bdd (max error 2.3%).
+# Absolute seconds hold for that machine only; the budget policy uses them to rank
+# the layer-1 configurations of one decode, which needs only the ratios: work
+# moved to a lower-resolution level is cheaper (full resolution costs ~2x per MAC,
+# few channels and memory-bound GroupNorm / SiLU), so scheme C (5.7x work) beats
+# B (5.3x).
+TIME_COEF = {1: 1.35, 2: 0.113, 4: 0.129, 8: 0.269}
 _SCHEME = [DEFAULT_SCHEME]
 
 
@@ -372,6 +382,7 @@ class LDMStripe(eng.StripeAdapter):
 
     name = "LDM stripes"
     hdim = 2                 # rows in [B, C, H, W]
+    schemes = SCHEMES
 
     def __init__(self, fsm, pqc, gn_scheme=None, module=None):
         self.fsm = fsm
@@ -399,6 +410,16 @@ class LDMStripe(eng.StripeAdapter):
 
     def save_positions(self):
         return self.saves
+
+    def variants(self, scheme=None):
+        """One adapter per GroupNorm scheme (only `scheme` when it is forced); this one
+        (the default scheme) first, so it wins ties (e.g. one stripe: no passes, all the same)."""
+        names = [scheme] if scheme else [self.gn_scheme] + [n for n in SCHEMES if n != self.gn_scheme]
+        return [self if n == self.gn_scheme else LDMStripe(self.fsm, self.pqc, gn_scheme=n) for n in names]
+
+    def predict_seconds(self, plan):
+        top = TIME_COEF[max(TIME_COEF)]
+        return sum(TIME_COEF.get(lv, top) * m for lv, m in plan.work_levels.items()) / 1e12
 
     def output_shape(self, samples):
         return (samples.shape[0], self.out_channels, int(samples.shape[-2]) * self.scale, int(samples.shape[-1]) * self.scale)

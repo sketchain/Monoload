@@ -186,11 +186,11 @@ class Pass:
     the norm's statistics over each stripe's core rows. On the way, the saves
     in `builds` (positions start < p <= unit) are filled with the core rows."""
     __slots__ = ("start", "unit", "norm", "chain", "heights", "widths", "rows", "stripes", "needs", "order", "builds",
-                 "alive", "live", "largest", "work")
+                 "alive", "live", "largest", "work", "work_levels")
 
 
 def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
-    """(needs, order, live, largest, work) of running `chain` on `stripes` (rows at
+    """(needs, order, live, largest, work by output width) of running `chain` on `stripes` (rows at
     the chain's output level). live: the largest unit peak (the first unit reads a
     slice of a save, counted on its own); tail(rows, s) -> the peak after the chain
     (the statistics of a pass). The peaks depend only on the rows each unit runs
@@ -204,7 +204,8 @@ def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
     for needs in needs_all:
         key = tuple(n[1] - n[0] for n in needs)
         patterns[key] = patterns.get(key, 0) + 1
-    live = largest = work = 0
+    live = largest = 0
+    work = {}   # output width (identifies the resolution level) -> conv MACs
     for rows, count in patterns.items():
         s = 0
         for i, u in enumerate(chain):
@@ -212,7 +213,8 @@ def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
             live = max(live, bound.unit_peak(u, r, widths[i], elem, ws, s))
             largest = max(largest, bound.unit_largest(u, r, widths[i], elem, ws))
             s = r * u.scale * widths[i + 1] * u.cout * elem
-            work += count * r * u.scale * widths[i + 1] * u.macs_row
+            w_out = widths[i + 1]
+            work[w_out] = work.get(w_out, 0) + count * r * u.scale * w_out * u.macs_row
         if tail is not None:
             live = max(live, tail(rows[-1], s))
     return needs_all, order, live, largest, work
@@ -255,6 +257,8 @@ class Plan:
         self.ckpt_bytes = bound.ckpt_channels * h8 * w8 * elem
         self.channels = [bound.ckpt_channels] + [u.cout for u in units]
         targets = [(i, nr) for i, u in enumerate(units) for nr in u.norms]
+        if len(split_rows(self.h_out, rows)) == 1:
+            targets = []   # one stripe: the whole image goes through every norm at once, no statistics passes needed
         saves = sorted(p for p in set(bound.save_positions()) if 0 < p <= targets[-1][0]) if targets else []
         self.saves = saves
 
@@ -274,7 +278,7 @@ class Plan:
             prefix_live = max(prefix_live, bound.prefix_peak(m, h8, w8, elem, ws, s))
             largest = max(largest, bound.prefix_largest(m, h8, w8, elem, ws))
             s = bound.prefix_out_channels(m) * h8 * w8 * elem
-        self.needs, self.order, strip_live, lg, work_stripes = _chain_cost(
+        self.needs, self.order, strip_live, lg, final_levels = _chain_cost(
             bound, self.final_units, self.final_heights, widths[sf:], self.stripes, elem, ws)
         largest = max(largest, lg)
         self.prefix_live, self.stripe_live = prefix_live, strip_live
@@ -375,7 +379,8 @@ class Plan:
                 best_v = (arena, name, alive, fb, pb, rows, live, save_alloc, extra)
         self.arena, self.save_layout, alive, self.stripe_bytes, self.pass_bytes, rows, self.live_peak, save_alloc, self.save_slack = best_v
         for ps, a, (r, (st, (needs, order, live, plg, work))) in zip(self.passes, alive, rows):
-            ps.alive, ps.rows, ps.stripes, ps.needs, ps.order, ps.live, ps.work = a, r, st, needs, order, live, work
+            ps.alive, ps.rows, ps.stripes, ps.needs, ps.order, ps.live = a, r, st, needs, order, live
+            ps.work_levels, ps.work = work, sum(work.values())
             largest = max(largest, plg, norm_temp(ps.norm.channels, max(b - a_ for a_, b in st), ps.widths[-1], ws))
         largest = max(largest, save_alloc)
         self.persistent = persistent
@@ -387,8 +392,15 @@ class Plan:
         self.estimate = self.arena + self.largest + ESTIMATE_PAD
         work_prefix = sum(bound.prefix_macs(m) for _, m in bound.prefix) * h8 * w8
         work_whole = work_prefix + sum(heights[i + 1] * widths[i + 1] * u.macs_row for i, u in enumerate(units))
+        work_stripes = sum(final_levels.values())
         self.work_passes = sum(ps.work for ps in self.passes)
         self.recompute = (work_prefix + work_stripes + self.work_passes) / max(1, work_whole)
+        # conv MACs by resolution level (output width / latent width: 1 = the prefix at H/8, 2, 4, 8), for the time model
+        levels = {1: work_prefix}
+        for d in [final_levels] + [ps.work_levels for ps in self.passes]:
+            for w_out, m in d.items():
+                levels[w_out // w8] = levels.get(w_out // w8, 0) + m
+        self.work_levels = levels
 
     def describe(self):
         d = "{} stripes of {} rows (core), recompute {:.2f}x, checkpoint {}".format(
@@ -678,21 +690,31 @@ class StripeAdapter:
     name = "?"
     hdim = 2
     scale = 8
+    schemes = ()     # GroupNorm schemes the variants differ by (LDM); empty: one variant
 
     def plan(self, vae, samples, budget, ws, rows=None, out_bytes=0, measure="estimate"):
         """rows=None: the largest stripe height whose `measure` ("estimate", the
         bound handed to load_models_gpu, or "arena", what is reserved) fits the
-        budget (None if even MIN_ROWS does not fit); else exactly `rows`."""
+        budget (None if no height fits: MIN_ROWS, doubled up to the image height);
+        else exactly `rows`."""
         h8, w8 = int(samples.shape[-2]), int(samples.shape[-1])
         elem = mm.dtype_size(vae.vae_dtype)
         lat = samples[0:1].numel() * elem
         if rows is not None:
             return Plan(self, h8, w8, rows, ws, elem, out_bytes, lat)
         h_out = h8 * self.scale
-        best = None
         lo, hi = min(MIN_ROWS, h_out), h_out
-        if getattr(Plan(self, h8, w8, lo, ws, elem, out_bytes, lat), measure) > budget:
-            return None
+        # the smallest height that fits; doubling from MIN_ROWS, since the peak is not monotone at the smallest
+        # heights when there are statistics passes (squeezed to a few rows, the save pool: an LDM decode with
+        # scheme B can need more with 8-row stripes than with 32)
+        while True:
+            best = Plan(self, h8, w8, lo, ws, elem, out_bytes, lat)
+            if getattr(best, measure) <= budget:
+                break
+            if lo >= h_out:
+                return None
+            lo = min(h_out, lo * 2)
+        lo += 1
         while lo <= hi:
             mid = (lo + hi) // 2
             p = Plan(self, h8, w8, mid, ws, elem, out_bytes, lat)
@@ -701,6 +723,29 @@ class StripeAdapter:
             else:
                 hi = mid - 1
         return best
+
+    def smallest_plan(self, vae, samples, ws, out_bytes=0):
+        """The plan with the lowest estimate among the heights plan() tries first
+        (MIN_ROWS, doubled up to the image height): what the error names when
+        nothing fits a budget."""
+        h_out = int(samples.shape[-2]) * self.scale
+        r, best = min(MIN_ROWS, h_out), None
+        while True:
+            p = self.plan(vae, samples, 0, ws, rows=r, out_bytes=out_bytes)
+            if best is None or p.estimate < best.estimate:
+                best = p
+            if r >= h_out:
+                return best
+            r = min(h_out, r * 2)
+
+    def variants(self, scheme=None):
+        """The layer-1 configurations of this decoder the budget policy chooses
+        among (vae.py); `scheme`: a forced GroupNorm scheme (LDM only)."""
+        return [self]
+
+    def predict_seconds(self, plan):
+        """Predicted decode time of `plan` for ranking variants, or None (one variant)."""
+        return None
 
     def save_positions(self):
         """Unit indices p whose input is kept whole (a save) for the statistics passes."""

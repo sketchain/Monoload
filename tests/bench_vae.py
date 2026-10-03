@@ -6,7 +6,8 @@ Runs, in one process with one loaded VAE, every resolution x mode:
             reported as OOM (the tiled fallback is aborted, never counted as a
             native result).
   monoload  Monoload's managed decode as the plugin runs it: layer 1 (stripe
-            decoding) for recognized decoders (Wan 2.1 single frame), layer 2
+            decoding) for recognized decoders (Wan 2.1 single frame, the LDM
+            decoder of SD1.5 / SDXL / SD3 / Flux), layer 2
             (conv row blocks + attention query blocks) for the rest; own memory
             estimate, OOM -> smaller blocks.
   monoload-l2  Monoload with layer 1 switched off: op-level chunking only
@@ -14,8 +15,11 @@ Runs, in one process with one loaded VAE, every resolution x mode:
   monoload-r<N>  monoload with the layer-1 stripe core height forced to N
             output rows (--stripe-rows adds these for a sweep).
   monoload-g<S>  monoload with the GroupNorm scheme S (A / B / C / D) of an LDM
-            layer-1 decode (--gn-schemes adds these for a sweep; with
+            layer-1 decode forced (--gn-schemes adds these for a sweep; with
             --stripe-rows too, every scheme x height: monoload-r<N>-g<S>).
+  monoload-b<G>  monoload with MONOLOAD_VAE_BUDGET = G GiB (e.g. monoload-b3,
+            monoload-b1.5): the fastest of layer 2 and the layer-1 configurations
+            whose estimate fits (--budgets adds these for a sweep).
   native2   native again: how much the GPU differs from itself.
 and reports per run (printed as it happens) and in summary tables:
   time      cold = first run of that mode at that resolution, warm = median
@@ -95,7 +99,7 @@ import comfy.utils  # noqa: E402
 import folder_paths  # noqa: E402
 import nodes  # noqa: E402
 from monoload import comfy_env, vae as mvae, vae_ops, vae_engine  # noqa: E402
-from monoload.errors import MonoloadVAEOOMError  # noqa: E402
+from monoload.errors import MonoloadError, MonoloadVAEOOMError  # noqa: E402
 
 GIB = 1024 ** 3
 
@@ -357,6 +361,9 @@ def decode_once(vae, latent, capture, sampler_interval):
             except MonoloadVAEOOMError as e:
                 row["status"] = "OOM"
                 row["error"] = str(e).splitlines()[0][:200]
+            except MonoloadError as e:          # MONOLOAD_VAE_BUDGET too small: reported, not a crash
+                row["status"] = "over budget"
+                row["error"] = str(e).splitlines()[0][:400]
             except Exception as e:
                 if mm.is_oom(e):
                     row["status"] = "OOM"
@@ -391,19 +398,25 @@ def decode_once(vae, latent, capture, sampler_interval):
 
 _DEFAULT_ROWS = mvae.stripe_rows()
 _DEFAULT_WS = []
-_DEFAULT_GN = mvae.gn_scheme()
+_DEFAULT_GN = mvae.gn_scheme() if mvae.gn_scheme_forced() else None   # None: the default scheme, not forced
+_DEFAULT_BUDGET = mvae.budget()
 
 
 def configure(mode):
-    """Install / uninstall Monoload's VAE wrapper and set layer 1 / the workspace / the GroupNorm scheme for `mode`
-    (a "-w<MiB>" suffix sets MONOLOAD_VAE_WORKSPACE for that mode, e.g. monoload-w128, monoload-l2-w256; a "-g<S>"
-    suffix before it sets MONOLOAD_VAE_GN_SCHEME, e.g. monoload-gD, monoload-r32-gA, monoload-gB-w256)."""
+    """Install / uninstall Monoload's VAE wrapper and set layer 1 / the workspace / the GroupNorm scheme / the budget
+    for `mode`. Suffixes, in this order: "-g<S>" forces MONOLOAD_VAE_GN_SCHEME (monoload-gD, monoload-r32-gA),
+    "-b<GiB>" sets MONOLOAD_VAE_BUDGET (monoload-b3, monoload-b1.5, monoload-gA-b2), "-w<MiB>" sets
+    MONOLOAD_VAE_WORKSPACE (monoload-w128, monoload-l2-w256, monoload-gB-w256)."""
     if not _DEFAULT_WS:
         _DEFAULT_WS.append(mvae.workspace())   # --workspace / MONOLOAD_VAE_WORKSPACE
     w = re.search(r"-w(\d+)$", mode)
     mvae.set_workspace(int(w.group(1)) * vae_ops.MIB if w else _DEFAULT_WS[0])
     if w:
         mode = mode[:w.start()]
+    b = re.search(r"-b(\d+(?:\.\d+)?)$", mode)
+    mvae.set_budget(int(float(b.group(1)) * vae_ops.GIB) if b else _DEFAULT_BUDGET)
+    if b:
+        mode = mode[:b.start()]
     g = re.search(r"-g([A-Da-d])$", mode)
     mvae.set_gn_scheme(g.group(1) if g else _DEFAULT_GN)
     if g:
@@ -433,15 +446,16 @@ def mono_line(m):
         if m.get("passes"):
             gn = "{} GroupNorm statistics passes (rows {}), saves {}, ".format(
                 m["passes"], ",".join(str(r) for r in m.get("pass_rows", [])), "+".join(vae_ops.fmt_bytes(b) for b in m.get("saves") or []) or "none")
-        return ("layer 1 ({}): {} stripes of {} rows, recompute {:.2f}x, checkpoint {}, {}{} (target {}), workspace {}, {} OOM retries; "
+        pred = " (time model {:.1f} s)".format(m["predicted_seconds"]) if m.get("predicted_seconds") is not None else ""
+        return ("layer 1 ({}){}: {} stripes of {} rows, recompute {:.2f}x, checkpoint {}, {}{} (target {}), workspace {}, {} OOM retries; "
                 "estimate {} GiB (live peak {}: prefix {} / checkpoint + stripes {} / persistent {}; native {}); {} Conv3d calls as conv2d, arena {}").format(
-            m.get("adapter"), m["stripes"], m["rows"], m["recompute"], vae_ops.fmt_bytes(m["checkpoint_bytes"]), gn, m.get("policy"), vae_ops.fmt_bytes(m["budget"]),
+            m.get("adapter"), pred, m["stripes"], m["rows"], m["recompute"], vae_ops.fmt_bytes(m["checkpoint_bytes"]), gn, m.get("policy"), vae_ops.fmt_bytes(m["budget"]),
             vae_ops.fmt_bytes(m["workspace"]), m["retries"], gib(e["total"]).strip(), vae_ops.fmt_bytes(e.get("live")), vae_ops.fmt_bytes(e["prefix"]), vae_ops.fmt_bytes(e["stripes"]),
             vae_ops.fmt_bytes(e["persistent"]), gib(m.get("native_estimate")).strip(), st.get("conv3d_as_2d"), vae_ops.fmt_bytes(st.get("arena")) if st.get("arena") else "none")
     st = m.get("stats", {})
     return ("layer 2 ({}): estimate {} GiB (native {}), workspace {}, {} OOM retries; conv {} of {} calls in {} row blocks "
             "(largest block workspace {}, largest whole-conv workspace {}); attention {} call(s), query block {} of {} tokens").format(
-        (m.get("layer1") or "")[:90], gib(m["estimate"]["total"]).strip(), gib(m.get("native_estimate")).strip(), vae_ops.fmt_bytes(m["workspace"]),
+        (m.get("policy") or m.get("layer1") or "")[:120], gib(m["estimate"]["total"]).strip(), gib(m.get("native_estimate")).strip(), vae_ops.fmt_bytes(m["workspace"]),
         m["retries"], st.get("conv_chunked"), st.get("conv_calls"), st.get("conv_blocks"), vae_ops.fmt_bytes(st.get("conv_ws_max_block")),
         vae_ops.fmt_bytes(st.get("conv_ws_max_full")), st.get("attn_calls"), st.get("attn_rows_min"), st.get("attn_tokens_max"))
 
@@ -835,7 +849,9 @@ def main():
     p.add_argument("--modes", default="native,monoload,native2",
                    help="comma list run in order per resolution: native, monoload (layer 1 where recognized, else layer 2), "
                         "monoload-l2 (layer 2 only), monoload-r<N> (layer 1 with N-row stripes), native2; "
-                        "a -w<MiB> suffix on a monoload mode sets the workspace for it (monoload-w128, monoload-l2-w256)")
+                        "a -w<MiB> suffix on a monoload mode sets the workspace for it (monoload-w128, monoload-l2-w256), "
+                        "-b<GiB> the budget (monoload-b3, monoload-b1.5), -g<S> forces the GroupNorm scheme (monoload-gD)")
+    p.add_argument("--budgets", help="comma list of MONOLOAD_VAE_BUDGET values in GiB to sweep (adds a monoload-b<G> mode per value)")
     p.add_argument("--stripe-rows", help="comma list of layer-1 stripe core heights to sweep (adds a monoload-r<N> mode per value)")
     p.add_argument("--gn-schemes", help="GroupNorm schemes of an LDM layer-1 decode to sweep, e.g. ADBC (adds a monoload-g<S> mode per "
                    "scheme, and monoload-r<N>-g<S> for every --stripe-rows value)")
@@ -910,6 +926,7 @@ def main():
         modes += ["monoload-r{}-g{}".format(r, g) for g in gn_sweep for r in rows_sweep]
     else:
         modes += ["monoload-r{}".format(r) for r in rows_sweep]
+    modes += ["monoload-b{}".format(b.strip()) for b in (a.budgets or "").split(",") if b.strip()]
     results = []
     accuracy = []
     outlier_info = []
@@ -985,10 +1002,14 @@ def main():
             if m.get("passes"):
                 layer += ", GN {} ({} passes, saves {})".format(m.get("gn_scheme"), m["passes"],
                                                                 "+".join(vae_ops.fmt_bytes(b) for b in m.get("saves") or []) or "none")
+            if m.get("predicted_seconds") is not None:
+                layer += ", model {:.1f} s".format(m["predicted_seconds"])
         elif m.get("strategy") == "layer2":
             layer = "L2"
         else:
             layer = ""
+        if m.get("candidates"):
+            layer += " [budget {}, {} candidates]".format(vae_ops.fmt_bytes(m.get("budget")), len(m["candidates"]))
         print("{:11s} {:13s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6} | {}".format(
             s["res"], s["mode"], s["status"], "{:.3f}".format(s["cold"]), "{:.3f}".format(s["warm"]) if s["warm"] is not None else "n/a",
             gib(s.get("alloc_peak")), gib(s.get("alloc_delta")), gib(s.get("res_delta")), gib(s.get("gtt_delta")), gib(s.get("cg_mempeak_delta")),

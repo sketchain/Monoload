@@ -33,15 +33,18 @@ decoder is decoded in
 stripes of output rows from a low-resolution checkpoint instead of the
 whole-image activations; everything else keeps layer 2. Default stripe height:
 the lowest peak that does not cost speed (DEFAULT_POLICY_ROWS, DESIGN
-§9.13.4); MONOLOAD_VAE_BUDGET / MONOLOAD_VAE_STRIPE_ROWS override it.
+§9.13.4); MONOLOAD_VAE_STRIPE_ROWS overrides it. With MONOLOAD_VAE_BUDGET the
+decode is the fastest whose estimate fits the budget: layer 2, or a layer-1
+GroupNorm scheme x stripe height (choose_budget, DESIGN §9.14.10).
 
 Switches (read at import / by the plugin entry): MONOLOAD_DISABLE_VAE=1 or
 MONOLOAD_EXACT=1 -> not installed; MONOLOAD_VAE_WORKSPACE (default 1G);
-MONOLOAD_DISABLE_VAE_STRIPE=1 -> layer 1 off; MONOLOAD_VAE_BUDGET (layer-1
-peak budget: the tallest stripes within it; unset = the default policy);
+MONOLOAD_DISABLE_VAE_STRIPE=1 -> layer 1 off; MONOLOAD_VAE_BUDGET (peak
+budget: the fastest decode within it; unset = the default policy);
 MONOLOAD_VAE_STRIPE_ROWS (force the stripe core height, for sweeps /
-debugging); MONOLOAD_VAE_GN_SCHEME (A / B / C / D: which GroupNorm inputs an
-LDM decode keeps whole, DESIGN §9.14).
+debugging); MONOLOAD_VAE_GN_SCHEME (force A / B / C / D: which GroupNorm
+inputs an LDM decode keeps whole, DESIGN §9.14; default B). The forced
+settings outrank the budget.
 """
 
 import inspect
@@ -131,19 +134,21 @@ def _rows_from_env():
 
 
 def _gn_scheme_from_env():
+    """(scheme, forced): MONOLOAD_VAE_GN_SCHEME, or the default (not forced)."""
     raw = os.environ.get("MONOLOAD_VAE_GN_SCHEME", "").strip().upper()
     if not raw:
-        return vae_ldm.DEFAULT_SCHEME
+        return vae_ldm.DEFAULT_SCHEME, False
     if raw not in vae_ldm.SCHEMES:
         logging.warning("[Monoload] MONOLOAD_VAE_GN_SCHEME={!r} is not one of {}; using {}".format(
             raw, "/".join(vae_ldm.SCHEMES), vae_ldm.DEFAULT_SCHEME))
-        return vae_ldm.DEFAULT_SCHEME
-    return raw
+        return vae_ldm.DEFAULT_SCHEME, False
+    return raw, True
 
 
+_GN_ENV = _gn_scheme_from_env()
 _SETTINGS = {"workspace": _workspace_from_env(), "budget": _budget_from_env(),
              "stripe": not _env_flag("MONOLOAD_DISABLE_VAE_STRIPE"), "stripe_rows": _rows_from_env(),
-             "gn_scheme": _gn_scheme_from_env()}
+             "gn_scheme": _GN_ENV[0], "gn_forced": _GN_ENV[1]}
 vae_ldm.set_scheme(_SETTINGS["gn_scheme"])
 _LAST = {}
 
@@ -162,9 +167,9 @@ def budget():
 
 
 def set_budget(n):
-    """Layer-1 peak budget in bytes, None = the default policy (tests / bench);
-    MONOLOAD_VAE_BUDGET at import. With a budget, a decode whose smallest
-    stripes do not fit it is an error."""
+    """Peak budget in bytes, None = the default policy (tests / bench);
+    MONOLOAD_VAE_BUDGET at import. With a budget, the fastest decode whose
+    estimate fits it is used (choose_budget); none fitting is an error."""
     _SETTINGS["budget"] = int(n) if n else None
 
 
@@ -196,10 +201,17 @@ def gn_scheme():
     return _SETTINGS["gn_scheme"]
 
 
+def gn_scheme_forced():
+    return _SETTINGS["gn_forced"]
+
+
 def set_gn_scheme(name):
-    """GroupNorm scheme of LDM layer-1 decodes (A / B / C / D; tests / bench); MONOLOAD_VAE_GN_SCHEME at import."""
+    """Force the GroupNorm scheme of LDM layer-1 decodes (A / B / C / D), None =
+    the default, not forced (tests / bench); MONOLOAD_VAE_GN_SCHEME at import.
+    A forced scheme is used as is; otherwise MONOLOAD_VAE_BUDGET may pick another."""
     vae_ldm.set_scheme(name)
     _SETTINGS["gn_scheme"] = vae_ldm.scheme()
+    _SETTINGS["gn_forced"] = bool(name)
 
 
 def last_decode():
@@ -434,6 +446,9 @@ def _managed_decode(self, samples_in, vae_options):
     _sync()  # do not count work queued before this decode
     t0 = time.perf_counter()
     with mm.cuda_device_context(self.device):
+        bud = budget()
+        if bud:
+            return _decode_budget(self, samples_in, vae_options, t0, bud)
         bound, why = _select_layer1(self, samples_in, vae_options)
         if bound is not None:
             ok, detail = _layer1_self_test(self, bound)
@@ -462,8 +477,11 @@ def choose_plan(vae, samples_in, bound, out_bytes):
     """(plan, budget, workspace, policy) for a layer-1 decode (DESIGN §9.13.4).
 
     forced rows   MONOLOAD_VAE_STRIPE_ROWS: exactly that core height.
-    budget        MONOLOAD_VAE_BUDGET: the tallest stripes whose estimate fits
-                  it; MonoloadError when even MIN_ROWS-row stripes do not.
+    budget        MONOLOAD_VAE_BUDGET: the tallest stripes of this bound whose
+                  estimate fits it; MonoloadError when no height does. (A
+                  managed decode with a budget goes through choose_budget,
+                  which also weighs layer 2 and the other variants; this
+                  branch is for the simulator / tests.)
     default       the lowest peak that does not cost speed: the peak (the arena,
                   what is reserved) of DEFAULT_POLICY_ROWS-row stripes is the
                   target (shorter stripes were clearly slower on the hardware,
@@ -482,11 +500,11 @@ def choose_plan(vae, samples_in, bound, out_bytes):
     if bud:
         plan = bound.plan(vae, samples_in, bud, ws, out_bytes=out_bytes)
         if plan is None:
-            smallest = bound.plan(vae, samples_in, bud, ws, rows=vae_engine.MIN_ROWS, out_bytes=out_bytes)
+            smallest = bound.smallest_plan(vae, samples_in, ws, out_bytes=out_bytes)
             raise MonoloadError(
-                "[Monoload] VAE 第一层（条带解码）在峰值预算 MONOLOAD_VAE_BUDGET={} 内放不下：latent {} 即使用 {} 行的条带也需要约 {}"
-                "（前缀 {}、条带 {}）。请调大 MONOLOAD_VAE_BUDGET 或去掉它（用默认策略），或设 MONOLOAD_DISABLE_VAE_STRIPE=1 改走第二层。".format(
-                    fmt_bytes(bud), list(samples_in.shape), vae_engine.MIN_ROWS, fmt_bytes(smallest.estimate),
+                "[Monoload] VAE 第一层（条带解码）在峰值预算 MONOLOAD_VAE_BUDGET={} 内放不下：latent {} 最少也需要约 {}（{} 行的条带，"
+                "前缀 {}、条带 {}）。请调大 MONOLOAD_VAE_BUDGET 或去掉它（用默认策略），或设 MONOLOAD_DISABLE_VAE_STRIPE=1 改走第二层。".format(
+                    fmt_bytes(bud), list(samples_in.shape), fmt_bytes(smallest.estimate), max(b - a for a, b in smallest.stripes),
                     fmt_bytes(smallest.prefix_bytes), fmt_bytes(smallest.stripe_bytes)))
         return plan, bud, ws, "MONOLOAD_VAE_BUDGET"
     ref = bound.plan(vae, samples_in, 0, ws, rows=DEFAULT_POLICY_ROWS, out_bytes=out_bytes)
@@ -495,10 +513,158 @@ def choose_plan(vae, samples_in, bound, out_bytes):
     return plan, target, ws, "default: peak of {}-row stripes".format(DEFAULT_POLICY_ROWS)
 
 
-def _decode_layer1(self, samples_in, bound, t0, selftest):
+def _selftest_failed(bound):
+    hit = vae_engine._SELFTEST.get(bound.key)
+    return hit is not None and not hit[0]
+
+
+def _candidate_label(c):
+    if c["layer"] == 2:
+        return "layer 2 {}".format(fmt_bytes(c["estimate"]))
+    what = "layer 1{} {} rows (workspace {})".format(" scheme " + c["gn_scheme"] if c["gn_scheme"] else "", c["rows"], fmt_bytes(c["workspace"]))
+    return "{} {}{}".format(what, fmt_bytes(c["estimate"]), ", ~{:.1f} s".format(c["seconds"]) if c["seconds"] is not None else "")
+
+
+def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
+    """MONOLOAD_VAE_BUDGET: the fastest decode whose estimate (the bound handed to
+    load_models_gpu) fits the budget (DESIGN §9.14.10). Returns a dict: layer
+    (1 or 2), policy, why (the log line), candidates (what was considered) and
+    for layer 1 bound / plan / workspace / selftest, for layer 2 estimate / probe
+    / note; raises MonoloadError when nothing fits.
+
+    candidates  layer 2 (workspace MONOLOAD_VAE_WORKSPACE), and for each layer-1
+                variant (LDM: one per GroupNorm scheme; Wan: one) the tallest
+                stripes whose estimate fits; layer-1 workspace layer1_workspace(budget).
+    ranking     layer 2 first: it runs every conv once, layer 1 recomputes (CT 700
+                4K: SDXL 9.9 s vs 35.5 s at best, Qwen 6.9 vs 8.4 s); then the
+                layer-1 variants by bound.predict_seconds (LDM: the time model,
+                vae_ldm.TIME_COEF).
+    forced      outrank the budget: MONOLOAD_DISABLE_VAE_STRIPE -> layer 2;
+                MONOLOAD_VAE_STRIPE_ROWS -> layer 1 at that height (the scheme is
+                still chosen); MONOLOAD_VAE_GN_SCHEME -> layer 1 with that scheme
+                for an LDM decoder (the height is still chosen). A forced
+                configuration that does not fit runs anyway (logged).
+    none fits   MonoloadError naming what each candidate needs.
+
+    selftest(bound) -> (ok, detail): the layer-1 self-test (default: run it,
+    cached per structure); a variant that fails it is skipped."""
+    if selftest is None:
+        selftest = lambda b: _layer1_self_test(vae, b)   # noqa: E731
+    rows = _SETTINGS["stripe_rows"]
+    scheme = gn_scheme() if gn_scheme_forced() else None
+    head = "MONOLOAD_VAE_BUDGET {}".format(fmt_bytes(bud))
+    considered = []
+
+    def layer2(policy, why, note):
+        est, probe = _layer2_estimate(vae, samples_in, vae_options, workspace())
+        c = {"layer": 2, "estimate": est["total"], "fits": est["total"] <= bud, "seconds": None}
+        considered.append(c)
+        return c, {"layer": 2, "estimate": est, "probe": probe, "note": note, "candidates": considered,
+                   "policy": "{}: {}{}".format(head, policy, "" if c["fits"] else "; estimate above the budget"),
+                   "why": "{} -> layer 2 (estimate {}): {}".format(head, fmt_bytes(est["total"]), why)}
+
+    bound, l1_note = _select_layer1(vae, samples_in, vae_options)
+    if not _SETTINGS["stripe"]:
+        return layer2("layer 2 forced (MONOLOAD_DISABLE_VAE_STRIPE)", "forced by MONOLOAD_DISABLE_VAE_STRIPE", l1_note)[1]
+    variants = []
+    if bound is not None:
+        variants = [v for v in bound.variants(scheme if bound.schemes else None) if not _selftest_failed(v)]
+        if not variants:
+            l1_note = "layer-1 self-test failed"
+    forced = []
+    if variants and rows:
+        forced.append("{} rows (MONOLOAD_VAE_STRIPE_ROWS)".format(rows))
+    if variants and scheme and bound.schemes:
+        forced.append("scheme {} (MONOLOAD_VAE_GN_SCHEME)".format(scheme))
+    if not forced:
+        c, d = layer2("layer 2 fits, the fastest candidate",
+                      "fits, and layer 2 is the fastest (every conv once, no recompute){}".format(
+                          "; layer 1 not available: {}".format(l1_note) if l1_note else ""), l1_note)
+        if c["fits"]:
+            return d
+
+    # layer-1 workspace: the budget's (layer1_workspace), else LAYER1_WORKSPACE, else MIN_WORKSPACE (a larger
+    # workspace raises the estimate: the budget's eighth can keep a variant out that fits with a smaller one)
+    ws_opts = sorted({layer1_workspace(bud), min(workspace(), LAYER1_WORKSPACE), min(workspace(), MIN_WORKSPACE)}, reverse=True)
+    fits, over = [], []
+    for v in variants:
+        outb = v.output_bytes(vae, samples_in)
+        p = None
+        for w in ws_opts:
+            q = v.plan(vae, samples_in, bud, w, rows=rows, out_bytes=outb)
+            if q is None or q.estimate > bud:
+                continue
+            if p is None:
+                p = q
+                if v.predict_seconds(q) is None:
+                    break          # nothing to rank by: the largest workspace that fits
+            elif v.predict_seconds(q) < v.predict_seconds(p):
+                p = q              # a smaller workspace allows taller stripes (ties: the larger workspace)
+        if p is None:
+            p = (v.plan(vae, samples_in, bud, ws_opts[-1], rows=rows, out_bytes=outb) if rows
+                 else v.smallest_plan(vae, samples_in, ws_opts[-1], out_bytes=outb))
+        c = {"layer": 1, "adapter": v.name, "gn_scheme": getattr(v, "gn_scheme", None), "rows": max(b - a for a, b in p.stripes),
+             "estimate": p.estimate, "seconds": v.predict_seconds(p), "fits": p.estimate <= bud, "workspace": p.workspace,
+             "prefix": p.prefix_bytes, "stripes": p.stripe_bytes}
+        considered.append(c)
+        (fits if c["fits"] else over).append((v, p, c))
+    fits.sort(key=lambda x: (x[2]["seconds"] is None, x[2]["seconds"] or 0.0))
+    pick, over_budget = fits, False
+    if not fits and rows and over:
+        pick, over_budget = sorted(over, key=lambda x: x[1].estimate), True   # forced rows outrank the budget
+    pre = "forced {}; ".format(", ".join(forced)) if forced else ""
+    for v, p, c in pick:
+        ok, detail = selftest(v)
+        if not ok:
+            c["selftest"] = "failed"
+            continue
+        if over_budget:
+            reason = pre + "no variant fits the budget at that height, the smallest estimate is used"
+        elif len(fits) > 1 or any(o["layer"] == 2 for o in considered):
+            reason = pre + ("the fastest predicted that fits" if c["seconds"] is not None else "the candidate that fits")
+        else:
+            reason = pre + "the only candidate"
+        others = "; ".join(_candidate_label(o) + ("" if o["fits"] else " (over)") for o in considered if o is not c) or "none"
+        return {"layer": 1, "bound": v, "plan": p, "workspace": p.workspace, "selftest": detail, "candidates": considered,
+                "policy": "{}: {}".format(head, "forced rows, estimate above the budget" if over_budget else "fastest within it"),
+                "why": "{} -> {}: {}; others: {}".format(head, _candidate_label(c), reason, others)}
+    if forced and pick:
+        # every forced layer-1 variant that fits failed its self-test: layer 2, as without a budget
+        return layer2("layer 2 (layer-1 self-test failed)", "layer-1 self-test failed", "layer-1 self-test failed")[1]
+    needs = []
+    for c in considered:
+        if c["layer"] == 2:
+            needs.append("第二层需要约 {}".format(fmt_bytes(c["estimate"])))
+        else:
+            needs.append("第一层{}用 {} 行的条带需要约 {}（前缀 {}、条带 {}）{}".format(
+                "（GroupNorm 方案 {}）".format(c["gn_scheme"]) if c["gn_scheme"] else "", c["rows"], fmt_bytes(c["estimate"]),
+                fmt_bytes(c["prefix"]), fmt_bytes(c["stripes"]), "，但自检未通过" if c.get("selftest") else ""))
+    if not variants:
+        needs.append("第一层不可用（{}）".format(l1_note))
+    raise MonoloadError(
+        "[Monoload] VAE 解码在峰值预算 MONOLOAD_VAE_BUDGET={} 内放不下（latent {}）：{}。请调大 MONOLOAD_VAE_BUDGET，"
+        "或去掉它（用默认策略）。".format(fmt_bytes(bud), list(samples_in.shape), "；".join(needs)))
+
+
+def _decode_budget(self, samples_in, vae_options, t0, bud):
+    try:
+        d = choose_budget(self, samples_in, vae_options, bud)
+    except MonoloadError:
+        _LAST.clear()
+        _LAST.update({"strategy": "error", "budget": bud})
+        raise
+    logging.info("[Monoload] VAE " + d["why"])
+    if d["layer"] == 2:
+        return _decode_layer2(self, samples_in, vae_options, t0, d["note"], est=d["estimate"], probe=d["probe"], policy=d["policy"],
+                              considered=d["candidates"])
+    return _decode_layer1(self, samples_in, d["bound"], t0, d["selftest"], choice=(d["plan"], bud, d["workspace"], d["policy"]),
+                          considered=d["candidates"])
+
+
+def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considered=None):
     outb = bound.output_bytes(self, samples_in)
     forced = _SETTINGS["stripe_rows"]
-    plan, bud, ws, policy = choose_plan(self, samples_in, bound, outb)
+    plan, bud, ws, policy = choice or choose_plan(self, samples_in, bound, outb)
     floor_ws = min(MIN_WORKSPACE, ws)
     min_rows = min(vae_engine.MIN_ROWS, max(b - a for a, b in plan.stripes))
     mm.load_models_gpu([self.patcher], memory_required=plan.estimate, force_full_load=self.disable_offload)
@@ -543,8 +709,8 @@ def _decode_layer1(self, samples_in, bound, t0, selftest):
                   "stripes": len(plan.stripes), "rows": max(b - a for a, b in plan.stripes), "recompute": plan.recompute,
                   "checkpoint_bytes": plan.ckpt_bytes, "boundaries": boundaries, "forced_rows": forced, "selftest": selftest,
                   "passes": len(plan.passes), "saves": [plan.save_bytes[p] for p in plan.saves], "gn_scheme": getattr(bound, "gn_scheme", None),
-                  "pass_rows": [ps.rows for ps in plan.passes],
-                  "stats": stats.as_dict()})
+                  "pass_rows": [ps.rows for ps in plan.passes], "candidates": considered,
+                  "predicted_seconds": bound.predict_seconds(plan), "stats": stats.as_dict()})
     logging.info("[Monoload] VAE decode {} -> layer 1 ({}): {}; {}, workspace {}{}; arena {}, memory estimate {} (native {}), {:.2f}s".format(
         "x".join(str(d) for d in samples_in.shape), bound.name, plan.describe(), policy, fmt_bytes(ws),
         ", {} OOM retries".format(retries) if retries else "", fmt_bytes(stats.arena) if stats.arena else "none",
@@ -552,26 +718,30 @@ def _decode_layer1(self, samples_in, bound, t0, selftest):
     return pixel_samples
 
 
-def _decode_layer2(self, samples_in, vae_options, t0, l1_note):
+def _layer2_estimate(vae, samples_in, vae_options, ws):
+    """(estimate dict, probe or None) of a layer-2 decode with workspace ws; the
+    shape probe (first decode of this model and latent layout) loads the weights."""
+    probe = _PROBES.get(vae.first_stage_model, {}).get((int(samples_in.shape[1]), samples_in.ndim))
+    if probe is None:
+        # the shape probe needs the weights where they compute
+        mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, samples_in[0:1, ..., :PROBE_SIZE, :PROBE_SIZE], ws)["total"],
+                           force_full_load=vae.disable_offload)
+        try:
+            probe = _probe(vae, samples_in, vae_options)
+        except Exception as e:
+            # a real problem with this decoder will surface again in the decode itself
+            logging.warning("[Monoload] VAE shape probe failed ({}: {}); memory estimate falls back to the widest conv at full resolution".format(type(e).__name__, e))
+    return estimate(vae, samples_in, ws, probe), probe
+
+
+def _decode_layer2(self, samples_in, vae_options, t0, l1_note, est=None, probe=None, policy=None, considered=None):
     budget = workspace()
     floor = min(MIN_WORKSPACE, budget)
     retries = 0
     stats = None
     with mm.cuda_device_context(self.device):
-        probe = None
-        cached = _PROBES.get(self.first_stage_model, {}).get((int(samples_in.shape[1]), samples_in.ndim))
-        if cached is None:
-            # the shape probe needs the weights where they compute
-            mm.load_models_gpu([self.patcher], memory_required=estimate(self, samples_in[0:1, ..., :PROBE_SIZE, :PROBE_SIZE], budget)["total"],
-                               force_full_load=self.disable_offload)
-            try:
-                probe = _probe(self, samples_in, vae_options)
-            except Exception as e:
-                # a real problem with this decoder will surface again in the decode itself
-                logging.warning("[Monoload] VAE shape probe failed ({}: {}); memory estimate falls back to the widest conv at full resolution".format(type(e).__name__, e))
-        else:
-            probe = cached
-        est = estimate(self, samples_in, budget, probe)
+        if est is None:
+            est, probe = _layer2_estimate(self, samples_in, vae_options, budget)
         mm.load_models_gpu([self.patcher], memory_required=est["total"], force_full_load=self.disable_offload)
         while True:
             stats = OpStats()
@@ -602,16 +772,17 @@ def _decode_layer2(self, samples_in, vae_options, t0, l1_note):
     native_est = _native_estimate(self, samples_in.shape)
     _LAST.clear()
     _LAST.update({"strategy": "layer2", "estimate": est, "native_estimate": native_est, "workspace": budget,
-                  "retries": retries, "seconds": dt, "probe": probe is not None, "stats": stats.as_dict(), "layer1": l1_note})
+                  "retries": retries, "seconds": dt, "probe": probe is not None, "stats": stats.as_dict(), "layer1": l1_note,
+                  "budget": _SETTINGS["budget"], "policy": policy, "candidates": considered})
     attn = ""
     if stats.attn_calls:
         attn = ", attention {} call(s) in query blocks of {} / {} tokens".format(stats.attn_calls, stats.attn_rows_min, stats.attn_tokens_max)
     if stats.attn_unmanaged:
         attn += ", attention left native: {}".format(", ".join(stats.attn_unmanaged[:4]))
     logging.info("[Monoload] VAE decode {} -> layer 2, op-level chunking (workspace {}{}): {} of {} conv call(s) in row blocks{}; "
-                 "memory estimate {} (native {}), {:.2f}s".format(
+                 "{}memory estimate {} (native {}), {:.2f}s".format(
                      "x".join(str(d) for d in samples_in.shape), fmt_bytes(budget), ", {} OOM retries".format(retries) if retries else "",
-                     stats.conv_chunked, stats.conv_calls, attn, fmt_bytes(est["total"]), fmt_bytes(native_est), dt))
+                     stats.conv_chunked, stats.conv_calls, attn, policy + "; " if policy else "", fmt_bytes(est["total"]), fmt_bytes(native_est), dt))
     return pixel_samples
 
 

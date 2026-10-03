@@ -28,6 +28,11 @@ Flux-like AutoencodingEngine), fp32 on the CPU unless noted.
      and arena ordered C < B < D < A / A < D < B < C on the full-size SDXL
      decoder; OOM -> smaller stripes, at the floor MonoloadVAEOOMError, never
      tiled or layer 2; MONOLOAD_VAE_GN_SCHEME;
+  5b. MONOLOAD_VAE_BUDGET: layer 2 when it fits; else the layer-1 scheme with
+     the lowest predicted time (one stripe: no passes, the default scheme);
+     a scheme failing its self-test -> the next; forced scheme / rows /
+     layer 2 outrank the budget; nothing fits -> MonoloadError naming the
+     needs; the README examples on the full-size SDXL decoder;
   6. caching allocator (tests/alloc_sim.py, full-size SDXL / Flux on the meta
      device): SDXL / Flux layer-2 CT 700 readings reproduced; layer-1 reserved
      <= estimate.
@@ -237,6 +242,8 @@ def compare(label, v, latent, rows=None, scheme="A", tol=1e-5, width=4, expect_p
         mask[torch.tensor(sorted(rows_b))] = True
     eb = float(d[:, :, mask].max()) if mask.any() else 0.0
     ei = float(d[:, :, ~mask].max()) if (~mask).any() else 0.0
+    if last.get("stripes") == 1:
+        expect_passes = 0   # one stripe: every norm sees the whole image, no statistics passes
     ok = (last.get("strategy") == "layer1" and e <= tol and raw.shape == ref.shape and raw.dtype == ref.dtype and eb <= max(tol, 3 * ei)
           and last.get("passes") == expect_passes and spy.tiled == 0 and no_overrides(v.first_stage_model))
     check("{}: scheme {}, {} stripes of {} rows, {} statistics passes (rows {}), saves {}, recompute {:.2f}x; max|Δ| {:.2g} (near boundaries {:.2g}, "
@@ -280,7 +287,7 @@ def decoder_tests(sd, fx, lat4, lat16):
         check("bf16 VAE, scheme {}: RMSE vs fp32 truth: layer 1 {:.3g}, native {:.3g}; max|Δ| {:.3g} / {:.3g}".format(
             scheme, rm, rn, float((mb - truth).abs().max()), float((nb - truth).abs().max())),
             last.get("strategy") == "layer1" and rm <= 1.5 * rn + 1e-4)
-    mvae.set_gn_scheme("A")
+    mvae.set_gn_scheme(None)
     return wide
 
 
@@ -332,7 +339,7 @@ def selftest_tests(sd, lat4):
         mvae.set_gn_scheme(scheme)
         managed_decode(sd, lat4)
     check("one self-test per structure and GroupNorm scheme ({} cached)".format(len(eng._SELFTEST)), len(eng._SELFTEST) == 2)
-    mvae.set_gn_scheme("A")
+    mvae.set_gn_scheme(None)
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +371,7 @@ def plan_tests(sd, lat4):
           res["C"].save_layout, res["B"].save_layout),
           res["A"].recompute > res["D"].recompute > res["B"].recompute and res["D"].recompute > res["C"].recompute
           and res["A"].arena < res["D"].arena < res["B"].arena < res["C"].arena)
-    mvae.set_gn_scheme("A")
+    mvae.set_gn_scheme("A")   # self-tested above: the injected OOM below must not hit a first self-test
     # OOM
     orig_run = eng.run_passes
     calls_l2 = [0]
@@ -374,11 +381,20 @@ def plan_tests(sd, lat4):
         calls_l2[0] += 1
         return orig_l2(*a, **kw)
 
+    orig_stripes = eng.run_stripes
+
     def oom_above(limit):
+        # in the statistics passes, and in the output stripes (one stripe: no passes)
         def run(plan, *a, **kw):
             if max(b - a_ for a_, b in plan.stripes) > limit:
                 raise torch.cuda.OutOfMemoryError("simulated OOM")
             return orig_run(plan, *a, **kw)
+
+        def stripes(units, plan, *a, **kw):
+            if max(b - a_ for a_, b in plan.stripes) > limit:
+                raise torch.cuda.OutOfMemoryError("simulated OOM")
+            return orig_stripes(units, plan, *a, **kw)
+        eng.run_stripes = stripes
         return run
     mvae._run = l2
     try:
@@ -399,8 +415,10 @@ def plan_tests(sd, lat4):
         check("... neither tiled nor layer 2 was called, no override left", spy.tiled == 0 and calls_l2[0] == 0 and no_overrides(sd.first_stage_model))
     finally:
         eng.run_passes = orig_run
+        eng.run_stripes = orig_stripes
         mvae._run = orig_l2
         mvae.set_stripe_rows(None)
+        mvae.set_gn_scheme(None)
     expect_raises("set_gn_scheme('E') -> ValueError", ValueError, lambda: mvae.set_gn_scheme("E"))
     import os
     old = os.environ.get("MONOLOAD_VAE_GN_SCHEME")
@@ -414,7 +432,186 @@ def plan_tests(sd, lat4):
             os.environ.pop("MONOLOAD_VAE_GN_SCHEME", None)
         else:
             os.environ["MONOLOAD_VAE_GN_SCHEME"] = old
-    check("MONOLOAD_VAE_GN_SCHEME: 'd' -> D, unknown -> the default {} (with a warning)".format(vl.DEFAULT_SCHEME), a == "D" and b == vl.DEFAULT_SCHEME)
+    check("MONOLOAD_VAE_GN_SCHEME: 'd' -> D forced, unknown -> the default {} not forced (with a warning)".format(vl.DEFAULT_SCHEME),
+          a == ("D", True) and b == (vl.DEFAULT_SCHEME, False))
+    mvae.set_gn_scheme("C")
+    c = (mvae.gn_scheme(), mvae.gn_scheme_forced())
+    mvae.set_gn_scheme(None)
+    check("set_gn_scheme('C') forces C; set_gn_scheme(None) -> the default {} (scheme B since the CT 700 measurements), not forced".format(
+        mvae.gn_scheme()), c == ("C", True) and mvae.gn_scheme() == "B" == vl.DEFAULT_SCHEME and not mvae.gn_scheme_forced())
+
+
+# ---------------------------------------------------------------------------
+# 5b. MONOLOAD_VAE_BUDGET: the fastest candidate within the budget
+# ---------------------------------------------------------------------------
+
+def _stub_selftest(bound):
+    return True, "stub"
+
+
+def budget_tests(sd, lat4):
+    from monoload.errors import MonoloadError
+    mvae.set_gn_scheme(None)
+    mvae.set_stripe_rows(None)
+    ref = native_decode(sd, lat4, raw=True)
+
+    def run(bud):
+        mvae.set_budget(bud)
+        try:
+            with Spy() as spy:
+                out = managed_decode(sd, lat4, raw=True)
+        finally:
+            mvae.set_budget(None)
+        last = mvae.last_decode()
+        return last, float((out - ref).abs().max()), spy.tiled
+
+    l2 = mvae._layer2_estimate(sd, lat4, {}, mvae.workspace())[0]["total"]
+    last, e, tiled = run(l2)
+    check("budget = the layer-2 estimate ({}): layer 2 (it fits and is the fastest), == native (max|Δ| {:.2g}); policy: {}".format(
+        vae_ops.fmt_bytes(l2), e, last.get("policy")),
+        last.get("strategy") == "layer2" and [c["layer"] for c in last["candidates"]] == [2] and e <= 1e-4 and tiled == 0)
+    last, e, _ = run(l2 - 1)
+    check("budget just below it: layer 1, one stripe (no statistics passes), the default scheme {} wins the tie: {} x {} rows, scheme {}, "
+          "{} passes, == native (max|Δ| {:.2g})".format(vl.DEFAULT_SCHEME, last.get("stripes"), last.get("rows"), last.get("gn_scheme"), last.get("passes"), e),
+          last.get("strategy") == "layer1" and last.get("stripes") == 1 and last.get("passes") == 0 and last.get("gn_scheme") == vl.DEFAULT_SCHEME
+          and e <= 1e-5 and len(last["candidates"]) == 5 and not last["candidates"][0]["fits"])
+
+    # a small workspace, so that the activations decide; this decoder is so small that layer 2 always fits before
+    # any layer-1 plan (whose arena has a fixed pad), so layer 2's estimate is made huge for the ranking tests
+    mvae.set_workspace(16 * 1024)
+    orig_l2 = mvae._layer2_estimate
+
+    def big_l2(*a, **kw):
+        est, probe = orig_l2(*a, **kw)
+        return dict(est, total=1 << 40), probe
+    try:
+        l2 = orig_l2(sd, lat4, {}, mvae.workspace())[0]["total"]
+        mvae._layer2_estimate = big_l2
+        floor = min(b.smallest_plan(sd, lat4, 16 * 1024, b.output_bytes(sd, lat4)).estimate for b in vl.match(sd, lat4, {})[0].variants())
+        pick = None
+        bud = floor
+        while bud < 8 * floor and pick is None:
+            mvae.set_budget(bud)
+            d = mvae.choose_budget(sd, lat4, {}, bud, selftest=_stub_selftest)
+            mvae.set_budget(None)
+            fit1 = [c for c in d["candidates"] if c["layer"] == 1 and c["fits"]]
+            if d["layer"] == 1 and len(d["plan"].stripes) > 1 and len(fit1) >= 3 and len({c["gn_scheme"] for c in fit1}) >= 3:
+                pick = bud
+            bud = int(bud * 1.03) + 1
+        check("a budget above the smallest layer-1 need ({}) where 3+ schemes fit with several stripes: {}".format(
+            vae_ops.fmt_bytes(floor), vae_ops.fmt_bytes(pick) if pick else None), pick is not None)
+        if pick is None:
+            return
+        last, e, tiled = run(pick)
+        cands = last.get("candidates") or []
+        fit1 = [c for c in cands if c["layer"] == 1 and c["fits"]]
+        chosen = [c for c in fit1 if c["gn_scheme"] == last.get("gn_scheme")]
+        check("budget {}: scheme {} ({} x {} rows, estimate {}, predicted {:.3g} s) = the fastest predicted of {} fitting ({}); layer 2 ({}, stubbed) does not fit; "
+              "== native (max|Δ| {:.2g})".format(
+                  vae_ops.fmt_bytes(pick), last.get("gn_scheme"), last.get("stripes"), last.get("rows"), vae_ops.fmt_bytes(last["estimate"]["total"]),
+                  last.get("predicted_seconds") or 0, len(fit1), ", ".join("{} {:.3g} s".format(c["gn_scheme"], c["seconds"]) for c in fit1),
+                  vae_ops.fmt_bytes(cands[0]["estimate"]) if cands else "?", e),
+              last.get("strategy") == "layer1" and cands and cands[0]["layer"] == 2 and not cands[0]["fits"] and len(chosen) == 1
+              and chosen[0]["seconds"] == min(c["seconds"] for c in fit1) and last["estimate"]["total"] <= pick and e <= 1e-5 and tiled == 0
+              and "fastest" in last.get("policy", ""))
+        # the chosen scheme fails its self-test: the next fastest
+        bound = vl.LDMStripe(sd.first_stage_model, sd.first_stage_model.post_quant_conv, gn_scheme=last["gn_scheme"])
+        first = last["gn_scheme"]
+        eng._SELFTEST[bound.key] = (False, "injected")
+        try:
+            last2, e2, _ = run(pick)
+        finally:
+            eng._SELFTEST.pop(bound.key, None)
+        rest = sorted((c for c in fit1 if c["gn_scheme"] != first), key=lambda c: c["seconds"])
+        check("... scheme {} marked as failing its self-test: the next fastest, {} (== native, max|Δ| {:.2g})".format(first, last2.get("gn_scheme"), e2),
+              last2.get("strategy") == "layer1" and rest and last2.get("gn_scheme") == rest[0]["gn_scheme"] and e2 <= 1e-5)
+        # forced settings outrank the budget
+        mvae.set_stripe_rows(16)
+        last, e, _ = run(pick)
+        fit16 = [c for c in last.get("candidates") or [] if c["fits"]]
+        check("MONOLOAD_VAE_STRIPE_ROWS=16 with that budget: 16-row stripes, scheme {} = the fastest fitting at 16 rows (of {}), no layer 2 "
+              "(== native, max|Δ| {:.2g})".format(last.get("gn_scheme"), len(fit16), e),
+              last.get("strategy") == "layer1" and last.get("rows") == 16 and all(c["layer"] == 1 and c["rows"] == 16 for c in last["candidates"])
+              and fit16 and last.get("gn_scheme") == min(fit16, key=lambda c: c["seconds"])["gn_scheme"] and e <= 1e-5)
+        last, e, _ = run(1 << 20)
+        check("... with a 1 MiB budget: runs anyway at 16 rows (forced outranks the budget, logged: {})".format(last.get("policy")),
+              last.get("strategy") == "layer1" and last.get("rows") == 16 and "above the budget" in last.get("policy", "") and e <= 1e-5)
+        mvae.set_stripe_rows(None)
+        mvae._layer2_estimate = orig_l2
+        mvae.set_gn_scheme("A")
+        last, e, _ = run(1 << 30)
+        mvae.set_gn_scheme(None)
+        check("MONOLOAD_VAE_GN_SCHEME=A with a 1 GiB budget (layer 2 would fit): layer 1, scheme A, tallest stripes within it, layer 2 not considered "
+              "(== native, max|Δ| {:.2g})".format(e),
+              last.get("strategy") == "layer1" and last.get("gn_scheme") == "A" and [c["gn_scheme"] for c in last["candidates"]] == ["A"] and e <= 1e-5)
+        mvae.set_gn_scheme("C")
+        mvae.set_budget(1 << 20)
+        try:
+            expect_raises("MONOLOAD_VAE_GN_SCHEME=C with a 1 MiB budget -> MonoloadError naming scheme C's need (no layer 2)", MonoloadError,
+                          lambda: managed_decode(sd, lat4), "方案 C")
+        finally:
+            mvae.set_budget(None)
+            mvae.set_gn_scheme(None)
+        mvae.set_stripe(False)
+        last, e, _ = run(1 << 20)
+        mvae.set_stripe(True)
+        check("MONOLOAD_DISABLE_VAE_STRIPE=1 with a 1 MiB budget: layer 2 anyway ({})".format(last.get("policy")),
+              last.get("strategy") == "layer2" and "forced" in last.get("policy", "") and e <= 1e-4)
+        mvae.set_budget(1 << 20)
+        try:
+            expect_raises("1 MiB budget, nothing forced -> MonoloadError naming what layer 2 and each scheme need", MonoloadError,
+                          lambda: managed_decode(sd, lat4), "MONOLOAD_VAE_BUDGET", "第二层需要约", "方案 A", "方案 B", "方案 C", "方案 D")
+            dec = sd.first_stage_model.decoder
+            dec.tanh_out = True
+            try:
+                expect_raises("... an unrecognized decoder (tanh_out): MonoloadError naming layer 2's need and why layer 1 is out", MonoloadError,
+                              lambda: managed_decode(sd, lat4), "第二层需要约", "第一层不可用", "tanh_out")
+                mvae.set_budget(l2)
+                managed_decode(sd, lat4)
+                check("... with a budget layer 2 fits: layer 2", mvae.last_decode().get("strategy") == "layer2")
+            finally:
+                dec.tanh_out = False
+        finally:
+            mvae.set_budget(None)
+    finally:
+        mvae._layer2_estimate = orig_l2
+        mvae.set_workspace(mvae.DEFAULT_WORKSPACE)
+        mvae.set_gn_scheme(None)
+        mvae.set_stripe_rows(None)
+        mvae.set_stripe(True)
+        mvae.set_budget(None)
+
+
+def budget_plan_tests():
+    """The README examples: full-size SDXL (meta device), budgets 20 / 3 / 1.5 GiB."""
+    import alloc_sim
+    G = float(1 << 30)
+    v = alloc_sim.meta_vae(torch.bfloat16, "sdxl")
+    want = {(1344, 768): ("L2", "L1 1 stripe", "C"), (2688, 1536): ("L2", "B", "D"), (3840, 2160): ("L2", "D", "A")}
+    for (w, h), exp in want.items():
+        lat = torch.empty(1, 4, h // 8, w // 8, device="meta")
+        with vae_ops.OpChunking(v.first_stage_model, 1 << 30, vae_ops.OpStats()):
+            mvae._probe(v, lat, {})
+        got = []
+        ok = True
+        for b, e in zip((20, 3, 1.5), exp):
+            bud = int(b * G)
+            mvae.set_budget(bud)
+            d = mvae.choose_budget(v, lat, {}, bud, selftest=_stub_selftest)
+            mvae.set_budget(None)
+            if d["layer"] == 2:
+                got.append("L2 {:.2f}".format(d["estimate"]["total"] / G))
+                ok = ok and e == "L2" and d["estimate"]["total"] <= bud
+            else:
+                p = d["plan"]
+                got.append("{} {}r {:.2f} ~{:.0f}s".format(d["bound"].gn_scheme, p.rows, p.estimate / G, d["bound"].predict_seconds(p)))
+                ok = ok and p.estimate <= bud and (len(p.stripes) == 1 if e == "L1 1 stripe" else d["bound"].gn_scheme == e)
+                fit = [c for c in d["candidates"] if c["layer"] == 1 and c["fits"]]
+                ok = ok and d["bound"].predict_seconds(p) == min(c["seconds"] for c in fit)
+        check("SDXL {}x{} budget 20 / 3 / 1.5 GiB -> {} (expected {})".format(w, h, " | ".join(got), " / ".join(exp)), ok)
+    i = alloc_sim.decode_trace(3840, 2160, "bf16", 309, model="sdxl", scheme="D", ws=64 << 20)
+    check("SDXL 4K budget 3 GiB plan (D, 309 rows, workspace 64 MiB): simulated reserved {:.2f} GiB <= estimate {:.2f} GiB".format(
+        i["reserved"] / G, i["estimate"] / G), i["reserved"] <= i["estimate"] <= 3 * G)
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +649,8 @@ def main():
     decoder_tests(sd, fx, lat4, lat16)
     selftest_tests(sd, lat4)
     plan_tests(sd, lat4)
+    budget_tests(sd, lat4)
+    budget_plan_tests()
     allocator_tests()
     finish()
 
