@@ -508,7 +508,7 @@ loop:
 | 设置 | 效果 |
 |---|---|
 | 默认 | 安装管理入口，预算 1 GiB |
-| `MONOLOAD_VAE_WORKSPACE` | 工作区：`1G`、`512M`、`768`（纯数字按 MiB）等。第二层直接用它；第一层用 `min(它, 384 MiB)`（设了 `MONOLOAD_VAE_BUDGET` 时 `min(它, max(64 MiB, 预算/8))`），见 §9.13.11 |
+| `MONOLOAD_VAE_WORKSPACE` | 工作区：`1G`、`512M`、`768`（纯数字按 MiB）等。第二层直接用它；第一层用 `min(它, 128 MiB)`（设了 `MONOLOAD_VAE_BUDGET` 时 `min(它, max(64 MiB, 预算/8))`），见 §9.13.11 |
 | `MONOLOAD_DISABLE_VAE=1` | 只关 VAE 部分，LoRA 部分照常 |
 | `MONOLOAD_DISABLE_VAE_STRIPE=1` | 只关第一层（§9.13），所有受管理的解码走第二层 |
 | `MONOLOAD_VAE_BUDGET` | 第一层的峰值预算；不设时用默认策略（128 行条带的峰值内最高的条带，§9.13.4） |
@@ -727,7 +727,7 @@ peak 按 62b3c94 的 forward 逐个数同时存活的张量。S 是模块输入�
 
 **arena 要多大：** 用模拟器对每个计划二分查找「不溢出（不另开 segment）的最小 arena」：输出缓冲前置之后，多条带的计划只需要 live 的 0.90–1.022 倍（4K 默认 0.996，1344 / 2688 默认 1.010–1.011，8K 1.001），只有一条条带（整图当一条）时要到 1.10–1.12 倍（整图尺寸的激活平面 1–2 GiB，夹在中间的洞放不下下一张）。所以 arena = live + live/32 + 64 MiB（一条条带时 live/8）。
 
-**估算为什么还要加 largest：** 在 384 个计划的网格（512² … 8K，bf16 / fp32，工作区 384 / 192 / 128 MiB，默认策略和 32 … 整图的强制高度）里，默认计划从不溢出；但一部分高条带的计划会溢出，而且每次都恰好是**一个**请求找不到连续的洞，于是单独开一个 segment：要么是一块 columns（例如 2688、384 行、bf16：洞 383 MiB，请求 384 MiB），要么是一张全分辨率平面（8K、fp32、480 行：1389 MiB）。之后同尺寸的请求都复用这个 segment，不会再长。所以上界取 `arena + largest + 16 MiB`（16 MiB 给 ≤ 1 MiB 的小块池，实测 2–6 MiB）：384 个计划里 reserved 全部 ≤ 估算，最小余量 16 MiB（fp32 1344、2 条 384 行，溢出被 largest 盖住）。代价是估算比实际 reserved 高一个 largest（默认计划约 0.39 GiB），但这只影响交给 `load_models_gpu` 的数，不多占内存；实际占用就是 arena。
+**估算为什么还要加 largest：** 在 384 个计划的网格（512² … 8K，bf16 / fp32，工作区 384 / 192 / 128 MiB，默认策略和 32 … 整图的强制高度）里，工作区 384 MiB 时默认计划从不溢出（128 MiB 时 8K 的默认计划溢出一次，见 §9.13.11）；但一部分高条带的计划会溢出，而且每次都恰好是**一个**请求找不到连续的洞，于是单独开一个 segment：要么是一块 columns（例如 2688、384 行、bf16：洞 383 MiB，请求 384 MiB），要么是一张全分辨率平面（8K、fp32、480 行：1389 MiB）。之后同尺寸的请求都复用这个 segment，不会再长。所以上界取 `arena + largest + 16 MiB`（16 MiB 给 ≤ 1 MiB 的小块池，实测 2–6 MiB）：384 个计划里 reserved 全部 ≤ 估算，最小余量 16 MiB（fp32 1344、2 条 384 行，溢出被 largest 盖住）。代价是估算比实际 reserved 高一个 largest（默认计划：工作区 384 MiB 时约 0.39 GiB，128 MiB 时 0.14–0.3 GiB），但这只影响交给 `load_models_gpu` 的数，不多占内存；实际占用就是 arena。
 
 **默认条带高度：在不明显变慢的前提下尽量低峰值。** 第一版是「3 GiB 预算内取最高的条带」：4K 选出 5 条 432 行，估 2.78 GiB，实测 reserved 2.66。真机扫参（4K，热启动；8% 以内是顺序 / 温度噪声）：
 
@@ -748,10 +748,10 @@ peak 按 62b3c94 的 forward 逐个数同时存活的张量。S 是模块输入�
   * 图像不足 128 行时就是一条整图。
 
   （725a010 用的是估算而不是 arena 来选；估算现在多了 largest 这一项，它随条带高度跳变，不适合用来比较峰值，所以改用 arena。）
-* 工作区沿用 384 MiB（`min(MONOLOAD_VAE_WORKSPACE, 384 MiB)`）。模拟显示更小的工作区会明显压低默认计划的峰值（128 MiB 时 4K 默认 0.87 GiB，2688 0.56，1344 0.36），但卷积块数会变成约 3 倍，速度要真机量（README 9.7 的 J、K，§9.13.11），数据回来之前不改默认。
+* 工作区：85a5c6f 时是 384 MiB（`min(MONOLOAD_VAE_WORKSPACE, 384 MiB)`），下面的表和扫参都是在它下面测的；workspace 实验之后默认改成 **128 MiB**（`LAYER1_WORKSPACE`，§9.13.11）：4K 默认 0.87 GiB / 8.44 s，2688 0.56 / 3.45 s，1344 0.36 / 0.71 s。
 * 设了 `MONOLOAD_VAE_BUDGET` 时改用预算：取**估算**不超过预算的最高条带（预算是给 `load_models_gpu` 的上界，所以和估算比；工作区 = `min(MONOLOAD_VAE_WORKSPACE, max(64 MiB, 预算/8))`），8 行条带也放不下就抛 `MonoloadError`，写明需要多少。设了 `MONOLOAD_VAE_STRIPE_ROWS` 时强制那个高度（覆盖默认规则和预算，估算超过预算时日志注明）。
 
-默认计划（Qwen，输出在 GPU 上；85a5c6f 实测 `bench_vae_l1c_*`，模拟器的预测在括号里）：
+85a5c6f（工作区 384 MiB）的默认计划（Qwen，输出在 GPU 上；实测 `bench_vae_l1c_*`，模拟器的预测在括号里；现在的默认见 §9.13.11）：
 
 | 输出 | dtype | 默认计划 | 重算 | live | 实测 reserved（模拟） | 估算 | 热启动耗时（原生） | 725a010 实测 reserved / 估算 |
 |---|---|---|---|---|---|---|---|---|
@@ -765,7 +765,7 @@ peak 按 62b3c94 的 forward 逐个数同时存活的张量。S 是模块输入�
 
 所有行（含冷启动）的 reserved / GTT 都在估算以内。强制高度（bf16，4K，实测）：r32 / r64 / r128 / r144 都是 1.13 GiB，r256（9 条 240 行）1.35，r512（5 条 432 行）1.82（725a010 2.09，4e54d20 2.66）；耗时 10.60 / 9.12 / 8.35 / 8.23 / 7.99 / 7.81 s，与 725a010 持平。
 
-**144 行以下峰值不再下降的原因：** live = 常驻 + max(前缀, 存档 + 条带)。4K 时前缀的存活峰值是 954 MiB（全局注意力：norm 输出 P + qkv 3P + 注意力输出 P + 分数块 384 MiB，P = 95 MiB），而 144 行条带的「存档 + 条带」是 938 MiB，已经低于前缀；128 / 64 / 32 行的条带部分是 898 / 741 / 662 MiB，都只是让条带部分更低，峰值仍是前缀的 954 MiB（加常驻 99 MiB = 1.03 GiB 存活，arena 1.12 GiB）。所以 4K 的瓶颈在前缀，要再降只能降前缀：工作区（分数块）或把注意力的 qkv 也分块，见 §9.13.11 和 docs/HANDOFF.md。
+**144 行以下峰值不再下降的原因：** live = 常驻 + max(前缀, 存档 + 条带)。4K 时前缀的存活峰值是 954 MiB（全局注意力：norm 输出 P + qkv 3P + 注意力输出 P + 分数块 384 MiB，P = 95 MiB），而 144 行条带的「存档 + 条带」是 938 MiB，已经低于前缀；128 / 64 / 32 行的条带部分是 898 / 741 / 662 MiB，都只是让条带部分更低，峰值仍是前缀的 954 MiB（加常驻 99 MiB = 1.03 GiB 存活，arena 1.12 GiB）。所以 4K 的瓶颈在前缀，要再降只能降前缀：工作区（分数块）或把注意力的 qkv 也分块。工作区改成 128 MiB 后前缀降到 698 MiB（6P + 128 MiB），4K 默认计划 14 条 155 行、峰值 0.87 GiB，仍由前缀决定（§9.13.11）。
 
 （「重算」是整个 decoder 的卷积算量相对整图解码，前缀只算一次。）
 
@@ -802,7 +802,7 @@ peak 按 62b3c94 的 forward 逐个数同时存活的张量。S 是模块输入�
 * 识别、开关、自检、预算、OOM：见上文各节；SDXL 式 / Flux 式结构继续走第二层（日志原因是「不是 WanVAE」），与原生的差和第一阶段相同。
 * 默认策略与内存模型：目标等于 128 行条带的 arena、选出的条带不超过目标且再高一档（160 行）就超过；`MONOLOAD_VAE_STRIPE_ROWS` 优先于默认策略和预算，只设预算时取预算内最高的条带；三种工作区下估算随条带高度单调不减，live = 常驻 + max(前缀, 存档 + 条带)、arena 按规则、估算 = arena + largest + 16 MiB，最大的条带排在第一个。
 * 分配器：自检后清空一次缓存，解码过程中不再清；在 CPU 上强制打开 arena 时，batch 2 的解码只分配一次 arena（大小等于计划的 arena），结果不变；CPU 上、以及 `max_split_size_mb` / `expandable_segments` 配置下不用 arena。
-* 缓存分配器（`tests/alloc_sim.py`，全尺寸 Wan decoder 放在 meta 设备上，§9.13.10）：模拟器复现 4e54d20 / 725a010 的 5 个真机读数（误差 ≤ 0.03 GiB）；本版 9 个计划（1344 默认和整图、1920×1088、2688、4K 默认 / 32 行 / 512 行、fp32 4K、8K）的模拟 reserved ≤ 估算。
+* 缓存分配器（`tests/alloc_sim.py`，全尺寸 Wan decoder 放在 meta 设备上，§9.13.10）：模拟器复现 4e54d20 / 725a010 / 85a5c6f 和工作区 128 MiB 默认计划的 9 个真机读数（误差 ≤ 0.03 GiB）；本版 9 个计划（1344 默认和整图、1920×1088、2688、4K 默认 / 32 行 / 512 行、fp32 4K、8K）的模拟 reserved ≤ 估算。
 * 单帧 Conv3d 改走 conv2d（在 CPU 上强制打开闸门测）：3×3（causal_zero）和 1×1 shortcut（输入是行切片）的 CausalConv3d，不分块和分块两种工作区，与模块原样输出一致（≤ 1e-5），且确实走了 conv2d；T=3 的输入、实例上已有别人的 `_conv_forward` 替换时不改走；整个 decoder 打开闸门后第一层仍与原生一致；CPU 张量上闸门关闭。
 * `tests/test_vae.py`（第二层）在关掉第一层后照旧全部通过，`tests/test_entry.py` 在各开关组合下通过。
 
@@ -817,7 +817,7 @@ peak 按 62b3c94 的 forward 逐个数同时存活的张量。S 是模块输入�
 * 第一版（4e54d20）已在真机上验收（README §10.2）：4K GTT 59.2 → 2.7 GiB，速度与原生相同，精度与原生同为 bf16 水平，没有接缝，SDXL 仍走第二层。
 * 725a010（默认策略、conv2d 改道）已复测（README §10.2）：计划、速度、精度、`aten::fill_` 都符合预期；reserved 超过估算、矮条带被清缓存反而变差，本版处理。
 * 85a5c6f 已复测（README §10.2），与模拟一致：默认 1344 / 2688 / 4K 的 GTT 0.71 / 0.87 / 1.13 GiB，fp32 0.80 / 1.16 / 1.70，所有行（含冷启动）都在估算以内；4K 扫参 r32–r144 1.13、r256 1.35、r512 1.82；速度与 725a010 持平，精度不变。**第二阶段验收通过。**
-* 待做：workspace 实验（README 9.7 的 J、K，§9.13.11），数据回来之前不改默认值。
+* workspace 实验已做（README §10.2，§9.13.11）：第一层默认工作区改成 128 MiB（4K 0.87 GiB），第二层保持 1 GiB。第二阶段到此结束，第三阶段见 docs/HANDOFF.md。
 
 #### 9.13.9 单帧 Conv3d 改走 conv2d（`aten::fill_`）
 
@@ -841,7 +841,7 @@ reserved（GTT）由 PyTorch 的缓存分配器决定，不能只靠存活量模
 * **分配器（`AllocatorSim`）：** 按 c10/cuda/CUDACachingAllocator.cpp 的规则和锁定镜像里 `c10/core/AllocatorConfig.h` 的常数：请求向上取整到 512 B；≤ 1 MiB 走小块池（2 MiB segment），1–10 MiB 开 20 MiB 的 segment，更大的按 2 MiB 取整单独开；从同一个池里 best fit（不小于请求的最小空闲块，同样大小取低地址）；大块池里拆分后剩余 > 1 MiB 才拆；释放时与同一 segment 里相邻的空闲块合并；`empty_cache` 释放整个空闲的 segment。分配器配置取默认（没有 max_split_size、expandable segments、垃圾回收阈值）。
 * **轨迹（`Tracer`）：** 在 meta 设备上构造全尺寸的 Wan decoder（qwen_image_vae 的维度），在 `TorchDispatchMode` 下跑 Monoload 的第一层或第二层：每个 aten 算子新产生的存储算一次分配，一个存储的所有张量和视图都消失时算一次释放（`StorageWeakRef`）。GPU 内核内部的缓冲按内核代码补上：Slow2d（关掉 cuDNN 的 4D 卷积）和 SlowDilated3d（5D）对非连续的输入 / 权重各拷一份，分配输出，再分配 im2col / vol2col 的 columns（Slow2d 的 1×1、stride 1、无 padding 不需要）；上采样对非连续输入拷一份。权重和 CPU 上的 latent 不计（bench 测的是解码前后的增量）。
 * **开关：** 可以复现以前的版本：`clear`（前缀后清缓存，725a010）、`order`（自上而下，4e54d20）、`conv2d`（单帧 Conv3d 走 SlowDilated3d，4e54d20）、`arena=0`（不分 arena）、`out_first=False`（分块卷积在第一块之后才分配输出，725a010 之前）。
-* **校验：** 24 个真机读数（4e54d20 和 725a010 的 4K 扫参、1344 / 2688、fp32 三档、第二层三档），alloc 和 reserved 的误差都 ≤ 0.02 GiB；峰值时刻的存活块与 profile 的「峰值构成」逐项一致（例如 725a010 4K 155 行：384 / 242 / 121 / 95 / 95 / 63 / 43 / 21 MiB）。
+* **校验：** 33 个真机读数（4e54d20、725a010、85a5c6f 的 4K 扫参、1344 / 2688、fp32 三档、第二层三档，以及 workspace 128 MiB 的默认三档），alloc 和 reserved 的误差都 ≤ 0.02 GiB。重放以前的版本时工作区固定为 384 MiB（`layer1_ws`），4e54d20 / 725a010 也关掉上采样输入的连续化（`contiguous=False`）；峰值时刻的存活块与 profile 的「峰值构成」逐项一致（例如 725a010 4K 155 行：384 / 242 / 121 / 95 / 95 / 63 / 43 / 21 MiB）。
 
 用法：`python tests/alloc_sim.py`（校验表），`python tests/alloc_sim.py --res 3840x2160 --rows 32,128,512 [--version v1|v2] [--peak] [--segments]`（某个计划的 alloc / reserved、峰值时刻的存活块、reserved 峰值时的 segment 布局）。在锁定镜像里用 `tests/docker_run.sh` 跑，不需要模型文件；4K 的一次模拟约 5 秒。
 
@@ -857,15 +857,15 @@ reserved（GTT）由 PyTorch 的缓存分配器决定，不能只靠存活量模
 **两层怎么取值：**
 
 * `MONOLOAD_VAE_WORKSPACE`（默认 1 GiB）是总设置。第二层（逐算子分块，SDXL / Flux，以及没走第一层的解码）直接用它。
-* 第一层（条带）用 `layer1_workspace()`：默认是 `min(MONOLOAD_VAE_WORKSPACE, 384 MiB)`，所以日志里写 `workspace 384 MiB`；设了 `MONOLOAD_VAE_BUDGET` 时是 `min(MONOLOAD_VAE_WORKSPACE, max(64 MiB, 预算/8))`。也就是说 `MONOLOAD_VAE_WORKSPACE` 只有设得比 384 MiB 小时才会改变第一层；设大了第一层仍是 384。
+* 第一层（条带）用 `layer1_workspace()`：默认是 `min(MONOLOAD_VAE_WORKSPACE, LAYER1_WORKSPACE)`，`LAYER1_WORKSPACE` 现在是 128 MiB（5d668b6 之前是 384），所以日志里写 `workspace 128 MiB`；设了 `MONOLOAD_VAE_BUDGET` 时是 `min(MONOLOAD_VAE_WORKSPACE, max(64 MiB, 预算/8))`。也就是说 `MONOLOAD_VAE_WORKSPACE` 只有设得比 128 MiB 小时才会改变第一层；设大了第一层仍是 128。
 
 **调小会影响什么：**
 
-* 第一层：前缀注意力的分数块（4K 前缀峰值 954 MiB 里的 384 MiB）和条带里卷积的 columns 都变小，所以 live、arena、估算、默认条带高度（默认规则按 arena 比）都会变；卷积块数变多（同一层卷积分成更多次 GEMM），注意力 query 块变多。数值只差 GEMM 形状带来的舍入。
+* 第一层：前缀注意力的分数块（384 MiB 时 4K 前缀峰值 954 MiB 里的 384 MiB）和条带里卷积的 columns 都变小，所以 live、arena、估算、默认条带高度（默认规则按 arena 比）都会变；卷积块数变多（同一层卷积分成更多次 GEMM），注意力 query 块变多。数值只差 GEMM 形状带来的舍入。
 * 第二层：columns 和分数块变小。Qwen 第二层的峰值主要是整图激活，模拟显示 reserved 几乎不变（4K 1 GiB / 384 / 128 MiB：9.59 / 9.69 / 9.63 GiB）；SDXL 第二层 4K 实测 14.86 GiB 里 columns 占多少要实测。
 * 估算（`load_models_gpu`）和 OOM 重试的起点（重试时工作区减半，下限 64 MiB）。
 
-**模拟器的预测（Qwen bf16，默认计划，reserved GiB）：**
+**模拟器的预测（Qwen bf16，默认计划，reserved GiB；实验前算的）：**
 
 | 工作区 | 1344 | 2688 | 4K | 第二层 1344 / 2688 / 4K |
 |---|---|---|---|---|
@@ -874,4 +874,20 @@ reserved（GTT）由 PyTorch 的缓存分配器决定，不能只靠存活量模
 | 256 MiB | 0.51 | 0.71 | 1.00 | 1.25 / 5.10 / 9.78 |
 | 128 MiB | 0.36 | 0.56 | 0.87 | 1.18 / 4.87 / 9.63 |
 
-速度只能真机量。命令和要看的指标见 README 9.7 的 J（Qwen，第一层 384 / 256 / 128，第二层 1G / 384 / 128）和 K（SDXL 第二层 1G / 512 / 256 / 128）；bench 的模式名加 `-w<MiB>` 就是只对这个模式改工作区。数据回来之前不改默认值。
+命令见 README 9.7 的 J（Qwen，第一层 384 / 256 / 128，第二层 1G / 384 / 128）和 K（SDXL 第二层 1G / 512 / 256 / 128）；bench 的模式名加 `-w<MiB>` 就是只对这个模式改工作区。
+
+**实测（5d668b6，`bench_vae_ws_*`）：** 与模拟一致，所有行 reserved ≤ 估算。
+
+| | 1344 | 2688 | 4K |
+|---|---|---|---|
+| 第一层 384 MiB：GTT / 热启动 | 0.66 GiB / 0.67 s | 0.87 / 3.21 | 1.13 / 8.24 |
+| 第一层 128 MiB：GTT / 热启动 | 0.36 / 0.71 | 0.56 / 3.45 | 0.87 / 8.44（14 条 155 行） |
+
+* 第二层，Qwen 4K：调小内存不降（reserved 9.59 → 9.63–9.69 GiB），反而变慢（6.94 → 7.83 / 9.07 s）。
+* 第二层，SDXL 4K：调小后 alloc 降了，但 reserved 反而升高（14.99 → 15.32–15.86 GiB，碎片），也更慢（9.89 → 13.15 s）。中低分辨率调小有收益，但不是峰值瓶颈。
+
+**决定（用户定）：**
+
+* 第一层默认工作区 384 → **128 MiB**（`LAYER1_WORKSPACE`）。峰值优先、多算可以接受：峰值降 23–45%，耗时多 2–7%。不选 64 MiB，是为了给 OOM 重试留一档可以缩（重试下限仍是 `MIN_WORKSPACE` = 64 MiB）。预算路径 `max(64 MiB, 预算/8)` 不变。
+* 第二层保持 1 GiB。SDXL / Flux 在第三阶段改走第一层。
+* 新默认就是实测过的 `-w128` 配置。用 `alloc_sim` 复核：384 个计划的网格里工作区 128 MiB 的 124 个计划 reserved 全部 ≤ 估算（最小余量 140 MiB）；默认计划 1344 / 2688 / 4K 的模拟 reserved 0.36 / 0.56 / 0.87 GiB 与实测相同，估算 0.50 / 0.71 / 1.16 GiB。工作区小了以后，高条带（例如强制 512 行）和 8K 默认计划更常有一个请求被挤出 arena（8K：arena 2.88、reserved 3.36 GiB），都在估算以内。
