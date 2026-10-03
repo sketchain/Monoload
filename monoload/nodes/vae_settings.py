@@ -20,10 +20,10 @@ on for this VAE even when it is globally off (MONOLOAD=0 included).
 MONOLOAD_DISABLE=1 (nothing installed): the node returns its input unchanged
 and says so once.
 
-Widget order: `budget` (the dropdown) comes after `budget_gib` and `mode` so
-that workflows saved with the first version of the node (budget_gib,
-gn_scheme, stripe_rows, mode) still load; budget_gib only counts with budget
-"custom".
+Widget order: budget (the dropdown) right before budget_gib, which only
+counts with budget "custom"; budget_gib keeps 0.01 GiB (step / round 0.01:
+the frontend derives the stored precision from the step). Workflows saved
+before this order load with shifted values (no compatibility, by decision).
 """
 
 import logging
@@ -49,12 +49,14 @@ class MonoloadVAESettings:
     def INPUT_TYPES(cls):
         return {"required": {
             "vae": ("VAE", {"tooltip": "The VAE; it is not changed, the output is a copy that shares its weights."}),
-            "budget_gib": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 4096.0, "step": 0.25,
+            "budget": (list(BUDGET_CHOICES), {"default": "default",
+                                              "tooltip": "default: follow the global setting (MONOLOAD_VAE_BUDGET); unlimited: no "
+                                                         "budget for this VAE (Monoload's default stripe policy); custom: budget_gib."}),
+            "budget_gib": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 4096.0, "step": 0.01, "round": 0.01,
                                      "tooltip": "Peak budget in GiB, used only when budget is custom: the fastest decode whose "
                                                 "estimate fits it (error naming what is needed when none fits)."}),
             "gn_scheme": (list(SCHEME_CHOICES), {"default": "default",
-                                                "tooltip": "GroupNorm scheme of an LDM decoder's layer 1 (SDXL / SD1.5 / SD3 / Flux ae): "
-                                                           "forces it. default = follow the global setting (MONOLOAD_VAE_GN_SCHEME)."}),
+                                                "tooltip": "GroupNorm scheme of layer 1 (stripe decoding) for LDM decoders (SDXL / SD1.5 / SD3 / Flux ae): which intermediate results are kept whole, so that the passes that gather the whole-image GroupNorm statistics can start from them instead of recomputing from the H/8 checkpoint. A: keeps nothing - lowest memory, most recomputation, slowest. D: keeps the output of the H/4 level. B: keeps the H/4 and H/2 level outputs - the built-in default. C: also keeps the input of every full-resolution block - most memory, fastest. SDXL 4K, measured: A ~1.1 GiB / 75 s, D ~1.5 / 58, B ~2.2 / 42, C ~4.7 / 36. default: follow the global setting (MONOLOAD_VAE_GN_SCHEME; without it B, or with a budget the fastest scheme that fits)."}),
             "stripe_rows": ("INT", {"default": 0, "min": 0, "max": 65536, "step": 8,
                                     "tooltip": "Layer-1 stripe height in output rows: forces it. "
                                                "0 = follow the global setting (MONOLOAD_VAE_STRIPE_ROWS)."}),
@@ -63,9 +65,6 @@ class MonoloadVAESettings:
                                                      "managed decode for this VAE (layer 1 stripes where the decoder is recognized, "
                                                      "else layer 2), also when it is globally off; layer 2 only: no stripes; "
                                                      "native: ComfyUI's own decode for this VAE."}),
-            "budget": (list(BUDGET_CHOICES), {"default": "default",
-                                              "tooltip": "default: follow the global setting (MONOLOAD_VAE_BUDGET); unlimited: no "
-                                                         "budget for this VAE (Monoload's default stripe policy); custom: budget_gib."}),
         }}
 
     def apply(self, vae, budget_gib=0.0, gn_scheme="default", stripe_rows=0, mode="default", budget="default"):

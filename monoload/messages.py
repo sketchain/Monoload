@@ -111,9 +111,9 @@ M = {
         "[Monoload] 内部错误：hook 不应走缓存权重的路径（key={key}）"),
     "release.done": (
         "[Monoload] released LoRA after prompt: {models} loaded model(s) back to base, {outputs} cached output(s), {objects} node LoRA "
-        "cache(s), {synced} clean clone(s) re-synced ({seconds:.2f}s)",
+        "cache(s), {synced} clean clone(s) re-synced, {repointed} orphaned loaded model(s) re-pointed ({seconds:.2f}s)",
         "[Monoload] prompt 结束后释放 LoRA：{models} 个已加载模型回到底模，{outputs} 个缓存输出，{objects} 个节点的 LoRA 缓存，"
-        "{synced} 个干净 clone 重新同步（{seconds:.2f}s）"),
+        "{synced} 个干净 clone 重新同步，{repointed} 个失去 patcher 的已加载模型重新指向（{seconds:.2f}s）"),
     "release.failed": ("[Monoload] releasing LoRA after the prompt failed", "[Monoload] prompt 结束后释放 LoRA 失败"),
     "node.lora_disabled": (
         "[Monoload] Monoload LoRA Settings: MONOLOAD_DISABLE is set, so the node passes MODEL and CLIP through unchanged",
@@ -166,7 +166,9 @@ M = {
     "vae.native_global": ("mode native ({var})", "模式原生（{var}）"),
     "vae.l1_not_used": ("[Monoload] VAE layer 1 (stripes) not used for {model}: {why} -> layer 2",
                         "[Monoload] {model} 不走 VAE 第一层（条带）：{why} -> 第二层"),
-    "vae.l1_disabled": ("layer 1 disabled (MONOLOAD_DISABLE_VAE_STRIPE)", "第一层已关闭（MONOLOAD_DISABLE_VAE_STRIPE）"),
+    "vae.l1_disabled": (
+        'layer 1 off (mode layer 2 only, from {src})',
+        '第一层关闭（模式「只用第二层」，来源：{src}）'),
     "vae.selftest_ok": ("[Monoload] VAE layer 1 ({name}) self-test passed: {detail}", "[Monoload] VAE 第一层（{name}）自检通过：{detail}"),
     "vae.selftest_failed": (
         "[Monoload] !!!!!!!! VAE layer 1 ({name}) SELF-TEST FAILED: {detail} !!!!!!!! layer 1 is disabled for this decoder structure in "
@@ -174,28 +176,39 @@ M = {
         "[Monoload] !!!!!!!! VAE 第一层（{name}）自检失败：{detail} !!!!!!!! 本进程里这种 decoder 结构不再走第一层，"
         "改走第二层（逐算子分块）。请报告这个问题。"),
     "vae.selftest_failed_short": ("layer-1 self-test failed", "第一层自检未通过"),
-    "vae.policy_forced_rows": ("forced {rows} rows (MONOLOAD_VAE_STRIPE_ROWS){over}", "强制 {rows} 行（MONOLOAD_VAE_STRIPE_ROWS）{over}"),
-    "vae.over_budget_note": ("; estimate above MONOLOAD_VAE_BUDGET", "；估算超过 MONOLOAD_VAE_BUDGET"),
+    "vae.policy_forced_rows": (
+        'forced {rows} rows (from {src}){over}',
+        '强制 {rows} 行（来源：{src}）{over}'),
+    "vae.over_budget_note": (
+        '; estimate above the budget',
+        '；估算超过预算'),
     "vae.policy_default": ("default: peak of {rows}-row stripes", "默认：{rows} 行条带的峰值"),
     "vae.err_l1_budget": (
-        "[Monoload] VAE layer 1 (stripe decoding) does not fit the peak budget MONOLOAD_VAE_BUDGET={budget}: latent {shape} needs at "
-        "least about {need} ({rows}-row stripes, prefix {prefix}, stripes {stripes}). Raise MONOLOAD_VAE_BUDGET or remove it (the default "
-        "policy), or set MONOLOAD_DISABLE_VAE_STRIPE=1 to use layer 2.",
-        "[Monoload] VAE 第一层（条带解码）在峰值预算 MONOLOAD_VAE_BUDGET={budget} 内放不下：latent {shape} 最少也需要约 {need}（{rows} 行的条带，"
-        "前缀 {prefix}、条带 {stripes}）。请调大 MONOLOAD_VAE_BUDGET 或去掉它（用默认策略），或设 MONOLOAD_DISABLE_VAE_STRIPE=1 改走第二层。"),
+        '[Monoload] VAE layer 1 (stripe decoding) does not fit the peak budget {budget} (from {src}): latent {shape} needs at least about {need} ({rows}-row stripes, prefix {prefix}, stripes {stripes}). {advice}',
+        '[Monoload] VAE 第一层（条带解码）在峰值预算 {budget}（来源：{src}）内放不下：latent {shape} 最少也需要约 {need}（{rows} 行的条带，前缀 {prefix}、条带 {stripes}）。{advice}'),
     "vae.cand_layer2": ("layer 2 {est}", "第二层 {est}"),
     "vae.cand_layer1": ("layer 1{scheme} {rows} rows (workspace {ws}) {est}{secs}", "第一层{scheme} {rows} 行（工作区 {ws}）{est}{secs}"),
     "vae.cand_scheme": (" scheme {scheme}", " 方案 {scheme}"),
     "vae.cand_secs": (", ~{secs:.1f} s", "，约 {secs:.1f} s"),
     "vae.cand_over": (" (over)", "（超出）"),
-    "vae.budget_head": ("MONOLOAD_VAE_BUDGET {budget}", "MONOLOAD_VAE_BUDGET {budget}"),
+    "vae.budget_head": (
+        'budget {budget} (from {src})',
+        '预算 {budget}（来源：{src}）'),
     "vae.policy_join": ("{head}: {policy}{over}", "{head}：{policy}{over}"),
     "vae.est_above": ("; estimate above the budget", "；估算超过预算"),
     "vae.why_layer2": ("{head} -> layer 2 (estimate {est}): {why}", "{head} -> 第二层（估算 {est}）：{why}"),
-    "vae.l2_forced_policy": ("layer 2 forced (MONOLOAD_DISABLE_VAE_STRIPE)", "强制第二层（MONOLOAD_DISABLE_VAE_STRIPE）"),
-    "vae.l2_forced_why": ("forced by MONOLOAD_DISABLE_VAE_STRIPE", "由 MONOLOAD_DISABLE_VAE_STRIPE 强制"),
-    "vae.forced_rows": ("{rows} rows (MONOLOAD_VAE_STRIPE_ROWS)", "{rows} 行（MONOLOAD_VAE_STRIPE_ROWS）"),
-    "vae.forced_scheme": ("scheme {scheme} (MONOLOAD_VAE_GN_SCHEME)", "方案 {scheme}（MONOLOAD_VAE_GN_SCHEME）"),
+    "vae.l2_forced_policy": (
+        'layer 2 forced (mode layer 2 only, from {src})',
+        '强制第二层（模式「只用第二层」，来源：{src}）'),
+    "vae.l2_forced_why": (
+        'forced by mode layer 2 only (from {src})',
+        '由模式「只用第二层」强制（来源：{src}）'),
+    "vae.forced_rows": (
+        '{rows} rows (from {src})',
+        '{rows} 行（来源：{src}）'),
+    "vae.forced_scheme": (
+        'scheme {scheme} (from {src})',
+        '方案 {scheme}（来源：{src}）'),
     "vae.l2_fits_policy": ("layer 2 fits, the fastest candidate", "第二层放得下，最快的候选"),
     "vae.l2_fits_why": ("fits, and layer 2 is the fastest (every conv once, no recompute){l1}",
                         "放得下，而且第二层最快（每个卷积只算一次，不重算）{l1}"),
@@ -219,10 +232,18 @@ M = {
     "vae.need_l1_unavailable": ("layer 1 not available ({why})", "第一层不可用（{why}）"),
     "vae.need_sep": ("; ", "；"),
     "vae.err_budget": (
-        "[Monoload] VAE decode does not fit the peak budget MONOLOAD_VAE_BUDGET={budget} (latent {shape}): {needs}. Raise "
-        "MONOLOAD_VAE_BUDGET or remove it (the default policy).",
-        "[Monoload] VAE 解码在峰值预算 MONOLOAD_VAE_BUDGET={budget} 内放不下（latent {shape}）：{needs}。请调大 MONOLOAD_VAE_BUDGET，"
-        "或去掉它（用默认策略）。"),
+        '[Monoload] VAE decode does not fit the peak budget {budget} (from {src}; latent {shape}): {needs}. {advice}',
+        '[Monoload] VAE 解码在峰值预算 {budget}（来源：{src}）内放不下（latent {shape}）：{needs}。{advice}'),
+    "vae.src_node": ("the Monoload VAE Settings node", "Monoload VAE 设置节点"),
+    "vae.src_env": ("environment variable {var}", "环境变量 {var}"),
+    "vae.advice_node": (
+        "Raise the budget on the Monoload VAE Settings node, or set its budget to default (follow global) or unlimited.",
+        "请在 Monoload VAE 设置节点上调大预算，或把预算改成「跟随全局」或「不限」。"),
+    "vae.advice_env": (
+        "Raise MONOLOAD_VAE_BUDGET or remove it (the default policy), or give this VAE its own budget with a Monoload VAE Settings node.",
+        "请调大 MONOLOAD_VAE_BUDGET 或去掉它（用默认策略），或用 Monoload VAE 设置节点给这个 VAE 单独设预算。"),
+    "vae.advice_l2_node": (" Or set the node's mode to layer 2 only.", "或把节点的模式设成「只用第二层」。"),
+    "vae.advice_l2_env": (" Or set MONOLOAD_DISABLE_VAE_STRIPE=1 to use layer 2.", "或设 MONOLOAD_DISABLE_VAE_STRIPE=1 改走第二层。"),
     "vae.budget_log": ("[Monoload] VAE {why}{note}", "[Monoload] VAE {why}{note}"),
     "vae.err_oom_l1": (
         "[Monoload] VAE decode out of memory: layer 1 (stripe decoding) still runs out of memory with {rows}-row stripes and workspace "
@@ -311,6 +332,7 @@ M = {
     "info.decode_l2": ("layer 2 (op-level chunking)", "第二层（逐算子分块）"),
     "info.decode_line": ("{what}, workspace {ws}, estimate {est}, measured peak {measured}{t}, OOM retries {retries}",
                          "{what}，工作区 {ws}，估算 {est}，实测峰值 {measured}{t}，OOM 重试 {retries} 次"),
+    "info.selftest_note": (" (includes the first-use self-test)", "（含首次自检）"),
     "info.secs": (", {secs:.2f} s", "，{secs:.2f} s"),
     "info.no_gpu": ("n/a (no GPU)", "无（没有 GPU）"),
     "info.vae_head": ("VAE ({model}{copy}):", "VAE（{model}{copy}）："),
@@ -320,6 +342,17 @@ M = {
                           "stripe rows {rows} [{rows_src}]",
                           "  设置：模式 {mode} [{mode_src}]，预算 {budget} [{budget_src}]，GroupNorm 方案 {scheme} [{scheme_src}]，"
                           "条带高度 {rows} [{rows_src}]"),
+    "info.scheme_hint": ("  GroupNorm scheme {scheme}: {hint}", "  GroupNorm 方案 {scheme}：{hint}"),
+    "scheme.A": ("keeps nothing, recomputes from the H/8 checkpoint - lowest memory, slowest (SDXL 4K ~1.1 GiB / 75 s)",
+                 "什么都不存，从 H/8 存档重算——内存最低、最慢（SDXL 4K 约 1.1 GiB / 75 s）"),
+    "scheme.D": ("keeps the H/4 level output - between A and B (SDXL 4K ~1.5 GiB / 58 s)",
+                 "存 H/4 级的输出——介于 A 和 B 之间（SDXL 4K 约 1.5 GiB / 58 s）"),
+    "scheme.B": ("keeps the H/4 and H/2 level outputs - the built-in default (SDXL 4K ~2.2 GiB / 42 s)",
+                 "存 H/4 和 H/2 级的输出——内置默认（SDXL 4K 约 2.2 GiB / 42 s）"),
+    "scheme.C": ("also keeps every full-resolution block's input - most memory, fastest (SDXL 4K ~4.7 GiB / 36 s)",
+                 "再存全分辨率每个块的输入——内存最高、最快（SDXL 4K 约 4.7 GiB / 36 s）"),
+    "info.unused_native": (" (not used in native mode)", "（原生模式下不使用）"),
+    "info.unused_layer2": (" (not used: layer 2 only)", "（只用第二层时不使用）"),
     "info.model_head": ("MODEL ({model}):", "MODEL（{model}）："),
     "info.lora_list": ("  LoRA: {items}", "  LoRA：{items}"),
     "info.lora_other": ("  LoRA: none from the LoRA loader nodes (other patches present)", "  LoRA：没有来自 LoRA 加载节点的（有其他 patch）"),

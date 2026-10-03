@@ -37,6 +37,7 @@ import gc
 import logging
 import time
 import uuid
+import weakref
 
 import torch
 
@@ -252,22 +253,65 @@ def _sync_clean_loaded_models():
     return n
 
 
+def _ancestor_chains():
+    """For every loaded model whose patcher is a clone: weak references to its
+    ancestors, nearest first (taken before anything is released)."""
+    chains = []
+    for lm in comfy.model_management.current_loaded_models:
+        p = lm.model
+        refs = []
+        q = getattr(p, "parent", None) if p is not None else None
+        while q is not None and len(refs) < 64:
+            refs.append(weakref.ref(q))
+            q = getattr(q, "parent", None)
+        if refs:
+            chains.append((lm, refs))
+    return chains
+
+
+def _repoint_orphans(chains):
+    """A LoadedModel follows its patcher's parent when the patcher dies
+    (ComfyUI's finalizer, one level). When a clone and its parent die in the
+    same garbage collection -- e.g. the Monoload LoRA Settings clone of a
+    LoraLoader clone whose LoRA has no text-encoder keys, both patch-free,
+    kept alive by an error's traceback until the collection -- the parent is
+    already gone and the LoadedModel is left without a patcher while its model
+    lives on in the base: ComfyUI then reports "memory leak with model ...".
+    Point such entries at their nearest living ancestor of the same model."""
+    n = 0
+    for lm, refs in chains:
+        if lm.model is not None or lm.real_model is None or lm.real_model() is None:
+            continue
+        for r in refs:
+            a = r()
+            if a is not None and a.model is lm.real_model():
+                lm._set_model(a)
+                lm.device = a.load_device
+                n += 1
+                break
+    return n
+
+
 def release_after_prompt(executor):
     glob = enabled()
     if not glob and not lora_overrides.used():
-        return {"models": 0, "outputs": 0, "objects": 0, "synced": 0}
+        return {"models": 0, "outputs": 0, "objects": 0, "synced": 0, "repointed": 0}
     t0 = time.perf_counter()
+    chains = _ancestor_chains()
     n_models = _release_loaded_models()
     caches = getattr(executor, "caches", None)
     n_out = _release_outputs(getattr(caches, "outputs", None))
     n_obj = _release_objects(getattr(caches, "objects", None)) if glob or n_models or n_out else 0
-    n_sync = 0
+    n_sync = n_rep = 0
     if n_models or n_out or n_obj:
         gc.collect()  # LoRA clones die here; LoadedModels of clean clones switch to their parents
+        n_rep = _repoint_orphans(chains)
         n_sync = _sync_clean_loaded_models()
         comfy.model_management.soft_empty_cache()
-        logging.info(msg("release.done", models=n_models, outputs=n_out, objects=n_obj, synced=n_sync, seconds=time.perf_counter() - t0))
-    return {"models": n_models, "outputs": n_out, "objects": n_obj, "synced": n_sync}
+        logging.info(msg("release.done", models=n_models, outputs=n_out, objects=n_obj, synced=n_sync, repointed=n_rep,
+                         seconds=time.perf_counter() - t0))
+    del chains
+    return {"models": n_models, "outputs": n_out, "objects": n_obj, "synced": n_sync, "repointed": n_rep}
 
 
 # ---------------------------------------------------------------------------

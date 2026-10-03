@@ -1193,3 +1193,12 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 **文档语言不变**（README / DESIGN / HANDOFF 仍是中文）。
 
+## 14. UI 实测之后的修正（polish-after-ui-test）
+
+* **`budget_gib` 的精度**：前端 1.48.7 的 FLOAT 控件按 `step` 推保存精度（`precision = max(0, -floor(log10(step)))`，`onFloatValueChange` 用 `toFixed(precision)`）：step 0.25 → 1 位小数，0.25 存成 0.3。改成 `step` / `round` 0.01（2 位小数）；浏览器里核对过 0.25、1.37 原样保存。控件顺序改成 `budget` 紧挨 `budget_gib` 前面；dev 不做旧工作流兼容（用户定）。
+* **Info**：总是在最后列全局默认值表；当前模式下不生效的设置标出来（VAE `native`：预算 / 方案 / 条带高度；`layer 2 only`：方案 / 条带高度；LoRA `native`：merge）；所用的 GroupNorm 方案附一句说明。
+* **方案说明**（`vae_ldm.scheme_positions`）：A 不存（每遍统计都从 H/8 存档重算），D 存 H/4 级输出，B 存 H/4 和 H/2 级输出，C 再存全分辨率每个块的输入；写进 tooltip（en / zh）、下拉标签、Info、README §4.1。
+* **预算等设置的来源**：`_Applied` 把逐项来源放进 `_SETTINGS["src"]`，`vae._from(item)` 给出「Monoload VAE 设置节点」或「环境变量 X」；预算行、预算报错、强制的条带高度 / 方案、只用第二层都写来源，预算放不下的建议按来源给（节点：改节点上的预算或改成跟随全局 / 不限；环境变量：改 `MONOLOAD_VAE_BUDGET`）。
+* **「memory leak with model SDXLClipModel」警告**：在锁定镜像里用 `/prompt` API 复现（合成 SD1.5 + 只改 UNet 的 LoRA）。条件：LoRA 没有 text-encoder key（`LoraLoader` 的 CLIP clone 不带 patch）+ Monoload LoRA Settings 接了 CLIP（又一层不带 patch 的 clone）+ 解码报错。已加载的 CLIP 是第二层 clone；release 丢掉两个节点的缓存输出后，这两层 clone 被报错留下的引用环（执行器里的 traceback / 列表）留到 release 的 `gc.collect()` 才一起回收；ComfyUI 的 `LoadedModel._switch_parent` 只往上切一层，切的时候父节点也已经死了，于是 LoadedModel 没有 patcher、但模型（底模的 `cond_stage_model`）还活着，`cleanup_models_gc` 每次加载都报「memory leak」。不是 Monoload 持有引用（追查过 CLIP clone 的引用者：只有 ComfyUI 的输出缓存和执行器的列表；解码记录、LoRA 名字元数据、Info、报错对象都不引用 CLIP）。对照：正常运行、带 TE key 的 LoRA（clone 带 patch，release 直接指回底模）、不加 LoRA 设置节点（只有一层）都不出现。修复：release 前记下每个已加载 clone 的祖先链（弱引用），`gc.collect()` 之后把没有 patcher 的条目指回活着的最近祖先（同一个模型），再同步 uuid。`tests/test_release_chain.py` 构造同样的两层 clone + 引用环：去掉修复时出现两条警告、LoadedModel 没有 patcher，加上修复后指回底模、没有警告；服务端复现也确认消失。
+* **第一次解码的实测峰值偏低**：一条带的解码 reserved 峰值不可能低于它自己的 arena，第一次只有 +1.25 GiB（arena 1.97）说明起点的 reserved 里有之前（采样）缓存下来的空闲块，被解码复用了；自检在测量窗口内只会让峰值变高。`_MemProbe` 改成先 `soft_empty_cache()` 再取起点；记录这次解码里有没有跑首次自检（`vae_engine._SELFTEST` 有没有变多），Info 注明「含首次自检」。
+

@@ -65,10 +65,11 @@ def registration():
           cls is not None and NODE_DISPLAY_NAME_MAPPINGS.get(NODE) == "Monoload VAE Settings")
     it = cls.INPUT_TYPES()["required"]
     check("interface: category {}, inputs {}, returns {}, function {}".format(cls.CATEGORY, list(it), cls.RETURN_TYPES, cls.FUNCTION),
-          cls.CATEGORY == "Monoload" and list(it) == ["vae", "budget_gib", "gn_scheme", "stripe_rows", "mode", "budget"] and cls.RETURN_TYPES == ("VAE",)
+          cls.CATEGORY == "Monoload" and list(it) == ["vae", "budget", "budget_gib", "gn_scheme", "stripe_rows", "mode"] and cls.RETURN_TYPES == ("VAE",)
           and it["gn_scheme"][0] == ["default", "A", "B", "C", "D"] and it["mode"][0] == ["default", "auto", "layer 2 only", "native"]
           and it["budget"][0] == ["default", "unlimited", "custom"] and it["budget"][1]["default"] == "default"
-          and it["budget_gib"][1]["default"] == 0.0 and it["stripe_rows"][1]["default"] == 0)
+          and it["budget_gib"][1]["default"] == 0.0 and it["budget_gib"][1]["step"] == 0.01 and it["budget_gib"][1]["round"] == 0.01
+          and it["stripe_rows"][1]["default"] == 0)
     return cls
 
 
@@ -160,8 +161,24 @@ def semantics_tests(cls, sd, lat):
     ref = native_decode(sd, lat, raw=True)
     before = snapshot()
     tiny = node_apply(cls, sd, budget="custom", budget_gib=0.001)
-    expect_raises("node budget too small -> MonoloadError naming what each candidate needs", MonoloadError,
-                  lambda: managed_decode(tiny, lat), "MONOLOAD_VAE_BUDGET", "layer 2 needs about", "scheme B")
+    expect_raises("node budget too small -> MonoloadError naming what each candidate needs, the budget's source (the node) and what to "
+                  "change on the node", MonoloadError, lambda: managed_decode(tiny, lat),
+                  "(from the Monoload VAE Settings node", "layer 2 needs about", "scheme B", "Raise the budget on the Monoload VAE Settings node")
+    try:
+        managed_decode(tiny, lat)
+    except MonoloadError as e:
+        check("... and does not point at MONOLOAD_VAE_BUDGET", "MONOLOAD_VAE_BUDGET" not in str(e))
+    mvae.set_budget(1 << 20)
+    try:
+        expect_raises("environment budget too small -> the source is the environment variable, the advice too", MonoloadError,
+                      lambda: managed_decode(sd, lat), "(from environment variable MONOLOAD_VAE_BUDGET", "Raise MONOLOAD_VAE_BUDGET")
+    finally:
+        mvae.set_budget(None)
+    with LogCapture() as cap:
+        managed_decode(node_apply(cls, sd, budget="custom", budget_gib=1024.0, stripe_rows=16), lat)
+    line = next((x for x in cap.lines if "budget 1024.00 GiB (from" in x), "")
+    check("the decode's budget line names the node, a forced height too: {}".format(line[:150]),
+          "budget 1024.00 GiB (from the Monoload VAE Settings node)" in line and "16 rows (from the Monoload VAE Settings node)" in line)
     check("... the global settings are restored after the error", snapshot() == before and mvae.last_decode()["settings_source"]["budget"] == "node")
     forced = node_apply(cls, sd, gn_scheme="D", stripe_rows=24)
     out = managed_decode(forced, lat, raw=True)

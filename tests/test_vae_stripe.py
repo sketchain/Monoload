@@ -246,7 +246,7 @@ def recognition_tests(v, lat):
     mvae.set_stripe(False)
     managed_decode(v, lat)
     last = mvae.last_decode()
-    check("MONOLOAD_DISABLE_VAE_STRIPE (set_stripe(False)): Wan decode uses layer 2", last.get("strategy") == "layer2" and "disabled" in (last.get("layer1") or ""))
+    check("MONOLOAD_DISABLE_VAE_STRIPE (set_stripe(False)): Wan decode uses layer 2", last.get("strategy") == "layer2" and "layer 2 only" in (last.get("layer1") or ""))
     mvae.set_stripe(True)
     d = v.first_stage_model.decoder.upsamples[-1].residual[5]
     d.p, d.training = 0.5, True
@@ -396,7 +396,7 @@ def policy_memory_tests(v):
     check("MONOLOAD_VAE_STRIPE_ROWS overrides the policy and the budget ({} x {} rows: {}); MONOLOAD_VAE_BUDGET alone: tallest within it ({} x {} rows: {})".format(
         len(pb.stripes), max(b - a for a, b in pb.stripes), policyb, len(pc.stripes), max(b - a for a, b in pc.stripes), policyc),
         len(p.stripes) == 5 and len(pb.stripes) == 5 and "forced" in policy and "forced" in policyb
-        and policyc == "MONOLOAD_VAE_BUDGET" and budc == ref.estimate and pc.estimate <= budc and len(pc.stripes) <= 3)
+        and policyc.startswith("budget ") and "(from environment variable MONOLOAD_VAE_BUDGET)" in policyc and budc == ref.estimate and pc.estimate <= budc and len(pc.stripes) <= 3)
     for w in (16 * 1024, 1 << 20, 384 << 20):
         plans = [bound.plan(v, lat, 0, w, rows=r, out_bytes=outb) for r in (1, 8, 16, 40, 64, 107, 160, 320)]
         mono = all(a.estimate <= b.estimate for a, b in zip(plans, plans[1:]))
