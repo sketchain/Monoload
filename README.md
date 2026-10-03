@@ -2,7 +2,7 @@
 
 **ComfyUI 插件：打 LoRA 时不改原权重、不做任何备份，每一层在计算的那一刻才临时合并 LoRA，用完即丢；每个 prompt 结束后自动释放 LoRA，底模继续常驻。** 装上后对所有模型生效（`UNETLoader`、`CheckpointLoaderSimple`、`CLIPLoader` 加载出的模型都算），原生的 `LoraLoader` / `LoraLoaderModelOnly` / Hook LoRA 节点照常使用，工作流不用改。
 
-合并默认走快速路径：普通 LoRA / LoCon 直接用一次融合的 fp16 `addmm_` 加进临时权重，其他类型在计算 dtype 下合并。它与原生合并的差异在 fp16 舍入量级（CT 700 实测：合并后权重的差异是 LoRA 改动量的 0.25%，单个元素最多差 1 个 ulp，见 §5.1）。设 `MONOLOAD_EXACT=1` 时，结果与原生 ComfyUI **逐位一致**，但每步更慢。fp8 这类量化层在两种模式下都有意做得比原生更精确（见 §5）。
+合并默认走快速路径：普通 LoRA / LoCon 直接用一次融合的 fp16 `addmm_` 加进临时权重，其他类型在计算 dtype 下合并。它与原生合并的差异在 fp16 舍入量级（CT 700 实测：合并后权重的差异是 LoRA 改动量的 0.25%，单个元素最多差 1 个 ulp，见 §5.1）。设高级选项 `MONOLOAD_EXACT=1`（§13）时，结果与原生 ComfyUI **逐位一致**，但每步更慢。fp8 这类量化层在两种模式下都有意做得比原生更精确（见 §5）。
 
 为 Strix Halo（gfx1151，统一内存，显存走 GTT）+ ROCm、`--gpu-only` 的配置设计。在这种配置下，原生 ComfyUI 打 LoRA 时会把被改动的原权重在 GTT 里再备份一份，LoRA 改到的权重越多，备份就越大。
 
@@ -38,13 +38,9 @@ services:
       - TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
       - TORCH_BLAS_PREFER_HIPBLASLT=1
       - GPU_PINNED_MIN_XFER_SIZE=65536        # 新增，见下
-      # - MONOLOAD_EXACT=1                    # 与原生逐位一致的合并（每步更慢），默认是融合 fp16 addmm
-      # - MONOLOAD_KEEP_LORA=1                # 不在每个 prompt 结束后释放 LoRA
-      # - MONOLOAD_DISABLE_VAE=1              # 只关掉 VAE 解码管理（§12），LoRA 部分照常
-      # - MONOLOAD_VAE_WORKSPACE=1G           # VAE 分块的工作区预算（默认 1G）
-      # - MONOLOAD_VAE_BUDGET=3G              # VAE 解码的峰值预算：预算内最快的做法（第二层 / 第一层的方案 × 条带高度），见 §4
-      # - MONOLOAD_DISABLE_VAE_STRIPE=1       # 关掉第一层，所有 VAE 都走第二层
-      # - MONOLOAD_DISABLE=1                  # 需要完全原生的行为时打开
+      # - MONOLOAD=0                         # 总开关：全局原生，只有节点上明确开启的模型 / VAE 走 Monoload（§4）
+      # - MONOLOAD_DISABLE=1                  # 什么都不装，完全原生
+      # 其余 MONOLOAD_* 是高级选项（全局默认值），见 §13
     volumes:
       - /models/comfy:/opt/ComfyUI/models
       - /pictures/comfy:/opt/ComfyUI/output
@@ -76,79 +72,60 @@ git clone https://github.com/sketchain/Monoload /srv/comfy/custom_nodes/monoload
 docker compose up -d --force-recreate comfyui
 docker logs comfyui 2>&1 | grep -i monoload
 # 应看到：
-#   [Monoload] runtime LoRA merge installed on ModelPatcher (no in-place LoRA, no weight backups), merge: fused fp16 addmm / relaxed (set MONOLOAD_EXACT=1 for bit-exact)
-#   [Monoload] LoRA is released after every prompt (base models stay loaded)
+#   [Monoload] master switch MONOLOAD: on
+#   [Monoload] LoRA: runtime merge (no in-place LoRA, no weight backups), merge fused fp16 addmm / relaxed (MONOLOAD_EXACT=1 for bit-exact); released after every prompt (base models stay loaded)
 #   [Monoload] VAE decode managed: op-level chunking (conv row blocks, attention query blocks), workspace 1.00 GiB ...
 #   [Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae single frame; ...): default stripe policy: the peak of 128-row stripes, tallest stripes within it ...
 ```
 
-没有额外依赖，不注册新节点（节点列表里不会出现 Monoload）。以只读方式挂载即可。
+`MONOLOAD=0` 时第一行是 `master switch MONOLOAD: off (MONOLOAD=0): native ComfyUI unless a Monoload node enables Monoload for its model / VAE`，VAE 一行是 `VAE decode: native by default (MONOLOAD=0) ...`。
 
-## 4. 开关
+没有额外依赖。节点在分类 `Monoload` 下（§4.1）。以只读方式挂载即可。
+
+## 4. 开关与节点
+
+只有一个总开关 `MONOLOAD`，外加完全不装的 `MONOLOAD_DISABLE`：
 
 | 设置 | 效果 |
 |---|---|
-| 默认（装上即生效） | 所有 `ModelPatcher` 走运行时合并，合并用快速路径（普通 LoRA/LoCon 融合 fp16 `addmm_`，其他类型在计算 dtype 下合并）；每个 prompt 结束后释放 LoRA，日志里有 `[Monoload] released LoRA after prompt: ...` |
-| `MONOLOAD_EXACT=1` | 合并改走逐位一致路径：结果与原生 ComfyUI 完全相同，每步多出的合并开销更大（CT 700 上约是默认路径的 3 倍：0.26s 对 0.08s，见 §5.1）。用于验收、对比，或需要和原生出图完全一致的时候。VAE 解码也走原生（分块会改变 GEMM 形状，不保证逐位一致） |
-| `MONOLOAD_KEEP_LORA=1` | 运行时合并照常，但 prompt 结束后不释放 LoRA（LoRA 节点缓存和挂着 LoRA 的 clone 保留，重复跑同一个 LoRA 工作流时省掉读 LoRA 文件） |
-| `MONOLOAD_DISABLE_VAE=1` | 只关掉 VAE 解码管理（§12），`VAE.decode` 保持原生；LoRA 部分不受影响 |
-| `MONOLOAD_VAE_WORKSPACE` | VAE 分块的工作区（卷积每块的 im2col 展开缓冲、注意力每块的分数矩阵的上限），默认 `1G`；写法 `1G`、`512M`、`768`（纯数字按 MiB）。第二层直接用它；第一层用 min(它, 128M)，所以只有设得比 128M 小才影响第一层（§12、DESIGN.md §9.13.11） |
-| `MONOLOAD_VAE_BUDGET` | VAE 解码的峰值预算，写法同上（`3G`、`1.5G`、`2560M`）。不设时用默认策略（第一层，128 行条带的峰值内最高的条带；LDM 用方案 B）。设了就在**估算不超过预算**的做法里选**预计最快**的：第二层能放下就用第二层（每个卷积只算一次，最快）；放不下就在第一层的「GroupNorm 方案 × 条带高度」里按耗时模型挑最快的；一个都放不下就报错并写明各需要多少。例子见下 |
-| `MONOLOAD_DISABLE_VAE_STRIPE=1` | 只关掉第一层，所有受管理的 VAE 解码都走第二层（设了预算也一样，超出预算时日志注明） |
-| `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（输出行数），用于扫参和调试，优先于默认策略和预算（有预算时方案仍按预算选；放不下也照跑，日志注明） |
-| `MONOLOAD_VAE_GN_SCHEME` | 强制 SDXL / SD1.5 / SD3 / Flux `ae`（LDM decoder）第一层的 GroupNorm 整图统计量方案：`A`（不存中间结果，峰值最低、重算最多）、`D`、`B`（**默认**）、`C`（存得越多峰值越高、越快），见 §12.8。设了它，有预算时也只用这个方案（条带高度仍按预算取） |
-| `MONOLOAD_DISABLE=1` | 插件不做任何事，行为与原生完全一致（LoRA 和 VAE 都不接管）；日志里是 `MONOLOAD_DISABLE is set: ... NOT installed` |
+| 不设，或 `MONOLOAD=1`（默认） | 所有模型和 VAE 用 Monoload 的默认策略：LoRA 运行时合并（快速路径，§5.1），每个 prompt 结束后释放 LoRA（日志 `[Monoload] released LoRA after prompt: ...`），VAE 解码管理（§12） |
+| `MONOLOAD=0` | **全局原生**：插件照常装上，但钩子把每个调用原样交给 ComfyUI。工作流里没有 Monoload 节点时，LoRA 和 VAE 的结果都与原版 ComfyUI **逐位一致**（权重原地合并 + 备份也是原生自己的），额外开销是每次调用多一次判断（实测 `patch_weight_to_device` 每次 +0.2 µs，`VAE.decode` 每次约 3 µs）。只有节点上**明确开启**的那个模型 / VAE（例如 VAE 节点的 `mode` 选 `auto`）走 Monoload |
+| `MONOLOAD_DISABLE=1` | 什么都不装（没有任何钩子），就是原版 ComfyUI。Monoload 节点仍然注册（保存的工作流照常能打开），但原样输出输入，日志里说明一次 |
 
-**`MONOLOAD_VAE_BUDGET` 的例子**（SDXL / Flux `ae`，bf16；「估算」是交给 `load_models_gpu` 的上界，峰值是模拟的 reserved（实测与它一致）；耗时：第二层和默认 B 是实测，其余是 CT 700 上耗时模型的预测；DESIGN.md §9.14.10–11）：
+**优先级（逐项判断）：节点上明确选的 > 高级选项（环境变量，§13） > 内置默认。** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。节点上留在 `default`（跟随全局）的项继承全局设置。例如 compose 里设了 `MONOLOAD_EXACT=1`（VAE 全局走原生），某个 VAE 节点的 `mode` 选了 `auto`：这个 VAE 照样走 Monoload 的解码管理，其他 VAE 原生。
 
-| 预算 | 1344×768 | 2688×1536 | 3840×2160 |
-|---|---|---|---|
-| 不设（默认） | 方案 B，6 条 128 行：峰值 0.62 GiB，4.6 s | B，12 条 128 行：1.33 GiB，19.5 s | B，17 条 128 行：2.17 GiB，42.0 s |
-| `20G` | 第二层：3.7 GiB，0.9 s | 第二层：9.2 GiB，4.0 s | 第二层：15.0 GiB，9.9 s |
-| `3G` | 第一层整图 1 条：2.0 GiB，约 0.8 s | C，4 条 384 行：2.7 GiB，约 12 s | B，12 条 180 行：2.4 GiB，约 41 s |
-| `2G` | C，2 条 384 行：1.2 GiB，约 2.8 s | B，11 条 140 行：1.7 GiB，约 19 s | D，18 条 120 行：1.5 GiB，约 59 s |
-| `1.5G` | C，2 条 384 行：1.05 GiB，约 2.8 s | B，16 条 96 行：1.2 GiB，约 21 s | A，17 条 128 行：1.1 GiB，约 74 s |
-| `1G` | C，2 条 384 行（工作区 128 MiB）：0.86 GiB，约 4 s | D，23 条 67 行：0.80 GiB，约 31 s | 报错：最少要约 1.38 GiB（方案 A），第二层要 17.9 GiB |
-
-* 预算比的是**估算**（上界），所以实际峰值通常比预算低 10–30%。有存档的方案（B / C / D）的估算在 vae-estimate-fix 之后收紧了：存档在 arena 里的位置有保证，不再当成「可能被挤出 arena 的那一块」算进估算（4K 默认 B 3.17 → 2.68 GiB），所以 4K 设 `3G` 能选 B 了（以前选 D，实测更慢、峰值更高）。
-* `qwen_image_vae`（只有一种第一层配置）：`20G` → 第二层（2.1 / 5.1 / 9.6 GiB）；`3G` → 第一层预算内最高的条带（1 条 768 行 / 2 条 768 行 / 4 条 540 行，1.3 / 2.0 / 2.1 GiB）；`1.5G` → 1.06 / 1.08 / 1.12 GiB；`1G` → 0.58 / 0.72 GiB，4K 报错（最少约 1.09 GiB）。
-* 日志写明选了什么、为什么、其他候选各要多少：`[Monoload] VAE MONOLOAD_VAE_BUDGET 3.00 GiB -> layer 1 scheme B 180 rows (workspace 128 MiB) 2.96 GiB, ~41.1 s: the fastest predicted that fits; others: layer 2 17.91 GiB (over); ...`。
-* 工作区也是候选的一维：依次试 预算/8、128 MiB、64 MiB，取耗时模型预测最快的（工作区越小分块越多、越慢，但估算也越低）。
-* 想固定某个方案或高度：再设 `MONOLOAD_VAE_GN_SCHEME` / `MONOLOAD_VAE_STRIPE_ROWS`，它们优先于预算。
-
-开关都接受 `1` / `true` / `yes` / `on`。
-
-改完要重启容器。
+高级选项（`MONOLOAD_EXACT`、`MONOLOAD_KEEP_LORA`、`MONOLOAD_DISABLE_VAE`、`MONOLOAD_VAE_*` 等）见 §13，一般不用设。开关接受 `1` / `true` / `yes` / `on`，`MONOLOAD` 另外接受 `0` / `false` / `no` / `off`（其他值按开启处理并警告）。改完要重启容器。
 
 ### 4.1 节点用法：Monoload VAE Settings（单独设置某个 VAE）
 
-环境变量（§4）对所有 VAE 生效。要让某一个 VAE 用不同的设置，在工作流里加 **Monoload VAE Settings** 节点（分类 `Monoload`）：输入一个 VAE，输出一个带设置的 VAE 副本，把副本接到 VAE Decode 等节点上。
+全局设置（总开关和高级选项）对所有 VAE 生效。要让某一个 VAE 用不同的设置，在工作流里加 **Monoload VAE Settings** 节点（分类 `Monoload`）：输入一个 VAE，输出一个带设置的 VAE 副本，把副本接到 VAE Decode 等节点上。
 
 * **副本共享权重**，不多占内存，加载 / 卸载仍由 ComfyUI 的模型管理统一处理；**输入的 VAE 不变**，工作流里其他直接用它的分支照旧按环境变量和默认值解码。
 * 任何对副本调用 `vae.decode` 的节点都按节点的设置解码；`VAE Decode (Tiled)` 按现有规则保持原生；encode 不受影响。
 * 一个工作流里可以有多个这样的节点（多个副本），各用各的设置。节点可以串联：下游节点没设的项沿用上游节点的值。
 
-| 选项 | 取值 | 含义（与对应的环境变量相同） |
+| 选项 | 取值 | 含义 |
 |---|---|---|
-| `budget_gib` | GiB，`0` = 不设 | 峰值预算，同 `MONOLOAD_VAE_BUDGET`：估算不超过它的做法里选预计最快的，一个都放不下就报错并写明各需要多少 |
-| `gn_scheme` | `default` / `A` / `B` / `C` / `D` | 强制 LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae`）第一层的 GroupNorm 方案，同 `MONOLOAD_VAE_GN_SCHEME` |
-| `stripe_rows` | 输出行数，`0` = 自动 | 强制第一层的条带高度，同 `MONOLOAD_VAE_STRIPE_ROWS` |
-| `mode` | `default` / `auto` / `layer 2 only` / `native` | `auto`：认得的 decoder 走第一层（条带），其余走第二层；`layer 2 only`：同 `MONOLOAD_DISABLE_VAE_STRIPE=1`；`native`：这个 VAE 用 ComfyUI 自己的解码 |
+| `mode` | `default` / `auto` / `layer 2 only` / `native` | `default`：跟随全局（默认开启时是 `auto`；`MONOLOAD=0`、`MONOLOAD_DISABLE_VAE=1`、`MONOLOAD_EXACT=1` 时是原生；`MONOLOAD_DISABLE_VAE_STRIPE=1` 时是 `layer 2 only`）；`auto`：**为这个 VAE 打开**解码管理，认得的 decoder 走第一层（条带），其余走第二层——全局关着（包括 `MONOLOAD=0`）也打开；`layer 2 only`：只用第二层；`native`：这个 VAE 用 ComfyUI 自己的解码 |
+| `budget` | `default` / `unlimited` / `custom` | 峰值预算。`default`：跟随全局（`MONOLOAD_VAE_BUDGET`，没设就是默认策略）；`unlimited`：这个 VAE 不限预算（默认策略），即使全局设了预算；`custom`：用 `budget_gib`——估算不超过它的做法里选预计最快的，一个都放不下就报错并写明各需要多少 |
+| `budget_gib` | GiB | 只在 `budget` 选 `custom` 时生效（这时必须大于 0）；选别的时填了也不用，日志里说明 |
+| `gn_scheme` | `default` / `A` / `B` / `C` / `D` | 强制 LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae`）第一层的 GroupNorm 方案（§12.8）；`default` 跟随全局 |
+| `stripe_rows` | 输出行数，`0` = 跟随全局 | 强制第一层的条带高度 |
 
-**优先级（逐项判断）：节点设置 > 环境变量 > 默认值。** 节点上某一项留在 `default` / `0`，这一项就看环境变量，环境变量也没设就用默认策略。例如 compose 里设了 `MONOLOAD_VAE_GN_SCHEME=D`，节点只设了 `budget_gib = 3`：预算来自节点，方案来自环境变量（强制 D），条带高度和模式用默认值。
+节点上留在 `default` / `0` 的项跟随全局设置（高级选项，§13），全局也没设就用内置默认。例如 compose 里设了 `MONOLOAD_VAE_GN_SCHEME=D`，节点只把 `budget` 设成 `custom`、`budget_gib = 3`：预算来自节点，方案来自环境变量（强制 D），条带高度和模式用默认值。`MONOLOAD_DISABLE=1` 时节点原样输出输入的 VAE。
 
-**全局开关仍然最高：** `MONOLOAD_DISABLE=1`、`MONOLOAD_DISABLE_VAE=1`、`MONOLOAD_EXACT=1` 时解码保持原生，节点不能把功能重新打开；节点照常输出副本（工作流不报错），日志里说明一次设置被忽略。
+**旧工作流：** 第一版节点（9b30154）只有 `budget_gib`（`0` = 不设）。新加的 `budget` 下拉框排在最后，旧工作流照常打开、控件值对得上；但旧工作流里 `budget_gib` 大于 0 的，现在 `budget` 是 `default`，预算不再生效（日志 `budget_gib ... not used`），要把 `budget` 改成 `custom`。
 
 **日志**：每次解码的那一行末尾写明设置和来源，例如 `settings: budget 3.00 GiB (node), GroupNorm scheme chosen by the budget (default), stripe rows auto (default), mode auto (default)`；`last_decode()` 里是 `settings` / `settings_source`。
 
 **例子：** 同一个 SDXL checkpoint，生成 4K 时想把 VAE 解码的峰值压在 3 GiB 以内，其他工作流不变：
 
 ```
-Load Checkpoint ──VAE──> Monoload VAE Settings (budget_gib 3) ──VAE──> VAE Decode ──> Save Image
+Load Checkpoint ──VAE──> Monoload VAE Settings (budget custom, budget_gib 3) ──VAE──> VAE Decode ──> Save Image
                 └─VAE──> VAE Encode（原 VAE，不受影响）
 ```
 
-4K 的这次解码按预算选第一层方案 B、12 条 180 行（预测约 2.4 GiB、约 41 s，§4 的表）；工作流里直接接原 VAE 的解码仍是默认的方案 B、17 条 128 行（2.17 GiB）。
+4K 的这次解码按预算选第一层方案 B、12 条 180 行（预测约 2.4 GiB、约 41 s，§13 的表；CT 700 实测 2.43 GiB、41.0 s）；工作流里直接接原 VAE 的解码仍是默认的方案 B、17 条 128 行（2.17 GiB）。
 
 ## 5. 支持的范围
 
@@ -222,17 +199,18 @@ CT 700 实测（WAI v17 SDXL + Smooth Booster，788 层，4.77 GiB 被 patch 的
 MODELS=/path/to/models tests/run_all.sh
 ```
 
-`run_all.sh` 先跑 6 遍入口测试和两个 VAE 测试，然后把下面每个 LoRA 功能测试在两种合并路径下各跑一遍：先 `MONOLOAD_EXACT=1`（逐位一致），再默认路径。只想跑 VAE 部分时：`MODELS=/path/to/models tests/docker_run.sh python tests/test_vae.py`（不需要任何模型文件，`$MODELS` 可以是空目录）。
+`run_all.sh` 先跑 7 遍入口测试、总开关测试和两个 VAE 测试，然后把下面每个 LoRA 功能测试在两种合并路径下各跑一遍：先 `MONOLOAD_EXACT=1`（逐位一致），再默认路径。只想跑 VAE 部分时：`MODELS=/path/to/models tests/docker_run.sh python tests/test_vae.py`（不需要任何模型文件，`$MODELS` 可以是空目录）。
 
 | 脚本 | 内容 |
 |---|---|
-| `tests/test_entry.py` | 按 ComfyUI 的方式加载插件：默认替换 `ModelPatcher` 的方法（`CoreModelPatcher` 也覆盖到）、包装 `PromptExecutor.execute_async` 和 `VAE.decode`；`MONOLOAD_KEEP_LORA=1` 时不包装执行器；`MONOLOAD_DISABLE_VAE=1` 或 `MONOLOAD_EXACT=1` 时 `VAE.decode` 保持原生；`MONOLOAD_DISABLE=1` 时都不动；合并路径与 `MONOLOAD_EXACT` 一致；`decode_tiled` 从不被替换 |
+| `tests/test_entry.py` | 按 ComfyUI 的方式加载插件：默认替换 `ModelPatcher` 的方法（`CoreModelPatcher` 也覆盖到）、包装 `PromptExecutor.execute_async` 和 `VAE.decode`；除 `MONOLOAD_DISABLE=1`（都不动）外每种开关组合都装上；`MONOLOAD=0` 时总开关关闭、VAE 全局默认原生；`MONOLOAD_KEEP_LORA=1` 时全局默认保留 LoRA；`MONOLOAD_DISABLE_VAE=1` / `MONOLOAD_EXACT=1` / `MONOLOAD_DISABLE_VAE_STRIPE=1` 时 VAE 全局默认分别是原生 / 原生 / 只用第二层；合并路径与 `MONOLOAD_EXACT` 一致；`decode_tiled` 从不被替换 |
 | `tests/test_dtype_paths.py` | `EXACT=1`：参数 dtype × 计算 dtype × lora dtype（含 gfx1151 上的 fp16）× {基础 LoRA、hook、两者都有}，54 种组合逐位对比原生合并的数值。默认路径：同样的 dtype 组合 × 8 种 patch 组合（LoRA、两个 LoRA、strength_model ≠ 1、LoHa、LoRA+LoHa、diff、hook、LoRA+hook），共 144 项；每项要求与独立实现的参照（`addmm_` / 原生 `LowVramPatch`）逐位一致，并且与原生合并的差异在容差以内。两种模式都再加 fp8 参数的 54 种组合，对比「先反量化 + 同一路径」 |
 | `tests/test_lora_hot.py` | 两条管线：`CheckpointLoaderSimple`；`UNETLoader` + `CLIPLoader`。同一串 LoRA 组合先用原生跑、再装上 Monoload 连续切换着跑。`EXACT=1`：TE 输出和采样结果与原生逐位一致。默认路径：UNet 和 TE 所有被 patch 的权重与原生合并的差异在容差以内（DESIGN.md §5.5），同样的 key 上重算逐位一致路径与原生逐位一致；latent 差异只报告。两种模式都检查无备份、权重不变、撤掉 LoRA 后逐位一致，加上 Hook LoRA、模型合并和报错场景 |
 | `tests/test_quant.py` | fp8 scaled UNet + LoRA：与「先反量化被改到的层 + 同一合并路径」逐位一致、无备份、fp8 权重不变；与原生的误差只报告 |
 | `tests/test_vae.py` | VAE 解码管理（§12），不需要模型文件：分块卷积 / 分块注意力与不分块的结果一致（含各种 kernel、stride、dilation、groups、padding、cast 路径 + weight_function、Wan CausalConv3d）；用 ComfyUI 自己的 LDM `Decoder` / `WanVAE`（小通道、随机权重）构造 SDXL 式、Flux 式、Qwen 式 VAE，受管理的解码与原生 `VAE.decode` 比较；多帧交给原生、OOM 缩小分块重试、下限时报错、绝不调用 tiled |
 | `tests/test_vae_stripe.py` | VAE 第一层（§12.7），不需要模型文件：区间倒推对照暴力依赖展开；每个单元（残差块、上采样、head 卷积）在任意切片上「有效行」与整图逐行一致、紧邻的下一行不一致；用 ComfyUI 的 `WanVAE`（小通道、随机权重）在 fp32 下比较第一层与原生整图解码（条带 1 行、不整除、等于整图、按预算自动、默认策略、奇数尺寸、很小的 latent、batch 2、条带内再分块、bf16），块边界附近的误差不比其他区域大；识别（Dropout 训练态、forward hook、开关）；故意少算一行 halo 时自检能抓到并回退第二层；预算报错；OOM 缩小条带、到下限报错、不退回 tiled 也不退回第二层；默认策略（128 行条带的估算为目标）和开关的优先级；内存模型单调、最大的条带先跑；自检后和前缀 / 条带之间清空缓存；SDXL / Flux 结构不归 Wan 适配器（归 LDM 适配器）；单帧 Conv3d 改走 conv2d 与模块原样一致、只在该改的时候改 |
-| `tests/test_vae_node.py` | Monoload VAE Settings 节点（§4.1），不需要模型文件：注册表和接口；按 ComfyUI 的方式调用节点；预算 / 方案 / 条带高度 / 模式逐项判断「节点 > 环境变量 > 默认值」；副本共享权重和 patcher、输入的 VAE 不变、ComfyUI 的模型管理里只有一个已加载模型、串联、encode 一致；预算报错、强制方案和高度、只用第二层、原生；解码后（包括报错后）全局设置复原；多个副本交替解码互不干扰；日志写明来源；包装卸掉时（全局开关）副本走原生、只说明一次。ComfyUI 加载器注册节点的检查在 `test_entry.py`（8 种开关组合） |
+| `tests/test_master_switch.py` | 总开关和全局默认（§4），不需要模型文件：`MONOLOAD` 的解析；`MONOLOAD=0` 且没有节点时，挂 LoRA 的模型（整体加载、lowvram 部分加载、Hook LoRA）和 VAE 解码与卸掉钩子的原版 ComfyUI 逐位一致，备份也和原生一样；释放不运行；包装每次调用的开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `mode auto` 打开管理、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 时节点原样透传 |
+| `tests/test_vae_node.py` | Monoload VAE Settings 节点（§4.1），不需要模型文件：注册表和接口；按 ComfyUI 的方式调用节点；预算（下拉框 + `budget_gib`）/ 方案 / 条带高度 / 模式逐项判断「节点 > 环境变量 > 默认值」；副本共享权重和 patcher、输入的 VAE 不变、ComfyUI 的模型管理里只有一个已加载模型、串联、encode 一致；预算报错、强制方案和高度、只用第二层、原生；解码后（包括报错后）全局设置复原；多个副本交替解码互不干扰；日志写明来源；包装没装上时副本走原生；总开关和全局默认下的节点行为在 `test_master_switch.py`。ComfyUI 加载器注册节点的检查在 `test_entry.py`（各种开关组合） |
 | `tests/test_vae_ldm.py` | VAE 第一层的 LDM decoder（§12.8），不需要模型文件：GroupNorm 统计量（Moments 对 fp64，含均值远大于标准差；冻结统计量的 GroupNorm 对 `F.group_norm`；实例替换走 weight_function、退出复原）；识别（11 种不认的结构走第二层、与原生一致）；整个 decoder（SDXL 式 / Flux 式，四种方案，不同条带高度、奇数 / 很小的 latent、batch 2、宽组、很小的工作区）与原生整图解码比；bf16 对 fp32 真值与原生同一水平；自检抓住注入的错误（条带局部统计量、丢一条带、halo 少一行）；全尺寸 SDXL 4K 的计划；OOM；开关；分配器模拟 |
 | `tests/test_release.py` | 用真正的 `PromptExecutor` 连续跑 LoRA → 无 LoRA → 只改 UNet 的 LoRA → 无 LoRA → Hook LoRA → 无 LoRA → bypass LoRA → 无 LoRA → LoRA（换种子）：弱引用确认 LoRA 全部释放、底模不重新加载、结果与从没见过 LoRA 的进程逐位一致；RAM pressure / classic / LRU 三种缓存各一遍，外加 `MONOLOAD_KEEP_LORA=1` |
 
@@ -255,8 +233,9 @@ MODELS=/path/to/models tests/run_all.sh
   * 备份、权重不变、撤掉 LoRA、报错、fp8、自动释放（三种缓存 + KEEP）这些检查与逐位一致路径完全相同，全部通过。
 * VAE 解码管理（`tests/test_vae.py`，131 项，0 失败）：分块卷积 53 项、分块注意力 18 项与不分块一致（卷积相对误差最大 4.6e-7，注意力 3.5e-7，多数为 0）；SDXL 式 / Flux 式 / Qwen 式 decoder 在 16 KiB 和 256 KiB 预算下（绝大多数卷积被分块）与原生 `VAE.decode` 的 raw 输出差 ≤ 7.2e-6、像素差 ≤ 3.2e-6（fp32；bf16 为 0）；预算足够大时与原生逐位一致；多帧交给原生；OOM 缩小分块重试、下限报错，tiled 从未被调用。加上 VAE 之后 LoRA 部分的 `test_dtype_paths.py`（198 / 108 项）和入口测试照旧全部通过。下面 826 项的合计是加入 VAE 之前的完整运行。
 * VAE 第一层（`tests/test_vae_stripe.py`，74 项，0 失败）：区间倒推与暴力展开 993 条条带全部一致；5 种单元在每个切片上的精确行与整图一致（≤ 3.6e-7）、halo 不多不少；整个 Wan decoder 在条带高度 1 / 7 / 40 / 整图 / 按预算 / 默认策略、奇数和很小的 latent、batch 2、条带内再分块下，与原生整图解码的 raw 差 ≤ 2.1e-6（fp32），条带边界附近不比其他区域差；halo 少算一行时自检两种方式都能抓到并回退第二层；SDXL / Flux 继续走第二层；默认策略选出「128 行条带的估算」之内最高的条带（320 行的图 3 条 107 行，再高一档就超过目标），`MONOLOAD_VAE_STRIPE_ROWS` / `MONOLOAD_VAE_BUDGET` 能覆盖它（设了预算而第二层放得下时走第二层）；估算随条带高度单调、最大的条带先跑；自检后清空 1 次缓存、batch 2 在前缀和条带之间清空 2 次；单帧 Conv3d 改走 conv2d 时与模块原样输出一致（≤ 4.8e-7），T=3 和已被别人替换过 `_conv_forward` 的模块不改走；arena 每次解码只分配一次、CPU 和非默认分配器配置下不用；分配器模拟器复现 9 个真机读数（4e54d20、725a010、85a5c6f 和工作区 128 MiB 的默认计划，误差 ≤ 0.03 GiB），本版 9 个计划（1344 … 8K、bf16 / fp32）的模拟 reserved ≤ 估算。
-* VAE 第一层的 LDM decoder（`tests/test_vae_ldm.py`，100 项，0 失败）：统计量对 fp64 相对误差 ≤ 1.9e-7（均值 1000、标准差 0.01 时也是，朴素的 E[x²]−E[x]² 在这里差 1.9e3 倍）；冻结统计量的 GroupNorm 与 `F.group_norm` 差 ≤ 7.2e-7（fp32）/ 0（bf16），行切片上也一样；11 种不认的结构都走第二层并与原生一致；SDXL 式 / Flux 式整个 decoder 在四种方案、条带 1 / 7 / 40 / 默认、奇数和很小的 latent、batch 2、ch 64、16 KiB 工作区下与原生整图解码的 raw 差 ≤ 4.6e-6（fp32），条带边界附近不比其他区域差；bf16 对 fp32 真值的 RMSE 与原生相同；自检误差 9e-7，三种注入的错误（条带局部统计量、丢一条带、halo 少一行）都被抓到并回退第二层；全尺寸 SDXL 4K 计划各方案的峰值与重算顺序；OOM 缩条带、到下限报错、不退回 tiled / 第二层；`MONOLOAD_VAE_GN_SCHEME`（强制与默认 B）；预算内最快（第二层放得下就选第二层；否则预测最快的方案，一条带时不跑统计遍、取默认方案；选中的方案自检失败时选下一个；强制高度 / 方案 / 第二层优先于预算；放不下时报错并列出各需要多少；全尺寸 SDXL 三档 × 20 / 3 / 1.5 GiB 选中 README §4 表里的配置）；估算收紧（`saves_fit` 的单元检查、4K 默认计划的存档有保证、largest 不是存档）；很高的 B 条带模拟 reserved ≤ 估算；耗时模型对 4K D 309 行 / 64 MiB 的实测 63.2 s 误差 ≤ 8%；模拟器复现 5 个第二层真机读数、5 个第一层计划 reserved ≤ 估算。「预算内最快」之后：`test_vae_stripe.py` 74 项、`test_vae.py` 131 项、入口测试 8 种开关组合（含 `MONOLOAD_VAE_GN_SCHEME=D` 和预算 + 强制高度）、`test_dtype_paths.py`（198 / 108 项）全过；`tests/alloc_sim.py` 的 51 个真机读数照旧复现（≤ 0.02 GiB）。
-* Monoload VAE Settings 节点（`tests/test_vae_node.py`，22 项，0 失败）：逐项优先级（四项各自「节点 > 环境变量 > 默认值」）；副本与原 VAE 共享模型和 patcher、原 VAE 不受影响（预算 1024 GiB 的副本走第二层，原 VAE 紧接着走第一层方案 B）、模型管理里只有一个已加载模型、串联、encode 一致；预算报错并写明各需要多少、报错后全局设置复原；强制 D + 24 行、只用第二层、原生；全局 `MONOLOAD_DISABLE_VAE_STRIPE=1` 时节点的 `auto` 仍走第一层；三个副本交替解码各用各的设置；包装卸掉时副本走原生，日志只说明一次。`test_entry.py` 8 种开关组合下 ComfyUI 的加载器都注册了这个节点（`MONOLOAD_DISABLE=1` 也注册）。
+* VAE 第一层的 LDM decoder（`tests/test_vae_ldm.py`，100 项，0 失败）：统计量对 fp64 相对误差 ≤ 1.9e-7（均值 1000、标准差 0.01 时也是，朴素的 E[x²]−E[x]² 在这里差 1.9e3 倍）；冻结统计量的 GroupNorm 与 `F.group_norm` 差 ≤ 7.2e-7（fp32）/ 0（bf16），行切片上也一样；11 种不认的结构都走第二层并与原生一致；SDXL 式 / Flux 式整个 decoder 在四种方案、条带 1 / 7 / 40 / 默认、奇数和很小的 latent、batch 2、ch 64、16 KiB 工作区下与原生整图解码的 raw 差 ≤ 4.6e-6（fp32），条带边界附近不比其他区域差；bf16 对 fp32 真值的 RMSE 与原生相同；自检误差 9e-7，三种注入的错误（条带局部统计量、丢一条带、halo 少一行）都被抓到并回退第二层；全尺寸 SDXL 4K 计划各方案的峰值与重算顺序；OOM 缩条带、到下限报错、不退回 tiled / 第二层；`MONOLOAD_VAE_GN_SCHEME`（强制与默认 B）；预算内最快（第二层放得下就选第二层；否则预测最快的方案，一条带时不跑统计遍、取默认方案；选中的方案自检失败时选下一个；强制高度 / 方案 / 第二层优先于预算；放不下时报错并列出各需要多少；全尺寸 SDXL 三档 × 20 / 3 / 1.5 GiB 选中 README §13 表里的配置）；估算收紧（`saves_fit` 的单元检查、4K 默认计划的存档有保证、largest 不是存档）；很高的 B 条带模拟 reserved ≤ 估算；耗时模型对 4K D 309 行 / 64 MiB 的实测 63.2 s 误差 ≤ 8%；模拟器复现 5 个第二层真机读数、5 个第一层计划 reserved ≤ 估算。「预算内最快」之后：`test_vae_stripe.py` 74 项、`test_vae.py` 131 项、入口测试 8 种开关组合（含 `MONOLOAD_VAE_GN_SCHEME=D` 和预算 + 强制高度）、`test_dtype_paths.py`（198 / 108 项）全过；`tests/alloc_sim.py` 的 51 个真机读数照旧复现（≤ 0.02 GiB）。
+* 总开关（`tests/test_master_switch.py`，18 项，0 失败）：`MONOLOAD=0`、没有节点时，LoRA 模型的整体加载 / lowvram 加载 / Hook LoRA / 撤掉 hook 四种输出与原版 ComfyUI（钩子卸掉）`torch.equal`，备份数相同（2 对 2），撤掉后权重逐位还原；VAE 解码 `torch.equal`，不打 INFO 日志；释放不运行；开销 `patch_weight_to_device` 每次 +0.2 µs、`VAE.decode` 包装每次 3.4 µs；对照组（开启）无备份，与原生差 1.2e-4（快速路径的舍入）。
+* Monoload VAE Settings 节点（`tests/test_vae_node.py`，22 项，0 失败）：逐项优先级（四项各自「节点 > 环境变量 > 默认值」）；副本与原 VAE 共享模型和 patcher、原 VAE 不受影响（预算 1024 GiB 的副本走第二层，原 VAE 紧接着走第一层方案 B）、模型管理里只有一个已加载模型、串联、encode 一致；预算报错并写明各需要多少、报错后全局设置复原；强制 D + 24 行、只用第二层、原生；全局 `MONOLOAD_DISABLE_VAE_STRIPE=1` 时节点的 `auto` 仍走第一层；三个副本交替解码各用各的设置；包装没装上时（ComfyUI 接口不符）副本走原生、不报预算错。`test_entry.py` 各种开关组合下 ComfyUI 的加载器都注册了这个节点（`MONOLOAD_DISABLE=1` 也注册）。
 * `tests/run_all.sh` 合计 826 项检查（入口 18；`MONOLOAD_EXACT=1`：dtype 108、LoRA 80、fp8 8、释放 2 + 42×3 + 22；默认路径：dtype 198、LoRA 106、fp8 8、释放 2 + 42×3 + 22），0 失败。
 
 **CPU 上的基准参考**（`tests/bench_lora.py`，SD1.5，256×256，3 步，只能看相对比例，不代表 GPU）：
@@ -586,7 +565,7 @@ P（Qwen）：计划和数字应当与 workspace 实验之后的默认相同：6
 * N / O：每个方案、每个高度的峰值和耗时。模拟显示 4K 的峰值下限约 1.05 GiB（由整图前缀决定）：A 用 32–96 行条带、或 D 用 32 行条带都能到这里，D 的算量更少（10.3× 对 12.3–13.1×）。
 * 把输出和 JSON 发给我。
 
-上面 L–P 已在 7059bdd 上测完，与模拟一致（§10.3）。之后的决定：LDM 默认方案改成 B，设了 `MONOLOAD_VAE_BUDGET` 时改成「预算内最快」（§4 的例子，DESIGN.md §9.14.10）。
+上面 L–P 已在 7059bdd 上测完，与模拟一致（§10.3）。之后的决定：LDM 默认方案改成 B，设了 `MONOLOAD_VAE_BUDGET` 时改成「预算内最快」（§13 的例子，DESIGN.md §9.14.10）。
 
 **默认方案 B 与「按预算选」**。bench 的模式名加 `-b<GiB>` 就是只对这个模式设 `MONOLOAD_VAE_BUDGET`（`monoload-b3`、`monoload-b1.5`），`--budgets 20,3,1.5,1` 一条命令加上这些模式；`-g<S>` 仍是强制方案（`monoload-gA-b2`：强制 A、预算 2G）。预算放不下时这一行的状态是 `over budget`，后面附上报错（写明各需要多少），不算失败。每条命令前都先 `/free`。
 
@@ -862,7 +841,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae
 * **4K 的方案与条带高度：** A 1.10 / 75.0，D 1.52 / 57.8，B 2.17 / 42.1，C 4.70 / 35.5；A r32 / r64 / r96 1.06 / 79.3、1.06 / 76.5、1.06 / 75.7；D r32 / r64 / r96 1.09 / 69.1、1.22 / 61.5、1.36 / 58.9。C 的算量（5.7×）比 B（5.3×）多却更快：全分辨率每次乘加的耗时约是低分辨率的两倍，C 把重算挪到了低分辨率（耗时模型，DESIGN.md §9.14.10）。
 * **精度：** 4K 对 fp32 的 RMSE：SDXL 0.00105（原生 0.00108），Flux 0.00107（0.00107）；各方案、各高度 PSNR 都约 61.2 dB；通道均值偏移与原生同一水平；条带边界附近不比其他行差。
 * **Qwen 回归：** GTT 0.36 / 0.56 / 0.87 GiB，热启动 0.72 / 3.43 / 8.46 s，不变。
-* **决定：** 1 GiB 和 2 GiB 的差别不重要，重要的是能自定义。LDM 默认方案改成 **B**（默认条带规则不变）；设了 `MONOLOAD_VAE_BUDGET` 时改成「预算内最快」（第二层和第一层各「方案 × 条带高度」里，估算不超过预算、预计最快的那个；§4）；`MONOLOAD_VAE_GN_SCHEME` / `MONOLOAD_VAE_STRIPE_ROWS` / `MONOLOAD_DISABLE_VAE_STRIPE` 仍可强制，且优先于预算。验证命令是 §9.7 的 Q–S。
+* **决定：** 1 GiB 和 2 GiB 的差别不重要，重要的是能自定义。LDM 默认方案改成 **B**（默认条带规则不变）；设了 `MONOLOAD_VAE_BUDGET` 时改成「预算内最快」（第二层和第一层各「方案 × 条带高度」里，估算不超过预算、预计最快的那个；§13）；`MONOLOAD_VAE_GN_SCHEME` / `MONOLOAD_VAE_STRIPE_ROWS` / `MONOLOAD_DISABLE_VAE_STRIPE` 仍可强制，且优先于预算。验证命令是 §9.7 的 Q–S。
 
 ### 10.4 默认方案 B 与按预算选（`bench_vae_b_*`、`bench_vae_budget_*`，2026-10，01377c4）
 
@@ -889,9 +868,10 @@ monoload/vae_ops.py         逐算子分块（卷积按输出行、注意力按 
 monoload/vae_engine.py      第一层的引擎（与 decoder 无关）：区间倒推、执行计划和估算、条带执行、arena、自检流程、适配器基类
 monoload/vae_wan.py         第一层的 Wan 2.1 VAE 单帧适配器（结构识别、单元、按 forward 数的内存模型、fp32 副本）
 monoload/vae_ldm.py         第一层的 LDM decoder 适配器（SD1.5 / SDXL / SD3 / Flux ae；结构识别、单元、GroupNorm 方案、内存模型、fp32 副本）
+monoload/settings.py        总开关 MONOLOAD、MONOLOAD_DISABLE（不导入 torch / ComfyUI）
 monoload/vae_overrides.py   单个 VAE 的设置（节点做的副本带的设置；不导入 torch / ComfyUI）
 monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），vae_settings.py = Monoload VAE Settings
-tests/                      测试和基准脚本（见第 8、9 节；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
+tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
                             bench_vae.py、check_vae_node.py、make_synthetic_vaes.py、alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10）
 tools/watch_mem.sh          GTT / cgroup 内存监视
 tools/compare_images.py     两张图逐像素比较
@@ -925,19 +905,9 @@ docs/HANDOFF.md             交接说明（当前状态、提交记录、规矩�
 
 ### 12.3 开关
 
-| 设置 | 效果 |
-|---|---|
-| 默认 | 启用，预算 1 GiB |
-| `MONOLOAD_VAE_WORKSPACE=512M` | 预算（卷积每块的展开缓冲、注意力每块的分数矩阵 + softmax 结果）。写法 `1G`、`512M`、`768`（纯数字按 MiB）。越小峰值越低、块越多 |
-| `MONOLOAD_VAE_BUDGET=3G` | 峰值预算：估算不超过它的做法里预计最快的（第二层，或第一层的方案 × 条带高度；§4 的例子）；不设时用默认策略 |
-| `MONOLOAD_DISABLE_VAE_STRIPE=1` | 关掉第一层，所有受管理的解码都走第二层 |
-| `MONOLOAD_VAE_STRIPE_ROWS=128` | 强制第一层的条带核心高度（扫参、调试） |
-| `MONOLOAD_VAE_GN_SCHEME=D` | 强制 LDM decoder（SDXL / Flux 等）第一层的 GroupNorm 方案 A / D / B / C（默认 B，§12.8） |
-| `MONOLOAD_DISABLE_VAE=1` | 只关 VAE 部分，LoRA 部分不受影响 |
-| `MONOLOAD_EXACT=1` | VAE 走原生（分块会改变 GEMM 形状，不保证逐位一致） |
-| `MONOLOAD_DISABLE=1` | 什么都不装 |
+总开关和节点见 §4 / §4.1：默认开启；`MONOLOAD=0` 时 VAE 全局原生，节点 `mode` 选 `auto` 的 VAE 照样管理。VAE 相关的高级选项（`MONOLOAD_VAE_WORKSPACE`、`MONOLOAD_VAE_BUDGET`、`MONOLOAD_DISABLE_VAE_STRIPE`、`MONOLOAD_VAE_STRIPE_ROWS`、`MONOLOAD_VAE_GN_SCHEME`、`MONOLOAD_DISABLE_VAE`）见 §13。
 
-启动日志写明状态和策略：`[Monoload] VAE decode managed: ... workspace 1.00 GiB ...` 加上 `[Monoload] VAE layer 1 (stripe decoding) on ...: default stripe policy: the peak of 128-row stripes, tallest stripes within it ...`（设了预算时是 `peak budget ... (MONOLOAD_VAE_BUDGET)`；或 `... off`），或 `[Monoload] VAE decode: native (...)`。每次解码的日志写明用了哪一层：`-> layer 1 (Wan 2.1 stripes): 14 stripes of 155 rows (core), recompute 1.21x, checkpoint 95 MiB; default: peak of 128-row stripes, workspace 128 MiB; arena 886 MiB, memory estimate 1.16 GiB ...` 或 `-> layer 2, op-level chunking ...`。
+启动日志写明状态和策略：`[Monoload] VAE decode managed: ... workspace 1.00 GiB ...` 加上 `[Monoload] VAE layer 1 (stripe decoding) on ...: default stripe policy: the peak of 128-row stripes, tallest stripes within it ...`（设了预算时是 `peak budget ... (MONOLOAD_VAE_BUDGET)`；或 `... off`），或 `[Monoload] VAE decode: native by default (MONOLOAD=0) ...`（全局原生时每次解码只在 DEBUG 级别记一行）。每次解码的日志写明用了哪一层：`-> layer 1 (Wan 2.1 stripes): 14 stripes of 155 rows (core), recompute 1.21x, checkpoint 95 MiB; default: peak of 128-row stripes, workspace 128 MiB; arena 886 MiB, memory estimate 1.16 GiB ...` 或 `-> layer 2, op-level chunking ...`。
 
 ### 12.4 覆盖范围
 
@@ -1002,7 +972,7 @@ docs/HANDOFF.md             交接说明（当前状态、提交记录、规矩�
 * **统计遍。** 条带部分有 19 个 GroupNorm（9 个残差块各两个 + `norm_out`），它们一个依赖一个。按顺序对每个 GroupNorm 跑一遍条带：只算到它的输入为止，把每条带「自己负责的那些行」的统计量累加起来，算完冻结；最后一遍按输出条带解码，所有 GroupNorm 都用冻结的整图统计量。结果与整图解码数学等价（fp32 测试里差 ≤ 4e-6）。
 * **统计量的数值。** fp32；每组先减去一个平移量（第一块的均值），块内用 `torch.var_mean`，块与块、条带与条带用 Chan 合并（数值稳定，不做 `E[x²] − E[x]²` 这种会抵消的减法）。应用时与 ATen 的 GroupNorm 内核同一算法（`x·a + b`，fp32 算、回到原 dtype）。
 * **GroupNorm 的实例级替换。** 只在受管理的第一层解码期间、只对条带部分的 19 个 GroupNorm 实例设实例属性 `forward`，退出时删掉；权重仍走模块自己的 cast / weight_function（包括 Monoload 的运行时 LoRA）。这是对「模块原样调用」的有意偏离，由 fp32 自检兜底（与原模型自己的整图 `decode` 比，≤ 1e-4）。
-* **方案 A / D / B / C 是同一个机制**，只是「哪些位置把中间结果整张存下来」不同，每遍从最近的存档出发：A 不存（峰值最低、算得最多），D 存 H/4 级的输出，B 再存 H/2 级的输出，C 再存全分辨率每个残差块的输出。存档在统计遍里顺便写好，不需要额外的遍。**默认 B**（4K 2.17 GiB / 42 s；7059bdd 时默认 A：1.10 GiB / 75 s）；`MONOLOAD_VAE_GN_SCHEME` 强制别的方案；设了 `MONOLOAD_VAE_BUDGET` 时方案和条带高度按「预算内最快」选（§4）。只有一条带时（条带高度 ≥ 图高）不跑统计遍，就是整图解码。
+* **方案 A / D / B / C 是同一个机制**，只是「哪些位置把中间结果整张存下来」不同，每遍从最近的存档出发：A 不存（峰值最低、算得最多），D 存 H/4 级的输出，B 再存 H/2 级的输出，C 再存全分辨率每个残差块的输出。存档在统计遍里顺便写好，不需要额外的遍。**默认 B**（4K 2.17 GiB / 42 s；7059bdd 时默认 A：1.10 GiB / 75 s）；`MONOLOAD_VAE_GN_SCHEME` 强制别的方案；设了 `MONOLOAD_VAE_BUDGET` 时方案和条带高度按「预算内最快」选（§13）。只有一条带时（条带高度 ≥ 图高）不跑统计遍，就是整图解码。
 * 其余沿用第二阶段：识别按真实结构（类型、kernel、padding、没有注意力 / 时间维 / tanh_out 等非默认分支、没有 hook），不认就走第二层并在日志写原因；每种结构 + 方案第一次使用前 fp32 自检；默认条带策略、预算、强制高度、OOM 缩条带和工作区、绝不退回 tiled、估算交给 `load_models_gpu`；整个解码在一个 arena 里。
 
 **模拟器的预测（SDXL / Flux，bf16，GiB）：**
@@ -1018,3 +988,35 @@ docs/HANDOFF.md             交接说明（当前状态、提交记录、规矩�
 **代价：速度。** 第一层要重算：4K 方案 A 75 s、D 58 s、B 42 s、C 35.5 s，第二层 9.9 s，原生 11.9 s（§10.3）。峰值和速度之间怎么取，用 `MONOLOAD_VAE_BUDGET` 自己定：预算够放下第二层就是第二层的速度。
 
 **限制：** 只认 2D 图像的 LDM decoder；3D / 视频 decoder、up 级带注意力、`tanh_out`、Flux 2 的 `batch_norm_latent` 走第二层。统计量与原生 GroupNorm 内核不逐位一致（累加顺序不同）。arena 和估算是模拟器验证的，不是证明。
+
+## 13. 高级选项（环境变量）
+
+一般不用设。它们都是**全局默认值**：`MONOLOAD` 开启（默认）时作用于所有模型 / VAE；`MONOLOAD=0` 时只作用于节点开启了的那个模型 / VAE 上节点没设的项。节点上明确选的值对那一个模型 / VAE 总是压过它们（§4 的优先级）。基准和测试脚本仍然用这些环境变量来配置。
+
+| 设置 | 效果 |
+|---|---|
+| `MONOLOAD_EXACT=1` | 合并改走逐位一致路径：结果与原生 ComfyUI 完全相同，每步多出的合并开销更大（CT 700 上约是默认路径的 3 倍：0.26s 对 0.08s，见 §5.1）。用于验收、对比，或需要和原生出图完全一致的时候。VAE 解码的全局默认也变成原生（分块会改变 GEMM 形状，不保证逐位一致）；节点 `mode` 选 `auto` 的 VAE 仍然管理 |
+| `MONOLOAD_KEEP_LORA=1` | 运行时合并照常，但 prompt 结束后不释放 LoRA（LoRA 节点缓存和挂着 LoRA 的 clone 保留，重复跑同一个 LoRA 工作流时省掉读 LoRA 文件） |
+| `MONOLOAD_DISABLE_VAE=1` | VAE 解码的全局默认变成原生（§12），LoRA 部分不受影响；节点 `mode` 选 `auto` 的 VAE 仍然管理 |
+| `MONOLOAD_VAE_WORKSPACE` | VAE 分块的工作区（卷积每块的 im2col 展开缓冲、注意力每块的分数矩阵的上限），默认 `1G`；写法 `1G`、`512M`、`768`（纯数字按 MiB）。第二层直接用它；第一层用 min(它, 128M)，所以只有设得比 128M 小才影响第一层（§12、DESIGN.md §9.13.11） |
+| `MONOLOAD_VAE_BUDGET` | VAE 解码的峰值预算，写法同上（`3G`、`1.5G`、`2560M`）。不设时用默认策略（第一层，128 行条带的峰值内最高的条带；LDM 用方案 B）。设了就在**估算不超过预算**的做法里选**预计最快**的：第二层能放下就用第二层（每个卷积只算一次，最快）；放不下就在第一层的「GroupNorm 方案 × 条带高度」里按耗时模型挑最快的；一个都放不下就报错并写明各需要多少。例子见下 |
+| `MONOLOAD_DISABLE_VAE_STRIPE=1` | 只关掉第一层，所有受管理的 VAE 解码都走第二层（设了预算也一样，超出预算时日志注明） |
+| `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（输出行数），用于扫参和调试，优先于默认策略和预算（有预算时方案仍按预算选；放不下也照跑，日志注明） |
+| `MONOLOAD_VAE_GN_SCHEME` | 强制 SDXL / SD1.5 / SD3 / Flux `ae`（LDM decoder）第一层的 GroupNorm 整图统计量方案：`A`（不存中间结果，峰值最低、重算最多）、`D`、`B`（**默认**）、`C`（存得越多峰值越高、越快），见 §12.8。设了它，有预算时也只用这个方案（条带高度仍按预算取） |
+
+**`MONOLOAD_VAE_BUDGET` 的例子**（SDXL / Flux `ae`，bf16；「估算」是交给 `load_models_gpu` 的上界，峰值是模拟的 reserved（实测与它一致）；耗时：第二层和默认 B 是实测，其余是 CT 700 上耗时模型的预测；DESIGN.md §9.14.10–11）：
+
+| 预算 | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| 不设（默认） | 方案 B，6 条 128 行：峰值 0.62 GiB，4.6 s | B，12 条 128 行：1.33 GiB，19.5 s | B，17 条 128 行：2.17 GiB，42.0 s |
+| `20G` | 第二层：3.7 GiB，0.9 s | 第二层：9.2 GiB，4.0 s | 第二层：15.0 GiB，9.9 s |
+| `3G` | 第一层整图 1 条：2.0 GiB，约 0.8 s | C，4 条 384 行：2.7 GiB，约 12 s | B，12 条 180 行：2.4 GiB，约 41 s |
+| `2G` | C，2 条 384 行：1.2 GiB，约 2.8 s | B，11 条 140 行：1.7 GiB，约 19 s | D，18 条 120 行：1.5 GiB，约 59 s |
+| `1.5G` | C，2 条 384 行：1.05 GiB，约 2.8 s | B，16 条 96 行：1.2 GiB，约 21 s | A，17 条 128 行：1.1 GiB，约 74 s |
+| `1G` | C，2 条 384 行（工作区 128 MiB）：0.86 GiB，约 4 s | D，23 条 67 行：0.80 GiB，约 31 s | 报错：最少要约 1.38 GiB（方案 A），第二层要 17.9 GiB |
+
+* 预算比的是**估算**（上界），所以实际峰值通常比预算低 10–30%。有存档的方案（B / C / D）的估算在 vae-estimate-fix 之后收紧了：存档在 arena 里的位置有保证，不再当成「可能被挤出 arena 的那一块」算进估算（4K 默认 B 3.17 → 2.68 GiB），所以 4K 设 `3G` 能选 B 了（以前选 D，实测更慢、峰值更高）。
+* `qwen_image_vae`（只有一种第一层配置）：`20G` → 第二层（2.1 / 5.1 / 9.6 GiB）；`3G` → 第一层预算内最高的条带（1 条 768 行 / 2 条 768 行 / 4 条 540 行，1.3 / 2.0 / 2.1 GiB）；`1.5G` → 1.06 / 1.08 / 1.12 GiB；`1G` → 0.58 / 0.72 GiB，4K 报错（最少约 1.09 GiB）。
+* 日志写明选了什么、为什么、其他候选各要多少：`[Monoload] VAE MONOLOAD_VAE_BUDGET 3.00 GiB -> layer 1 scheme B 180 rows (workspace 128 MiB) 2.96 GiB, ~41.1 s: the fastest predicted that fits; others: layer 2 17.91 GiB (over); ...`。
+* 工作区也是候选的一维：依次试 预算/8、128 MiB、64 MiB，取耗时模型预测最快的（工作区越小分块越多、越慢，但估算也越低）。
+* 想固定某个方案或高度：再设 `MONOLOAD_VAE_GN_SCHEME` / `MONOLOAD_VAE_STRIPE_ROWS`，它们优先于预算。
