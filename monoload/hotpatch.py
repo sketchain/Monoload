@@ -9,7 +9,8 @@ MonoloadRuntimePatch in its weight_function/bias_function list, and
 comfy.ops' cast_bias_weight merges it into a temporary copy of that one layer
 when the layer runs.
 
-Two merge paths (switch: MONOLOAD_EXACT, read at import; set_exact() at runtime):
+Two merge paths (global default: MONOLOAD_EXACT, read at import; set_exact()
+at runtime; a model's Monoload LoRA Settings node may choose its own):
   default         plain LoRA / LoCon patches are added with one fused
                   addmm_ into the compute-dtype temporary (C); every other
                   patch type goes through comfy.lora.calculate_weight with the
@@ -18,16 +19,17 @@ Two merge paths (switch: MONOLOAD_EXACT, read at import; set_exact() at runtime)
                   a native (baked) merge; see docs/DESIGN.md for the error.
   MONOLOAD_EXACT=1  bit-identical to native ComfyUI.
 
-Master switch (monoload/settings.py): with MONOLOAD=0 every replaced method
-passes the call straight to ComfyUI's original (_active() is False), so
-patchers behave exactly as native; the installed methods only cost one
-check per call.
+Which patchers Monoload drives (_enabled): a patcher whose Monoload LoRA
+Settings mode is enable / native (monoload/lora_overrides.py, carried in
+model_options), else the master switch (monoload/settings.py). For one it
+does not drive (MONOLOAD=0, or mode native) every replaced method passes the
+call straight to ComfyUI's original (_active() is False), so it behaves
+exactly as native; the installed methods only cost one check per call.
 
 uninstall() restores the original methods (models should be unloaded first).
 """
 
 import logging
-import os
 import weakref
 
 import torch
@@ -41,7 +43,7 @@ import comfy.utils
 import comfy.weight_adapter
 from comfy.model_patcher import LowVramPatch, ModelPatcher, get_key_weight
 
-from . import settings
+from . import lora_overrides, settings
 from .errors import MonoloadError, MonoloadUnsupportedError
 
 _ORIG = {}
@@ -49,21 +51,16 @@ _ORIG_DYNAMIC = {}
 _WARNED = set()
 
 
-def _env_flag(name):
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
-
-
-_MODE = {"exact": _env_flag("MONOLOAD_EXACT")}
-
-
 def set_exact(on):
-    """True: bit-exact merge (= native ComfyUI). False: fused/relaxed default.
-    Takes effect at the next layer call; nothing has to be reloaded."""
-    _MODE["exact"] = bool(on)
+    """True: bit-exact merge (= native ComfyUI) as the global default. False:
+    fused/relaxed default. Takes effect at the next layer call; nothing has to
+    be reloaded. A model whose Monoload LoRA Settings node chose a merge keeps it."""
+    settings.set_exact(on)
 
 
 def is_exact():
-    return _MODE["exact"]
+    """The global default merge (MONOLOAD_EXACT at import)."""
+    return settings.exact()
 
 
 _MATH_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
@@ -172,8 +169,9 @@ class MonoloadRuntimePatch(LowVramPatch):
 
     is_monoload_patch = True
 
-    def __init__(self, key, patches, module, attr, state):
+    def __init__(self, key, patches, module, attr, state, exact=None):
         super().__init__(key, patches)
+        self.exact = exact   # the model's own merge (Monoload LoRA Settings), None = the global default
         self._module = weakref.ref(module)
         self.attr = attr
         self.state = state
@@ -220,7 +218,7 @@ class MonoloadRuntimePatch(LowVramPatch):
         if not base and not hooks:
             return weight
         param = getattr(self._module(), self.attr)
-        if not _MODE["exact"]:
+        if not (settings.exact() if self.exact is None else self.exact):
             return self._call_fast(weight, param, base, hooks)
         device = weight.device
         pdt = param.dtype  # for a QuantizedTensor: its dequantized dtype
@@ -324,8 +322,9 @@ def _is_runtime_patch(f):
 # ---------------------------------------------------------------------------
 
 def _enabled(patcher):
-    """Monoload drives this patcher's LoRA: the master switch (MONOLOAD)."""
-    return settings.master()
+    """Monoload drives this patcher's LoRA: its Monoload LoRA Settings mode
+    (enable / native), else the master switch (MONOLOAD)."""
+    return lora_overrides.enabled(patcher)
 
 
 def _active(patcher):
@@ -395,7 +394,7 @@ def _install_runtime_patch(patcher, key):
     funcs = [f for f in getattr(module, fn_attr, []) if not (_is_runtime_patch(f) and f.key == key)]
     # LoRA first: under a native full load it is baked into the weight, so it
     # comes before any weight_wrapper_patches.
-    funcs.insert(0, MonoloadRuntimePatch(key, patcher.patches, module, attr, st))
+    funcs.insert(0, MonoloadRuntimePatch(key, patcher.patches, module, attr, st, exact=lora_overrides.merge_exact(patcher)))
     setattr(module, fn_attr, funcs)
 
 
