@@ -1,4 +1,4 @@
-# Monoload 交接说明（第三阶段已验收，默认方案 B 与「预算内最快」已实现、待真机，2026-10）
+# Monoload 交接说明（第三阶段与「预算内最快」已验收；估算收紧、VAE 设置节点待真机，2026-10）
 
 给下一个对话用：当前做到了哪里、必须遵守的规矩、第三阶段（LDM decoder）的状态和待决定的事。细节分别在 README.md（使用、真机结果、bench 命令）和 docs/DESIGN.md（§9：VAE 解码降峰值的设计；§9.14：第三阶段）。
 
@@ -22,7 +22,7 @@ CT 700（Strix Halo，gfx1151，统一内存 62.5 GiB GTT）上 4K（3840×2160�
 
 还没做的 / 要用户决定的：
 
-1. **默认方案 B 和「预算内最快」的真机测试**：README 9.7 的命令 Q–S（每行有预测：选中的配置、估算、模拟 reserved、耗时模型的预测）。重点看耗时模型在 B / C / D 和 1344 / 2688 上准不准（下面 6.4）。
+1. **收紧估算之后的按预算选**：README 9.7 的命令 T（SDXL 三档 × 3G / 1.5G，每行有预测）。重点：4K 3G 现在选 B（12 条 180 行，预测 2.43 GiB / 约 41 s），以前选 D（2.33 GiB / 63.2 s）。默认 B 与 Q–S 已在 01377c4 上验收（README §10.4）。
 2. 第二层「总是比第一层快」是 CT 700 的实测结论，预算策略把它写成了固定优先级；换硬件时要复核。
 3. 多帧 Wan 视频 latent 目前交给原生（不是永远不做）。
 4. Flux 2 的 `batch_norm_latent`、带注意力的 up 级等 LDM 变体目前走第二层，可以以后按需加。
@@ -41,7 +41,8 @@ CT 700（Strix Halo，gfx1151，统一内存 62.5 GiB GTT）上 4K（3840×2160�
 | 第一层工作区 128 MiB | 13d2384 | b742b16 | `LAYER1_WORKSPACE` 384 → 128 MiB；workspace 实验结果 |
 | 第三阶段 3a | aa07431 | a68161b | 拆出 `vae_engine.py` / `vae_wan.py`，行为和数字不变 |
 | 第三阶段 3b + 3c | 7059bdd | 96daa32 | `alloc_sim` 的 LDM 构造（复现第二层 18 个读数）；`vae_ldm.py`；引擎的统计遍、GroupNorm 替换、存档布局；`test_vae_ldm.py`；bench 的 `-g<S>` / `--gn-schemes` / `--fp32-chunked` |
-| 默认 B、预算内最快 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） | 见合并 | LDM 默认方案 B；`choose_budget`；耗时模型 `vae_ldm.TIME_COEF`；一条带不跑统计遍；预算内最高条带的搜索在最矮处不单调时继续找；bench 的 `-b<GiB>` / `--budgets`、预算放不下记为 `over budget`；7059bdd 的实测写进文档 |
+| 默认 B、预算内最快 | 01377c4 | 0a64213 | LDM 默认方案 B；`choose_budget`；耗时模型 `vae_ldm.TIME_COEF`；一条带不跑统计遍；预算内最高条带的搜索在最矮处不单调时继续找；bench 的 `-b<GiB>` / `--budgets`、预算放不下记为 `over budget`；7059bdd 的实测写进文档 |
+| 估算收紧、耗时模型第二版 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） | 见合并 | 检查点前置 + `saves_fit`（有保证的存档不算进 largest）；耗时模型加卷积调用数和前缀注意力；README §10.4、命令 T |
 
 LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行时合并 → 释放、fp8、默认融合 addmm 路径），见 `git log --first-parent dev`。
 
@@ -84,7 +85,7 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 * `monoload/vae_engine.py`：第一层的引擎，与 decoder 无关。适配器接口写在模块注释里。区间（`Unit`、`need_in`、`valid_out`、`stripe_needs`、`split_rows`）；`Plan`（最后一遍的条带、统计遍 `Pass`、存档布局「分开 / 池」、存活量 → arena → 估算、重算倍数）；执行（`run_prefix`、`run_chain`、`run_stripes`、`run_passes`）；GroupNorm（`NormRef`、`Moments`、`group_norm_frozen`、`GlobalNorms`）；arena；`StripeAdapter` 基类（`plan` 找预算内最高条带、`smallest_plan`、`variants` / `predict_seconds` 给预算策略用）；`Plan.work_levels`（各分辨率级的卷积 MAC，耗时模型的输入）；自检流程。
 * `monoload/vae_wan.py`：Wan 2.1 单帧适配器（没有需要整图统计的归一化，所以没有统计遍；数字与第二阶段相同）。
 * `monoload/vae_ldm.py`：LDM 适配器：识别（`ldm_structure`）、单元（残差块带 norm1 / norm2 的 `NormRef`，norm2 的「部分单元」）、方案的存档位置（`scheme_positions`）、按 forward 数的内存模型、fp32 副本（按配置重建 `Decoder` + `post_quant_conv`）、`variants()`（每个方案一个，默认方案在前）、耗时模型 `TIME_COEF` / `predict_seconds`。
-* 测试：`tests/test_vae_ldm.py`（95 项）、`tests/test_vae_stripe.py`（74 项）、`tests/test_vae.py`（131 项）、`tests/alloc_sim.py`、`tests/bench_vae.py`、`tests/make_synthetic_vaes.py`。
+* 测试：`tests/test_vae_ldm.py`（100 项）、`tests/test_vae_stripe.py`（74 项）、`tests/test_vae.py`（131 项）、`tests/alloc_sim.py`、`tests/bench_vae.py`、`tests/make_synthetic_vaes.py`。
 
 **以后加一种新 VAE**：写一个适配器（`match`，以及 `StripeAdapter` 的子类：结构、单元、代价模型、fp32 副本 / 参照解码），注册到 `STRIPE_ADAPTERS`；有需要整图统计的 GroupNorm 就在单元上挂 `NormRef`，引擎自动安排统计遍；先用 `alloc_sim` 加一个 meta 构造，验证 reserved ≤ 估算，再上真机。
 
@@ -118,4 +119,11 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 * **第二层固定优先**（放得下就选），依据是实测（SDXL 4K 9.9 s 对 ≥ 35.5 s，Qwen 6.9 对 8.4 s）。
 * **第一层工作区**依次试 预算/8、128 MiB、64 MiB：预算/8 的工作区会把 B 挤出 3G（4K）。
 * **两处引擎改动**：一条带不跑统计遍（整图就是整图统计量）；「预算内最高条带」在最矮的高度放不下时翻倍继续找（B 在 8 / 16 行比 32 行需要更多：统计遍被挤到 1–3 行、存档用池）。
-* **待真机确认**：Q–S 的耗时与模型预测的差距（模型没见过 B / C / D 在 1344 / 2688 上的读数）；4K 设 3G 选 D（预测 54 s）是否确实比 A（67 s）快。
+* **真机（01377c4）**：选择都与预测一致，GTT ≤ 估算 ≤ 预算；但 4K 3G 选中的 D（7×309，64 MiB）实测 63.2 s，比默认 B（42.0 s）慢、峰值也更高。原因两个：B 的估算里含 1 GiB 的存档（3.17 > 3G）；耗时模型看不到工作区（64 MiB 的卷积调用数翻倍）。下面 6.5 修了这两处。
+
+### 6.5 收紧估算、耗时模型第二版（DESIGN §9.14.11）
+
+* **检查点前置**：有存档的计划，前缀之前先分配检查点缓冲（arena 的最前面），前缀输出拷进去。之后的长寿命分配（检查点、输出缓冲、各存档 / 池）是确定的序列，`vae_engine.saves_fit` 按缓存分配器的 best fit 规则重放它；每个存档都放得下，就说明它不会被挤出 arena，估算的 largest 不再算它（`Plan.saves_guaranteed`）。4K 默认 B 的估算 3.17 → 2.68 GiB，C 8.67 → 5.21，arena 不变。
+* **耗时模型第二版**（`vae_ldm.TIME_COEF` / `TIME_PER_CALL` / `TIME_ATTN`）：H/4 / H/2 / H 的 MAC 系数 0.0922 / 0.1294 / 0.2464 秒 / 10¹²，每次卷积 GEMM 调用 0.237 ms（`unit_calls` 按工作区算行块，`Plan.conv_calls`），前缀注意力 0.239 × 2·C·token² / 10¹²。22 个读数拟合，最大误差 5.3%（整图一条带 −17%）。
+* **很高的条带（老问题，扩大的网格里发现）**：4K 方案 B 540 / 768 行时 reserved 超过估算（死掉的存档留下的洞放不下全分辨率的大临时量，一次「挤出」变成好几次）。arena 规则补了两条（有存档时）：`Plan.front_arena`（洞用不上时，临时量放在存活存档的上面）；`arena_bytes` 在 ≤ 3 条带时用 live/8、工作区 > 128 MiB 时余量至少一个工作区。默认计划不变。403 个计划 reserved 全部 ≤ 估算（DESIGN §9.14.11）。
+* **按预算选的新结果**（SDXL）：3G → 1344 整图一条带、2688 C 4×384、4K B 12×180（预测 2.43 GiB / 41 s）；1.5G → 1344 C、2688 B、4K A。验证命令 README 9.7 的 T。
