@@ -12,13 +12,17 @@ loaded) installs
 Set MONOLOAD_DISABLE=1 to leave ComfyUI completely native, MONOLOAD_EXACT=1
 for the bit-exact merge instead of the fused default (monoload/hotpatch.py)
 and a native VAE decode.
+
+Nodes (monoload/nodes, registered in every case): Monoload VAE Settings --
+a copy of a VAE with its own settings for the managed decode.
 """
 
 import logging
 import os
 
-NODE_CLASS_MAPPINGS = {}
-NODE_DISPLAY_NAME_MAPPINGS = {}
+# the nodes (monoload/nodes) are registered whatever the switches say, so that saved workflows load; with a
+# switch that turns their function off they pass through and say so
+from .monoload.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
 
 def _flag(name):
