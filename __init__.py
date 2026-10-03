@@ -16,8 +16,9 @@ nothing at all. The advanced variables (MONOLOAD_EXACT, MONOLOAD_KEEP_LORA,
 MONOLOAD_DISABLE_VAE, MONOLOAD_DISABLE_VAE_STRIPE, MONOLOAD_VAE_*) are global
 defaults that a node's explicit choice overrides for its model / VAE.
 
-Nodes (monoload/nodes, registered in every case): Monoload VAE Settings --
-a copy of a VAE with its own settings for the managed decode.
+Nodes (monoload/nodes, registered in every case): Monoload LoRA Settings,
+Monoload VAE Settings (per model / VAE settings), Monoload Info (what
+Monoload is doing; its text is shown by web/monoload_info.js).
 """
 
 import logging
@@ -26,6 +27,8 @@ import logging
 # MONOLOAD_DISABLE they pass their input through and say so
 from .monoload.nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from .monoload import settings
+
+WEB_DIRECTORY = "./web"   # web/monoload_info.js: the Monoload Info node's text in the node box
 
 if settings.disabled():
     logging.info("[Monoload] MONOLOAD_DISABLE is set: nothing installed, ComfyUI stays native and the Monoload nodes pass their input through")
@@ -36,6 +39,12 @@ else:
     hotpatch.install()
     release.install()
     installed_vae = vae.install()
+    try:
+        import nodes as _comfy_nodes
+        from .monoload import lora_overrides
+        lora_overrides.install_names(_comfy_nodes.LoraLoader)   # LoRA file names for the Monoload Info node
+    except Exception:
+        logging.warning("[Monoload] LoRA names for the Monoload Info node not available (LoraLoader not found)")
     logging.info("[Monoload] master switch MONOLOAD: {}".format(settings.master_note()))
     if settings.master():
         logging.info("[Monoload] LoRA: runtime merge (no in-place LoRA, no weight backups), merge {}; {}".format(
@@ -63,4 +72,4 @@ else:
             else:
                 logging.info("[Monoload] VAE layer 1 (stripe decoding) off (MONOLOAD_DISABLE_VAE_STRIPE): every managed decode uses layer 2")
 
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
