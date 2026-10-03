@@ -75,8 +75,8 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 
 * `monoload/vae.py`：入口和策略。`install()` 包 `VAE.decode` → `_decode`（覆盖范围判断，不管的交给原生）→ `_managed_decode`（选层、自检）→ `_decode_layer1`（`choose_plan`、`load_models_gpu`、OOM 循环、日志、`last_decode()`）或 `_decode_layer2`（形状探测、`estimate()`、OOM 循环）。设置读环境变量（`workspace()`、`budget()`、`layer1_workspace()`、`stripe_rows()`）。`STRIPE_ADAPTERS` 是第一层适配器的注册表。
 * `monoload/vae_ops.py`：第二层的引擎，完全通用。`OpChunking`（实例级替换 `_conv_forward` 和 `optimized_attention`）、`_ConvChunker`（行分块、只在真实边缘补零、先分配输出、单帧 Conv3d 改走 conv2d）、三种注意力的 query 分块、`OpStats`。
-* `monoload/vae_stripe.py`：第一层，通用部分和 Wan 专用部分混在一起（见下表）。
-* `tests/test_vae_stripe.py`（69 项）、`tests/test_vae.py`（131 项）、`tests/alloc_sim.py`、`tests/bench_vae.py`、`tests/make_synthetic_vaes.py`。
+* `monoload/vae_engine.py`：第一层的引擎（与 decoder 无关）；`monoload/vae_wan.py`：Wan 2.1 单帧适配器。第三阶段 3a 从原来的 `monoload/vae_stripe.py` 拆出（DESIGN §9.14.1），下面 6.2 的表是拆分前的分析。
+* `tests/test_vae_stripe.py`（73 项）、`tests/test_vae.py`（131 项）、`tests/alloc_sim.py`、`tests/bench_vae.py`、`tests/make_synthetic_vaes.py`。
 
 ## 6. 第三阶段入口：LDM decoder（SDXL / Flux）
 
