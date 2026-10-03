@@ -37,8 +37,10 @@ the lowest peak that does not cost speed (DEFAULT_POLICY_ROWS, DESIGN
 decode is the fastest whose estimate fits the budget: layer 2, or a layer-1
 GroupNorm scheme x stripe height (choose_budget, DESIGN §9.14.10).
 
-Switches (read at import / by the plugin entry): MONOLOAD_DISABLE_VAE=1 or
-MONOLOAD_EXACT=1 -> not installed; MONOLOAD_VAE_WORKSPACE (default 1G);
+Switches (read at import; global defaults, a Monoload VAE Settings node
+overrides them item by item for its VAE, monoload/settings.py): MONOLOAD=0,
+MONOLOAD_DISABLE_VAE=1 or MONOLOAD_EXACT=1 -> native decode (the wrapper
+passes the call to ComfyUI); MONOLOAD_VAE_WORKSPACE (default 1G);
 MONOLOAD_DISABLE_VAE_STRIPE=1 -> layer 1 off; MONOLOAD_VAE_BUDGET (peak
 budget: the fastest decode within it; unset = the default policy);
 MONOLOAD_VAE_STRIPE_ROWS (force the stripe core height, for sweeps /
@@ -60,7 +62,7 @@ import comfy.ops
 import comfy.sd
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
-from . import vae_engine, vae_ldm, vae_overrides, vae_wan
+from . import settings, vae_engine, vae_ldm, vae_overrides, vae_wan
 from .errors import MonoloadError, MonoloadVAEOOMError
 from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
 
@@ -145,8 +147,16 @@ def _gn_scheme_from_env():
     return raw, True
 
 
+def _native_from_env():
+    """The variable making the native decode the global default (besides MONOLOAD=0), or None."""
+    for name in ("MONOLOAD_DISABLE_VAE", "MONOLOAD_EXACT"):
+        if _env_flag(name):
+            return name + "=1"
+    return None
+
+
 _GN_ENV = _gn_scheme_from_env()
-_SETTINGS = {"workspace": _workspace_from_env(), "budget": _budget_from_env(),
+_SETTINGS = {"native": _native_from_env(), "workspace": _workspace_from_env(), "budget": _budget_from_env(),
              "stripe": not _env_flag("MONOLOAD_DISABLE_VAE_STRIPE"), "stripe_rows": _rows_from_env(),
              "gn_scheme": _GN_ENV[0], "gn_forced": _GN_ENV[1]}
 vae_ldm.set_scheme(_SETTINGS["gn_scheme"])
@@ -177,6 +187,25 @@ def layer1_workspace(bud=None):
     """Workspace of layer 1: a budget's eighth (at least MIN_WORKSPACE), else
     LAYER1_WORKSPACE; never above MONOLOAD_VAE_WORKSPACE."""
     return min(workspace(), max(MIN_WORKSPACE, bud // 8) if bud else LAYER1_WORKSPACE)
+
+
+def global_mode():
+    """The decode mode of a VAE without its own: ("native" / "layer2" / "auto",
+    the variable that set it or None for the built-in default)."""
+    if not settings.master():
+        return "native", "MONOLOAD=0"
+    if _SETTINGS["native"]:
+        return "native", _SETTINGS["native"]
+    if not _SETTINGS["stripe"]:
+        return "layer2", "MONOLOAD_DISABLE_VAE_STRIPE=1"
+    return "auto", None
+
+
+def set_native(var):
+    """Native decode as the global default, named after the variable that asks
+    for it (e.g. "MONOLOAD_DISABLE_VAE=1"); None = off (tests). Read from
+    MONOLOAD_DISABLE_VAE / MONOLOAD_EXACT at import."""
+    _SETTINGS["native"] = var or None
 
 
 def stripe_enabled():
@@ -247,7 +276,10 @@ def resolve_settings(vae):
     if "mode" in own:
         eff["mode"], src["mode"] = own["mode"], "node"
     else:
-        eff["mode"], src["mode"] = ("auto", "default") if _SETTINGS["stripe"] else ("layer2", "env")
+        eff["mode"], var = global_mode()
+        src["mode"] = "env" if var else "default"
+        if var:
+            eff["mode_env"] = var
     return eff, src
 
 
@@ -255,8 +287,9 @@ def settings_note(eff, src):
     """The decode log's account of its settings and where each came from."""
     scheme = eff["gn_scheme"] if eff["gn_forced"] or not eff["budget"] else "chosen by the budget"
     return "settings: budget {} ({}), GroupNorm scheme {} ({}), stripe rows {} ({}), mode {} ({})".format(
-        fmt_bytes(eff["budget"]) if eff["budget"] else "none", src["budget"], scheme, src["gn_scheme"],
-        eff["stripe_rows"] or "auto", src["stripe_rows"], {"layer2": "layer 2 only"}.get(eff["mode"], eff["mode"]), src["mode"])
+        fmt_bytes(eff["budget"]) if eff["budget"] else "unlimited" if src["budget"] == "node" else "none", src["budget"], scheme, src["gn_scheme"],
+        eff["stripe_rows"] or "auto", src["stripe_rows"], {"layer2": "layer 2 only"}.get(eff["mode"], eff["mode"]),
+        "env {}".format(eff["mode_env"]) if eff.get("mode_env") else src["mode"])
 
 
 class _Applied:
@@ -507,9 +540,14 @@ def _native_estimate(vae, shape):
 def _decode(self, samples_in, vae_options={}):
     eff, src = resolve_settings(self)
     note = settings_note(eff, src)
-    reason = "mode native (Monoload VAE Settings node)" if eff["mode"] == "native" else _native_reason(self, samples_in)
+    if eff["mode"] == "native":
+        # a global native default (MONOLOAD=0 ...) is ComfyUI's own decode, not worth a line per decode
+        reason = "mode native (Monoload VAE Settings node)" if src["mode"] == "node" else "mode native ({})".format(eff.get("mode_env"))
+        level = logging.INFO if src["mode"] == "node" else logging.DEBUG
+    else:
+        reason, level = _native_reason(self, samples_in), logging.INFO
     if reason is not None:
-        logging.info("[Monoload] VAE decode left native: {}; {}".format(reason, note))
+        logging.log(level, "[Monoload] VAE decode left native: {}; {}".format(reason, note))
         _LAST.clear()
         _LAST.update({"strategy": "native", "reason": reason, "settings": dict(eff), "settings_source": dict(src)})
         return _ORIG["decode"](self, samples_in, vae_options)
