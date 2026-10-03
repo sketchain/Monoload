@@ -46,6 +46,7 @@ import comfy.model_patcher
 from comfy.model_patcher import ModelPatcher
 
 from . import lora_overrides, settings
+from .messages import msg
 
 _ORIG = {}
 
@@ -265,9 +266,7 @@ def release_after_prompt(executor):
         gc.collect()  # LoRA clones die here; LoadedModels of clean clones switch to their parents
         n_sync = _sync_clean_loaded_models()
         comfy.model_management.soft_empty_cache()
-        logging.info("[Monoload] released LoRA after prompt: {} loaded model(s) back to base, {} cached output(s), "
-                     "{} node LoRA cache(s), {} clean clone(s) re-synced ({:.2f}s)".format(
-                         n_models, n_out, n_obj, n_sync, time.perf_counter() - t0))
+        logging.info(msg("release.done", models=n_models, outputs=n_out, objects=n_obj, synced=n_sync, seconds=time.perf_counter() - t0))
     return {"models": n_models, "outputs": n_out, "objects": n_obj, "synced": n_sync}
 
 
@@ -294,7 +293,7 @@ def install():
             try:
                 release_after_prompt(self)
             except Exception:
-                logging.exception("[Monoload] releasing LoRA after the prompt failed")
+                logging.exception(msg("release.failed"))
 
     execute_async.__wrapped__ = orig
     execution.PromptExecutor.execute_async = execute_async

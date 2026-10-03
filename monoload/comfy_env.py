@@ -21,7 +21,8 @@ def find_comfyui_root():
     for c in candidates:
         if c and os.path.isfile(os.path.join(c, "main.py")) and os.path.isdir(os.path.join(c, "comfy")):
             return os.path.abspath(c)
-    raise RuntimeError("找不到 ComfyUI 目录；请设置环境变量 COMFYUI_PATH")
+    from .messages import msg
+    raise RuntimeError(msg("env.no_comfyui"))
 
 
 def pid1_comfy_args():

@@ -26,6 +26,7 @@ import logging
 
 from .. import lora_overrides, settings
 from ..lora_overrides import AFTER_CHOICES, MERGE_CHOICES, MODE_CHOICES
+from ..messages import msg
 
 _NOTED = []
 
@@ -68,9 +69,9 @@ class MonoloadLoRASettings:
         if settings.disabled():
             if not _NOTED:
                 _NOTED.append(True)
-                logging.info("[Monoload] Monoload LoRA Settings: MONOLOAD_DISABLE is set, so the node passes MODEL and CLIP through unchanged")
+                logging.info(msg("node.lora_disabled"))
             return (model, clip)
         m = lora_overrides.with_settings(model, mode=mode, merge=merge, after_prompt=after_prompt)
         c = lora_overrides.with_settings_clip(clip, mode=mode, merge=merge, after_prompt=after_prompt) if clip is not None else None
-        logging.info("[Monoload] Monoload LoRA Settings: {}".format(lora_overrides.note(*lora_overrides.resolve(m))))
+        logging.info(msg("node.lora_settings", note=lora_overrides.note(*lora_overrides.resolve(m))))
         return (m, c)

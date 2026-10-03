@@ -19,6 +19,7 @@ import os
 import time
 
 from . import __version__, settings
+from .messages import msg
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -68,22 +69,21 @@ def _source(names, value, builtin):
     environment, else a runtime change (tests / bench), else built-in."""
     for n in names:
         if _env(n):
-            return "env {}={}".format(n, _env(n))
-    return "built-in" if value == builtin else "set at runtime"
+            return msg("info.src_env", name=n, value=_env(n))
+    return msg("info.src_builtin") if value == builtin else msg("info.src_runtime")
 
 
 def header():
     commit, branch = git_commit()
-    where = "commit {}".format(commit) if commit else "commit unknown"
+    where = msg("info.commit", commit=commit) if commit else msg("info.commit_unknown")
     if branch:
-        where += ", branch {}".format(branch)
-    lines = ["Monoload {} ({})".format(__version__, where)]
+        where += msg("info.branch", branch=branch)
+    lines = [msg("info.version", version=__version__, where=where)]
     if settings.disabled():
-        lines.append("MONOLOAD_DISABLE=1: nothing installed, ComfyUI is native and the Monoload nodes pass their inputs through")
+        lines.append(msg("info.disabled"))
         return lines
-    lines.append("master switch MONOLOAD: {} [{}]".format(
-        "on" if settings.master() else "off: native ComfyUI unless a Monoload node enables it",
-        _source(["MONOLOAD"], settings.master(), True)))
+    lines.append(msg("info.master", state=msg("info.master_on") if settings.master() else msg("info.master_off"),
+                     src=_source(["MONOLOAD"], settings.master(), True)))
     return lines
 
 
@@ -95,43 +95,46 @@ def global_defaults():
     def row(label, value, src):
         rows.append("  {:<22s} {:<28s} [{}]".format(label, value, src))
 
-    rows.append("installed: runtime LoRA merge {}, per-prompt LoRA release {}, VAE decode wrapper {}".format(
-        "yes" if hotpatch.is_installed() else "no", "yes" if release.is_installed() else "no", "yes" if vae.is_installed() else "no"))
-    rows.append("global defaults (a Monoload node's explicit choice overrides them for its model / VAE):")
-    row("LoRA mode", "enable (Monoload)" if settings.master() else "native", _source(["MONOLOAD"], settings.master(), True))
-    row("LoRA merge", "exact (bit-identical)" if settings.exact() else "fused", _source(["MONOLOAD_EXACT"], settings.exact(), False))
-    row("LoRA after prompt", "keep" if settings.keep() else "release", _source(["MONOLOAD_KEEP_LORA"], settings.keep(), False))
+    yes = lambda b: msg("info.yes") if b else msg("info.no")   # noqa: E731
+    rows.append(msg("info.installed", a=yes(hotpatch.is_installed()), b=yes(release.is_installed()), c=yes(vae.is_installed())))
+    rows.append(msg("info.globals"))
+    row(msg("info.row_lora_mode"), msg("info.enable_monoload") if settings.master() else msg("info.native"),
+        _source(["MONOLOAD"], settings.master(), True))
+    row(msg("info.row_lora_merge"), msg("info.exact") if settings.exact() else msg("info.fused"), _source(["MONOLOAD_EXACT"], settings.exact(), False))
+    row(msg("info.row_lora_after"), msg("info.keep") if settings.keep() else msg("info.release"),
+        _source(["MONOLOAD_KEEP_LORA"], settings.keep(), False))
     mode, var = vae.global_mode()
-    row("VAE mode", {"layer2": "layer 2 only"}.get(mode, mode), "env {}".format(var) if var else "built-in")
+    row(msg("info.row_vae_mode"), msg("vae.layer2_only") if mode == "layer2" else msg("info.native") if mode == "native" else msg("vae.auto"),
+        msg("info.src_envvar", var=var) if var else msg("info.src_builtin"))
     bud = vae.budget()
-    row("VAE budget", fmt_bytes(bud) if bud else "none (default policy)", _source(["MONOLOAD_VAE_BUDGET"], bud, None))
-    row("VAE GroupNorm scheme", "{}{}".format(vae.gn_scheme(), " (forced)" if vae.gn_scheme_forced() else ""),
+    row(msg("info.row_vae_budget"), fmt_bytes(bud) if bud else msg("info.budget_none"), _source(["MONOLOAD_VAE_BUDGET"], bud, None))
+    row(msg("info.row_vae_scheme"), "{}{}".format(vae.gn_scheme(), msg("info.forced") if vae.gn_scheme_forced() else ""),
         _source(["MONOLOAD_VAE_GN_SCHEME"], vae.gn_scheme_forced(), False))
-    row("VAE stripe rows", str(vae.stripe_rows() or "auto"), _source(["MONOLOAD_VAE_STRIPE_ROWS"], vae.stripe_rows(), None))
-    row("VAE workspace", fmt_bytes(vae.workspace()), _source(["MONOLOAD_VAE_WORKSPACE"], vae.workspace(), vae.DEFAULT_WORKSPACE))
+    row(msg("info.row_vae_rows"), str(vae.stripe_rows() or msg("vae.auto")), _source(["MONOLOAD_VAE_STRIPE_ROWS"], vae.stripe_rows(), None))
+    row(msg("info.row_vae_ws"), fmt_bytes(vae.workspace()), _source(["MONOLOAD_VAE_WORKSPACE"], vae.workspace(), vae.DEFAULT_WORKSPACE))
     return rows
 
 
-_SRC = {"node": "node", "env": "env", "default": "built-in"}
+def _src(s):
+    return {"node": msg("info.src_node"), "env": "env", "default": msg("info.src_builtin")}[s]
 
 
 def describe_decode(r):
     """One line for a decode record (vae.decode_record)."""
     if r is None:
-        return "last decode: not decoded yet (connect images from its VAE Decode to run this node after the decode)"
-    ago = time.time() - r.get("when", time.time())
-    head = "last decode ({:.0f} s ago): ".format(ago)
+        return msg("info.not_decoded")
+    head = msg("info.decode_head", ago=time.time() - r.get("when", time.time()))
     strat = r.get("strategy")
     secs = r.get("seconds")
-    t = ", {:.2f} s".format(secs) if secs is not None else ""
+    t = msg("info.secs", secs=secs) if secs is not None else ""
     if strat == "native":
-        return head + "native ComfyUI decode ({}){}".format(r.get("reason"), t)
+        return head + msg("info.decode_native", reason=r.get("reason"), t=t)
     if strat == "error":
-        return head + "error: no decode fits the budget {}".format(_gib(r.get("budget")))
+        return head + msg("info.decode_error", budget=_gib(r.get("budget")))
     if strat == "layer1":
-        what = "layer 1 ({}), {} stripes of {} rows".format(r.get("adapter"), r.get("stripes"), r.get("rows"))
+        what = msg("info.decode_l1", adapter=r.get("adapter"), n=r.get("stripes"), rows=r.get("rows"))
     elif strat == "layer2":
-        what = "layer 2 (op-level chunking)"
+        what = msg("info.decode_l2")
     else:
         what = str(strat)
     est = (r.get("estimate") or {}).get("total")
@@ -141,24 +144,23 @@ def describe_decode(r):
         measured.append("reserved +{}".format(_gib(mem["reserved_peak"])))
     if mem.get("gtt_peak") is not None:
         measured.append("GTT +{}".format(_gib(mem["gtt_peak"])))
-    return head + "{}, workspace {}, estimate {}, measured peak {}{}, OOM retries {}".format(
-        what, _gib(r.get("workspace")), _gib(est), ", ".join(measured) or "n/a (no GPU)", t, r.get("retries", 0))
+    return head + msg("info.decode_line", what=what, ws=_gib(r.get("workspace")), est=_gib(est), measured=", ".join(measured) or msg("info.no_gpu"),
+                      t=t, retries=r.get("retries", 0))
 
 
 def vae_section(v):
     from . import vae, vae_overrides
     own = vae_overrides.overrides(v)
-    lines = ["VAE ({}{}):".format(type(getattr(v, "first_stage_model", None)).__name__,
-                                  ", a Monoload VAE Settings copy" if own else "")]
+    lines = [msg("info.vae_head", model=type(getattr(v, "first_stage_model", None)).__name__, copy=msg("info.vae_copy") if own else "")]
     if not vae.is_installed():
-        lines.append("  the managed decode is not installed: ComfyUI's own decode")
+        lines.append(msg("info.vae_not_installed"))
     eff, src = vae.resolve_settings(v)
-    scheme = eff["gn_scheme"] if eff["gn_forced"] or not eff["budget"] else "chosen by the budget"
-    budget = _gib(eff["budget"]) if eff["budget"] else ("unlimited" if src["budget"] == "node" else "none (default policy)")
-    mode_src = "env {}".format(eff["mode_env"]) if eff.get("mode_env") else _SRC[src["mode"]]
-    lines.append("  settings: mode {} [{}], budget {} [{}], GroupNorm scheme {} [{}], stripe rows {} [{}]".format(
-        {"layer2": "layer 2 only"}.get(eff["mode"], eff["mode"]), mode_src, budget, _SRC[src["budget"]],
-        scheme, _SRC[src["gn_scheme"]], eff["stripe_rows"] or "auto", _SRC[src["stripe_rows"]]))
+    scheme = eff["gn_scheme"] if eff["gn_forced"] or not eff["budget"] else msg("vae.by_budget")
+    budget = _gib(eff["budget"]) if eff["budget"] else (msg("vae.unlimited") if src["budget"] == "node" else msg("info.budget_none"))
+    mode_src = msg("info.src_envvar", var=eff["mode_env"]) if eff.get("mode_env") else _src(src["mode"])
+    mode = {"layer2": msg("vae.layer2_only"), "native": msg("info.native"), "auto": msg("vae.auto")}.get(eff["mode"], eff["mode"])
+    lines.append(msg("info.vae_settings", mode=mode, mode_src=mode_src, budget=budget, budget_src=_src(src["budget"]), scheme=scheme,
+                     scheme_src=_src(src["gn_scheme"]), rows=eff["stripe_rows"] or msg("vae.auto"), rows_src=_src(src["stripe_rows"])))
     lines.append("  " + describe_decode(vae.decode_record(v)))
     return lines
 
@@ -170,20 +172,19 @@ def _runtime_patches(model):
 
 def model_section(p):
     from . import lora_overrides as lo
-    lines = ["MODEL ({}):".format(type(getattr(p, "model", None)).__name__)]
+    lines = [msg("info.model_head", model=type(getattr(p, "model", None)).__name__)]
     names = lo.lora_names(p)
     n_patched = len(getattr(p, "patches", {}) or {})
     n_hooks = len(getattr(p, "hook_patches", {}) or {})
     if names:
-        lines.append("  LoRA: " + ", ".join("{} x {:g}".format(x["name"], x["strength"]) for x in names))
+        lines.append(msg("info.lora_list", items=", ".join("{} x {:g}".format(x["name"], x["strength"]) for x in names)))
     elif n_patched:
-        lines.append("  LoRA: none from the LoRA loader nodes (other patches present)")
+        lines.append(msg("info.lora_other"))
     else:
-        lines.append("  LoRA: none")
-    lines.append("  patched weights: {}{}".format(n_patched, ", hook-LoRA groups: {}".format(n_hooks) if n_hooks else ""))
-    eff, src = lo.resolve(p)
-    lines.append("  " + lo.note(eff, src).replace("LoRA settings: ", "settings: "))
-    state = "not loaded"
+        lines.append(msg("info.lora_none"))
+    lines.append(msg("info.patched", n=n_patched, hooks=msg("info.hooks", n=n_hooks) if n_hooks else ""))
+    lines.append(msg("info.settings", note=lo.note(*lo.resolve(p))))
+    state = msg("info.state_not_loaded")
     try:
         import comfy.model_management as mm
         loaded = [x.model for x in mm.current_loaded_models if x.model is not None and x.model.model is p.model]
@@ -191,16 +192,16 @@ def model_section(p):
             rp = _runtime_patches(p.model)
             bk = len(p.backup)
             if rp:
-                state = "loaded; Monoload runtime merge on {} weights (no weight backups)".format(rp)
+                state = msg("info.state_runtime", n=rp)
             elif bk:
-                state = "loaded; native: LoRA baked into the weights ({} backups)".format(bk)
+                state = msg("info.state_baked", n=bk)
             else:
-                state = "loaded; no LoRA in effect"
+                state = msg("info.state_clean")
         elif loaded:
-            state = "the shared model is loaded for another clone"
+            state = msg("info.state_other")
     except Exception:
         pass
-    lines.append("  now: " + state)
+    lines.append(msg("info.state", state=state))
     return lines
 
 

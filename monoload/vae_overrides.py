@@ -9,6 +9,8 @@ ComfyUI, so the node works (as a no-op) when Monoload is disabled.
 
 import copy
 
+from .messages import msg
+
 ATTR = "_monoload_vae_settings"
 GIB = 1 << 30
 
@@ -42,22 +44,22 @@ def with_settings(vae, budget=0.0, gn_scheme="default", stripe_rows=0, mode="def
     if isinstance(budget, str) and budget.strip().lower() == "unlimited":
         new["budget"] = None
     elif budget is not None and float(budget) < 0:
-        raise ValueError("budget {} < 0".format(budget))
+        raise ValueError(msg("node.negative", item="budget", value=budget))
     elif budget:
         new["budget"] = int(float(budget) * GIB)
     s = str(gn_scheme or "default").strip()
     if s.lower() != "default":
         if s.upper() not in SCHEME_CHOICES[1:]:
-            raise ValueError("GroupNorm scheme {!r} is not one of {}".format(gn_scheme, "/".join(SCHEME_CHOICES)))
+            raise ValueError(msg("node.bad_choice", item="GroupNorm scheme", value=gn_scheme, choices="/".join(SCHEME_CHOICES)))
         new["gn_scheme"] = s.upper()
     if stripe_rows is not None and int(stripe_rows) < 0:
-        raise ValueError("stripe_rows {} < 0".format(stripe_rows))
+        raise ValueError(msg("node.negative", item="stripe_rows", value=stripe_rows))
     if stripe_rows:
         new["stripe_rows"] = int(stripe_rows)
     m = str(mode or "default").strip().lower()
     if m != "default":
         if m not in MODES:
-            raise ValueError("mode {!r} is not one of {}".format(mode, "/".join(MODE_CHOICES)))
+            raise ValueError(msg("node.bad_choice", item="mode", value=mode, choices="/".join(MODE_CHOICES)))
         new["mode"] = MODES[m]
     out = copy.copy(vae)
     setattr(out, ATTR, new)
