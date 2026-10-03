@@ -114,6 +114,17 @@ docker logs comfyui 2>&1 | grep -i monoload
 | `stripe_rows` | 输出行数，`0` = 跟随全局 | 强制第一层的条带高度 |
 | `mode` | `default` / `auto` / `layer 2 only` / `native` | `default`：跟随全局（默认开启时是 `auto`；`MONOLOAD=0`、`MONOLOAD_DISABLE_VAE=1`、`MONOLOAD_EXACT=1` 时是原生；`MONOLOAD_DISABLE_VAE_STRIPE=1` 时是 `layer 2 only`）；`auto`：**为这个 VAE 打开**解码管理，认得的 decoder 走第一层（条带），其余走第二层——全局关着（包括 `MONOLOAD=0`）也打开；`layer 2 only`：只用第二层；`native`：这个 VAE 用 ComfyUI 自己的解码 |
 
+**GroupNorm 方案（`gn_scheme`）是什么：** 只对 LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae`）的第一层（条带解码）有意义。GroupNorm 要用整张图的统计量，所以第一层在出图之前要先跑几遍「统计遍」；方案决定把哪些中间结果整张存下来，让这几遍从存档出发，而不必每遍都从 H/8 的存档重算：
+
+| 方案 | 存什么 | 取舍 | SDXL 4K 实测（GTT / 耗时） |
+|---|---|---|---|
+| A | 什么都不存（只有 H/8 存档） | 内存最低，重算最多，最慢 | 约 1.1 GiB / 75 s |
+| D | H/4 级的输出 | 介于 A 和 B 之间 | 约 1.5 GiB / 58 s |
+| B | H/4 和 H/2 级的输出 | **内置默认** | 约 2.2 GiB / 42 s |
+| C | B 再加上全分辨率每个块的输入 | 内存最高，最快 | 约 4.7 GiB / 36 s |
+
+`default` = 跟随全局：看 `MONOLOAD_VAE_GN_SCHEME`；没设时用 B；设了预算（节点或环境变量）时，在放得下预算的方案里选预计最快的。选了具体方案就强制用它（预算只决定条带高度）。界面上的提示和 Monoload Info 里都有同样的一句说明。
+
 节点上留在 `default` / `0` 的项跟随全局设置（高级选项，§13），全局也没设就用内置默认。例如 compose 里设了 `MONOLOAD_VAE_GN_SCHEME=D`，节点只把 `budget` 设成 `custom`、`budget_gib = 3`：预算来自节点，方案来自环境变量（强制 D），条带高度和模式用默认值。`MONOLOAD_DISABLE=1` 时节点原样输出输入的 VAE。
 
 **控件顺序：** `budget` 下拉框紧挨在 `budget_gib` 前面。`budget_gib` 精度 0.01 GiB（填 0.25 就存 0.25）。dev 不做旧工作流兼容：之前存的用到这个节点的工作流，控件值会错位，要重新设一次。

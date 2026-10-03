@@ -161,7 +161,15 @@ def vae_section(v):
     mode = {"layer2": msg("vae.layer2_only"), "native": msg("info.native"), "auto": msg("vae.auto")}.get(eff["mode"], eff["mode"])
     lines.append(msg("info.vae_settings", mode=mode, mode_src=mode_src, budget=budget, budget_src=_src(src["budget"]), scheme=scheme,
                      scheme_src=_src(src["gn_scheme"]), rows=eff["stripe_rows"] or msg("vae.auto"), rows_src=_src(src["stripe_rows"])))
-    lines.append("  " + describe_decode(vae.decode_record(v)))
+    r = vae.decode_record(v)
+    lines.append("  " + describe_decode(r))
+    shown = None   # the scheme to explain: the one the last decode used, else the one the settings fix
+    if r is not None and r.get("strategy") == "layer1" and r.get("gn_scheme"):
+        shown = r["gn_scheme"]
+    elif eff["mode"] != "native" and eff["mode"] != "layer2" and (eff["gn_forced"] or not eff["budget"]):
+        shown = eff["gn_scheme"]
+    if shown in ("A", "B", "C", "D"):
+        lines.append(msg("info.scheme_hint", scheme=shown, hint=msg("scheme." + shown)))
     return lines
 
 

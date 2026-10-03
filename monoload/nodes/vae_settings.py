@@ -56,8 +56,7 @@ class MonoloadVAESettings:
                                      "tooltip": "Peak budget in GiB, used only when budget is custom: the fastest decode whose "
                                                 "estimate fits it (error naming what is needed when none fits)."}),
             "gn_scheme": (list(SCHEME_CHOICES), {"default": "default",
-                                                "tooltip": "GroupNorm scheme of an LDM decoder's layer 1 (SDXL / SD1.5 / SD3 / Flux ae): "
-                                                           "forces it. default = follow the global setting (MONOLOAD_VAE_GN_SCHEME)."}),
+                                                "tooltip": "GroupNorm scheme of layer 1 (stripe decoding) for LDM decoders (SDXL / SD1.5 / SD3 / Flux ae): which intermediate results are kept whole, so that the passes that gather the whole-image GroupNorm statistics can start from them instead of recomputing from the H/8 checkpoint. A: keeps nothing - lowest memory, most recomputation, slowest. D: keeps the output of the H/4 level. B: keeps the H/4 and H/2 level outputs - the built-in default. C: also keeps the input of every full-resolution block - most memory, fastest. SDXL 4K, measured: A ~1.1 GiB / 75 s, D ~1.5 / 58, B ~2.2 / 42, C ~4.7 / 36. default: follow the global setting (MONOLOAD_VAE_GN_SCHEME; without it B, or with a budget the fastest scheme that fits)."}),
             "stripe_rows": ("INT", {"default": 0, "min": 0, "max": 65536, "step": 8,
                                     "tooltip": "Layer-1 stripe height in output rows: forces it. "
                                                "0 = follow the global setting (MONOLOAD_VAE_STRIPE_ROWS)."}),

@@ -135,6 +135,8 @@ def vae_tests():
     check("after decoding the copy: copy -> layer 2 with budget 1024 GiB [node]; the original still shows its own layer-1 decode\n  "
           + last.strip(), "layer 2 (op-level chunking)" in t_copy and "budget 1.00 TiB [node]" in t_copy.replace("1024.00 GiB", "1.00 TiB")
           and "layer 1 (LDM stripes" in t_orig2 and re.search(r"workspace .*, estimate .*, measured peak .*, [0-9.]+ s, OOM retries 0", last))
+    check("the scheme the decode used is explained in one line: {}".format(next((l for l in t_orig2.splitlines() if "GroupNorm scheme B:" in l), "").strip()),
+          "GroupNorm scheme B: keeps the H/4 and H/2 level outputs" in t_orig2)
     nat = node_apply(cls_v, sd, mode="native")
     native_decode(nat, lat)   # the original method: no record
     comfy.sd.VAE.decode(nat, lat)
