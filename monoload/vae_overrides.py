@@ -14,6 +14,7 @@ GIB = 1 << 30
 
 SCHEME_CHOICES = ("default", "A", "B", "C", "D")
 MODE_CHOICES = ("default", "auto", "layer 2 only", "native")
+BUDGET_CHOICES = ("default", "unlimited", "custom")   # the node's budget dropdown; "custom" uses budget_gib
 MODES = {"auto": "auto", "layer 2 only": "layer2", "layer2": "layer2", "native": "native"}
 
 
@@ -30,15 +31,19 @@ def with_settings(vae, budget=0.0, gn_scheme="default", stripe_rows=0, mode="def
     keep what `vae` itself carries when it is such a copy (chained nodes),
     else the environment / default applies.
 
-    budget       GiB (MONOLOAD_VAE_BUDGET)
+    budget       GiB (MONOLOAD_VAE_BUDGET); "unlimited": no budget for this
+                 VAE whatever MONOLOAD_VAE_BUDGET says (the default stripe
+                 policy)
     gn_scheme    "A" / "B" / "C" / "D" (MONOLOAD_VAE_GN_SCHEME, forces it)
     stripe_rows  output rows (MONOLOAD_VAE_STRIPE_ROWS, forces it)
     mode         "auto" (layer 1 where recognized), "layer 2 only"
                  (MONOLOAD_DISABLE_VAE_STRIPE=1), "native" (ComfyUI's decode)"""
     new = overrides(vae)
-    if budget is not None and float(budget) < 0:
+    if isinstance(budget, str) and budget.strip().lower() == "unlimited":
+        new["budget"] = None
+    elif budget is not None and float(budget) < 0:
         raise ValueError("budget {} < 0".format(budget))
-    if budget:
+    elif budget:
         new["budget"] = int(float(budget) * GIB)
     s = str(gn_scheme or "default").strip()
     if s.lower() != "default":
