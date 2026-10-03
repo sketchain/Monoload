@@ -317,7 +317,8 @@ def _patched(obj, name, value):
         setattr(obj, name, old)
 
 
-def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, order="largest", conv2d=True, arena=None, batch=1, out_first=True):
+def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, order="largest", conv2d=True, arena=None, batch=1, out_first=True,
+                 layer1_ws=None, contiguous=True):
     """alloc / reserved deltas (bytes) of one decode of a w x h image, as bench_vae measures them
     (cache emptied and peaks reset right before the decode, the weights already loaded).
 
@@ -327,6 +328,8 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     conv2d  single-frame Conv3d as conv2d (SlowDilated3d otherwise)
     arena   None: the plan's arena (the current code); 0: none (the earlier versions); bytes: that size
     out_first  a row-blocked conv allocates its output before the first block (False: after it, up to 725a010)
+    layer1_ws  monoload.vae.LAYER1_WORKSPACE for this decode (384 MiB up to 5d668b6, 128 MiB since)
+    contiguous the row slice into a Resample is made contiguous first (False: up to 725a010)
     """
     import torch
     import comfy.model_management as mm
@@ -367,6 +370,10 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
         es.enter_context(_patched(vae_ops, "OUT_FIRST", out_first))
         es.enter_context(_patched(mm, "soft_empty_cache", soft_empty_cache))
         es.enter_context(_patched(vs, "arena_supported", lambda device: True))
+        if layer1_ws:
+            es.enter_context(_patched(mvae, "LAYER1_WORKSPACE", layer1_ws))
+        if not contiguous:
+            es.enter_context(_patched(vs, "CONTIGUOUS_INPUT", ()))
         if clear:
             es.enter_context(_patched(vs, "run_prefix", run_prefix_clear))
         if layer == 1:
@@ -412,8 +419,10 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
 # validation against CT 700
 # ---------------------------------------------------------------------------
 
-# (label, w, h, dtype, rows, layer, version, measured alloc GiB, measured reserved GiB)
-# version "v1" = 4e54d20 (SlowDilated3d, no cache emptied, top-to-bottom), "v2" = 725a010
+# (label, w, h, dtype, rows, layer, version, measured alloc GiB or None, measured reserved GiB)
+# version "v1" = 4e54d20 (SlowDilated3d, no cache emptied, top-to-bottom), "v2" = 725a010, "v3" = 85a5c6f
+# (arena, layer-1 workspace 384 MiB), "cur" = the current code (layer-1 workspace 128 MiB; GTT readings of
+# the -w128 runs of the workspace experiment). rows None = the default plan.
 MEASURED = [
     ("4K r32 v2", 3840, 2160, "bf16", 32, 1, "v2", 0.94, 1.07),
     ("4K r64 v2", 3840, 2160, "bf16", 64, 1, "v2", 0.94, 1.14),
@@ -436,6 +445,15 @@ MEASURED = [
     ("fp32 1344 2x384 v1", 1344, 768, "fp32", 384, 1, "v1", 1.13, 1.80),
     ("fp32 2688 5x308 v1", 2688, 1536, "fp32", 308, 1, "v1", 1.67, 2.70),
     ("fp32 4K 10x216 v1", 3840, 2160, "fp32", 216, 1, "v1", 1.84, 3.22),
+    ("4K default v3", 3840, 2160, "bf16", None, 1, "v3", 1.12, 1.13),
+    ("2688 default v3", 2688, 1536, "bf16", None, 1, "v3", 0.86, 0.87),
+    ("4K r32 v3", 3840, 2160, "bf16", 32, 1, "v3", 1.12, 1.13),
+    ("4K r256 v3", 3840, 2160, "bf16", 256, 1, "v3", 1.35, 1.35),
+    ("4K r512 v3", 3840, 2160, "bf16", 512, 1, "v3", 1.82, 1.82),
+    ("fp32 4K default v3", 3840, 2160, "fp32", None, 1, "v3", 1.70, 1.70),
+    ("1344 default cur", 1344, 768, "bf16", None, 1, "cur", None, 0.36),
+    ("2688 default cur", 2688, 1536, "bf16", None, 1, "cur", None, 0.56),
+    ("4K default cur", 3840, 2160, "bf16", None, 1, "cur", None, 0.87),
     ("1344 layer 2", 1344, 768, "bf16", None, 2, "v1", 1.82, 2.12),
     ("2688 layer 2", 2688, 1536, "bf16", None, 2, "v1", 3.80, 5.07),
     ("4K layer 2", 3840, 2160, "bf16", None, 2, "v1", 6.45, 9.61),
@@ -444,9 +462,11 @@ MEASURED = [
 
 def _version(version):
     if version == "v1":
-        return dict(clear=False, order="natural", conv2d=False, arena=0, out_first=False)
+        return dict(clear=False, order="natural", conv2d=False, arena=0, out_first=False, layer1_ws=384 * MIB, contiguous=False)
     if version == "v2":
-        return dict(clear=True, order="largest", conv2d=True, arena=0, out_first=False)
+        return dict(clear=True, order="largest", conv2d=True, arena=0, out_first=False, layer1_ws=384 * MIB, contiguous=False)
+    if version == "v3":
+        return dict(layer1_ws=384 * MIB)
     return {}
 
 
@@ -456,7 +476,7 @@ def main():
     ap.add_argument("--res", default=None)
     ap.add_argument("--rows", default=None)
     ap.add_argument("--dtype", default="bf16")
-    ap.add_argument("--version", default="current", help="current / v1 / v2")
+    ap.add_argument("--version", default="current", help="current / v1 / v2 / v3")
     ap.add_argument("--peak", action="store_true", help="list the live blocks at the allocation peak")
     ap.add_argument("--segments", action="store_true", help="the segments (>= 2 MiB) and their blocks when reserved peaked")
     a = ap.parse_args()
@@ -479,8 +499,8 @@ def main():
     for label, w, h, dt, rows, layer, ver, ma, mr in MEASURED:
         i = decode_trace(w, h, dt, rows, layer=layer, **_version(ver))
         est = i.get("estimate")
-        print("{:24s} {:5.2f} / {:5.2f} {:5.2f} / {:5.2f} {:>9s}".format(label, ma, i["alloc"] / G, mr, i["reserved"] / G,
-                                                                    "{:.2f}".format(est / G) if est else ""))
+        print("{:24s} {:>5s} / {:5.2f} {:5.2f} / {:5.2f} {:>9s}".format(label, "{:.2f}".format(ma) if ma is not None else "-", i["alloc"] / G,
+                                                                    mr, i["reserved"] / G, "{:.2f}".format(est / G) if est else ""))
 
 
 if __name__ == "__main__":

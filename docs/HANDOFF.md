@@ -17,13 +17,12 @@ CT 700（Strix Halo，gfx1151，统一内存 62.5 GiB GTT）上 4K（3840×2160�
 | VAE | 原生 | 第二层 | 第一层 |
 |---|---|---|---|
 | SDXL / Flux `ae` | 52.5 GiB | 14.9 GiB | （第三阶段） |
-| `qwen_image_vae` | 59.2 GiB | 9.6 GiB | 1.13 GiB（估算 1.52，8.24 s，原生 7.89 s） |
+| `qwen_image_vae` | 59.2 GiB | 9.6 GiB | 0.87 GiB（估算 1.16，8.44 s，原生 7.89 s） |
 
-第二阶段已验收（85a5c6f，README §10.2）。还没做的：
+第二阶段已完成：85a5c6f 验收通过（README §10.2），之后按 workspace 实验把第一层默认工作区从 384 改成 128 MiB（4K 1.13 → 0.87 GiB，8.24 → 8.44 s；DESIGN §9.13.11）。第二层默认工作区保持 1 GiB（调小对 Qwen / SDXL 4K 的峰值没有好处，反而更慢）。还没做的：
 
-1. workspace 实验（README 9.7 的 J、K；DESIGN §9.13.11）：数据回来之前不改默认值。
-2. 第三阶段：SDXL / Flux 的 LDM decoder 走第一层（下面第 5 节）。
-3. 多帧 Wan 视频 latent 目前交给原生（不是永远不做）。
+1. 第三阶段：SDXL / Flux 的 LDM decoder 走第一层（下面第 6 节）。
+2. 多帧 Wan 视频 latent 目前交给原生（不是永远不做）。
 
 ## 2. 提交记录（`dev` 上的合并提交 ← 功能提交）
 
@@ -35,11 +34,14 @@ CT 700（Strix Halo，gfx1151，统一内存 62.5 GiB GTT）上 4K（3840×2160�
 | 第二阶段 | 4e54d20 | 6a50513 | 第一层：Wan 2.1 单帧条带解码、自检、预算 |
 | 第二阶段调整 | 725a010 | 0826ff9 | 默认条带策略、按 forward 数的内存模型、单帧 Conv3d 改走 conv2d |
 | 第二阶段第三轮 | 85a5c6f | 45a0b6b | arena、估算 = arena + largest、分块卷积先分配输出、`tests/alloc_sim.py` |
-| 收尾 | 本文件所在的合并 | — | 实测值写进文档、workspace 实验命令（bench `-w<MiB>`）、本交接说明 |
+| 收尾 | 5d668b6 | 9387168 | 实测值写进文档、workspace 实验命令（bench `-w<MiB>`）、本交接说明 |
+| 第一层工作区 128 MiB | 本文件所在的合并（`git log --first-parent dev` 最上面一条） | — | `LAYER1_WORKSPACE` 384 → 128 MiB；workspace 实验结果；本说明补充优先级和 GroupNorm 方案表 |
 
 LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行时合并 → 释放、fp8、默认融合 addmm 路径），见 `git log --first-parent dev`。
 
 ## 3. 必须遵守的规矩
+
+**优先级（用户定）：峰值内存优先，多算几遍可以接受，速度是次要的。** 取舍时先比峰值（reserved / GTT），再看耗时；例如第一层工作区选 128 MiB（峰值降 23–45%，耗时多 2–7%），默认条带高度取「不明显变慢的最低峰值」。
 
 **行为：**
 
@@ -67,7 +69,7 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 * **跑测试**：`MODELS=<目录> tests/docker_run.sh python tests/test_vae_stripe.py`（把仓库只读挂进镜像的 custom_nodes）。VAE 测试不需要真实模型；需要 VAE 文件的（bench 的 CPU 冒烟）用 `python tests/make_synthetic_vaes.py OUT_DIR [--full]` 生成随机权重的 SDXL / Flux / Wan 结构文件（`--full` 是真实宽度），放在 `$MODELS/vae`。
 * **CT 700 的事实**：`--gpu-only --bf16-vae`；ComfyUI 在 AMD 上设 `cudnn.enabled = False`，所以 4D 卷积走 Slow2d（im2col + GEMM，im2col 缓冲就是原生峰值的主因），5D 卷积走 SlowDilated3d；VAE 注意力是 split（`normal_attention`）；统一内存，显存占用看 GTT。
 * **`tests/bench_vae.py`**（README 9.7）：`--checkpoint` / `--vae`；`--res`；`--modes native,monoload,monoload-l2,monoload-r<N>,native2`，模式名加 `-w<MiB>` 只对该模式改工作区；`--stripe-rows`；`--warm`；`--fp32-ref`；`--profile-only --profile-modes ...`；`--no-arena`；`--json`。输出每次运行的 alloc / reserved / GTT / 耗时、估算、精度（对原生、对 fp32）、条带 / 分块边界附近的误差、离群点。
-* **`tests/alloc_sim.py`**（DESIGN §9.13.10）：在 meta 设备上跑全尺寸 Wan decoder，按 PyTorch 缓存分配器的规则重放分配 / 释放，复现了 24 个 CT 700 读数（≤ 0.02 GiB）。`python tests/alloc_sim.py --res 3840x2160 --rows 32,144,512 [--version v1|v2] [--peak] [--segments]`。改了内存相关的代码先用它看，再让用户上真机。
+* **`tests/alloc_sim.py`**（DESIGN §9.13.10）：在 meta 设备上跑全尺寸 Wan decoder，按 PyTorch 缓存分配器的规则重放分配 / 释放，复现了 33 个 CT 700 读数（≤ 0.02 GiB）。`python tests/alloc_sim.py --res 3840x2160 --rows 32,144,512 [--version v1|v2] [--peak] [--segments]`。改了内存相关的代码先用它看，再让用户上真机。
 
 ## 5. 代码地图
 
@@ -123,17 +125,29 @@ ResnetBlock: GroupNorm → swish → conv3×3 → GroupNorm → swish → dropou
 5. `tests/alloc_sim.py`：模型构造按适配器分（加一个 LDM 的 meta 构造，SDXL / Flux 的维度），`decode_trace` 不再直接用 `vae_stripe.match`。有了 LDM 构造，第二层的 SDXL 也能模拟（现在只能实测）。
 6. 测试拆成引擎测试（区间、arena、分配器）和各适配器的测试（结构识别、精确行、整个 decoder 与原生比）。
 
-### 6.4 GroupNorm 统计量跨条带调度（要在第三阶段定的方案）
+### 6.4 GroupNorm 统计量跨条带调度（方案和代价，交给用户决定）
 
 要求不变：结果与整图解码数学等价（只差浮点误差），不能用 tile 局部统计量近似。
 
-* **统计量本身**：每个 GroupNorm 需要其输入在全图上每组的均值和方差。条带可以各自累加每组的 Σx、Σx²（或按 Welford 合并的 count / mean / M2），全部条带跑完后得到全图统计量。要用 fp32 累加；与 torch 的 `group_norm` 内核（bf16 输入时内部也用 fp32）不是逐位一致，但应在自检容差内。
-* **依赖链**：第 k 个 GroupNorm 的输入依赖第 1 … k−1 个 GroupNorm 的统计量。最直接的做法是一个 GroupNorm 一遍：第 k 遍从存档跑所有条带到第 k 个 GroupNorm 的输入为止，只累加统计量。19 个 GroupNorm 就是 19 遍，越靠后的遍越长，卷积重算大约是整图的 10 倍量级，太慢。
-* **分级存档**：一级（同一分辨率的 3 个残差块）里的 GroupNorm 统计量都算完后，把这一级的输出整张存下来当作下一级的存档。下一级只需要为自己的 6 个 GroupNorm 跑遍数，每遍只从本级存档开始。代价是存档变大：4K bf16 时 H/4 × 512 通道约 0.53 GB，H/2 × 256 通道约 1.06 GB，全分辨率 × 128 通道约 2.1 GB。全分辨率那一级的存档本身就是整张激活。
-* **折中方案**：在某一级停止升级存档（例如只到 H/2），全分辨率级用逐 GroupNorm 的遍数。也可以把每遍算出的中间结果按条带缓存一部分，减少重复。总遍数、每遍的重算和存档大小之间的权衡，要用重算比例和 `alloc_sim` 的峰值一起算，再上真机扫参。
-* **怎么把统计量用上**：GroupNorm 不能在切片上原样调用（它会用切片自己的统计量）。需要在受管理的解码期间对 GroupNorm 实例做实例级替换（与 `OpChunking` 替换 `_conv_forward` 同一手法）：已知统计量时按 `(x − mean) / sqrt(var + eps) × weight + bias` 计算，统计遍时只累加、不需要输出后面的部分。这是对「模块原样调用」原则的一个有意偏离，要在设计里写清楚，并由自检（fp32、与原生整图比）兜底。
+* **统计量本身**：每个 GroupNorm 需要其输入在全图上每组的均值和方差。条带可以各自累加每组的 Σx、Σx²（或按 Welford 合并的 count / mean / M2），全部条带跑完后得到全图统计量。要用 fp32 累加；与 torch 的 `group_norm` 内核（bf16 输入时内部也用 fp32）不是逐位一致，但应在自检容差内。存档正好是某个 GroupNorm 的输入时，统计量直接从存档算，不需要跑卷积。
+* **依赖链**：第 k 个 GroupNorm 的输入依赖第 1 … k−1 个 GroupNorm 的统计量，所以第 k 个的统计量要等前面的都算完。每一「遍」从某个存档出发跑完所有条带、到某个 GroupNorm 的输入为止，只累加统计量；最后一遍用全部统计量算出输出。
+* **怎么把统计量用上**：GroupNorm 不能在切片上原样调用（它会用切片自己的统计量）。需要在受管理的解码期间对 GroupNorm 实例做实例级替换（与 `OpChunking` 替换 `_conv_forward` 同一手法）：已知统计量时按 `(x − mean) / sqrt(var + eps) × weight + bias` 计算，统计遍里只累加。这是对「模块原样调用」原则的一个有意偏离，要在设计里写清楚，并由自检（fp32、与原生整图比）兜底。
 * **注意力**：SDXL / Flux decoder 的注意力只在 mid（H/8），在前缀里整图算，与 Wan 相同，不进条带。
-* **预期**：SDXL 4K 的前缀与 Qwen 量级相近（H/8 × 512 通道，P ≈ 133 MB，注意力约 6P + 分数块），条带部分取决于 6.4 的方案。目标是把第二层的 14.9 GiB 降到几个 GiB。具体数字等方案定了再用 `alloc_sim` 算。
+
+**方案对比**（SDXL 4K、bf16 的粗估，按卷积算量；前缀到 H/8 的 3 个残差块为止，存档 H/8 × 512 通道 = 133 MB；条带部分 19 个 GroupNorm：H/4、H/2、H 各 6 个 + `norm_out`）：
+
+| 方案 | 额外存档 | 峰值（粗估） | 条带部分的卷积算量（相对一次整图解码的条带部分） | 遍数 |
+|---|---|---|---|---|
+| A. 每个 GroupNorm 一遍，只用 H/8 存档 | 无 | 约 1 GB（前缀决定，与 Qwen 量级相同） | 约 11×（加条带 halo 的重算约 13×） | 20 |
+| D. A + H/4 级输出存档 | 0.53 GB | 约 1.5 GB | 约 8×（约 9–10×） | 20 + 1 |
+| B. 分级存档：H/4 级、H/2 级的输出各存一次 | 0.53 + 1.06 GB | 约 2–2.5 GB（存 H/2 级时两份同时在） | 约 5×（约 6×） | 20 + 2 |
+| C. B + 全分辨率级内每个残差块后也存 | 再加 2 × 2.1 GB | 约 4.5 GB | 约 3.7×（约 4.5×） | 20 + 4 |
+| 现状：第二层（逐算子分块） | — | 14.9 GB（实测） | 1×（9.9 s） | 1 |
+
+* 算量的数法：每一遍的工作 = 从它的出发存档到目标 GroupNorm 输入之间的卷积；A 的 19 个统计遍之和约为条带部分总量的 9.9 倍，加最后一遍约 11 倍。各级的卷积量（10¹² MAC）：H/4 级 7.3、上采样到 H/2 4.9、H/2 级 8.8、上采样到 H 4.9、H 级 8.8（再加 H/8 → H/4 的上采样 1.2），合计约 36。
+* 耗时不与算量成正比（Qwen 第一层 1.23 倍重算只比原生慢约 7%；GEMM 越大效率越高），只能真机扫参确定。按用户的优先级（峰值优先），A / D 是候选；B / C 用峰值换速度。
+* 峰值数字是粗估，第三阶段开始后应先在 `tests/alloc_sim.py` 里加 LDM 的 meta 构造，按实际方案算出 live、arena 和估算，再上真机。
+* 可以混合：例如 H/4、H/2 级用分级存档、全分辨率级用逐 GroupNorm 的遍数，或者在统计遍里把一部分中间结果按条带缓存下来。是否值得做，取决于 A / D 在真机上的耗时。
 
 ### 6.5 第三阶段开始前建议先做的
 

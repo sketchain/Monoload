@@ -484,7 +484,11 @@ def allocator_tests():
             ("4e54d20, 4K, 5 x 432 rows", dict(w=3840, h=2160, rows=512, **alloc_sim._version("v1")), 2.66),
             ("725a010, 4K, 14 x 155 rows", dict(w=3840, h=2160, rows=155, **alloc_sim._version("v2")), 1.44),
             ("725a010, 4K, 5 x 432 rows", dict(w=3840, h=2160, rows=512, **alloc_sim._version("v2")), 2.09),
-            ("725a010, fp32 2688, 12 x 128 rows", dict(w=2688, h=1536, dtype="fp32", rows=128, **alloc_sim._version("v2")), 1.41)):
+            ("725a010, fp32 2688, 12 x 128 rows", dict(w=2688, h=1536, dtype="fp32", rows=128, **alloc_sim._version("v2")), 1.41),
+            ("85a5c6f (arena, workspace 384 MiB), 4K default", dict(w=3840, h=2160, **alloc_sim._version("v3")), 1.13),
+            ("85a5c6f, 4K, 5 x 432 rows", dict(w=3840, h=2160, rows=512, **alloc_sim._version("v3")), 1.82),
+            ("current (workspace 128 MiB), 4K default", dict(w=3840, h=2160), 0.87),
+            ("current (workspace 128 MiB), 1344 default", dict(w=1344, h=768), 0.36)):
         i = alloc_sim.decode_trace(**kw)
         check("allocator simulator reproduces CT 700: {}: reserved {:.2f} GiB (measured {:.2f})".format(label, i["reserved"] / G, mres),
               abs(i["reserved"] / G - mres) <= 0.03)

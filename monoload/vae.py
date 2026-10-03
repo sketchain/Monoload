@@ -61,7 +61,8 @@ _ORIG = {}
 
 DEFAULT_WORKSPACE = 1 * GIB
 DEFAULT_POLICY_ROWS = 128  # layer-1 default: the peak of 128-row stripes, with the tallest stripes that stay at it (DESIGN §9.13.4)
-LAYER1_WORKSPACE = 384 * MIB  # layer-1 workspace without MONOLOAD_VAE_BUDGET (capped by MONOLOAD_VAE_WORKSPACE)
+LAYER1_WORKSPACE = 128 * MIB  # layer-1 workspace without MONOLOAD_VAE_BUDGET (capped by MONOLOAD_VAE_WORKSPACE); 384 MiB up to 5d668b6,
+                              # 128 MiB after the CT 700 workspace experiment (DESIGN §9.13.11); OOM retries halve it to MIN_WORKSPACE
 MIN_WORKSPACE = 64 * MIB
 ACTIVATION_COPIES = 4      # live full-size activations bounded by 4x the largest one (DESIGN §9.4)
 PROBE_SIZE = 8             # latent rows/cols of the shape probe
