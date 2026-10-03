@@ -26,8 +26,10 @@ VAEDecodeTiled / VAE.decode_tiled -- stays native (logged).
 
 Layer 1 (stripe decoding for recognized decoders) plugs in through
 STRIPE_ADAPTERS: the engine (monoload/vae_engine.py) plus one adapter per
-decoder structure (monoload/vae_wan.py: the Wan 2.1 VAE single frame). A
-recognized, self-tested decoder is decoded in
+decoder structure (monoload/vae_wan.py: the Wan 2.1 VAE single frame;
+monoload/vae_ldm.py: the LDM Decoder of SD1.5 / SDXL / SD3 / Flux ae, with
+GroupNorm statistics gathered across stripes). A recognized, self-tested
+decoder is decoded in
 stripes of output rows from a low-resolution checkpoint instead of the
 whole-image activations; everything else keeps layer 2. Default stripe height:
 the lowest peak that does not cost speed (DEFAULT_POLICY_ROWS, DESIGN
@@ -38,7 +40,8 @@ MONOLOAD_EXACT=1 -> not installed; MONOLOAD_VAE_WORKSPACE (default 1G);
 MONOLOAD_DISABLE_VAE_STRIPE=1 -> layer 1 off; MONOLOAD_VAE_BUDGET (layer-1
 peak budget: the tallest stripes within it; unset = the default policy);
 MONOLOAD_VAE_STRIPE_ROWS (force the stripe core height, for sweeps /
-debugging).
+debugging); MONOLOAD_VAE_GN_SCHEME (A / B / C / D: which GroupNorm inputs an
+LDM decode keeps whole, DESIGN §9.14).
 """
 
 import inspect
@@ -54,7 +57,7 @@ import comfy.ops
 import comfy.sd
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
-from . import vae_engine, vae_wan
+from . import vae_engine, vae_ldm, vae_wan
 from .errors import MonoloadError, MonoloadVAEOOMError
 from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
 
@@ -127,8 +130,21 @@ def _rows_from_env():
         return None
 
 
+def _gn_scheme_from_env():
+    raw = os.environ.get("MONOLOAD_VAE_GN_SCHEME", "").strip().upper()
+    if not raw:
+        return vae_ldm.DEFAULT_SCHEME
+    if raw not in vae_ldm.SCHEMES:
+        logging.warning("[Monoload] MONOLOAD_VAE_GN_SCHEME={!r} is not one of {}; using {}".format(
+            raw, "/".join(vae_ldm.SCHEMES), vae_ldm.DEFAULT_SCHEME))
+        return vae_ldm.DEFAULT_SCHEME
+    return raw
+
+
 _SETTINGS = {"workspace": _workspace_from_env(), "budget": _budget_from_env(),
-             "stripe": not _env_flag("MONOLOAD_DISABLE_VAE_STRIPE"), "stripe_rows": _rows_from_env()}
+             "stripe": not _env_flag("MONOLOAD_DISABLE_VAE_STRIPE"), "stripe_rows": _rows_from_env(),
+             "gn_scheme": _gn_scheme_from_env()}
+vae_ldm.set_scheme(_SETTINGS["gn_scheme"])
 _LAST = {}
 
 
@@ -176,6 +192,16 @@ def set_stripe_rows(n):
     _SETTINGS["stripe_rows"] = int(n) if n else None
 
 
+def gn_scheme():
+    return _SETTINGS["gn_scheme"]
+
+
+def set_gn_scheme(name):
+    """GroupNorm scheme of LDM layer-1 decodes (A / B / C / D; tests / bench); MONOLOAD_VAE_GN_SCHEME at import."""
+    vae_ldm.set_scheme(name)
+    _SETTINGS["gn_scheme"] = vae_ldm.scheme()
+
+
 def last_decode():
     """What the last VAE.decode call did (strategy, estimate, budget, retries, OpStats dict)."""
     return dict(_LAST)
@@ -194,7 +220,7 @@ def last_decode():
 #   bound.plan(vae, samples, budget, workspace, rows=None, out_bytes=0) -> plan (estimate, stripes, recompute,
 #                                       ckpt_bytes, describe()) or None when the budget cannot be met
 #   bound.run(vae, samples, plan, workspace, stats) -> pixel_samples (process_output applied), native layout
-STRIPE_ADAPTERS = [vae_wan]
+STRIPE_ADAPTERS = [vae_wan, vae_ldm]
 
 _L1_NOTED = weakref.WeakKeyDictionary()   # first_stage_model -> last logged layer-1 reason
 
@@ -516,6 +542,8 @@ def _decode_layer1(self, samples_in, bound, t0, selftest):
                   "native_estimate": native_est, "budget": bud, "policy": policy, "workspace": ws, "retries": retries, "seconds": dt,
                   "stripes": len(plan.stripes), "rows": max(b - a for a, b in plan.stripes), "recompute": plan.recompute,
                   "checkpoint_bytes": plan.ckpt_bytes, "boundaries": boundaries, "forced_rows": forced, "selftest": selftest,
+                  "passes": len(plan.passes), "saves": [plan.save_bytes[p] for p in plan.saves], "gn_scheme": getattr(bound, "gn_scheme", None),
+                  "pass_rows": [ps.rows for ps in plan.passes],
                   "stats": stats.as_dict()})
     logging.info("[Monoload] VAE decode {} -> layer 1 ({}): {}; {}, workspace {}{}; arena {}, memory estimate {} (native {}), {:.2f}s".format(
         "x".join(str(d) for d in samples_in.shape), bound.name, plan.describe(), policy, fmt_bytes(ws),
@@ -610,6 +638,11 @@ def _check_api():
         for name in ("normal_attention", "pytorch_attention", "xformers_attention", "vae_attention"):
             if not callable(getattr(ldm_model, name, None)):
                 return "comfy.ldm.modules.diffusionmodules.model.{} missing".format(name)
+        for name in ("CastBiasWeightContext", "CastWeightBiasOp", "run_every_op"):
+            if getattr(comfy.ops, name, None) is None:
+                return "comfy.ops.{} missing".format(name)
+        if not issubclass(comfy.ops.disable_weight_init.GroupNorm, torch.nn.GroupNorm):
+            return "comfy.ops GroupNorm is not a torch.nn.GroupNorm"
         for name in ("raise_non_oom", "cuda_device_context", "soft_empty_cache", "dtype_size"):
             if not callable(getattr(mm, name, None)):
                 return "comfy.model_management.{} missing".format(name)

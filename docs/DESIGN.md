@@ -385,7 +385,7 @@ CPU 上计算 dtype 是 fp32，默认路径在 fp32 下合并、不舍入回 fp1
 
 | 层 | 适用 | 做法 | 状态 |
 |---|---|---|---|
-| 第一层：条带解码 | 认得的结构（LDM `Decoder`、Wan `Decoder3d` 单帧） | 低分辨率前缀（含 mid 全局注意力）整图算；只在每个分辨率阶段末尾存档；按输出条带倒推每层所需的输入行区间并重算；GroupNorm 的全局统计逐层空跑求得（条带内 fp32 Welford，跨条带 Chan 合并）；按峰值预算自动选条带高度和存档方案，满足不了就报错 | **第二阶段已实现 Wan `Decoder3d` 单帧（§9.13）**；第三阶段做 LDM |
+| 第一层：条带解码 | 认得的结构（LDM `Decoder`、Wan `Decoder3d` 单帧） | 低分辨率前缀（含 mid 全局注意力）整图算；只在每个分辨率阶段末尾存档；按输出条带倒推每层所需的输入行区间并重算；GroupNorm 的全局统计逐层空跑求得（条带内 fp32 Welford，跨条带 Chan 合并）；按峰值预算自动选条带高度和存档方案，满足不了就报错 | **第二阶段已实现 Wan `Decoder3d` 单帧（§9.13）**；第三阶段已实现 LDM（§9.14，待真机） |
 | 第二层：逐算子分块 | 不认识结构也能用 | 原 forward 原样运行，只在受管理的解码过程中替换重算子：卷积按输出行分块，限制 im2col 工作区；注意力按 query 分块，K/V 完整，每个 query 仍对全图做 softmax。整图语义不变，算量约 1 倍 | 第一阶段实现（真机验收通过，§9.12） |
 | 兜底 | 前两层都处理不了 | 原生整图解码（结果本身正确），打一条日志 | 第一阶段实现 |
 
@@ -543,7 +543,7 @@ loop:
 3. 精度：`monoload vs native` 与 `native2 vs native` 的量级对比，块边界附近有没有系统性误差。——PSNR ≥ 60 dB，没有接缝；max|Δ| 离群点经 fp32 参照确认是 bf16 固有噪声。
 4. 速度：冷/热耗时与原生相比。——低分辨率慢 1–4%，高分辨率快 9–17%。
 
-### 9.11 后两阶段计划（第二阶段已完成，见 §9.13）
+### 9.11 后两阶段计划（第二阶段已完成，见 §9.13；第三阶段的实际做法见 §9.14）
 
 * **共同部分。** 结构识别按真实模块（类型、通道、kernel、stride、padding、norm、注意力）而不是文件名；每种结构第一次使用时用小 latent 和原生对比自检，不通过就对这个 VAE 禁用第一层、醒目警告，退回第二层。适配接口是 `vae.STRIPE_ADAPTERS`（`match` / `self_test` / `plan` / `run`），第二阶段登记了 Wan 2.1 的适配器。
 * **第二阶段：Qwen（Wan `Decoder3d` 单帧）。** 已实现，见 §9.13。
@@ -905,3 +905,92 @@ reserved（GTT）由 PyTorch 的缓存分配器决定，不能只靠存活量模
 适配器接口写在 `vae_engine.py` 的模块注释里。`vae.py` 只经过接口：`_layer1_self_test` 调 `vae_engine.self_test`，自检的显存是 `bound.selftest_memory()`，输出缓冲是 `bound.output_bytes()`（原来的 `_out_bytes` / `_selftest_memory` 去掉了）。`tests/alloc_sim.py` 经过 `vae._select_layer1` 选适配器，不再直接调用某个适配器的 `match`。
 
 执行顺序与原来逐行相同（前缀 → 释放 latent 副本 → 第一次分配输出缓冲 → 条带），所以分配顺序不变。验证：`tests/alloc_sim.py` 的 33 行校验表与拆分前逐字相同；`tests/test_vae_stripe.py` 73 项全过，每一行输出（含误差数字）与拆分前相同（只差计时）；`test_vae.py` 131 项、`test_entry.py` 7 种开关组合、`test_dtype_paths.py` 两种模式全过。
+
+#### 9.14.2 结构核对（62b3c94）与识别
+
+`comfy.sd.VAE` 对 SD1.5 / SDXL 建 `AutoencoderKL`（`AutoencodingEngineLegacy`，`post_quant_conv` 1×1 后接 decoder），对 Flux `ae` / SD3 建 `AutoencodingEngine`（直接 decoder），decoder 都是 `comfy.ldm.modules.diffusionmodules.model.Decoder`。逐行核对了 4D 输入、`conv3d=False` 时的执行路径：
+
+* `Decoder.forward`：`conv_carry_causal_3d([z], conv_in)` 对非 `CarriedConv3d` 就是 `conv_in(z)`；`mid.block_1(h, temb=None)` → `mid.attn_1(h)` → `mid.block_2`；`carried=False` 时 `h = [h]`，循环只跑一次；每级 `block[i](h, None, None, None)`，`attn` 为空时不调用；`i_level != 0` 时 `upsample(h, None, None)`；最后 `norm_out` → `nonlinearity`（`F.silu`，不是原地）→ `conv_out`；`tanh_out=False` 时没有 tanh。
+* `ResnetBlock.forward`（`temb=None`）：`norm1 → swish（SiLU(inplace=True)，作用在 norm1 的新输出上）→ conv1 → norm2 → swish → dropout（inplace，eval 时不做事）→ conv2`，`in != out` 时 `nin_shortcut(x)`（1×1），最后 `x + h`。`x` 不被原地修改。
+* `Upsample.forward`：4D 时 `interpolate(x, scale_factor=(2.0, 2.0), mode="nearest")`，然后 3×3 conv。
+* GroupNorm 是 `comfy.ops` 的 `GroupNorm`（`torch.nn.GroupNorm` 子类，32 组、eps 1e-6、affine）；有 cast / weight_function 时走 `forward_comfy_cast_weights`：`CastBiasWeightContext` 里 `F.group_norm(input, num_groups, weight, bias, eps)`。
+
+拆点与 Wan 相同：**前缀**（整图，H/8）是 `[post_quant_conv,] conv_in, mid.block_1, mid.attn_1, mid.block_2, up[L-1].block[*]`，存档是它的输出（512 通道）；**条带部分**的单元依次是 `up[L-1].upsample`、各级的 ResnetBlock 和 Upsample、`norm_out`、`nonlinearity`、`conv_out`（SDXL：15 个单元）。halo：ResnetBlock 2、Upsample 1（输出分辨率上）、`conv_out` 1、norm / silu 0。
+
+**识别**（`vae_ldm.ldm_structure`，任何一项不符就走第二层，日志写原因）：
+
+* `first_stage_model` 的类型恰好是 `AutoencoderKL` / `AutoencodingEngineLegacy` / `AutoencodingEngine`；decoder 恰好是 `Decoder`；`post_quant_conv`（有的话）是 1×1、通道对得上；没有 `bn`（Flux 2 的 `batch_norm_latent`）。
+* 非默认分支一律不认：`carried`（3D conv / 时间维）、`tanh_out`、`give_pre_end`（这个版本没有这个属性，别的版本有的话为 True 也不认）、up 级里有注意力（`attn_resolutions`）、Upsample 的 scale 不是 2.0 或没有 conv、`conv_shortcut`（3×3 shortcut）。VideoDecoder 一类类型不同，直接不认。
+* 每个 ResnetBlock：norm1 / norm2 是 affine 的 `GroupNorm`、通道整除组数；conv1 / conv2 3×3、stride 1、padding 1、zeros；通道对得上；swish 是 SiLU；Dropout 处于 eval 或 p=0；通道变化时 `nin_shortcut` 1×1。mid 的 AttnBlock 类型恰好是 `AttnBlock`、q/k/v/proj 1×1。`norm_out`、`conv_out` 同样检查。
+* 模型上没有 forward hook、实例级 forward；没有 vae_options；latent 4D、通道数对得上。
+
+#### 9.14.3 GroupNorm 统计量跨条带调度：一个参数化的机制
+
+条带部分有 19 个 GroupNorm（9 个 ResnetBlock 各两个 + `norm_out`），每个都要它的输入在**整张图**上每组的均值和方差，而它的输入又依赖前面所有 GroupNorm 的统计量。做法：
+
+* **统计遍。** 按调用顺序，对每个 GroupNorm 跑一遍：从最近的存档出发，按条带算出这个 GroupNorm 的输入（前面的 GroupNorm 都已有统计量），只在每条带的「核心行」上累加统计量，算完冻结。norm1 / `norm_out` 的输入就是单元的输入；norm2 在 ResnetBlock 内部，统计遍的最后一步是一个「部分单元」`norm1 → swish → conv1`（halo 1，同样调用原模块实例）。
+* **最后一遍**从最后一个存档出发，按输出条带解码，所有 GroupNorm 都用冻结的整图统计量。
+* **方案 = 存档位置。** A / D / B / C 是同一个机制，只是「哪些单元的输入整张存下来」不同（`vae_ldm.scheme_positions`）：A 不存（每遍都从 H/8 存档出发），D 存 H/4 级的输出，B 存 H/4、H/2 级的输出，C 再加全分辨率每个残差块的输出。每遍从不超过目标位置的最近存档出发。
+* **存档不需要额外的遍。** 某个位置的存档在「第一个经过它、且它之前的 GroupNorm 都已冻结」的统计遍里顺便写好（每条带把它在该位置的核心行拷进去），之后的遍从它出发，更早的存档随即释放。所以 HANDOFF 表里的「20 + 1 / 20 + 2 / 20 + 4 遍」都是 19 个统计遍 + 1 个最后一遍。
+* **核心行**：统计遍的条带按目标位置的行均分；在更低分辨率的位置上，核心行是 `[⌊t0·h_p/h_t⌋, ⌊t1·h_p/h_t⌋)`。因为倒推的需求区间包含这个范围（逐级 floor 可以合并），存档拷贝和统计都只用精确行，每行恰好被一条带计入一次。
+* **统计遍的条带高度**单独选：先算每遍用 1 行条带时也躲不开的峰值（它持有的存档 + 最小的条带），与前缀、最后一遍的峰值取最大，作为上限；每遍在这个上限内取最高的条带（二分）。所以统计遍不抬高峰值，低分辨率的遍用很高的条带、少算重复的 halo。遍的代价只依赖几何和它自己的条带，按结构缓存，规划一次 4K 解码 < 0.6 s（第一次），之后是查表。
+* **存档放在哪：两种布局，取 arena 小的那个。** 存档是大块、长寿命的分配，处理不好会把 arena 切碎（越来越大的存档 H/4 → H/2 → H 放不进前面释放的洞：C 不处理时要 1.37 倍存活量的 arena）。
+  * 分开：每个存档单独分配，没人再从它出发就释放；arena 另加「新存档分配时已经释放、但比它小的存档」的总大小作为余量（这些洞它用不上）。
+  * 存档池：所有存档放进一次分配的池，按槽轮换（一个存档只和它的前一个同时存活，两个槽就够）；没有洞，但池从第一个存档起整块占到最后。
+  * 每个计划两种都算（各自的统计遍条带高度也随之重选），用 arena 小的。SDXL 4K 默认计划：D 只有一个存档，两种一样；B 选「分开」（池会让最后一遍多占 H/4 的槽，2.57 → 2.17 GiB）；C 选「池」（分开要 1.37 倍，池 4.70 GiB，代价是早期统计遍的条带变矮，重算 4.0 → 5.7 倍）。
+
+#### 9.14.4 统计量的数值，GroupNorm 的替换
+
+* **统计量：fp32，shifted data + 块内 var_mean + Chan 合并。** 每组先取第一块的均值 K 作为平移量；每块（≤ 工作区的行数）拷成 fp32、原地减 K，用 `torch.var_mean`（PyTorch 的 Welford / 两遍归约）得到块的均值和 M2；块与块、条带与条带之间用 Chan 等人的成对合并（`d = m_b − m_a，mean += d·n_b/n，M2 += M2_b + d²·n_a·n_b/n`）。理由：`E[x²] − E[x]²` 在均值远大于标准差时灾难性抵消（测试里均值 1000、标准差 0.01 时相对误差 1.9e3）；Chan 合并本身不相减两个大和；平移让合并的量都很小，否则累计均值的 fp32 舍入（1000 附近 6e-5）会通过 d² 项放大（不平移时同一测试 1.2e-3，平移后 ≤ 1e-5 的检查通过）。方差是有偏的 `M2/n`，与 GroupNorm 一致。
+* **应用：与 ATen 的 GroupNorm 内核相同的算法。** 有了每组的 mean / rstd（`rsqrt(var + eps)`），每通道 `a = rstd·weight，b = bias − mean·a`（fp32），`y = x·a + b` 用 fp32 的 `addcmul` 算、写回 x 的 dtype（ATen CUDA 的 `ComputeFusedParams` 就是这样，bf16 输入时内部用 float）。按行分块，每块的 fp32 临时量 ≤ 工作区。
+* **有意偏离「模块原样调用」。** GroupNorm 在条带上原样调用会用条带自己的统计量（这正是 tiled 不等价的原因），所以在受管理的第一层解码期间（`vae_engine.GlobalNorms`，只在 `stripe_pass` 里），条带部分的 19 个 GroupNorm 实例各设一个实例属性 `forward`：先走模块自己的权重路径（`comfy.ops` 的 `run_every_op`、`CastBiasWeightContext`，即 cast / weight_function / bias_function，包括 Monoload 的运行时 LoRA；普通 `torch.nn.GroupNorm` 直接用参数），再按冻结的统计量做上面的计算。没有统计量就调用是内部错误。退出（含异常）时删掉实例属性。前缀里的 GroupNorm（整图）不替换，原生计算。其余模块（卷积、上采样、SiLU、残差块本身）仍原样调用在切片上。
+* **兜底：fp32 自检。** 每种结构 + 方案在本进程第一次使用时，用 fp32 副本、24×24 latent、40 行条带（5 条）、8 MiB 工作区跑完整的 19 个统计遍 + 最后一遍，与原模型类自己的 `decode`（`AutoencoderKL.decode` / `AutoencodingEngine.decode`，在副本上）整图比，相对误差 ≤ 1e-4（实测 1e-6 量级）。测试里故意注入的三种错误都被抓到：统计量只用条带自己的（tiled 式）、丢掉一条带的统计、halo 少一行。
+
+#### 9.14.5 内存模型与 arena
+
+* **单元的存活量**按 62b3c94 的 forward 数（`vae_ldm.py` 注释）：ResnetBlock `S + max(A + G, A + B + 卷积额外, 2B + G, 2B + 卷积额外, 2B，有 nin_shortcut 时再加 2B + 1×1 权重、3B)`，G 是冻结统计量 GroupNorm 的 fp32 块（前缀里原生 GroupNorm 为 0）；Upsample 与 Wan 的 Resample 相同；norm_out `S + A + G`；silu `S + A`；conv_out 与 Wan 的 head 卷积相同；注意力与 Wan 相同。统计遍的末尾另加目标张量 + fp32 统计块。
+* **两个修正（模拟器发现的）：** (1) `nin_shortcut` 是 1×1 卷积，第二层从不分块它，Slow2d 会把非连续的行切片整份拷一份——共用的 `conv_extra` 把它当成按行分块，低估了（fp32 1344、256 行时存活量低估 10.5%）。(2) 这份拷贝发生在残差块的最后，arena 已被块内的临时量切碎，它常常放不下（4K A 需要 1.15 倍存活量的 arena）。改成：有 `nin_shortcut` 的残差块在调用前把行切片拷成连续的（`Unit.contiguous`，与 Upsample 单元一样），Slow2d 不再拷；4K A 需要的 arena 降到 1.07 倍。修正后模型与模拟的张量峰值差 −0.1% … +0.7%。这两处只在 LDM 适配器里，Wan 的模型不变。
+* **arena**：没有存档的计划（A，以及 Wan）照旧 `存活量 + 存活量/32 + 64 MiB`；有存档的计划（D / B / C）用 `/16`（存档把 arena 切成几段，模拟里最多要存活量 + 9.5%），「分开」布局再加上面的余量。估算仍是 `arena + largest + 16 MiB`，largest 里包括最大的存档（或整个池）。
+
+#### 9.14.6 模拟结果（`tests/alloc_sim.py`）
+
+**模拟器先对上第二层的真机读数。** SDXL / Flux 的 meta 构造（`--model sdxl|flux`）复现了 18 个读数，误差都 ≤ 0.02 GiB：README §10.1 的 SDXL / Flux 三档（af9abc6，分块卷积在第一块之后才分配输出），以及 workspace 实验 K 的 SDXL 十二个 GTT 读数（1G / 512M / 256M / 128M × 三档），包括 4K「工作区越小 reserved 反而越高」（14.97 / 15.84 / 15.40 / 15.30，实测 14.99 / 15.86 / 15.42 / 15.32）。§10.1 和实验 K 的 4K 相差 0.13 GiB，正是 85a5c6f 改了分块卷积输出的分配顺序：模拟器用两种顺序分别得到 14.84 和 14.97。
+
+**第一层各方案（SDXL bf16，默认条带策略，GiB；reserved 就是 arena）：**
+
+| 方案 | 1344×768：reserved / 估算 / 重算 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| A（默认） | 0.47 / 0.61 / 11.9× | 0.79 / 0.99 / 12.1× | 1.10 / 1.48 / 12.1× |
+| D | 0.54 / 0.68 / 8.0× | 1.01 / 1.27 / 8.1× | 1.52 / 2.03 / 8.1× |
+| B | 0.62 / 0.76 / 5.1×（分开） | 1.33 / 1.84 / 5.1×（分开） | 2.17 / 3.18 / 5.3×（分开） |
+| C | 0.79 / 1.30 / 5.9×（池） | 2.44 / 4.42 / 5.2×（池） | 4.70 / 8.67 / 5.7×（池） |
+
+Flux 与 SDXL 只差 latent 通道，数字相同到 0.01。重算是整个 decoder 的卷积算量相对整图解码（前缀算一次）；HANDOFF 粗估的「条带部分」倍数与之量级一致（A 13×、D 9–10×、B 6×、C 4.5×）。
+
+**4K 的方案 × 条带高度：** A 在 32 / 64 / 96 行时都是 1.06 GiB（13.1× / 12.5× / 12.3×），D 是 1.09 / 1.22 / 1.36 GiB（10.3× / 9.0× / 8.5×）。4K 的峰值下限约 1.05 GiB，由整图前缀（全局注意力）和输出缓冲决定；D 用 32 行条带也能到下限，算量比 A 少。默认规则（128 行条带的峰值为目标）是第二阶段按 Wan 的速度定的，对 LDM 是否合适要看真机（命令 N / O）。
+
+**估算是 reserved 的上界：** 202 个计划（SDXL 1024² / 1344 / 1920×1088 / 2688 / 4K × bf16 / fp32 × 四种方案 × 默认 / 32 / 128 / 256 行，加工作区 64 MiB、Flux、8K），reserved 全部 ≤ 估算；只有 2 个计划有一个请求落在 arena 外（fp32 4K 强制 256 行，余量 13 MiB；8K 方案 D），都被估算里的 largest 盖住，与 Wan 8K 默认计划的情形相同。
+
+**存活量模型与模拟的张量峰值：** 修正后（§9.14.5）差 −0.1% … +0.7%。
+
+**规划耗时：** 每遍的代价只与几何和它自己的条带有关，按结构缓存；条带的代价按「每个单元跑多少行」的模式去重。4K 一次 `choose_plan` 第一次 < 0.6 s（修正前 10 s），之后是查表。
+
+#### 9.14.7 默认值与开关
+
+* **方案：默认 A**（`vae_ldm.DEFAULT_SCHEME`）。按用户定的优先级「峰值优先」，在现有的默认条带规则下 A 在每个分辨率上峰值都最低（§9.14.6）。`MONOLOAD_VAE_GN_SCHEME=A|B|C|D` 选别的方案（大小写都行，不认识的值打警告、用默认）；bench 的模式名加 `-g<S>`（`monoload-gD`、`monoload-r32-gA`），`--gn-schemes ADBC` 一条命令扫遍。
+* **条带高度：沿用第二阶段的默认规则**（以 128 行条带的 arena 为目标，取不超过它的最高条带），预算 `MONOLOAD_VAE_BUDGET`、强制高度 `MONOLOAD_VAE_STRIPE_ROWS` 照旧且优先；统计遍的条带高度由引擎在这个峰值内自动取（§9.14.3）。
+* **工作区**：第一层照旧 128 MiB（`LAYER1_WORKSPACE`）；GroupNorm 的 fp32 块也受它限制。
+* **自检**按「结构 + 方案」缓存：换方案会重新自检一次。
+* **OOM**：与 Wan 相同，条带高度和工作区一起减半重试（统计遍的条带随之变矮），到 8 行 / 64 MiB 抛 `MonoloadVAEOOMError`；不退回 tiled，不退回第二层。
+* **日志**：启动时写明 LDM 也走第一层和当前方案；每次解码 `-> layer 1 (LDM stripes, GroupNorm scheme A): 17 stripes of 128 rows (core), recompute 12.1x, checkpoint 127 MiB; 19 statistics passes, saves none; ...`；不认的结构 `VAE layer 1 (stripes) not used for AutoencoderKL: ...; decoder.up[1] has attention -> layer 2`（两个适配器的原因都列出）。
+
+#### 9.14.8 测试（`tests/test_vae_ldm.py`，CPU，不需要模型文件）
+
+见 README §8 的结果。要点：统计量（Moments 对 fp64，含均值远大于标准差的情形；冻结统计量的 GroupNorm 对 `F.group_norm`，fp32 / bf16、整图 / 行切片；`GlobalNorms` 走 weight_function 路径、退出复原、缺统计量报错）；识别（11 种不认的结构都走第二层且与原生一致）；整个 decoder 与原生 `VAE.decode`（SDXL 式 / Flux 式，四种方案，条带 1 / 7 / 40 / 默认，奇数、很小的 latent、batch 2、ch 64、16 KiB 工作区）；bf16 对 fp32 真值与原生 bf16 同一水平；自检抓住三种注入的错误；SDXL 4K 全尺寸的计划（19 遍、各方案的存档数、峰值与重算的顺序）；OOM；开关；分配器模拟（第二层复现真机、第一层 reserved ≤ 估算）。`tests/test_vae_stripe.py`（Wan）照旧全过，Wan 的模拟校验表与拆分前相同。
+
+#### 9.14.9 限制与待真机确认
+
+* **速度。** 方案 A 的卷积算量约是整图解码的 12 倍（D 约 8 倍、B 约 5 倍、C 约 4–6 倍）。耗时不与算量成正比（大 GEMM 效率高、第二层本身在 4K 比原生快），只能真机测：4K 的 A 可能要一两分钟。这是「峰值优先、多算可以接受」的代价，默认值要看真机数据再定。
+* **arena 和估算是用模拟器验证的**（§9.14.6 的网格），不是证明；模拟器对 LDM 第二层复现了 18 个真机读数，第一层的 LDM 读数要等这一轮真机测试。
+* **统计量与原生不逐位一致**：累加顺序不同（fp32），和原生 GroupNorm 内核的差在 1e-6 量级（fp32 测试），bf16 下由 bench 的 `--fp32-ref` 判断。
+* 只认 2D 图像的 LDM decoder；3D（carried / VideoConv3d）、up 级带注意力、`tanh_out` 等非默认分支走第二层。Flux 2 的 `batch_norm_latent` 也走第二层（可以以后加，它只是 decoder 之前的逐点变换）。
