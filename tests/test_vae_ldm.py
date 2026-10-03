@@ -612,6 +612,12 @@ def budget_plan_tests():
     i = alloc_sim.decode_trace(3840, 2160, "bf16", 180, model="sdxl", scheme="B", ws=128 << 20)
     check("SDXL 4K budget 3 GiB plan (B, 180 rows, workspace 128 MiB): simulated reserved {:.2f} GiB <= estimate {:.2f} GiB".format(
         i["reserved"] / G, i["estimate"] / G), i["reserved"] <= i["estimate"] <= 3 * G)
+    # a very tall B plan: the dead saves' holes are useless to its temporaries (Plan.front_arena), few stripes / a large
+    # workspace fragment more (arena_bytes); 4K B with 540 / 768 rows stranded several requests before (DESIGN §9.14.11)
+    for rows, ws in ((540, 128), (768, 64)):
+        i = alloc_sim.decode_trace(3840, 2160, "bf16", rows, model="sdxl", scheme="B", ws=ws << 20)
+        check("SDXL 4K B {} rows, workspace {} MiB: simulated reserved {:.2f} GiB <= estimate {:.2f} GiB (arena {:.2f})".format(
+            rows, ws, i["reserved"] / G, i["estimate"] / G, i["arena"] / G), i["reserved"] <= i["estimate"])
 
 
 def estimate_tests():
