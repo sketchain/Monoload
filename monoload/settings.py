@@ -59,6 +59,29 @@ def set_master(on):
     _MASTER[0] = bool(on)
 
 
+_GLOBAL = {"exact": env_flag("MONOLOAD_EXACT"), "keep": env_flag("MONOLOAD_KEEP_LORA")}
+
+
+def exact():
+    """Global default of the LoRA merge: bit-exact (MONOLOAD_EXACT=1) or the fused default."""
+    return _GLOBAL["exact"]
+
+
+def set_exact(on):
+    """Tests / bench; MONOLOAD_EXACT at import. Takes effect at the next layer call."""
+    _GLOBAL["exact"] = bool(on)
+
+
+def keep():
+    """Global default after a prompt: keep the LoRA state (MONOLOAD_KEEP_LORA=1) or release it."""
+    return _GLOBAL["keep"]
+
+
+def set_keep(on):
+    """Tests; MONOLOAD_KEEP_LORA at import."""
+    _GLOBAL["keep"] = bool(on)
+
+
 def disabled():
     """MONOLOAD_DISABLE=1: nothing installed, nodes pass through."""
     return env_flag("MONOLOAD_DISABLE")

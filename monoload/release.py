@@ -22,10 +22,15 @@ finished (successfully or not), release_after_prompt():
      current_weight_patches_uuid for patch-free loaded patchers +
      soft_empty_cache.
 
-Whether it runs is decided after every prompt (enabled()): not with the
-master switch off (MONOLOAD=0: native ComfyUI keeps LoRA state between
-prompts), not with MONOLOAD_KEEP_LORA=1 (the global default "keep"; read at
-import, set_keep() for tests). Otherwise the wrapper only adds the call.
+What is released is decided per patcher (lora_overrides.wants_release): a
+Monoload LoRA Settings node's after_prompt (release / keep), else the global
+default -- release for patchers Monoload drives unless MONOLOAD_KEEP_LORA=1,
+keep for native ones (MONOLOAD=0, or mode native: native ComfyUI keeps the
+LoRA state between prompts). Hook-LoRA groups (no patcher of their own) and
+the loaders' file caches follow the global default (enabled()); the file
+caches are also cleared whenever anything was released. With nothing to
+release possible (global default keep and no node used in this process)
+the wrapper returns at once.
 """
 
 import gc
@@ -40,25 +45,24 @@ import comfy.model_management
 import comfy.model_patcher
 from comfy.model_patcher import ModelPatcher
 
-from . import settings
+from . import lora_overrides, settings
 
 _ORIG = {}
-_KEEP = [settings.env_flag("MONOLOAD_KEEP_LORA")]
 
 
 def keep():
     """The global default: LoRA state kept between prompts (MONOLOAD_KEEP_LORA=1)."""
-    return _KEEP[0]
+    return settings.keep()
 
 
 def set_keep(on):
     """Tests; MONOLOAD_KEEP_LORA at import."""
-    _KEEP[0] = bool(on)
+    settings.set_keep(on)
 
 
 def enabled():
-    """Release LoRA after this prompt: master switch on and not MONOLOAD_KEEP_LORA."""
-    return settings.master() and not _KEEP[0]
+    """The global default after a prompt: release (master switch on and not MONOLOAD_KEEP_LORA)."""
+    return settings.master() and not settings.keep()
 _MAX_DEPTH = 8
 
 
@@ -83,25 +87,34 @@ def _hook_group_has_weights(g):
     return False
 
 
-def carries_lora(value, depth=0):
+def _releasable(p):
+    return patcher_has_weight_patches(p) and lora_overrides.wants_release(p)
+
+
+def carries_lora(value, depth=0, glob=None):
+    """`value` holds LoRA state that is to be released: a patcher with weight
+    patches whose settings say release, or a weight-hook group while the
+    global default is release."""
+    if glob is None:
+        glob = enabled()
     if depth > _MAX_DEPTH or value is None or isinstance(value, (torch.Tensor, str, bytes, int, float, bool)):
         return False
     if isinstance(value, ModelPatcher):
-        return patcher_has_weight_patches(value)
+        return _releasable(value)
     if isinstance(value, comfy.hooks.HookGroup):
-        return _hook_group_has_weights(value)
+        return glob and _hook_group_has_weights(value)
     if isinstance(value, comfy.hooks.Hook):
-        return getattr(value, "hook_type", None) == comfy.hooks.EnumHookType.Weight
+        return glob and getattr(value, "hook_type", None) == comfy.hooks.EnumHookType.Weight
     patcher = getattr(value, "patcher", None)
     if isinstance(patcher, ModelPatcher):  # CLIP, VAE, ...
-        if patcher_has_weight_patches(patcher):
+        if _releasable(patcher):
             return True
         hooks = getattr(value, "apply_hooks_to_conds", None)
-        return hooks is not None and _hook_group_has_weights(hooks)
+        return glob and hooks is not None and _hook_group_has_weights(hooks)
     if isinstance(value, dict):
-        return any(carries_lora(v, depth + 1) for v in value.values())
+        return any(carries_lora(v, depth + 1, glob) for v in value.values())
     if isinstance(value, (list, tuple)):
-        return any(carries_lora(v, depth + 1) for v in value)
+        return any(carries_lora(v, depth + 1, glob) for v in value)
     return False
 
 
@@ -134,6 +147,8 @@ def _release_loaded_models():
         if p is None:
             continue
         if not patcher_has_weight_patches(p) and not _model_has_runtime_patches(p.model):
+            continue
+        if not lora_overrides.wants_release(p):
             continue
         model = p.model
         if getattr(model, "model_lowvram", False):
@@ -195,10 +210,11 @@ def _drop_key(cache, key):
 
 def _release_outputs(outputs_cache):
     n = 0
+    glob = enabled()
     for c in _iter_caches(outputs_cache):
         for key, entry in list(c.cache.items()):
             outs = getattr(entry, "outputs", entry)
-            if carries_lora(outs):
+            if carries_lora(outs, glob=glob):
                 _drop_key(c, key)
                 n += 1
     return n
@@ -236,11 +252,14 @@ def _sync_clean_loaded_models():
 
 
 def release_after_prompt(executor):
+    glob = enabled()
+    if not glob and not lora_overrides.used():
+        return {"models": 0, "outputs": 0, "objects": 0, "synced": 0}
     t0 = time.perf_counter()
     n_models = _release_loaded_models()
     caches = getattr(executor, "caches", None)
     n_out = _release_outputs(getattr(caches, "outputs", None))
-    n_obj = _release_objects(getattr(caches, "objects", None))
+    n_obj = _release_objects(getattr(caches, "objects", None)) if glob or n_models or n_out else 0
     n_sync = 0
     if n_models or n_out or n_obj:
         gc.collect()  # LoRA clones die here; LoadedModels of clean clones switch to their parents
@@ -273,8 +292,7 @@ def install():
             return await orig(self, prompt, prompt_id, extra_data, execute_outputs)
         finally:
             try:
-                if enabled():
-                    release_after_prompt(self)
+                release_after_prompt(self)
             except Exception:
                 logging.exception("[Monoload] releasing LoRA after the prompt failed")
 

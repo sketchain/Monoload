@@ -1145,3 +1145,27 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 **测试（`tests/test_master_switch.py`，18 项）：** 解析；`MONOLOAD=0` 且没有节点时，带 LoRA 的两层 `comfy.ops` 模型在整体加载、lowvram 加载（`lowvram_model_memory=1`）、Hook LoRA、撤掉 hook 四种情况下的输出与卸掉钩子的原版逐位相同，备份数相同，撤掉后权重逐位还原、没有残留的 weight function；VAE 解码逐位相同、没有 INFO 日志；释放只在开启且不保留时运行；包装开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `auto` 打开、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 透传。`tests/test_entry.py` 加了 `MONOLOAD=0` 组合，并改成检查每种组合下都装上、全局默认对得上。
 
+## 11. Monoload LoRA Settings 节点：按模型决定 LoRA 怎么处理（lora-settings-node）
+
+**设置存在哪里：** 节点输出 `model.clone()`（CLIP：`clip.clone()`，也就是克隆它的 patcher），在 clone 的 `model_options["monoload_lora"]` 里放一个只含明确选了的项的 dict（`monoload/lora_overrides.py`）。选 `model_options` 是因为 `ModelPatcher.clone()` 用 `deepcopy_list_dict` 复制它：`LoraLoader` / `LoraLoaderModelOnly`（`comfy.sd.load_lora_for_models` 里 `model.clone()` + `add_patches`）、`CLIP.clone()`、采样时的 clone 都会带上，所以节点放在 LoRA 加载器前后都行（测试两种位置都确认）。没有选 `attachments`：clone 时只是按引用复制，能用但语义上是「附加对象」；也没有用对象属性：clone 不复制。
+
+**patches_uuid：** 设置和上游不同的 clone 换一个新的 `patches_uuid`。原因：同一个底模的两个 clone 共享 `self.model`，ComfyUI 切换时看 `model.current_weight_patches_uuid` 是否等于新 patcher 的 `patches_uuid` 决定要不要先还原权重（`partially_load` 里 `unpatch_weights`）。只改设置、不换 uuid 的话，切到另一个 clone 时不会重新加载，上一个 clone 的处理方式（运行时 patch 或烘焙进权重）会留下来。换了 uuid，切换时先 `unpatch_model`（原生还原备份——备份字典在 clone 之间共享——再由 `_unpatch_model` 按模型上的 `_monoload_runtime` 标记去掉运行时 patch），再按新 clone 的方式加载。节点全留 `default` 时 uuid 不变（不触发重新加载）。
+
+**每项怎么取（`resolve`，逐项）：**
+
+| 项 | 节点选了 | 否则 |
+|---|---|---|
+| `mode` | `enable` / `native` | 总开关：开 → `enable`（default），`MONOLOAD=0` → `native`（env） |
+| `merge` | `fused` / `exact` | `MONOLOAD_EXACT=1` → `exact`（env），否则 `fused`（default） |
+| `after_prompt` | `release` / `keep` | 模式是 `native` → `keep`（和原版一样，来源同 mode）；否则 `MONOLOAD_KEEP_LORA=1` → `keep`（env），否则 `release`（default） |
+
+**运行时合并按 ModelPatcher 决定（核对过 hotpatch）：** 以前「是否接管」和「合并路径」都是全局的：`_active()` 只看类，`MonoloadRuntimePatch.__call__` 读全局 `_MODE["exact"]`。现在：
+
+* `_enabled(patcher)` = `lora_overrides.enabled(patcher)`：patcher 的 `mode`，没有就看总开关。所有替换的方法都经过 `_active()`（它先看 `_enabled`），`patch_weight_to_device`、`ModelPatcherDynamic.load` 也看。没有节点时就是总开关，行为与以前相同。
+* 合并路径：`_install_runtime_patch` 建 `MonoloadRuntimePatch` 时传入 `exact = lora_overrides.merge_exact(patcher)`（节点选了就是 True / False，没选是 None = 每次调用时读全局 `settings.exact()`，`set_exact()` 照旧立刻生效）。运行时 patch 每次 `load()` 都重新装（`_load` 清掉 `comfy_patched_weights`），所以总是对应当前加载的 patcher。
+* 全局默认的 `exact` / `keep` 挪到 `settings.py`（`hotpatch.set_exact` / `is_exact`、`release.keep` / `set_keep` 转发过去），`lora_overrides` 不导入 torch / ComfyUI。
+
+**prompt 结束后按 patcher 释放：** `release_after_prompt` 对每个已加载模型看 `wants_release(patcher)`；输出缓存里的 MODEL / CLIP 也按各自的 patcher 判断；没有 patcher 的 Hook LoRA 组按全局默认；`LoraLoader` 等的文件缓存（`loaded_lora`）在全局默认是释放、或者这次释放了任何东西时清掉（保留的模型的 LoRA 张量被它的 patches 引用着，清掉文件缓存不影响它，只是加载器重新执行时要重读文件）。全局默认是保留、而且这个进程里没用过 LoRA 节点时直接返回（`MONOLOAD=0` 不加节点时零开销）。原生模型的 `release`：`unpatch_model` 走原生，按备份逐位还原，然后照常指回底模。
+
+**测试：** `tests/test_lora_node.py`（19 项）用 `tests/make_synthetic_checkpoint.py` 生成的随机权重 SD1.5（真实结构，fp16，约 2 GiB）和一个 rank 4 的普通 LoRA（改 UNet 的 184 个权重、文本编码器的 72 个），走 ComfyUI 自己的 `CheckpointLoaderSimple` / `LoraLoader` / `LoraLoaderModelOnly`，CPU 上 8×8 latent 采一步。`exact` 和 `native` 与卸掉钩子的原版比较 `torch.equal`（TE 输出和 latent），`native` 的备份数（256）与原版相同；`fused` 与原版的相对差异 3e-4。用同一个合成模型跑了 `tests/test_release.py`（默认 / `MONOLOAD_KEEP_LORA=1` / `MONOLOAD_EXACT=1`）：42 / 22 / 42 项全过，默认行为没变。真机：`tests/check_lora_node.py`（README §9.8 的 V）。
+
