@@ -173,9 +173,9 @@ Load Checkpoint ──> Load LoRA（可以串好几个）──MODEL/CLIP──>
 
 | 接了什么 | 显示什么 |
 |---|---|
-| 什么都不接（或只接 `images`） | Monoload 版本和 commit、总开关状态、装上了哪些钩子，以及每一项全局默认值和来源（`env 变量=值` / `built-in` / `set at runtime`） |
-| `vae` | 这个 VAE 实际用的解码设置（逐项，带来源：`node` / `env ...` / `built-in`），以及**这个 VAE 对象**上一次解码的记录：第几层、方案、条带数和行数、工作区、估算、实测峰值（reserved 和 GTT 的增量）、耗时、OOM 重试次数；还没解码过就写 `not decoded yet` |
-| `model` | 挂在这个模型上的 LoRA（文件名 × 强度，按 `LoraLoader` / `LoraLoaderModelOnly` 加载的顺序）、被改动的权重数、mode / merge / after prompt 三项设置和来源、当前内存里的状态（Monoload 运行时合并 / 原生烘焙 + 备份数 / 没加载） |
+| 总是显示 | 开头：Monoload 版本和 commit、总开关状态；**最后**：装上了哪些钩子，以及每一项全局默认值和来源（`env 变量=值` / `built-in` / `set at runtime`）——接了 vae / model 时也有 |
+| `vae` | 这个 VAE 实际用的解码设置（逐项，带来源：`node` / `env ...` / `built-in`），以及**这个 VAE 对象**上一次解码的记录：第几层、方案、条带数和行数、工作区、估算、实测峰值（reserved 和 GTT 的增量）、耗时、OOM 重试次数；还没解码过就写 `not decoded yet`；当前模式下不生效的设置会标出来（`native` 时预算、方案、条带高度标「native 模式下不使用」，`layer 2 only` 时方案和条带高度标「只用第二层时不使用」）；所用的 GroupNorm 方案附一句说明 |
+| `model` | 挂在这个模型上的 LoRA（文件名 × 强度，按 `LoraLoader` / `LoraLoaderModelOnly` 加载的顺序）、被改动的权重数、mode / merge / after prompt 三项设置和来源（模式是 native 时 merge 标「不使用」）、当前内存里的状态（Monoload 运行时合并 / 原生烘焙 + 备份数 / 没加载） |
 | `images` | 不读内容，只用来**排顺序**：把 VAE Decode 的 IMAGE 接过来，Info 就在这次解码之后运行，显示的就是这次解码 |
 
 ```

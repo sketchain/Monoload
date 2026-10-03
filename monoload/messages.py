@@ -350,6 +350,8 @@ M = {
                  "存 H/4 和 H/2 级的输出——内置默认（SDXL 4K 约 2.2 GiB / 42 s）"),
     "scheme.C": ("also keeps every full-resolution block's input - most memory, fastest (SDXL 4K ~4.7 GiB / 36 s)",
                  "再存全分辨率每个块的输入——内存最高、最快（SDXL 4K 约 4.7 GiB / 36 s）"),
+    "info.unused_native": (" (not used in native mode)", "（原生模式下不使用）"),
+    "info.unused_layer2": (" (not used: layer 2 only)", "（只用第二层时不使用）"),
     "info.model_head": ("MODEL ({model}):", "MODEL（{model}）："),
     "info.lora_list": ("  LoRA: {items}", "  LoRA：{items}"),
     "info.lora_other": ("  LoRA: none from the LoRA loader nodes (other patches present)", "  LoRA：没有来自 LoRA 加载节点的（有其他 patch）"),
