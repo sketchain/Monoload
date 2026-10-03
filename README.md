@@ -89,7 +89,7 @@ docker logs comfyui 2>&1 | grep -i monoload
 | 设置 | 效果 |
 |---|---|
 | 不设，或 `MONOLOAD=1`（默认） | 所有模型和 VAE 用 Monoload 的默认策略：LoRA 运行时合并（快速路径，§5.1），每个 prompt 结束后释放 LoRA（日志 `[Monoload] released LoRA after prompt: ...`），VAE 解码管理（§12） |
-| `MONOLOAD=0` | **全局原生**：插件照常装上，但钩子把每个调用原样交给 ComfyUI。工作流里没有 Monoload 节点时，LoRA 和 VAE 的结果都与原版 ComfyUI **逐位一致**（权重原地合并 + 备份也是原生自己的），额外开销是每次调用多一次判断（实测 `patch_weight_to_device` 每次 +0.2 µs，`VAE.decode` 每次约 3 µs）。只有节点上**明确开启**的那个模型 / VAE（例如 VAE 节点的 `mode` 选 `auto`）走 Monoload |
+| `MONOLOAD=0` | **全局原生**：插件照常装上，但钩子把每个调用原样交给 ComfyUI。工作流里没有 Monoload 节点时，LoRA 和 VAE 的结果都与原版 ComfyUI **逐位一致**（权重原地合并 + 备份也是原生自己的），额外开销是每次调用多一次判断（实测 `patch_weight_to_device` 每次 +0.2 µs，`VAE.decode` 每次约 3 µs）。只有节点上**明确开启**的那个模型 / VAE（LoRA 节点的 `mode` 选 `enable`，VAE 节点的 `mode` 选 `auto`）走 Monoload |
 | `MONOLOAD_DISABLE=1` | 什么都不装（没有任何钩子），就是原版 ComfyUI。Monoload 节点仍然注册（保存的工作流照常能打开），但原样输出输入，日志里说明一次 |
 
 **优先级（逐项判断）：节点上明确选的 > 高级选项（环境变量，§13） > 内置默认。** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。节点上留在 `default`（跟随全局）的项继承全局设置。例如 compose 里设了 `MONOLOAD_EXACT=1`（VAE 全局走原生），某个 VAE 节点的 `mode` 选了 `auto`：这个 VAE 照样走 Monoload 的解码管理，其他 VAE 原生。
@@ -126,6 +126,33 @@ Load Checkpoint ──VAE──> Monoload VAE Settings (budget custom, budget_gi
 ```
 
 4K 的这次解码按预算选第一层方案 B、12 条 180 行（预测约 2.4 GiB、约 41 s，§13 的表；CT 700 实测 2.43 GiB、41.0 s）；工作流里直接接原 VAE 的解码仍是默认的方案 B、17 条 128 行（2.17 GiB）。
+
+### 4.2 节点用法：Monoload LoRA Settings（单独设置某个模型的 LoRA）
+
+全局设置对所有模型生效。要让某一个模型（和它的 CLIP）的 LoRA 用不同的处理方式，在工作流里加 **Monoload LoRA Settings** 节点（分类 `Monoload`）。典型接法：
+
+```
+Load Checkpoint ──> Load LoRA（可以串好几个）──MODEL/CLIP──> Monoload LoRA Settings ──MODEL──> KSampler
+                                                                               └─CLIP──> CLIP Text Encode
+```
+
+* 输入 MODEL（必接）、CLIP（可选）；输出 MODEL 和 CLIP。没接 CLIP 时 CLIP 输出是空的（`LoraLoaderModelOnly` 后面只接 MODEL 就行，不报错）。
+* 输出是 ComfyUI 的 clone：**共享权重**、不多占内存，**输入不变**，工作流里其他直接用输入的分支照旧按全局设置。
+* **放在 LoRA 加载器之前也可以**：设置存在模型的 `model_options` 里，ComfyUI 每次 clone（包括 `LoraLoader`、`LoraLoaderModelOnly` 内部的 clone 和 `CLIP.clone()`）都会复制它，所以 `Load Checkpoint → Monoload LoRA Settings → Load LoRA → KSampler` 和接在后面效果一样。节点可以串联：下游节点留在 `default` 的项沿用上游节点的值。
+
+| 选项 | 取值 | 含义 |
+|---|---|---|
+| `mode` | `default` / `enable` / `native` | `default`：跟随全局（默认开启；`MONOLOAD=0` 时原生）；`enable`：这个模型用 Monoload 的运行时合并（不改权重、不留备份），全局关着（包括 `MONOLOAD=0`）也打开；`native`：这个模型用 ComfyUI 自己的 LoRA 处理（权重原地合并 + 备份） |
+| `merge` | `default` / `fused` / `exact` | `default`：跟随全局（`MONOLOAD_EXACT`，没设就是 `fused`）；`fused`：默认的快速路径（普通 LoRA 一次融合的 fp16 `addmm_`，与原生差在 fp16 舍入量级，§5.1）；`exact`：与原生 ComfyUI **逐位一致**（每步更慢）。只在这个模型走 Monoload 时有意义 |
+| `after_prompt` | `default` / `release` / `keep` | `default`：跟随全局（走 Monoload 的模型释放，`MONOLOAD_KEEP_LORA=1` 时保留；原生的模型保留，和原版一样）；`release`：每个 prompt 结束后释放这个模型的 LoRA（底模继续常驻）；`keep`：保留到下一个 prompt |
+
+**优先级（逐项判断）：节点上明确选的 > 高级选项（§13） > 内置默认**，同 §4。例子：compose 里设了 `MONOLOAD=0`（全局原生），某个工作流的 SDXL 想用 Monoload 并且逐位一致：节点 `mode = enable`、`merge = exact`，`after_prompt` 留 `default`（这个模型走 Monoload，所以按全局默认释放）。
+
+* **按模型生效的合并方式**：运行时 patch 在装上时记下这个模型的 `merge`，同一个进程里一个模型用 `exact`、另一个用 `fused` 互不影响。
+* **同一个底模的两个 clone 设置不同时**（比如一个分支 `native`、一个分支 `enable`），设置不同的 clone 会换一个 `patches_uuid`，ComfyUI 在两者之间切换时会把权重还原再按各自的方式加载（测试确认交替加载各得各的结果，最后底模权重逐位还原）。
+* 日志：节点执行时打一行 `[Monoload] Monoload LoRA Settings: LoRA settings: mode enable (node), merge exact (node), after prompt release (default)`（括号里是来源：`node` / `env MONOLOAD=0` 等 / `default`）。
+* `MONOLOAD_DISABLE=1` 时节点原样输出输入的 MODEL / CLIP，日志说明一次。
+* 不在范围内的照旧：bypass LoRA（`LoraLoaderBypass`）不经过运行时合并；`force_patch_weights`（保存合并后的模型）在走 Monoload 的模型上照旧报错——这时把那个模型的 `mode` 设成 `native` 即可，不用重启（§6）。
 
 ## 5. 支持的范围
 
@@ -165,7 +192,7 @@ CT 700 实测（WAI v17 SDXL + Smooth Booster，788 层，4.77 GiB 被 patch 的
 | kind | 情况 | 怎么办 |
 |---|---|---|
 | `dynamic_vram` | 开了 DynamicVRAM（comfy-aimdo）的同时打 LoRA | 用 `--gpu-only`（目标配置），或 `MONOLOAD_DISABLE=1` |
-| `force_patch_weights` | 有节点要求把 LoRA 合并进权重：`ModelSave`、`CheckpointSave`、保存合并后的模型等 | 做这类操作时设 `MONOLOAD_DISABLE=1` 重启 |
+| `force_patch_weights` | 有节点要求把 LoRA 合并进权重：`ModelSave`、`CheckpointSave`、保存合并后的模型等 | 在这个模型前面加 Monoload LoRA Settings，`mode` 选 `native`（§4.2）；或设 `MONOLOAD=0` / `MONOLOAD_DISABLE=1` 重启 |
 | `lora_non_comfy_ops_param` | LoRA 改到的参数不属于 `comfy.ops` 层（没有运行时合并路径） | 设 `MONOLOAD_DISABLE=1` |
 | `lora_shape_change` | patch 会改变权重形状 | 同上 |
 
@@ -210,6 +237,7 @@ MODELS=/path/to/models tests/run_all.sh
 | `tests/test_vae.py` | VAE 解码管理（§12），不需要模型文件：分块卷积 / 分块注意力与不分块的结果一致（含各种 kernel、stride、dilation、groups、padding、cast 路径 + weight_function、Wan CausalConv3d）；用 ComfyUI 自己的 LDM `Decoder` / `WanVAE`（小通道、随机权重）构造 SDXL 式、Flux 式、Qwen 式 VAE，受管理的解码与原生 `VAE.decode` 比较；多帧交给原生、OOM 缩小分块重试、下限时报错、绝不调用 tiled |
 | `tests/test_vae_stripe.py` | VAE 第一层（§12.7），不需要模型文件：区间倒推对照暴力依赖展开；每个单元（残差块、上采样、head 卷积）在任意切片上「有效行」与整图逐行一致、紧邻的下一行不一致；用 ComfyUI 的 `WanVAE`（小通道、随机权重）在 fp32 下比较第一层与原生整图解码（条带 1 行、不整除、等于整图、按预算自动、默认策略、奇数尺寸、很小的 latent、batch 2、条带内再分块、bf16），块边界附近的误差不比其他区域大；识别（Dropout 训练态、forward hook、开关）；故意少算一行 halo 时自检能抓到并回退第二层；预算报错；OOM 缩小条带、到下限报错、不退回 tiled 也不退回第二层；默认策略（128 行条带的估算为目标）和开关的优先级；内存模型单调、最大的条带先跑；自检后和前缀 / 条带之间清空缓存；SDXL / Flux 结构不归 Wan 适配器（归 LDM 适配器）；单帧 Conv3d 改走 conv2d 与模块原样一致、只在该改的时候改 |
 | `tests/test_master_switch.py` | 总开关和全局默认（§4），不需要模型文件：`MONOLOAD` 的解析；`MONOLOAD=0` 且没有节点时，挂 LoRA 的模型（整体加载、lowvram 部分加载、Hook LoRA）和 VAE 解码与卸掉钩子的原版 ComfyUI 逐位一致，备份也和原生一样；释放不运行；包装每次调用的开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `mode auto` 打开管理、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 时节点原样透传 |
+| `tests/test_lora_node.py` | Monoload LoRA Settings 节点（§4.2），需要 `tests/make_synthetic_checkpoint.py $MODELS` 生成的随机权重 SD1.5 checkpoint 和 LoRA（约 2 GiB）：接口；逐项优先级和来源；clone 共享权重、输入不变、设置不同时换 uuid；节点放在 `LoraLoader` 前面设置也保留；串联；`LoraLoader` / `LoraLoaderModelOnly`（不接 CLIP）/ 两个串联的 `LoraLoader`：`exact` 和 `native` 与卸掉钩子的原版逐位一致（`native` 的备份数也一样），`fused` = 不加节点的默认路径；同一底模的不同设置交替加载各得各的结果、底模权重逐位还原；`MONOLOAD=0` 下 `enable`；prompt 结束后的释放 / 保留；`MONOLOAD_DISABLE` 透传 |
 | `tests/test_vae_node.py` | Monoload VAE Settings 节点（§4.1），不需要模型文件：注册表和接口；按 ComfyUI 的方式调用节点；预算（下拉框 + `budget_gib`）/ 方案 / 条带高度 / 模式逐项判断「节点 > 环境变量 > 默认值」；副本共享权重和 patcher、输入的 VAE 不变、ComfyUI 的模型管理里只有一个已加载模型、串联、encode 一致；预算报错、强制方案和高度、只用第二层、原生；解码后（包括报错后）全局设置复原；多个副本交替解码互不干扰；日志写明来源；包装没装上时副本走原生；总开关和全局默认下的节点行为在 `test_master_switch.py`。ComfyUI 加载器注册节点的检查在 `test_entry.py`（各种开关组合） |
 | `tests/test_vae_ldm.py` | VAE 第一层的 LDM decoder（§12.8），不需要模型文件：GroupNorm 统计量（Moments 对 fp64，含均值远大于标准差；冻结统计量的 GroupNorm 对 `F.group_norm`；实例替换走 weight_function、退出复原）；识别（11 种不认的结构走第二层、与原生一致）；整个 decoder（SDXL 式 / Flux 式，四种方案，不同条带高度、奇数 / 很小的 latent、batch 2、宽组、很小的工作区）与原生整图解码比；bf16 对 fp32 真值与原生同一水平；自检抓住注入的错误（条带局部统计量、丢一条带、halo 少一行）；全尺寸 SDXL 4K 的计划；OOM；开关；分配器模拟 |
 | `tests/test_release.py` | 用真正的 `PromptExecutor` 连续跑 LoRA → 无 LoRA → 只改 UNet 的 LoRA → 无 LoRA → Hook LoRA → 无 LoRA → bypass LoRA → 无 LoRA → LoRA（换种子）：弱引用确认 LoRA 全部释放、底模不重新加载、结果与从没见过 LoRA 的进程逐位一致；RAM pressure / classic / LRU 三种缓存各一遍，外加 `MONOLOAD_KEEP_LORA=1` |
@@ -665,6 +693,33 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae
 * 解码日志末尾有 `settings: budget 3.00 GiB (node), GroupNorm scheme chosen by the budget (default), ...`（副本）和 `settings: budget none (default), ...`（原 VAE）。
 * 把输出发给我。
 
+### 9.8 节点：Monoload LoRA Settings（`tests/check_lora_node.py`）
+
+真实的 SDXL checkpoint（默认 `waiIllustriousSDXL_v170.safetensors`）+ 一个 LoRA（`--lora`，经 `LoraLoader`，强度 1.0）。先卸掉钩子用原版 ComfyUI 采样一次作参照，然后每一行用不同的节点设置采同一个种子（1024×1024，8 步，CFG 6）。不带 `--lora` 时列出 `models/loras` 和 `models/checkpoints` 后退出。
+
+```bash
+# V. LoRA 节点：路径、来源、每步耗时、与原生的差异、prompt 结束后的处理
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_lora_node.py --lora <models/loras 下的文件> 2>&1 | tee check_lora_node.txt
+```
+
+预期（每行打印实际路径、设置和来源、step1 / 每步耗时、GTT、与原生的差异、prompt 结束后释放还是保留）：
+
+| 行 | 路径 | 与原生 | prompt 结束后 |
+|---|---|---|---|
+| `reference` | 原版 ComfyUI（钩子卸掉），有备份 | — | — |
+| `no node` | Monoload 运行时合并，0 备份；设置全 `(default)` | 有小差异（fp16 舍入量级） | 释放 |
+| `node enable` | 同上；mode `(node)` | 与 `no node` 逐位相同 | 释放 |
+| `node exact` | Monoload，0 备份；merge exact `(node)` | **IDENTICAL**；每步比 fused 慢（约 1.3–1.7 倍，§10） | 释放 |
+| `node native` | 原生：LoRA 合并进权重，备份数同 `reference` | **IDENTICAL**；每步同原生 | 保留 |
+| `node keep` | Monoload，0 备份 | 同 `no node` | 保留 |
+| `node exact before LoRA` | 节点在 checkpoint 和 `LoraLoader` 之间；Monoload，merge exact `(node)` | **IDENTICAL** | 释放 |
+| `MONOLOAD=0, no node` | 原生，备份数同 `reference`；mode native `(env MONOLOAD=0)` | **IDENTICAL** | 保留 |
+| `MONOLOAD=0, node enable` | Monoload，0 备份 | 与 `no node` 逐位相同 | 释放 |
+
+* 最后一行打印 `'no node' == 'node enable' == 'MONOLOAD=0, node enable' bit for bit: True`。
+* GTT：原生的行比 Monoload 的行多出备份的大小（§10 第一轮：13.9 对 8.6 GiB）。
+* 把输出发给我。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
@@ -869,9 +924,10 @@ monoload/vae_engine.py      第一层的引擎（与 decoder 无关）：区间�
 monoload/vae_wan.py         第一层的 Wan 2.1 VAE 单帧适配器（结构识别、单元、按 forward 数的内存模型、fp32 副本）
 monoload/vae_ldm.py         第一层的 LDM decoder 适配器（SD1.5 / SDXL / SD3 / Flux ae；结构识别、单元、GroupNorm 方案、内存模型、fp32 副本）
 monoload/settings.py        总开关 MONOLOAD、MONOLOAD_DISABLE（不导入 torch / ComfyUI）
+monoload/lora_overrides.py  单个模型的 LoRA 设置（存在 model_options 里，逐项取值和来源；不导入 torch / ComfyUI）
 monoload/vae_overrides.py   单个 VAE 的设置（节点做的副本带的设置；不导入 torch / ComfyUI）
-monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），vae_settings.py = Monoload VAE Settings
-tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
+monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），lora_settings.py = Monoload LoRA Settings，vae_settings.py = Monoload VAE Settings
+tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
                             bench_vae.py、check_vae_node.py、make_synthetic_vaes.py、alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10）
 tools/watch_mem.sh          GTT / cgroup 内存监视
 tools/compare_images.py     两张图逐像素比较
