@@ -1,4 +1,4 @@
-# Monoload 交接说明（第三阶段与「预算内最快」已验收；估算收紧、VAE 设置节点待真机，2026-10）
+# Monoload 交接说明（第三阶段与「预算内最快」已验收；估算收紧、Monoload VAE Settings 节点已实现、待真机，2026-10）
 
 给下一个对话用：当前做到了哪里、必须遵守的规矩、第三阶段（LDM decoder）的状态和待决定的事。细节分别在 README.md（使用、真机结果、bench 命令）和 docs/DESIGN.md（§9：VAE 解码降峰值的设计；§9.14：第三阶段）。
 
@@ -12,6 +12,7 @@
   * 第一层（条带解码）：前缀在 H/8 上整图算出存档，之后按输出行条带倒推重算；整个解码在一个缓存分配器 arena 里运行。引擎 `vae_engine.py` + 每种 decoder 一个适配器：Wan 2.1 单帧（`qwen_image_vae`，第二阶段，已验收）；LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae`，第三阶段，7059bdd 已验收），GroupNorm 的整图统计量用统计遍跨条带求得，默认方案 B。
   * **选择策略**：不设预算时用默认规则（第一层，128 行条带的 arena 为目标）；设了 `MONOLOAD_VAE_BUDGET` 时「预算内最快」（`vae.choose_budget`：第二层能放下就用第二层，否则第一层各方案 × 条带高度里耗时模型预测最快的；DESIGN §9.14.10）。
   * 管理入口：自己的内存估算交给 `load_models_gpu`、batch 逐张、OOM 缩块重试、从不调用 tiled。
+  * **节点 Monoload VAE Settings**（插件的第一个节点，`monoload/nodes/`）：输入一个 VAE，输出共享权重的副本，副本带自己的预算 / 方案 / 条带高度 / 模式；逐项「节点 > 环境变量 > 默认值」；全局开关仍最高（DESIGN §9.15，README §4.1）。
 
 CT 700（Strix Halo，gfx1151，统一内存 62.5 GiB GTT）上 4K（3840×2160）解码的 GTT 增量：
 
@@ -22,10 +23,11 @@ CT 700（Strix Halo，gfx1151，统一内存 62.5 GiB GTT）上 4K（3840×2160�
 
 还没做的 / 要用户决定的：
 
-1. **收紧估算之后的按预算选**：README 9.7 的命令 T（SDXL 三档 × 3G / 1.5G，每行有预测）。重点：4K 3G 现在选 B（12 条 180 行，预测 2.43 GiB / 约 41 s），以前选 D（2.33 GiB / 63.2 s）。默认 B 与 Q–S 已在 01377c4 上验收（README §10.4）。
-2. 第二层「总是比第一层快」是 CT 700 的实测结论，预算策略把它写成了固定优先级；换硬件时要复核。
-3. 多帧 Wan 视频 latent 目前交给原生（不是永远不做）。
-4. Flux 2 的 `batch_norm_latent`、带注意力的 up 级等 LDM 变体目前走第二层，可以以后按需加。
+1. **节点的真机验证**：README 9.7 的命令 U（`tests/check_vae_node.py`：真实 SDXL VAE，节点预算 3G 解码 4K，原 VAE 仍走默认 B）。
+2. **收紧估算之后的按预算选**：README 9.7 的命令 T（SDXL 三档 × 3G / 1.5G，每行有预测）。重点：4K 3G 现在选 B（12 条 180 行，预测 2.43 GiB / 约 41 s），以前选 D（2.33 GiB / 63.2 s）。默认 B 与 Q–S 已在 01377c4 上验收（README §10.4）。
+3. 第二层「总是比第一层快」是 CT 700 的实测结论，预算策略把它写成了固定优先级；换硬件时要复核。
+4. 多帧 Wan 视频 latent 目前交给原生（不是永远不做）。
+5. Flux 2 的 `batch_norm_latent`、带注意力的 up 级等 LDM 变体目前走第二层，可以以后按需加。
 
 ## 2. 提交记录（`dev` 上的合并提交 ← 功能提交）
 
@@ -42,7 +44,8 @@ CT 700（Strix Halo，gfx1151，统一内存 62.5 GiB GTT）上 4K（3840×2160�
 | 第三阶段 3a | aa07431 | a68161b | 拆出 `vae_engine.py` / `vae_wan.py`，行为和数字不变 |
 | 第三阶段 3b + 3c | 7059bdd | 96daa32 | `alloc_sim` 的 LDM 构造（复现第二层 18 个读数）；`vae_ldm.py`；引擎的统计遍、GroupNorm 替换、存档布局；`test_vae_ldm.py`；bench 的 `-g<S>` / `--gn-schemes` / `--fp32-chunked` |
 | 默认 B、预算内最快 | 01377c4 | 0a64213 | LDM 默认方案 B；`choose_budget`；耗时模型 `vae_ldm.TIME_COEF`；一条带不跑统计遍；预算内最高条带的搜索在最矮处不单调时继续找；bench 的 `-b<GiB>` / `--budgets`、预算放不下记为 `over budget`；7059bdd 的实测写进文档 |
-| 估算收紧、耗时模型第二版 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） | 见合并 | 检查点前置 + `saves_fit`（有保证的存档不算进 largest）；耗时模型加卷积调用数和前缀注意力；README §10.4、命令 T |
+| 估算收紧、耗时模型第二版 | cc3b9d9 | cfa5a56、fb919af、68ba014、7127617 | 检查点前置 + `saves_fit`（有保证的存档不算进 largest）；耗时模型加卷积调用数和前缀注意力；README §10.4、命令 T |
+| Monoload VAE Settings 节点 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） | 见合并 | `monoload/nodes/`（注册表 + 节点）、`vae_overrides.py`、`vae.resolve_settings` / `_Applied`；`test_vae_node.py`、`test_entry.py` 的注册检查、`check_vae_node.py`；README §4.1、DESIGN §9.15 |
 
 LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行时合并 → 释放、fp8、默认融合 addmm 路径），见 `git log --first-parent dev`。
 
@@ -58,6 +61,7 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 * **预算可以用环境变量覆盖，显式设置时严格执行**：`MONOLOAD_VAE_BUDGET` 设了就在估算不超过它的做法里选预计最快的（第二层，或第一层的方案 × 条带高度；第一层仍取预算内最高的条带），一个都放不下直接抛 `MonoloadError`（写明各需要多少），不悄悄放宽；不认识的 decoder 只能走第二层，放不下也报错。强制设置优先于预算：`MONOLOAD_VAE_STRIPE_ROWS`（强制条带高度，方案仍按预算选，放不下也照跑并注明）、`MONOLOAD_VAE_GN_SCHEME`（强制方案，默认 B，高度仍按预算取）、`MONOLOAD_DISABLE_VAE_STRIPE=1`（第二层）。其他开关：`MONOLOAD_VAE_WORKSPACE`、`MONOLOAD_DISABLE_VAE=1`、`MONOLOAD_EXACT=1`（VAE 走原生）、`MONOLOAD_DISABLE=1`。
 * **原模型的模块实例原样调用**（条带里是调用在行切片上），`comfy.ops` 的 cast / `weight_function`（包括 Monoload 的运行时 LoRA）照常生效；替换只做在实例属性上、只在受管理的解码期间，退出时恢复（`OpChunking`）。唯一的有意例外：LDM 第一层期间条带部分的 GroupNorm 实例换成「用冻结的整图统计量」的 forward（`vae_engine.GlobalNorms`，权重仍走模块自己的 cast / weight_function），由 fp32 自检兜底（DESIGN §9.14.4）。
 * **按真实结构识别，不看文件名**；不认识就走第二层并打一条日志说明原因。
+* **单个 VAE 的设置（节点）与环境变量语义完全相同**，逐项「节点 > 环境变量 > 默认值」；全局开关（`MONOLOAD_DISABLE` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT`）压过节点；节点不修改输入的 VAE（返回共享权重的副本）。
 * **第一层每种结构在本进程第一次使用前做 fp32 自检**（与原生整图解码比，相对误差 ≤ 1e-4），不通过就对这种结构禁用第一层、醒目警告、走第二层。
 * **精度**：不承诺与原生逐位一致（GEMM 形状不同），但 fp32 下与整图等价（≤ 1e-5），bf16 下对 fp32 真值与原生同一水平；用 bench 的 `--fp32-ref` 判断离群点是不是 bf16 噪声。
 * **不改 LoRA 部分的行为。**
@@ -65,7 +69,7 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 **流程：**
 
 * 从 `dev` 开 feature 分支，做完合回 `dev`（`git merge --no-ff`），push `dev`。不碰 `main`，不开 PR（除非用户要求）。
-* **只跑小测试，不跑 `tests/run_all.sh`。** VAE 相关的小测试：`tests/test_vae_ldm.py`、`tests/test_vae_stripe.py`、`tests/test_vae.py`、`tests/test_entry.py`（8 种开关组合，见文件头）、`tests/test_dtype_paths.py`（默认和 `MONOLOAD_EXACT=1`）。
+* **只跑小测试，不跑 `tests/run_all.sh`。** VAE 相关的小测试：`tests/test_vae_node.py`、`tests/test_vae_ldm.py`、`tests/test_vae_stripe.py`、`tests/test_vae.py`、`tests/test_entry.py`（8 种开关组合，见文件头）、`tests/test_dtype_paths.py`（默认和 `MONOLOAD_EXACT=1`）。
 * **CT 700 上的 bench 代码由我们写，容器操作（拉代码、重建镜像、`/free`、跑命令、切开关）由用户做。** 报告里不写容器层面的步骤，只给 `docker exec ... python tests/bench_vae.py ...` 命令和要看的指标。
 * 文档和报告用中文。报告写明合并提交、小测试结果、与要求不同之处及原因。冲突时以用户的最新要求为准。
 * 提交信息结尾加 Co-Authored-By / Claude-Session 两行（见会话里的 attribution 提示）。
@@ -84,8 +88,10 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 * `monoload/vae_ops.py`：第二层的引擎，完全通用。`OpChunking`（实例级替换 `_conv_forward` 和 `optimized_attention`）、`_ConvChunker`、三种注意力的 query 分块、`OpStats`。
 * `monoload/vae_engine.py`：第一层的引擎，与 decoder 无关。适配器接口写在模块注释里。区间（`Unit`、`need_in`、`valid_out`、`stripe_needs`、`split_rows`）；`Plan`（最后一遍的条带、统计遍 `Pass`、存档布局「分开 / 池」、存活量 → arena → 估算、重算倍数）；执行（`run_prefix`、`run_chain`、`run_stripes`、`run_passes`）；GroupNorm（`NormRef`、`Moments`、`group_norm_frozen`、`GlobalNorms`）；arena；`StripeAdapter` 基类（`plan` 找预算内最高条带、`smallest_plan`、`variants` / `predict_seconds` 给预算策略用）；`Plan.work_levels`（各分辨率级的卷积 MAC，耗时模型的输入）；自检流程。
 * `monoload/vae_wan.py`：Wan 2.1 单帧适配器（没有需要整图统计的归一化，所以没有统计遍；数字与第二阶段相同）。
+* `monoload/nodes/`：ComfyUI 节点。`__init__.py` 是注册表（`NODES` → `NODE_CLASS_MAPPINGS` / `NODE_DISPLAY_NAME_MAPPINGS`，插件入口导出，任何开关下都注册），`vae_settings.py` 是 Monoload VAE Settings。加节点：写模块、把类加进 `NODES`。
+* `monoload/vae_overrides.py`：单个 VAE 的设置（副本上的属性、`with_settings`），不导入 torch / ComfyUI；`vae.py` 的 `resolve_settings`（逐项取设置）、`_Applied`（解码期间换进全局设置、结束换回）。
 * `monoload/vae_ldm.py`：LDM 适配器：识别（`ldm_structure`）、单元（残差块带 norm1 / norm2 的 `NormRef`，norm2 的「部分单元」）、方案的存档位置（`scheme_positions`）、按 forward 数的内存模型、fp32 副本（按配置重建 `Decoder` + `post_quant_conv`）、`variants()`（每个方案一个，默认方案在前）、耗时模型 `TIME_COEF` / `predict_seconds`。
-* 测试：`tests/test_vae_ldm.py`（100 项）、`tests/test_vae_stripe.py`（74 项）、`tests/test_vae.py`（131 项）、`tests/alloc_sim.py`、`tests/bench_vae.py`、`tests/make_synthetic_vaes.py`。
+* 测试：`tests/test_vae_node.py`（22 项）、`tests/test_vae_ldm.py`（100 项）、`tests/test_vae_stripe.py`（74 项）、`tests/test_vae.py`（131 项）、`tests/alloc_sim.py`、`tests/bench_vae.py`、`tests/make_synthetic_vaes.py`。
 
 **以后加一种新 VAE**：写一个适配器（`match`，以及 `StripeAdapter` 的子类：结构、单元、代价模型、fp32 副本 / 参照解码），注册到 `STRIPE_ADAPTERS`；有需要整图统计的 GroupNorm 就在单元上挂 `NormRef`，引擎自动安排统计遍；先用 `alloc_sim` 加一个 meta 构造，验证 reserved ≤ 估算，再上真机。
 
@@ -127,3 +133,12 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 * **耗时模型第二版**（`vae_ldm.TIME_COEF` / `TIME_PER_CALL` / `TIME_ATTN`）：H/4 / H/2 / H 的 MAC 系数 0.0922 / 0.1294 / 0.2464 秒 / 10¹²，每次卷积 GEMM 调用 0.237 ms（`unit_calls` 按工作区算行块，`Plan.conv_calls`），前缀注意力 0.239 × 2·C·token² / 10¹²。22 个读数拟合，最大误差 5.3%（整图一条带 −17%）。
 * **很高的条带（老问题，扩大的网格里发现）**：4K 方案 B 540 / 768 行时 reserved 超过估算（死掉的存档留下的洞放不下全分辨率的大临时量，一次「挤出」变成好几次）。arena 规则补了两条（有存档时）：`Plan.front_arena`（洞用不上时，临时量放在存活存档的上面）；`arena_bytes` 在 ≤ 3 条带时用 live/8、工作区 > 128 MiB 时余量至少一个工作区。默认计划不变。403 个计划 reserved 全部 ≤ 估算（DESIGN §9.14.11）。
 * **按预算选的新结果**（SDXL）：3G → 1344 整图一条带、2688 C 4×384、4K B 12×180（预测 2.43 GiB / 41 s）；1.5G → 1344 C、2688 B、4K A。验证命令 README 9.7 的 T。
+
+## 7. Monoload VAE Settings 节点（DESIGN §9.15，README §4.1）
+
+* **做什么**：输入一个 VAE，输出一个副本（`copy.copy`，共享 `first_stage_model` 和 `patcher`），副本带自己的设置：`budget_gib`（0 = 不设）、`gn_scheme`（default / A / B / C / D）、`stripe_rows`（0 = 自动）、`mode`（default / auto / layer 2 only / native）。语义与对应的环境变量相同。
+* **优先级**：逐项「节点 > 环境变量 > 默认值」（`vae.resolve_settings`）；串联的节点，下游没设的项沿用上游。每次解码的日志末尾写明各项的值和来源（node / env / default），`last_decode()` 有 `settings` / `settings_source`。
+* **怎么生效**：`_decode` 取设置后，在 `_Applied` 里换进全局的 `_SETTINGS` 和 `vae_ldm` 的方案，解码结束（含报错）换回；解码路径其余部分不变。依赖「ComfyUI 一次只执行一个 prompt」。
+* **全局开关**：`MONOLOAD_DISABLE` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 时包装没装上，副本走原生，节点在日志里说明一次。节点在任何开关下都注册（保存的工作流能加载）。
+* **测试**：`tests/test_vae_node.py`（22 项）；`tests/test_entry.py` 在 8 种开关组合下检查 ComfyUI 的加载器注册了节点。
+* **待真机**：README 9.7 的命令 U（`tests/check_vae_node.py`）。

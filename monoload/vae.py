@@ -60,7 +60,7 @@ import comfy.ops
 import comfy.sd
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
-from . import vae_engine, vae_ldm, vae_wan
+from . import vae_engine, vae_ldm, vae_overrides, vae_wan
 from .errors import MonoloadError, MonoloadVAEOOMError
 from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
 
@@ -212,6 +212,81 @@ def set_gn_scheme(name):
     vae_ldm.set_scheme(name)
     _SETTINGS["gn_scheme"] = vae_ldm.scheme()
     _SETTINGS["gn_forced"] = bool(name)
+
+
+# ---------------------------------------------------------------------------
+# per-VAE settings (the Monoload VAE Settings node, monoload/vae_overrides.py)
+# ---------------------------------------------------------------------------
+
+def with_settings(vae, budget=0.0, gn_scheme="default", stripe_rows=0, mode="default"):
+    """A copy of `vae` with its own decode settings (vae_overrides.with_settings)."""
+    return vae_overrides.with_settings(vae, budget=budget, gn_scheme=gn_scheme, stripe_rows=stripe_rows, mode=mode)
+
+
+def resolve_settings(vae):
+    """The settings a decode of `vae` uses, item by item: the VAE's own (set by
+    the node on a copy), else the environment (the global settings: the
+    MONOLOAD_VAE_* variables, or the set_* functions of tests / bench), else
+    Monoload's default. -> {budget, gn_scheme, gn_forced, stripe_rows, mode}
+    and {item: "node" / "env" / "default"}."""
+    own = vae_overrides.overrides(vae)
+    eff, src = {}, {}
+    if "budget" in own:
+        eff["budget"], src["budget"] = own["budget"], "node"
+    else:
+        eff["budget"], src["budget"] = _SETTINGS["budget"], "env" if _SETTINGS["budget"] else "default"
+    if "gn_scheme" in own:
+        eff["gn_scheme"], eff["gn_forced"], src["gn_scheme"] = own["gn_scheme"], True, "node"
+    else:
+        eff["gn_scheme"], eff["gn_forced"] = _SETTINGS["gn_scheme"], _SETTINGS["gn_forced"]
+        src["gn_scheme"] = "env" if _SETTINGS["gn_forced"] else "default"
+    if "stripe_rows" in own:
+        eff["stripe_rows"], src["stripe_rows"] = own["stripe_rows"], "node"
+    else:
+        eff["stripe_rows"], src["stripe_rows"] = _SETTINGS["stripe_rows"], "env" if _SETTINGS["stripe_rows"] else "default"
+    if "mode" in own:
+        eff["mode"], src["mode"] = own["mode"], "node"
+    else:
+        eff["mode"], src["mode"] = ("auto", "default") if _SETTINGS["stripe"] else ("layer2", "env")
+    return eff, src
+
+
+def settings_note(eff, src):
+    """The decode log's account of its settings and where each came from."""
+    scheme = eff["gn_scheme"] if eff["gn_forced"] or not eff["budget"] else "chosen by the budget"
+    return "settings: budget {} ({}), GroupNorm scheme {} ({}), stripe rows {} ({}), mode {} ({})".format(
+        fmt_bytes(eff["budget"]) if eff["budget"] else "none", src["budget"], scheme, src["gn_scheme"],
+        eff["stripe_rows"] or "auto", src["stripe_rows"], {"layer2": "layer 2 only"}.get(eff["mode"], eff["mode"]), src["mode"])
+
+
+class _Applied:
+    """The resolved settings in place of the global ones for one decode (the
+    decode reads them from _SETTINGS / vae_ldm's scheme); restored on exit.
+    ComfyUI runs one prompt at a time, so one decode at a time."""
+
+    def __init__(self, eff, note):
+        self.eff = eff
+        self.note = note
+
+    def __enter__(self):
+        self.saved = dict(_SETTINGS), vae_ldm.scheme(), _NOTE[0]
+        eff = self.eff
+        _SETTINGS.update({"budget": eff["budget"], "stripe": eff["mode"] != "layer2", "stripe_rows": eff["stripe_rows"],
+                          "gn_scheme": eff["gn_scheme"], "gn_forced": eff["gn_forced"]})
+        vae_ldm.set_scheme(eff["gn_scheme"])
+        _NOTE[0] = self.note
+        return self
+
+    def __exit__(self, *exc):
+        settings, scheme, note = self.saved
+        _SETTINGS.clear()
+        _SETTINGS.update(settings)
+        vae_ldm.set_scheme(scheme)
+        _NOTE[0] = note
+        return False
+
+
+_NOTE = [""]   # the settings note of the decode in progress (for its log line and last_decode())
 
 
 def last_decode():
@@ -430,13 +505,19 @@ def _native_estimate(vae, shape):
 
 
 def _decode(self, samples_in, vae_options={}):
-    reason = _native_reason(self, samples_in)
+    eff, src = resolve_settings(self)
+    note = settings_note(eff, src)
+    reason = "mode native (Monoload VAE Settings node)" if eff["mode"] == "native" else _native_reason(self, samples_in)
     if reason is not None:
-        logging.info("[Monoload] VAE decode left native: {}".format(reason))
+        logging.info("[Monoload] VAE decode left native: {}; {}".format(reason, note))
         _LAST.clear()
-        _LAST.update({"strategy": "native", "reason": reason})
+        _LAST.update({"strategy": "native", "reason": reason, "settings": dict(eff), "settings_source": dict(src)})
         return _ORIG["decode"](self, samples_in, vae_options)
-    return _managed_decode(self, samples_in, vae_options)
+    with _Applied(eff, note):
+        try:
+            return _managed_decode(self, samples_in, vae_options)
+        finally:
+            _LAST["settings"], _LAST["settings_source"] = dict(eff), dict(src)
 
 
 def _managed_decode(self, samples_in, vae_options):
@@ -653,7 +734,7 @@ def _decode_budget(self, samples_in, vae_options, t0, bud):
         _LAST.clear()
         _LAST.update({"strategy": "error", "budget": bud})
         raise
-    logging.info("[Monoload] VAE " + d["why"])
+    logging.info("[Monoload] VAE " + d["why"] + ("; " + _NOTE[0] if _NOTE[0] else ""))
     if d["layer"] == 2:
         return _decode_layer2(self, samples_in, vae_options, t0, d["note"], est=d["estimate"], probe=d["probe"], policy=d["policy"],
                               considered=d["candidates"])
@@ -711,10 +792,10 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
                   "passes": len(plan.passes), "saves": [plan.save_bytes[p] for p in plan.saves], "gn_scheme": getattr(bound, "gn_scheme", None),
                   "pass_rows": [ps.rows for ps in plan.passes], "candidates": considered,
                   "predicted_seconds": bound.predict_seconds(plan), "stats": stats.as_dict()})
-    logging.info("[Monoload] VAE decode {} -> layer 1 ({}): {}; {}, workspace {}{}; arena {}, memory estimate {} (native {}), {:.2f}s".format(
+    logging.info("[Monoload] VAE decode {} -> layer 1 ({}): {}; {}, workspace {}{}; arena {}, memory estimate {} (native {}), {:.2f}s; {}".format(
         "x".join(str(d) for d in samples_in.shape), bound.name, plan.describe(), policy, fmt_bytes(ws),
         ", {} OOM retries".format(retries) if retries else "", fmt_bytes(stats.arena) if stats.arena else "none",
-        fmt_bytes(plan.estimate), fmt_bytes(native_est), dt))
+        fmt_bytes(plan.estimate), fmt_bytes(native_est), dt, _NOTE[0]))
     return pixel_samples
 
 
@@ -780,9 +861,10 @@ def _decode_layer2(self, samples_in, vae_options, t0, l1_note, est=None, probe=N
     if stats.attn_unmanaged:
         attn += ", attention left native: {}".format(", ".join(stats.attn_unmanaged[:4]))
     logging.info("[Monoload] VAE decode {} -> layer 2, op-level chunking (workspace {}{}): {} of {} conv call(s) in row blocks{}; "
-                 "{}memory estimate {} (native {}), {:.2f}s".format(
+                 "{}memory estimate {} (native {}), {:.2f}s; {}".format(
                      "x".join(str(d) for d in samples_in.shape), fmt_bytes(budget), ", {} OOM retries".format(retries) if retries else "",
-                     stats.conv_chunked, stats.conv_calls, attn, policy + "; " if policy else "", fmt_bytes(est["total"]), fmt_bytes(native_est), dt))
+                     stats.conv_chunked, stats.conv_calls, attn, policy + "; " if policy else "", fmt_bytes(est["total"]), fmt_bytes(native_est), dt,
+                     _NOTE[0]))
     return pixel_samples
 
 

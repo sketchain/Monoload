@@ -1099,3 +1099,21 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 | 1G | C 2 × 384（128 MiB）0.99 / 0.86，4.2 s | D 23 × 67（128 MiB）1.00 / 0.80，30.7 s | 放不下（A 最少 1.38） |
 
 4K 3G 现在选 B（以前 D 7 × 309 / 64 MiB，实测 63.2 s）。4K 1.5G 仍是 A，但工作区从 64 回到 128 MiB（模型现在知道 64 MiB 更慢）。验证命令是 README §9.7 的 T。
+
+### 9.15 Monoload VAE Settings 节点：单独设置某个 VAE
+
+插件的第一个节点（README §4.1）。环境变量对所有 VAE 生效；这个节点让工作流里的某一个 VAE 用自己的峰值预算、GroupNorm 方案、条带高度和模式。
+
+**节点的注册结构（`monoload/nodes/`）：** 每个节点是一个模块里的一个类，用 ComfyUI 经典的节点接口（`INPUT_TYPES`、`RETURN_TYPES`、`FUNCTION`、`CATEGORY`）外加 `DISPLAY_NAME`；`monoload/nodes/__init__.py` 的 `NODES` 列出它们，生成 `NODE_CLASS_MAPPINGS`（键是类名）和 `NODE_DISPLAY_NAME_MAPPINGS`，插件入口 `__init__.py` 直接导出这两个表。以后加节点：写一个模块，把类加进 `NODES`。节点在任何开关下都注册（包括 `MONOLOAD_DISABLE=1`），保存过的工作流总能加载；开关让节点的功能失效时，由节点自己说明。
+
+**副本，而不是修改输入：** 节点返回 `copy.copy(vae)`，在副本上设一个属性（`vae_overrides.ATTR`，一个只含设了的项的 dict）。浅拷贝共享 `first_stage_model` 和 `patcher`：权重不多占内存，`load_models_gpu`、卸载、ComfyUI 的缓存都看到同一个 `ModelPatcher`（测试确认模型管理里只有一个已加载模型）；`VAE` 对象自己在解码 / 编码时只写 `size` 这个缓存。输入的 VAE 不变，工作流里其他直接用它的分支不受影响；encode 不经过 Monoload，结果相同。节点串联时，下游节点没设的项沿用上游副本的值。`vae_overrides.py` 不导入 torch / ComfyUI，节点在 `MONOLOAD_DISABLE=1` 时也不导入解码的代码。
+
+**每次解码怎么取设置（`vae.resolve_settings`，逐项）：** 副本自己的值 → 全局设置（环境变量 `MONOLOAD_VAE_BUDGET` / `MONOLOAD_VAE_GN_SCHEME` / `MONOLOAD_VAE_STRIPE_ROWS` / `MONOLOAD_DISABLE_VAE_STRIPE`，测试和 bench 用 `set_*` 改的也算在这一级）→ 默认值。节点上的「不设」是 `default` / `0`（预算 0 = 不设，条带高度 0 = 自动）。语义与环境变量完全相同：节点的方案、高度就是「强制」，节点的预算走同一个 `choose_budget`（放不下就报错、写明各需要多少），模式 `layer 2 only` 等于 `MONOLOAD_DISABLE_VAE_STRIPE=1`，`auto` 是第一层 + 第二层（压过全局的 `MONOLOAD_DISABLE_VAE_STRIPE=1`），`native` 是这个 VAE 走 ComfyUI 自己的解码。
+
+**怎么生效：** `_decode`（`VAE.decode` 的包装）先取这次的设置，再在 `_Applied` 里把它们换进全局的 `_SETTINGS` 和 `vae_ldm` 的方案，解码完（包括报错）换回来。解码路径的其余代码不用改，任何调用 `vae.decode` 的节点都生效；`decode_tiled` 不经过包装，按现有规则保持原生。ComfyUI 一次执行一个 prompt，解码不会并发，这样换是安全的（测试确认三个副本交替解码各用各的设置，报错后全局设置复原）。
+
+**全局开关最高：** `MONOLOAD_DISABLE`、`MONOLOAD_DISABLE_VAE`、`MONOLOAD_EXACT` 时包装没装上，`_decode` 不会被调用，副本的设置自然不生效；节点照常返回副本，日志里说明一次（每种原因一次）。
+
+**日志：** 每次受管理的解码，那一行末尾是 `settings: budget 3.00 GiB (node), GroupNorm scheme chosen by the budget (default), stripe rows auto (default), mode auto (default)`（来源 `node` / `env` / `default`）；按预算选的那一行也带上；`mode native` 时是 `VAE decode left native: mode native (Monoload VAE Settings node); settings: ...`。`last_decode()` 里有 `settings` 和 `settings_source`。
+
+**测试：** `tests/test_vae_node.py`（README §8）；ComfyUI 加载器的注册在 `tests/test_entry.py` 的 8 种开关组合里检查。真机验证：`tests/check_vae_node.py`（README §9.7 的 U）。
