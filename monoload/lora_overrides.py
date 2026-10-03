@@ -138,3 +138,58 @@ def note(eff, src):
         return src[item]
     return "LoRA settings: mode {} ({}), merge {} ({}), after prompt {} ({})".format(
         eff["mode"], s("mode"), eff["merge"], s("merge"), eff["after_prompt"], s("after_prompt"))
+
+
+# ---------------------------------------------------------------------------
+# which LoRA files a patcher carries (for the Monoload Info node)
+# ---------------------------------------------------------------------------
+
+NAMES_KEY = "monoload_lora_names"   # model_options: [{"name", "strength"}, ...] added by the LoRA loader nodes
+_ORIG = {}
+
+
+def lora_names(patcher):
+    """[{"name": file, "strength": s}, ...] in the order the loader nodes applied them."""
+    mo = getattr(patcher, "model_options", None)
+    return list(mo.get(NAMES_KEY) or ()) if isinstance(mo, dict) else []
+
+
+def _note_name(patcher, name, strength, before):
+    if patcher is None or patcher is before or not strength:
+        return
+    mo = getattr(patcher, "model_options", None)
+    if isinstance(mo, dict):
+        mo[NAMES_KEY] = list(mo.get(NAMES_KEY) or ()) + [{"name": name, "strength": float(strength)}]
+
+
+def install_names(lora_loader_cls):
+    """Wrap LoraLoader.load_lora (LoraLoaderModelOnly calls it too) so that the
+    clones it returns remember the file name and strength in model_options.
+    Only metadata: patches, uuids and numerics are untouched."""
+    if _ORIG:
+        return False
+    orig = lora_loader_cls.__dict__["load_lora"]
+    _ORIG["load_lora"] = (lora_loader_cls, orig)
+
+    def load_lora(self, model, clip, lora_name, strength_model, strength_clip, *args, **kwargs):
+        out = orig(self, model, clip, lora_name, strength_model, strength_clip, *args, **kwargs)
+        try:
+            m, c = out[0], out[1]
+            _note_name(m, lora_name, strength_model, model)
+            if c is not None and clip is not None and c is not clip:
+                _note_name(getattr(c, "patcher", None), lora_name, strength_clip, getattr(clip, "patcher", None))
+        except Exception:   # never break a loader for metadata
+            pass
+        return out
+
+    load_lora.__wrapped__ = orig
+    lora_loader_cls.load_lora = load_lora
+    return True
+
+
+def uninstall_names():
+    if not _ORIG:
+        return False
+    cls, orig = _ORIG.pop("load_lora")
+    cls.load_lora = orig
+    return True

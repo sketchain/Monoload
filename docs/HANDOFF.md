@@ -23,7 +23,7 @@ CT 700（Strix Halo，gfx1151，统一内存 62.5 GiB GTT）上 4K（3840×2160�
 
 还没做的 / 要用户决定的：
 
-1. **四个分支（用户 2026-10 的要求，按顺序，每个合回 `dev` 后再开下一个）**：① settings-master-switch（7482eec，§8）；② lora-settings-node（Monoload LoRA Settings 节点，运行时合并按 patcher 决定，§9）；③ info-node（Monoload Info 节点）；④ i18n（界面中英文、后端消息表 `MONOLOAD_LANG`）。
+1. **四个分支（用户 2026-10 的要求，按顺序，每个合回 `dev` 后再开下一个）**：① settings-master-switch（7482eec，§8）；② lora-settings-node（48c9e54，§9）；③ info-node（Monoload Info 节点，§10）；④ i18n（界面中英文、后端消息表 `MONOLOAD_LANG`）。
    待真机：README §9.8 的命令 V（`tests/check_lora_node.py`）。
 2. 第二层「总是比第一层快」是 CT 700 的实测结论，预算策略把它写成了固定优先级；换硬件时要复核。
 3. 多帧 Wan 视频 latent 目前交给原生（不是永远不做）。
@@ -50,7 +50,8 @@ CT 700（Strix Halo，gfx1151，统一内存 62.5 GiB GTT）上 4K（3840×2160�
 | Monoload VAE Settings 节点 | 9b30154 | 316b22c 等 | `monoload/nodes/`（注册表 + 节点）、`vae_overrides.py`、`vae.resolve_settings` / `_Applied`；`test_vae_node.py`、`test_entry.py` 的注册检查、`check_vae_node.py`；README §4.1、DESIGN §9.15 |
 
 | 总开关 `MONOLOAD`、高级变量变成全局默认 | 7482eec | 01d212c 等 | `monoload/settings.py`；hotpatch / release / vae 总是装上、关闭时直通；VAE 节点预算下拉框；`test_master_switch.py`；README §4 / §13、DESIGN §10 |
-| Monoload LoRA Settings 节点 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） | 见合并 | `lora_overrides.py`；hotpatch 按 patcher 决定接管和合并路径；release 按 patcher 释放；`nodes/lora_settings.py`；`test_lora_node.py`、`make_synthetic_checkpoint.py`、`check_lora_node.py`；README §4.2、§9.8，DESIGN §11 |
+| Monoload LoRA Settings 节点 | 48c9e54 | 3fdfbae 等 | `lora_overrides.py`；hotpatch 按 patcher 决定接管和合并路径；release 按 patcher 释放；`nodes/lora_settings.py`；`test_lora_node.py`、`make_synthetic_checkpoint.py`、`check_lora_node.py`；README §4.2、§9.8，DESIGN §11 |
+| Monoload Info 节点 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） | 见合并 | `monoload/info.py`、`nodes/info.py`、`web/monoload_info.js`；`vae.decode_record` / `_MemProbe`；`lora_overrides.install_names`；`test_info_node.py`；README §4.3、DESIGN §12 |
 
 LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行时合并 → 释放、fp8、默认融合 addmm 路径），见 `git log --first-parent dev`。
 
@@ -74,7 +75,7 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 **流程：**
 
 * 从 `dev` 开 feature 分支，做完合回 `dev`（`git merge --no-ff`），push `dev`。不碰 `main`，不开 PR（除非用户要求）。
-* **只跑小测试，不跑 `tests/run_all.sh`。** 小测试：`tests/test_lora_node.py`（先 `python tests/make_synthetic_checkpoint.py $MODELS`）、`tests/test_master_switch.py`、`tests/test_vae_node.py`、`tests/test_vae_ldm.py`、`tests/test_vae_stripe.py`、`tests/test_vae.py`、`tests/test_entry.py`（各种开关组合，含 `MONOLOAD=0`，见文件头）、`tests/test_dtype_paths.py`（默认和 `MONOLOAD_EXACT=1`）。
+* **只跑小测试，不跑 `tests/run_all.sh`。** 小测试：`tests/test_info_node.py`、`tests/test_lora_node.py`（先 `python tests/make_synthetic_checkpoint.py $MODELS`）、`tests/test_master_switch.py`、`tests/test_vae_node.py`、`tests/test_vae_ldm.py`、`tests/test_vae_stripe.py`、`tests/test_vae.py`、`tests/test_entry.py`（各种开关组合，含 `MONOLOAD=0`，见文件头）、`tests/test_dtype_paths.py`（默认和 `MONOLOAD_EXACT=1`）。
 * **CT 700 上的 bench 代码由我们写，容器操作（拉代码、重建镜像、`/free`、跑命令、切开关）由用户做。** 报告里不写容器层面的步骤，只给 `docker exec ... python tests/bench_vae.py ...` 命令和要看的指标。
 * 文档和报告用中文。报告写明合并提交、小测试结果、与要求不同之处及原因。冲突时以用户的最新要求为准。
 * 提交信息结尾加 Co-Authored-By / Claude-Session 两行（见会话里的 attribution 提示）。
@@ -98,7 +99,7 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 * `monoload/nodes/`：ComfyUI 节点。`__init__.py` 是注册表（`NODES` → `NODE_CLASS_MAPPINGS` / `NODE_DISPLAY_NAME_MAPPINGS`，插件入口导出，任何开关下都注册），`vae_settings.py` 是 Monoload VAE Settings。加节点：写模块、把类加进 `NODES`。
 * `monoload/vae_overrides.py`：单个 VAE 的设置（副本上的属性、`with_settings`），不导入 torch / ComfyUI；`vae.py` 的 `resolve_settings`（逐项取设置）、`_Applied`（解码期间换进全局设置、结束换回）。
 * `monoload/vae_ldm.py`：LDM 适配器：识别（`ldm_structure`）、单元（残差块带 norm1 / norm2 的 `NormRef`，norm2 的「部分单元」）、方案的存档位置（`scheme_positions`）、按 forward 数的内存模型、fp32 副本（按配置重建 `Decoder` + `post_quant_conv`）、`variants()`（每个方案一个，默认方案在前）、耗时模型 `TIME_COEF` / `predict_seconds`。
-* 测试：`tests/test_lora_node.py`（19 项，需要 `make_synthetic_checkpoint.py` 生成的合成 SD1.5）、`tests/test_master_switch.py`（18 项）、`tests/test_vae_node.py`（22 项）、`tests/test_vae_ldm.py`（100 项）、`tests/test_vae_stripe.py`（74 项）、`tests/test_vae.py`（131 项）、`tests/alloc_sim.py`、`tests/bench_vae.py`、`tests/make_synthetic_vaes.py`。
+* 测试：`tests/test_info_node.py`（16 项）、`tests/test_lora_node.py`（19 项，需要 `make_synthetic_checkpoint.py` 生成的合成 SD1.5）、`tests/test_master_switch.py`（18 项）、`tests/test_vae_node.py`（22 项）、`tests/test_vae_ldm.py`（100 项）、`tests/test_vae_stripe.py`（74 项）、`tests/test_vae.py`（131 项）、`tests/alloc_sim.py`、`tests/bench_vae.py`、`tests/make_synthetic_vaes.py`。
 
 **以后加一种新 VAE**：写一个适配器（`match`，以及 `StripeAdapter` 的子类：结构、单元、代价模型、fp32 副本 / 参照解码），注册到 `STRIPE_ADAPTERS`；有需要整图统计的 GroupNorm 就在单元上挂 `NormRef`，引擎自动安排统计遍；先用 `alloc_sim` 加一个 meta 构造，验证 reserved ≤ 估算，再上真机。
 
@@ -166,4 +167,11 @@ LoRA 部分的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 全局运行
 * **release 按 patcher**：已加载模型和输出缓存按各自设置；原生模型默认保留；全局默认保留且没用过节点时直接返回。
 * **测试**：`tests/test_lora_node.py`（19 项）；合成模型 `tests/make_synthetic_checkpoint.py $MODELS`（约 2 GiB，云端测试时放在 scratchpad 的 models 目录）。
 * **待真机**：命令 V（`tests/check_lora_node.py --lora <文件>`，默认 checkpoint `waiIllustriousSDXL_v170.safetensors`）。
+
+## 10. Monoload Info 节点（DESIGN §12，README §4.3）
+
+* **输入都可选**（vae、model、images），输出 STRING，同样的文字显示在节点框里；输出节点、每次运行都刷新。
+* **节点框里的文字**：`web/monoload_info.js`（插件导出 `WEB_DIRECTORY`）用前端自带的 `window.comfyAPI.textPreviewWidgets`（核心 Preview as Text 的控件）；在锁定镜像起服务、用 Chromium 打开真实前端核对过。改前端相关代码时，用同样的办法看（`docker run -p 127.0.0.1:8188:8188 ... python main.py --cpu --listen 0.0.0.0`，Playwright 在 `/opt/node-tools/node_modules/playwright`）。
+* **内容**：不接输入 → 版本 / commit、总开关、每项全局默认和来源；vae → 设置和来源、这个 VAE 对象上一次解码的记录（`vae.decode_record`，含实测 reserved / GTT 峰值增量）；model → LoRA 名字和强度（`LoraLoader` 包装记在 `model_options`）、设置和来源、当前状态。
+* **测试**：`tests/test_info_node.py`（16 项）。
 

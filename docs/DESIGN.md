@@ -1169,3 +1169,17 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 **测试：** `tests/test_lora_node.py`（19 项）用 `tests/make_synthetic_checkpoint.py` 生成的随机权重 SD1.5（真实结构，fp16，约 2 GiB）和一个 rank 4 的普通 LoRA（改 UNet 的 184 个权重、文本编码器的 72 个），走 ComfyUI 自己的 `CheckpointLoaderSimple` / `LoraLoader` / `LoraLoaderModelOnly`，CPU 上 8×8 latent 采一步。`exact` 和 `native` 与卸掉钩子的原版比较 `torch.equal`（TE 输出和 latent），`native` 的备份数（256）与原版相同；`fused` 与原版的相对差异 3e-4。用同一个合成模型跑了 `tests/test_release.py`（默认 / `MONOLOAD_KEEP_LORA=1` / `MONOLOAD_EXACT=1`）：42 / 22 / 42 项全过，默认行为没变。真机：`tests/check_lora_node.py`（README §9.8 的 V）。
 
+## 12. Monoload Info 节点（info-node）
+
+**节点框里怎么显示文字（核对过锁定版本）：** ComfyUI 0.31.0 的后端只负责把节点返回的 `{"ui": {...}}` 通过 `executed` 消息发给前端，前端怎么画由前端扩展决定；经典节点接口本身没有「在节点里显示文字」的机制。前端 1.48.7（`comfyui_frontend_package`）里核心节点 `PreviewAny`（「Preview as Text」）用的是扩展 `Comfy.PreviewAny`：`onNodeCreated` 时调 `addTextPreviewWidgets(node)`（一个 `textPreview` 控件 + Markdown / 纯文本开关），`onExecuted` 时调 `updateTextPreviewWidgets(node, message)`（取 `message.text`，数组用空行连接）；这两个函数挂在 `window.comfyAPI.textPreviewWidgets` 上。所以插件导出 `WEB_DIRECTORY = "./web"`，`web/monoload_info.js` 对 `MonoloadInfo` 做同样的事；拿不到这两个函数（别的前端版本）时退回一个只读的多行文本控件。后端：`OUTPUT_NODE = True`（`text` 不接也执行），返回 `{"ui": {"text": [text]}, "result": (text,)}`，`IS_CHANGED` 返回 NaN（与自己不相等，每次都重新执行）。在云端容器里用锁定镜像起了 ComfyUI 服务，用 Chromium（Playwright）打开真实前端：节点框里显示了文字，连上 checkpoint → VAE Settings → VAE Decode → Info 和 LoRA Settings → Info 的图也显示了这次解码的记录和 LoRA 名字。
+
+**内容（`monoload/info.py`，每次调用重新生成）：** 开头总是版本（`monoload.__version__`）和 commit（直接读插件目录的 `.git/HEAD` / refs / `packed-refs`，不调用 git）、总开关；不接 `vae` / `model` 时列出每一项全局默认值和来源；接了就分别写 VAE 段和 MODEL 段。来源：环境变量里设了就是 `env 名字=值`，否则值等于内置默认是 `built-in`，不等（测试 / bench 用 `set_*` 改过）是 `set at runtime`。
+
+**解码记录按 VAE 对象：** `vae._RECORDS` 是 `WeakKeyDictionary`（VAE 对象 → 这个对象最后一次解码的记录），`_decode` 每次（受管理的、原生的、报错的）结束时写入，`decode_record(vae)` 读。节点做的副本是另一个对象，所以副本和原 VAE 各记各的；`last_decode()`（全局最后一次）照旧。受管理的解码外面套 `_MemProbe`：GPU 上记 `torch.cuda.max_memory_reserved` 相对解码前的增量（解码开始时 `reset_peak_memory_stats`），有 amdgpu 的 `mem_info_gtt_used` 时开一个线程每 20 ms 读一次取峰值增量；CPU 上都不测。原生解码只记策略、原因和耗时（不测内存，保持 `MONOLOAD=0` 下开销接近零）。
+
+**LoRA 名字：** patch 里没有文件名。插件入口包装 `nodes.LoraLoader.load_lora`（`LoraLoaderModelOnly` 也调用它），在它返回的 clone 的 `model_options["monoload_lora_names"]` 末尾加一条 `{name, strength}`（强度为 0、返回原对象时不记）。只有元数据：patch、`patches_uuid`、数值都不变；`model_options` 随 clone 复制，所以串联的加载器按顺序累积。别的插件的加载器不经过它，Info 只显示被改动的权重数。Hook LoRA（`CreateHookLora`）挂在条件上，不在 MODEL 段里。
+
+**`images` 输入：** 不读，只让 Info 依赖 VAE Decode 的输出，从而在解码之后执行。没接时 Info 可能在解码之前执行，显示的是上一次的记录（或 `not decoded yet`）。
+
+**测试：** `tests/test_info_node.py`（16 项，不需要模型文件）；`tests/test_entry.py` 检查三个节点、web 目录、`LoraLoader` 的包装。
+

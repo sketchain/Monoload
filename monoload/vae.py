@@ -49,9 +49,12 @@ inputs an LDM decode keeps whole, DESIGN §9.14; default B). The forced
 settings outrank the budget.
 """
 
+import glob
 import inspect
 import logging
 import os
+import re
+import threading
 import time
 import weakref
 
@@ -327,6 +330,90 @@ def last_decode():
     return dict(_LAST)
 
 
+_RECORDS = weakref.WeakKeyDictionary()   # VAE object -> the record of its last decode (the Monoload Info node)
+
+
+def decode_record(vae):
+    """The record of the last decode of this VAE object (a copy made by the
+    Monoload VAE Settings node is its own object), or None: last_decode()'s
+    fields plus "mem" (measured: reserved_peak / gtt_peak increases in bytes,
+    None where not measurable) and "when" (time.time())."""
+    try:
+        r = _RECORDS.get(vae)
+    except TypeError:
+        return None
+    return dict(r) if r is not None else None
+
+
+def _record(vae, mem=None):
+    try:
+        _RECORDS[vae] = dict(_LAST, mem=mem, when=time.time())
+    except TypeError:
+        pass
+
+
+def _gtt_files():
+    out = {}
+    for d in glob.glob("/sys/class/drm/card*"):
+        if re.search(r"/card\d+$", d):
+            p = os.path.join(d, "device", "mem_info_gtt_used")
+            if os.path.exists(p):
+                out.setdefault(os.path.realpath(os.path.join(d, "device")), p)
+    return list(out.values())
+
+
+def _read_gtt(files):
+    try:
+        return sum(int(open(p).read()) for p in files)
+    except (OSError, ValueError):
+        return None
+
+
+class _MemProbe:
+    """Measured memory of one managed decode: the increase of torch's peak
+    reserved memory on the VAE's CUDA / ROCm device, and the peak increase of
+    amdgpu GTT used (sampled every 20 ms by a thread, where the sysfs file
+    exists). Nothing is measured on the CPU."""
+
+    def __init__(self, device):
+        self.device = device
+        self.result = {"reserved_peak": None, "gtt_peak": None}
+
+    def __enter__(self):
+        dev = self.device
+        self.cuda = getattr(dev, "type", None) == "cuda" and torch.cuda.is_available()
+        if self.cuda:
+            self.base_res = torch.cuda.memory_reserved(dev)
+            torch.cuda.reset_peak_memory_stats(dev)
+        self.files = _gtt_files() if self.cuda else []
+        self.thread = None
+        if self.files:
+            self.base_gtt = self.peak_gtt = _read_gtt(self.files)
+            self.stop = threading.Event()
+            self.thread = threading.Thread(target=self._sample, daemon=True)
+            self.thread.start()
+        return self
+
+    def _sample(self):
+        while not self.stop.wait(0.02):
+            v = _read_gtt(self.files)
+            if v is not None and (self.peak_gtt is None or v > self.peak_gtt):
+                self.peak_gtt = v
+
+    def __exit__(self, *exc):
+        if self.thread is not None:
+            self.stop.set()
+            self.thread.join()
+            v = _read_gtt(self.files)
+            if v is not None and self.peak_gtt is not None:
+                self.peak_gtt = max(self.peak_gtt, v)
+            if self.base_gtt is not None and self.peak_gtt is not None:
+                self.result["gtt_peak"] = self.peak_gtt - self.base_gtt
+        if self.cuda:
+            self.result["reserved_peak"] = torch.cuda.max_memory_reserved(self.device) - self.base_res
+        return False
+
+
 # ---------------------------------------------------------------------------
 # layer 1 (phases 2/3): stripe decoding adapters for recognized decoders
 # ---------------------------------------------------------------------------
@@ -550,12 +637,19 @@ def _decode(self, samples_in, vae_options={}):
         logging.log(level, "[Monoload] VAE decode left native: {}; {}".format(reason, note))
         _LAST.clear()
         _LAST.update({"strategy": "native", "reason": reason, "settings": dict(eff), "settings_source": dict(src)})
-        return _ORIG["decode"](self, samples_in, vae_options)
+        t0 = time.perf_counter()
+        out = _ORIG["decode"](self, samples_in, vae_options)
+        _LAST["seconds"] = time.perf_counter() - t0
+        _record(self)
+        return out
+    probe = _MemProbe(getattr(self, "device", None))
     with _Applied(eff, note):
         try:
-            return _managed_decode(self, samples_in, vae_options)
+            with probe:
+                return _managed_decode(self, samples_in, vae_options)
         finally:
             _LAST["settings"], _LAST["settings_source"] = dict(eff), dict(src)
+            _record(self, probe.result)
 
 
 def _managed_decode(self, samples_in, vae_options):

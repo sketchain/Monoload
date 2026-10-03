@@ -13,7 +13,7 @@ runtime.
     MONOLOAD_DISABLE_VAE_STRIPE=1 python tests/test_entry.py  # VAE layer 1 off, layer 2 on
     MONOLOAD_VAE_BUDGET=2G MONOLOAD_VAE_STRIPE_ROWS=64 python tests/test_entry.py
     MONOLOAD_VAE_GN_SCHEME=D python tests/test_entry.py   # LDM layer-1 GroupNorm scheme
-The Monoload nodes (LoRA Settings, VAE Settings) are registered in every combination.
+The Monoload nodes (LoRA Settings, VAE Settings, Info) and the web directory are registered in every combination.
 """
 
 import asyncio
@@ -36,10 +36,12 @@ keep = os.environ.get("MONOLOAD_KEEP_LORA", "") == "1"
 release_hooked = execution.PromptExecutor.execute_async is not native_exec
 vae_hooked = comfy.sd.VAE.decode is not native_vae_decode
 check("VAE.decode_tiled / decode_tiled_ never touched", (comfy.sd.VAE.decode_tiled, comfy.sd.VAE.decode_tiled_) == native_vae_tiled)
-want_nodes = {"MonoloadLoRASettings": "Monoload LoRA Settings", "MonoloadVAESettings": "Monoload VAE Settings"}
+want_nodes = {"MonoloadLoRASettings": "Monoload LoRA Settings", "MonoloadVAESettings": "Monoload VAE Settings", "MonoloadInfo": "Monoload Info"}
 got_nodes = {k: (nodes.NODE_DISPLAY_NAME_MAPPINGS.get(k), getattr(nodes.NODE_CLASS_MAPPINGS.get(k), "CATEGORY", None)) for k in want_nodes}
 check("nodes registered by ComfyUI's loader in every switch combination: {}".format(got_nodes),
       all(got_nodes[k] == (want_nodes[k], "Monoload") for k in want_nodes))
+web = [d for d in nodes.EXTENSION_WEB_DIRS.values() if os.path.exists(os.path.join(d, "monoload_info.js"))]
+check("web directory registered (Monoload Info's text widget): {}".format(web), len(web) == 1)
 flag = lambda n: os.environ.get(n, "").strip().lower() in ("1", "true", "yes", "on")
 now = {n: comfy.model_patcher.ModelPatcher.__dict__[n] for n in native}
 changed = [n for n in native if now[n] is not native[n]]
@@ -63,6 +65,7 @@ else:
     want_mode = ("native", "MONOLOAD=0") if not master else ("native", "MONOLOAD_DISABLE_VAE=1") if flag("MONOLOAD_DISABLE_VAE") else \
         ("native", "MONOLOAD_EXACT=1") if exact else ("layer2", "MONOLOAD_DISABLE_VAE_STRIPE=1") if flag("MONOLOAD_DISABLE_VAE_STRIPE") else ("auto", None)
     check("VAE global default mode {} ({})".format(*vae.global_mode()), vae.global_mode() == want_mode)
+    check("LoraLoader.load_lora wrapped for the LoRA names (metadata only)", getattr(nodes.LoraLoader.load_lora, "__wrapped__", None) is not None)
     want = os.environ.get("MONOLOAD_VAE_WORKSPACE", "")
     if want:
         check("MONOLOAD_VAE_WORKSPACE={} honoured".format(want), vae.workspace() == vae.parse_size(want))
