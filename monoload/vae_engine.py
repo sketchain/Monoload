@@ -250,6 +250,13 @@ def arena_bytes(live, stripes=2, saves=False, ws=0):
     return -(-a // (2 * MIB)) * (2 * MIB)
 
 
+CALLS = "calls"    # key of the conv GEMM call count in a work dict (_chain_cost)
+
+
+def _macs(work):
+    return sum(v for k, v in work.items() if k != CALLS)
+
+
 class Pass:
     """One statistics pass (DESIGN §9.14): from the save at `start`, run `chain`
     (units[start:unit], plus the norm's partial unit when the norm sits inside
@@ -261,11 +268,13 @@ class Pass:
 
 
 def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
-    """(needs, order, live, largest, work by output width) of running `chain` on `stripes` (rows at
+    """(needs, order, live, largest, work) of running `chain` on `stripes` (rows at
     the chain's output level). live: the largest unit peak (the first unit reads a
     slice of a save, counted on its own); tail(rows, s) -> the peak after the chain
     (the statistics of a pass). The peaks depend only on the rows each unit runs
-    on, so each distinct pattern of rows is evaluated once."""
+    on, so each distinct pattern of rows is evaluated once. work: conv MACs by
+    output width (identifies the resolution level), and under the key CALLS the
+    number of conv GEMM calls (row blocks under the workspace; bound.unit_calls)."""
     needs_all = [stripe_needs(chain, heights, a, b) for a, b in stripes]
     # the stripe with the largest slices runs first: the blocks it leaves in the allocator's cache fit every later stripe
     size = [sum(n[1] - n[0] for n in needs) for needs in needs_all]
@@ -276,7 +285,8 @@ def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
         key = tuple(n[1] - n[0] for n in needs)
         patterns[key] = patterns.get(key, 0) + 1
     live = largest = 0
-    work = {}   # output width (identifies the resolution level) -> conv MACs
+    work = {CALLS: 0}
+    unit_calls = getattr(bound, "unit_calls", None)
     for rows, count in patterns.items():
         s = 0
         for i, u in enumerate(chain):
@@ -286,6 +296,8 @@ def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
             s = r * u.scale * widths[i + 1] * u.cout * elem
             w_out = widths[i + 1]
             work[w_out] = work.get(w_out, 0) + count * r * u.scale * w_out * u.macs_row
+            if unit_calls is not None:
+                work[CALLS] += count * unit_calls(u, r, widths[i], elem, ws)
         if tail is not None:
             live = max(live, tail(rows[-1], s))
     return needs_all, order, live, largest, work
@@ -454,7 +466,7 @@ class Plan:
         self.arena, self.save_layout, alive, self.stripe_bytes, self.pass_bytes, rows, self.live_peak, save_alloc, self.save_slack = best_v
         for ps, a, (r, (st, (needs, order, live, plg, work))) in zip(self.passes, alive, rows):
             ps.alive, ps.rows, ps.stripes, ps.needs, ps.order, ps.live, ps.largest = a, r, st, needs, order, live, plg
-            ps.work_levels, ps.work = work, sum(work.values())
+            ps.work_levels, ps.work = work, _macs(work)
             largest = max(largest, plg, norm_temp(ps.norm.channels, max(b - a_ for a_, b in st), ps.widths[-1], ws))
         self.persistent = persistent
         self.front_arena = 0
@@ -485,15 +497,20 @@ class Plan:
         self.estimate = self.arena + self.largest + ESTIMATE_PAD
         work_prefix = sum(bound.prefix_macs(m) for _, m in bound.prefix) * h8 * w8
         work_whole = work_prefix + sum(heights[i + 1] * widths[i + 1] * u.macs_row for i, u in enumerate(units))
-        work_stripes = sum(final_levels.values())
+        work_stripes = _macs(final_levels)
         self.work_passes = sum(ps.work for ps in self.passes)
         self.recompute = (work_prefix + work_stripes + self.work_passes) / max(1, work_whole)
         # conv MACs by resolution level (output width / latent width: 1 = the prefix at H/8, 2, 4, 8), for the time model
         levels = {1: work_prefix}
+        calls = 0
         for d in [final_levels] + [ps.work_levels for ps in self.passes]:
             for w_out, m in d.items():
-                levels[w_out // w8] = levels.get(w_out // w8, 0) + m
+                if w_out == CALLS:
+                    calls += m
+                else:
+                    levels[w_out // w8] = levels.get(w_out // w8, 0) + m
         self.work_levels = levels
+        self.conv_calls = calls   # conv GEMM calls of the stripes and passes (the prefix's are the same for every plan)
 
     def long_lived(self, out_bytes):
         """The long-lived allocations of one sample of a decode with saves, in

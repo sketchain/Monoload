@@ -43,15 +43,21 @@ PART = "part"   # the start of a ResnetBlock up to norm2's input (norm1 -> swish
 SCHEMES = ("A", "B", "C", "D")
 DEFAULT_SCHEME = "B"     # A up to 7059bdd; B after the CT 700 measurements (DESIGN §9.14.10): 4K 2.17 GiB / 42 s vs A 1.10 / 75 s
 
-# Time model of the budget policy (DESIGN §9.14.10): seconds per 1e12 conv MACs by
-# resolution level (output width / latent width: 1 = the prefix at H/8, then H/4,
-# H/2, H), fitted to the 12 CT 700 bf16 SDXL decodes of 7059bdd (max error 2.3%).
-# Absolute seconds hold for that machine only; the budget policy uses them to rank
-# the layer-1 configurations of one decode, which needs only the ratios: work
-# moved to a lower-resolution level is cheaper (full resolution costs ~2x per MAC,
-# few channels and memory-bound GroupNorm / SiLU), so scheme C (5.7x work) beats
-# B (5.3x).
-TIME_COEF = {1: 1.35, 2: 0.113, 4: 0.129, 8: 0.269}
+# Time model of the budget policy (DESIGN §9.14.10, §9.14.11): seconds per 1e12
+# conv MACs of the stripes and statistics passes by resolution level (output width
+# / latent width: H/4, H/2, H), plus a cost per conv GEMM call (a smaller
+# workspace splits a conv into more row blocks: more calls, each with its im2col,
+# input and output copies), plus the prefix's mid-block attention (2 x channels x
+# tokens^2 MACs, tokens = latent pixels; the same for every plan of an image).
+# Fitted to 22 CT 700 bf16 SDXL decodes of 7059bdd and 01377c4 (workspace 64 /
+# 128 / 192 / 384 MiB; max error 5.3 %, a single whole-image stripe -17 %).
+# Absolute seconds hold for that machine only; the budget policy uses them to
+# rank the layer-1 configurations of one decode: work moved to a lower
+# resolution is cheaper (full resolution costs ~2x per MAC), so scheme C (5.7x
+# work) beats B (5.3x); a 64 MiB workspace doubles the calls of 128 MiB.
+TIME_COEF = {2: 0.0922, 4: 0.1294, 8: 0.2464}
+TIME_PER_CALL = 2.37e-4
+TIME_ATTN = 0.239
 _SCHEME = [DEFAULT_SCHEME]
 
 
@@ -321,6 +327,29 @@ def unit_peak(u, r, w, e, ws, s):
     return s + a + (norm_temp(u.cin, r, w, ws) if u.norms else 0)
 
 
+def conv_calls(cin, r, w, e, ws):
+    """GEMM calls of a 3x3 conv on r output rows of width w under the layer-2
+    conv wrapper: one, or one per row block of columns <= ws (vae_ops._ConvChunker)."""
+    per_row = 9 * cin * w * e
+    if per_row * r <= ws:
+        return 1
+    return -(-r // max(1, ws // per_row))
+
+
+def unit_calls(u, r, w, e, ws):
+    """Conv GEMM calls while unit u runs on r input rows of width w (the time model's workspace term)."""
+    if u.kind in (RES, PART):
+        n = conv_calls(u.cin, r, w, e, ws)
+        if u.kind == RES:
+            n += conv_calls(u.cout, r, w, e, ws) + (1 if u.shortcut else 0)
+        return n
+    if u.kind == UP:
+        return conv_calls(u.cin, 2 * r, 2 * w, e, ws)
+    if u.kind == CONV:
+        return conv_calls(u.cin, r, w, e, ws)
+    return 0
+
+
 def unit_largest(u, r, w, e, ws):
     """Largest single allocation while unit u runs on r input rows of width w."""
     a, b = r * w * u.cin * e, r * w * u.cout * e
@@ -402,6 +431,7 @@ class LDMStripe(eng.StripeAdapter):
                     int(dec.ch), int(dec.num_res_blocks), tuple((u.kind, u.cin, u.cout) for u in self.units), self.gn_scheme)
 
     unit_peak = staticmethod(unit_peak)
+    unit_calls = staticmethod(unit_calls)
     unit_largest = staticmethod(unit_largest)
     prefix_peak = staticmethod(prefix_peak)
     prefix_largest = staticmethod(prefix_largest)
@@ -419,7 +449,9 @@ class LDMStripe(eng.StripeAdapter):
 
     def predict_seconds(self, plan):
         top = TIME_COEF[max(TIME_COEF)]
-        return sum(TIME_COEF.get(lv, top) * m for lv, m in plan.work_levels.items()) / 1e12
+        macs = sum(TIME_COEF.get(lv, top) * m for lv, m in plan.work_levels.items() if lv > 1)   # level 1: the prefix, in the attention term
+        tokens = plan.heights[0] * plan.widths[0]
+        return macs / 1e12 + TIME_PER_CALL * plan.conv_calls + TIME_ATTN * 2 * self.ckpt_channels * tokens * tokens / 1e12
 
     def output_shape(self, samples):
         return (samples.shape[0], self.out_channels, int(samples.shape[-2]) * self.scale, int(samples.shape[-1]) * self.scale)

@@ -618,6 +618,13 @@ def budget_plan_tests():
         i = alloc_sim.decode_trace(3840, 2160, "bf16", rows, model="sdxl", scheme="B", ws=ws << 20)
         check("SDXL 4K B {} rows, workspace {} MiB: simulated reserved {:.2f} GiB <= estimate {:.2f} GiB (arena {:.2f})".format(
             rows, ws, i["reserved"] / G, i["estimate"] / G, i["arena"] / G), i["reserved"] <= i["estimate"])
+    # the time model against CT 700 (01377c4): 4K D, 309-row stripes, workspace 64 MiB measured 63.2 s (the levels-only model said 53.6)
+    lat = torch.empty(1, 4, 270, 480, device="meta")
+    bd = vl.LDMStripe(v.first_stage_model, v.first_stage_model.post_quant_conv, gn_scheme="D")
+    t64 = bd.predict_seconds(bd.plan(v, lat, 0, 64 << 20, rows=309, out_bytes=bd.output_bytes(v, lat)))
+    t128 = bd.predict_seconds(bd.plan(v, lat, 0, 128 << 20, rows=309, out_bytes=bd.output_bytes(v, lat)))
+    check("time model: 4K D 309 rows, workspace 64 MiB {:.1f} s (CT 700 63.2 s), 128 MiB {:.1f} s: a smaller workspace is slower".format(t64, t128),
+          abs(t64 / 63.2 - 1) <= 0.08 and t64 > t128)
 
 
 def estimate_tests():
