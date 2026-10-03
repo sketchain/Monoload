@@ -20,8 +20,9 @@ No model files needed: small SDXL-like / Flux-like VAEs with random weights
      native; the global settings restored after every decode (also after an
      error);
   5. several copies with different settings, interleaved;
-  6. global switches win: with the wrapper uninstalled (MONOLOAD_DISABLE_VAE /
-     MONOLOAD_EXACT) the copy decodes natively and the node says so once.
+  6. the wrapper not installed: the copy decodes natively (the global
+     defaults MONOLOAD=0 / MONOLOAD_DISABLE_VAE / MONOLOAD_EXACT /
+     MONOLOAD_DISABLE: tests/test_master_switch.py).
 
     python tests/test_vae_node.py
 """
@@ -64,8 +65,9 @@ def registration():
           cls is not None and NODE_DISPLAY_NAME_MAPPINGS.get(NODE) == "Monoload VAE Settings")
     it = cls.INPUT_TYPES()["required"]
     check("interface: category {}, inputs {}, returns {}, function {}".format(cls.CATEGORY, list(it), cls.RETURN_TYPES, cls.FUNCTION),
-          cls.CATEGORY == "Monoload" and list(it) == ["vae", "budget_gib", "gn_scheme", "stripe_rows", "mode"] and cls.RETURN_TYPES == ("VAE",)
+          cls.CATEGORY == "Monoload" and list(it) == ["vae", "budget_gib", "gn_scheme", "stripe_rows", "mode", "budget"] and cls.RETURN_TYPES == ("VAE",)
           and it["gn_scheme"][0] == ["default", "A", "B", "C", "D"] and it["mode"][0] == ["default", "auto", "layer 2 only", "native"]
+          and it["budget"][0] == ["default", "unlimited", "custom"] and it["budget"][1]["default"] == "default"
           and it["budget_gib"][1]["default"] == 0.0 and it["stripe_rows"][1]["default"] == 0)
     return cls
 
@@ -106,7 +108,7 @@ def priority_tests(cls, sd):
               and eff["stripe_rows"] == 32 and eff["mode"] == "layer2")
         rows = []
         ok = True
-        for item, kw, want in (("budget", {"budget_gib": 3.0}, ("budget", 3 << 30)), ("gn_scheme", {"gn_scheme": "A"}, ("gn_scheme", "A")),
+        for item, kw, want in (("budget", {"budget": "custom", "budget_gib": 3.0}, ("budget", 3 << 30)), ("gn_scheme", {"gn_scheme": "A"}, ("gn_scheme", "A")),
                                ("stripe_rows", {"stripe_rows": 64}, ("stripe_rows", 64)), ("mode", {"mode": "auto"}, ("mode", "auto"))):
             eff, src = mvae.resolve_settings(node_apply(cls, sd, **kw))
             others = [k for k in src if k != item]
@@ -119,7 +121,7 @@ def priority_tests(cls, sd):
 
 
 def copy_tests(cls, sd, lat):
-    big = node_apply(cls, sd, budget_gib=1024.0)
+    big = node_apply(cls, sd, budget="custom", budget_gib=1024.0)
     check("the copy shares the first-stage model and the patcher; the input VAE has no settings",
           big is not sd and big.first_stage_model is sd.first_stage_model and big.patcher is sd.patcher and vo.overrides(sd) == {}
           and vo.overrides(big) == {"budget": 1024 << 30})
@@ -157,7 +159,7 @@ def copy_tests(cls, sd, lat):
 def semantics_tests(cls, sd, lat):
     ref = native_decode(sd, lat, raw=True)
     before = snapshot()
-    tiny = node_apply(cls, sd, budget_gib=0.001)
+    tiny = node_apply(cls, sd, budget="custom", budget_gib=0.001)
     expect_raises("node budget too small -> MonoloadError naming what each candidate needs", MonoloadError,
                   lambda: managed_decode(tiny, lat), "MONOLOAD_VAE_BUDGET", "第二层需要约", "方案 B")
     check("... the global settings are restored after the error", snapshot() == before and mvae.last_decode()["settings_source"]["budget"] == "node")
@@ -187,7 +189,7 @@ def semantics_tests(cls, sd, lat):
     expect_raises("unknown scheme -> ValueError", ValueError, lambda: vo.with_settings(sd, gn_scheme="E"))
     expect_raises("unknown mode -> ValueError", ValueError, lambda: vo.with_settings(sd, mode="fast"))
     with LogCapture() as cap:
-        managed_decode(node_apply(cls, sd, budget_gib=1024.0), lat)
+        managed_decode(node_apply(cls, sd, budget="custom", budget_gib=1024.0), lat)
     line = next((l for l in cap.lines if "-> layer 2" in l and "settings:" in l), "")
     check("the decode's log line names where each setting came from: ...{}".format(line[line.find("settings:"):][:140]),
           "budget 1024.00 GiB (node)" in line and "mode auto (default)" in line)
@@ -207,21 +209,18 @@ def several_tests(cls, sd, lat):
 
 
 def global_switch_tests(cls, sd, lat):
-    from monoload.nodes import vae_settings as nv
+    """The wrapper not installed (e.g. a ComfyUI whose API differs): copies
+    decode natively, their settings unused, no budget error. The global
+    defaults (MONOLOAD=0, MONOLOAD_DISABLE_VAE, MONOLOAD_EXACT, MONOLOAD_DISABLE)
+    are covered by tests/test_master_switch.py."""
     ref = native_decode(sd, lat)
-    copy_ = node_apply(cls, sd, budget_gib=0.001)
+    copy_ = node_apply(cls, sd, budget="custom", budget_gib=0.001)
     mvae.uninstall()
-    nv._NOTED.clear()
     try:
-        with LogCapture() as cap:
-            again = node_apply(cls, sd, budget_gib=0.001)
-            node_apply(cls, sd, gn_scheme="A")
-            out = comfy.sd.VAE.decode(copy_, lat)
-            out2 = comfy.sd.VAE.decode(again, lat)
-        notes = [l for l in cap.lines if "Monoload VAE Settings" in l]
-        check("wrapper uninstalled (MONOLOAD_DISABLE_VAE / MONOLOAD_EXACT): copies decode natively, no budget error; logged once ({})".format(
-              notes[0][:110] if notes else ""),
-              len(notes) == 1 and "ignored" in notes[0] and torch.equal(out, ref) and torch.equal(out, out2))
+        again = node_apply(cls, sd, budget="custom", budget_gib=0.001)
+        out = comfy.sd.VAE.decode(copy_, lat)
+        out2 = comfy.sd.VAE.decode(again, lat)
+        check("wrapper not installed: copies decode natively, no budget error", torch.equal(out, ref) and torch.equal(out, out2))
     finally:
         mvae.install()
 

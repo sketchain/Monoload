@@ -59,7 +59,7 @@ def main():
     w, h = (int(x) for x in a.res.split("x"))
     lat = B.random_latent(vae, w, h, a.seed, 1.0)
     node = NODE_CLASS_MAPPINGS["MonoloadVAESettings"]
-    copy = getattr(node(), node.FUNCTION)(vae=vae, budget_gib=a.budget, gn_scheme=a.gn_scheme, stripe_rows=a.stripe_rows, mode=a.mode)[0]
+    copy = getattr(node(), node.FUNCTION)(vae=vae, budget="custom" if a.budget > 0 else "default", budget_gib=a.budget, gn_scheme=a.gn_scheme, stripe_rows=a.stripe_rows, mode=a.mode)[0]
     print("VAE: {} ({}), latent {}; node: budget {} GiB, scheme {}, stripe rows {}, mode {}".format(
         what, type(vae.first_stage_model).__name__, list(lat.shape), a.budget, a.gn_scheme, a.stripe_rows, a.mode), flush=True)
     print("copy shares the weights: {}; the original VAE carries no settings: {}".format(

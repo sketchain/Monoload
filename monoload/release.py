@@ -22,7 +22,10 @@ finished (successfully or not), release_after_prompt():
      current_weight_patches_uuid for patch-free loaded patchers +
      soft_empty_cache.
 
-MONOLOAD_KEEP_LORA=1 (checked by the plugin entry) skips installing this.
+Whether it runs is decided after every prompt (enabled()): not with the
+master switch off (MONOLOAD=0: native ComfyUI keeps LoRA state between
+prompts), not with MONOLOAD_KEEP_LORA=1 (the global default "keep"; read at
+import, set_keep() for tests). Otherwise the wrapper only adds the call.
 """
 
 import gc
@@ -37,7 +40,25 @@ import comfy.model_management
 import comfy.model_patcher
 from comfy.model_patcher import ModelPatcher
 
+from . import settings
+
 _ORIG = {}
+_KEEP = [settings.env_flag("MONOLOAD_KEEP_LORA")]
+
+
+def keep():
+    """The global default: LoRA state kept between prompts (MONOLOAD_KEEP_LORA=1)."""
+    return _KEEP[0]
+
+
+def set_keep(on):
+    """Tests; MONOLOAD_KEEP_LORA at import."""
+    _KEEP[0] = bool(on)
+
+
+def enabled():
+    """Release LoRA after this prompt: master switch on and not MONOLOAD_KEEP_LORA."""
+    return settings.master() and not _KEEP[0]
 _MAX_DEPTH = 8
 
 
@@ -252,7 +273,8 @@ def install():
             return await orig(self, prompt, prompt_id, extra_data, execute_outputs)
         finally:
             try:
-                release_after_prompt(self)
+                if enabled():
+                    release_after_prompt(self)
             except Exception:
                 logging.exception("[Monoload] releasing LoRA after the prompt failed")
 
