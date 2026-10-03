@@ -411,7 +411,7 @@ def plan_tests(sd, lat4):
         eng.run_passes = oom_above(0)
         with Spy() as spy:
             expect_raises("OOM even with the smallest stripes -> MonoloadVAEOOMError", MonoloadVAEOOMError,
-                          lambda: managed_decode(sd, lat4), "不会退回到 tiled", "第二层")
+                          lambda: managed_decode(sd, lat4), "never falls back to the approximate tiled", "nor to layer 2")
         check("... neither tiled nor layer 2 was called, no override left", spy.tiled == 0 and calls_l2[0] == 0 and no_overrides(sd.first_stage_model))
     finally:
         eng.run_passes = orig_run
@@ -548,7 +548,7 @@ def budget_tests(sd, lat4):
         mvae.set_budget(1 << 20)
         try:
             expect_raises("MONOLOAD_VAE_GN_SCHEME=C with a 1 MiB budget -> MonoloadError naming scheme C's need (no layer 2)", MonoloadError,
-                          lambda: managed_decode(sd, lat4), "方案 C")
+                          lambda: managed_decode(sd, lat4), "scheme C")
         finally:
             mvae.set_budget(None)
             mvae.set_gn_scheme(None)
@@ -560,12 +560,12 @@ def budget_tests(sd, lat4):
         mvae.set_budget(1 << 20)
         try:
             expect_raises("1 MiB budget, nothing forced -> MonoloadError naming what layer 2 and each scheme need", MonoloadError,
-                          lambda: managed_decode(sd, lat4), "MONOLOAD_VAE_BUDGET", "第二层需要约", "方案 A", "方案 B", "方案 C", "方案 D")
+                          lambda: managed_decode(sd, lat4), "MONOLOAD_VAE_BUDGET", "layer 2 needs about", "scheme A", "scheme B", "scheme C", "scheme D")
             dec = sd.first_stage_model.decoder
             dec.tanh_out = True
             try:
                 expect_raises("... an unrecognized decoder (tanh_out): MonoloadError naming layer 2's need and why layer 1 is out", MonoloadError,
-                              lambda: managed_decode(sd, lat4), "第二层需要约", "第一层不可用", "tanh_out")
+                              lambda: managed_decode(sd, lat4), "layer 2 needs about", "layer 1 not available", "tanh_out")
                 mvae.set_budget(l2)
                 managed_decode(sd, lat4)
                 check("... with a budget layer 2 fits: layer 2", mvae.last_decode().get("strategy") == "layer2")

@@ -1183,3 +1183,13 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 **测试：** `tests/test_info_node.py`（16 项，不需要模型文件）；`tests/test_entry.py` 检查三个节点、web 目录、`LoraLoader` 的包装。
 
+## 13. 多语言（i18n）
+
+**界面（节点名、输入名、下拉显示、提示）：** 用 ComfyUI 官方的 locales 机制（https://docs.comfy.org/custom-nodes/i18n）：`locales/en/nodeDefs.json`、`locales/zh/nodeDefs.json`，结构 `{节点类名: {display_name, description, inputs: {输入名: {name, tooltip, options: {存储值: 显示文字}}}, outputs: {"0": {name}}}}`。服务端 `app/custom_node_manager.py` 的 `/i18n` 把各插件的 locales 合并后给前端。英文文件从节点的 `INPUT_TYPES` 生成（名字与真实输入名一致），中文手写；`tests/test_messages.py` 检查两份都覆盖每个节点、输入、下拉选项、输出。
+
+**锁定版本上核对的结果（前端 1.48.7，Chromium 实测）：** 节点标题、输入名、输出名、提示都按 `Comfy.Locale` 翻译；**下拉选项的显示文字不翻译**——前端读了 nodeDefs 的 `options` 键（文档里有），但没有接到 combo 控件上，显示的仍是存储值。combo 控件本身有一个只影响显示的钩子 `widget.options.getOptionLabel`（`_displayValue`、下拉菜单、Vue 版的 WidgetSelect 都用它，值不变）。所以 `web/monoload_i18n.js` 在 `nodeCreated` / `loadedGraphNode` 时给三个节点的 combo 控件设 `getOptionLabel`，文字取自同一份 `/i18n` 数据（`[locale].nodeDefs.<节点>.inputs.<输入>.options.<值>`，locale 依次试 `Comfy.Locale`、去掉地区的部分、`en`），每次显示时现查，切换语言立即生效。实测：中文界面显示「跟随全局 / 自定义」，`app.graph.serialize()` 的 `widgets_values` 和 `graphToPrompt()` 的输入仍是 `default` / `custom`。将来前端自己支持 `options` 时，这个扩展设的是同一份文字，不冲突。英文界面的显示文字也带说明（`default (follow global)`、`exact (bit-identical)`），存储值不变。
+
+**后端消息（`monoload/messages.py`）：** 一张表 `M = {key: (英文, 中文)}`，`msg(key, **字段)` 按当前语言取、用命名字段格式化。语言：`MONOLOAD_LANG` 不设 / `en` → 英文（默认），`zh` / `zh-CN` / `zh_CN` → 中文，其他值警告后用英文；启动时读一次，`set_lang()` 给测试用。覆盖所有用户能看到的日志和报错：启动日志、LoRA 的报错（DynamicVRAM、`force_patch_weights`、非 comfy.ops 参数、形状改变）、释放日志、VAE 的环境变量警告、每次解码的日志（包括按预算选的理由、候选列表、计划描述 `Plan.describe`）、预算放不下 / OOM 的报错（以前是中文，现在默认英文）、自检通过 / 失败、节点的日志和输入错误、Info 节点的全部文字；句子里的设置值和来源（`node` / `env` / `default`、`enable` / `native` …）也按语言显示（`label()`）。不在表里、保持英文的：「不应该发生」的内部诊断（`StripeError` 的 internal error、分块卷积的 internal error 等，给报 bug 用；自检失败时它们出现在已翻译的警告句子里），以及照抄 ComfyUI 原文的一条 hook 警告。`tests/test_messages.py` 检查每项都有中英文、字段一致，代码里消息表以外没有中文。
+
+**文档语言不变**（README / DESIGN / HANDOFF 仍是中文）。
+

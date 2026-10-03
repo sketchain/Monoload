@@ -96,6 +96,8 @@ docker logs comfyui 2>&1 | grep -i monoload
 
 高级选项（`MONOLOAD_EXACT`、`MONOLOAD_KEEP_LORA`、`MONOLOAD_DISABLE_VAE`、`MONOLOAD_VAE_*` 等）见 §13，一般不用设。开关接受 `1` / `true` / `yes` / `on`，`MONOLOAD` 另外接受 `0` / `false` / `no` / `off`（其他值按开启处理并警告）。改完要重启容器。
 
+**界面语言：** 三个节点的名字、输入名、下拉选项的显示文字、提示跟随 ComfyUI 的语言设置（设置 → Comfy → Locale，中文 / English）；存进工作流的下拉取值始终是英文（`default`、`custom` 等），换语言不影响已保存的工作流。日志和报错默认英文，设 `MONOLOAD_LANG=zh` 改成中文（§13）；Monoload Info 节点的文字跟随 `MONOLOAD_LANG`。下文的选项按存储的英文取值写，中文界面上显示的是对应的中文（`default` = 跟随全局）。
+
 ### 4.1 节点用法：Monoload VAE Settings（单独设置某个 VAE）
 
 全局设置（总开关和高级选项）对所有 VAE 生效。要让某一个 VAE 用不同的设置，在工作流里加 **Monoload VAE Settings** 节点（分类 `Monoload`）：输入一个 VAE，输出一个带设置的 VAE 副本，把副本接到 VAE Decode 等节点上。
@@ -262,6 +264,7 @@ MODELS=/path/to/models tests/run_all.sh
 | `tests/test_master_switch.py` | 总开关和全局默认（§4），不需要模型文件：`MONOLOAD` 的解析；`MONOLOAD=0` 且没有节点时，挂 LoRA 的模型（整体加载、lowvram 部分加载、Hook LoRA）和 VAE 解码与卸掉钩子的原版 ComfyUI 逐位一致，备份也和原生一样；释放不运行；包装每次调用的开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `mode auto` 打开管理、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 时节点原样透传 |
 | `tests/test_lora_node.py` | Monoload LoRA Settings 节点（§4.2），需要 `tests/make_synthetic_checkpoint.py $MODELS` 生成的随机权重 SD1.5 checkpoint 和 LoRA（约 2 GiB）：接口；逐项优先级和来源；clone 共享权重、输入不变、设置不同时换 uuid；节点放在 `LoraLoader` 前面设置也保留；串联；`LoraLoader` / `LoraLoaderModelOnly`（不接 CLIP）/ 两个串联的 `LoraLoader`：`exact` 和 `native` 与卸掉钩子的原版逐位一致（`native` 的备份数也一样），`fused` = 不加节点的默认路径；同一底模的不同设置交替加载各得各的结果、底模权重逐位还原；`MONOLOAD=0` 下 `enable`；prompt 结束后的释放 / 保留；`MONOLOAD_DISABLE` 透传 |
 | `tests/test_info_node.py` | Monoload Info 节点（§4.3），不需要模型文件：接口（输出节点、输入都可选、不缓存、界面文字 = STRING 输出）；不接输入时的版本 / 总开关 / 全局默认和来源；VAE 的设置来源、`not decoded yet`、解码记录归属（副本和原 VAE 不混）、原生解码也有记录、每次刷新；模型的 LoRA 名字和强度（串联、只接 MODEL、强度 0）、设置来源、加载后的状态；各种输入组合和 `MONOLOAD_DISABLE` 不报错 |
+| `tests/test_messages.py` | 消息和翻译，不需要模型文件：消息表每一项都有英文和中文、格式字段一致；`MONOLOAD_LANG` 的解析；`zh` 时预算报错、OOM 报错、不支持 LoRA 的报错、节点的报错和日志、Info 的文字都是中文；代码里（消息表以外）没有中文；`locales/en`、`locales/zh` 的 `nodeDefs.json` 覆盖每个节点、输入（名字、提示）、下拉选项（键 = 存储的英文值）、输出 |
 | `tests/test_vae_node.py` | Monoload VAE Settings 节点（§4.1），不需要模型文件：注册表和接口；按 ComfyUI 的方式调用节点；预算（下拉框 + `budget_gib`）/ 方案 / 条带高度 / 模式逐项判断「节点 > 环境变量 > 默认值」；副本共享权重和 patcher、输入的 VAE 不变、ComfyUI 的模型管理里只有一个已加载模型、串联、encode 一致；预算报错、强制方案和高度、只用第二层、原生；解码后（包括报错后）全局设置复原；多个副本交替解码互不干扰；日志写明来源；包装没装上时副本走原生；总开关和全局默认下的节点行为在 `test_master_switch.py`。ComfyUI 加载器注册节点的检查在 `test_entry.py`（各种开关组合） |
 | `tests/test_vae_ldm.py` | VAE 第一层的 LDM decoder（§12.8），不需要模型文件：GroupNorm 统计量（Moments 对 fp64，含均值远大于标准差；冻结统计量的 GroupNorm 对 `F.group_norm`；实例替换走 weight_function、退出复原）；识别（11 种不认的结构走第二层、与原生一致）；整个 decoder（SDXL 式 / Flux 式，四种方案，不同条带高度、奇数 / 很小的 latent、batch 2、宽组、很小的工作区）与原生整图解码比；bf16 对 fp32 真值与原生同一水平；自检抓住注入的错误（条带局部统计量、丢一条带、halo 少一行）；全尺寸 SDXL 4K 的计划；OOM；开关；分配器模拟 |
 | `tests/test_release.py` | 用真正的 `PromptExecutor` 连续跑 LoRA → 无 LoRA → 只改 UNet 的 LoRA → 无 LoRA → Hook LoRA → 无 LoRA → bypass LoRA → 无 LoRA → LoRA（换种子）：弱引用确认 LoRA 全部释放、底模不重新加载、结果与从没见过 LoRA 的进程逐位一致；RAM pressure / classic / LRU 三种缓存各一遍，外加 `MONOLOAD_KEEP_LORA=1` |
@@ -744,6 +747,20 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_lor
 * GTT：原生的行比 Monoload 的行多出备份的大小（§10 第一轮：13.9 对 8.6 GiB）。
 * 把输出发给我。
 
+### 9.9 网页界面手动检查
+
+拉代码、重启容器后在浏览器里打开 ComfyUI（强制刷新一次，让前端扩展 `monoload_info.js`、`monoload_i18n.js` 生效）：
+
+1. **节点能搜到**：双击画布打开搜索，输入 `Monoload`：应列出 Monoload LoRA Settings、Monoload VAE Settings、Monoload Info（中文界面下是「Monoload LoRA 设置」「Monoload VAE 设置」「Monoload 信息」）；节点库里有 `Monoload` 分类。
+2. **中英切换**：设置 → Comfy → Locale 切到中文：节点标题、输入名（如「模式」「合并方式」「prompt 结束后」「预算 (GiB)」）、下拉显示（「跟随全局」「启用」「逐位一致」「不限」「自定义」……）、鼠标悬停的提示都是中文；切回 English 是英文（下拉显示 `default (follow global)` 等）。切换后**保存工作流**再看 JSON（或导出）：下拉的值仍是 `default` / `custom` 等英文。
+3. **旧工作流**：打开以前存的、用到 Monoload VAE Settings 的工作流，不报错，各控件值对得上（新加的 `budget` 是 `default`）。
+4. **Info 节点内容**：
+   * 单独放一个 Monoload Info（什么都不接）→ 运行：节点框里出现文字，第一行 `Monoload 0.2.0 (commit …, branch dev)`，然后总开关、每项全局默认值和来源（compose 里设了的显示 `env 变量=值`，其余 `built-in`）。
+   * 搭 `Load Checkpoint → Load LoRA → Monoload LoRA Settings → KSampler → VAE Decode`，VAE 经过 Monoload VAE Settings（预算 `custom` 3）；Info 的 `vae` 接 VAE Settings 的输出、`model` 接 LoRA Settings 的输出、`images` 接 VAE Decode 的输出 → 运行：VAE 段显示设置和来源、这次解码的层 / 方案 / 条带 / 工作区 / 估算 / 实测峰值（reserved、GTT）/ 耗时；MODEL 段显示 LoRA 文件名和强度、三项设置和来源、`now: loaded; Monoload runtime merge on … weights`（或原生时 `baked … backups`）。
+   * 再运行一次（不改任何东西）：Info 仍然重新执行，「… s ago」变了。
+   * `text` 输出接到一个显示文本的节点：内容与节点框里相同。
+5. **`MONOLOAD_LANG=zh`**（compose 里加上并重启）：启动日志、解码日志、报错（例如把 VAE 节点的预算设成 `custom` 0.5 解码 4K）都是中文；Info 节点的文字是中文。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
@@ -949,8 +966,11 @@ monoload/vae_wan.py         第一层的 Wan 2.1 VAE 单帧适配器（结构识
 monoload/vae_ldm.py         第一层的 LDM decoder 适配器（SD1.5 / SDXL / SD3 / Flux ae；结构识别、单元、GroupNorm 方案、内存模型、fp32 副本）
 monoload/settings.py        总开关 MONOLOAD、MONOLOAD_DISABLE（不导入 torch / ComfyUI）
 monoload/lora_overrides.py  单个模型的 LoRA 设置（存在 model_options 里，逐项取值和来源；LoraLoader 的包装记下 LoRA 文件名；不导入 torch / ComfyUI）
+monoload/messages.py        所有用户可见的日志 / 报错 / Info 文字的消息表（英文默认，MONOLOAD_LANG=zh 中文）
+locales/{en,zh}/nodeDefs.json  节点界面的翻译（ComfyUI 官方的 locales 机制）
 monoload/info.py            Monoload Info 节点的文字（版本、全局默认、VAE 设置和解码记录、模型的 LoRA）
 web/monoload_info.js        前端扩展：把 Monoload Info 的文字显示在节点框里
+web/monoload_i18n.js        前端扩展：下拉选项的显示文字按语言翻译（只改显示，存储值不变）
 monoload/vae_overrides.py   单个 VAE 的设置（节点做的副本带的设置；不导入 torch / ComfyUI）
 monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），lora_settings.py = Monoload LoRA Settings，vae_settings.py = Monoload VAE Settings，info.py = Monoload Info
 tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
@@ -1084,6 +1104,7 @@ docs/HANDOFF.md             交接说明（当前状态、提交记录、规矩�
 | `MONOLOAD_VAE_BUDGET` | VAE 解码的峰值预算，写法同上（`3G`、`1.5G`、`2560M`）。不设时用默认策略（第一层，128 行条带的峰值内最高的条带；LDM 用方案 B）。设了就在**估算不超过预算**的做法里选**预计最快**的：第二层能放下就用第二层（每个卷积只算一次，最快）；放不下就在第一层的「GroupNorm 方案 × 条带高度」里按耗时模型挑最快的；一个都放不下就报错并写明各需要多少。例子见下 |
 | `MONOLOAD_DISABLE_VAE_STRIPE=1` | 只关掉第一层，所有受管理的 VAE 解码都走第二层（设了预算也一样，超出预算时日志注明） |
 | `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（输出行数），用于扫参和调试，优先于默认策略和预算（有预算时方案仍按预算选；放不下也照跑，日志注明） |
+| `MONOLOAD_LANG` | 日志、报错和 Monoload Info 节点文字的语言：不设 / `en` = 英文（默认），`zh` = 中文。节点界面不看它，跟随 ComfyUI 自己的语言设置 |
 | `MONOLOAD_VAE_GN_SCHEME` | 强制 SDXL / SD1.5 / SD3 / Flux `ae`（LDM decoder）第一层的 GroupNorm 整图统计量方案：`A`（不存中间结果，峰值最低、重算最多）、`D`、`B`（**默认**）、`C`（存得越多峰值越高、越快），见 §12.8。设了它，有预算时也只用这个方案（条带高度仍按预算取） |
 
 **`MONOLOAD_VAE_BUDGET` 的例子**（SDXL / Flux `ae`，bf16；「估算」是交给 `load_models_gpu` 的上界，峰值是模拟的 reserved（实测与它一致）；耗时：第二层和默认 B 是实测，其余是 CT 700 上耗时模型的预测；DESIGN.md §9.14.10–11）：

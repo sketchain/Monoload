@@ -30,6 +30,7 @@ import logging
 
 from .. import settings
 from ..vae_overrides import BUDGET_CHOICES, MODE_CHOICES, SCHEME_CHOICES, with_settings
+from ..messages import msg
 
 _NOTED = []
 
@@ -71,17 +72,17 @@ class MonoloadVAESettings:
         if settings.disabled():
             if not _NOTED:
                 _NOTED.append(True)
-                logging.info("[Monoload] Monoload VAE Settings: MONOLOAD_DISABLE is set, so the node passes the VAE through unchanged")
+                logging.info(msg("node.vae_disabled"))
             return (vae,)
         b = str(budget or "default").strip().lower()
         if b not in BUDGET_CHOICES:
-            raise ValueError("budget {!r} is not one of {}".format(budget, "/".join(BUDGET_CHOICES)))
+            raise ValueError(msg("node.bad_choice", item="budget", value=budget, choices="/".join(BUDGET_CHOICES)))
         if b == "custom":
             if not budget_gib or float(budget_gib) <= 0:
-                raise ValueError("budget custom needs budget_gib > 0 (got {})".format(budget_gib))
+                raise ValueError(msg("node.custom_zero", gib=budget_gib))
             value = budget_gib
         else:
             value = "unlimited" if b == "unlimited" else 0.0
             if budget_gib and float(budget_gib) > 0:
-                logging.info("[Monoload] Monoload VAE Settings: budget_gib {} not used, budget is {} (choose custom to use it)".format(budget_gib, b))
+                logging.info(msg("node.budget_unused", gib=budget_gib, budget=msg("v.follow") if b == "default" else msg("vae.unlimited")))
         return (with_settings(vae, budget=value, gn_scheme=gn_scheme, stripe_rows=stripe_rows, mode=mode),)

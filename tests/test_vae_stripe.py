@@ -328,7 +328,7 @@ def selftest_tests(v, lat):
 def budget_oom_tests(v, lat):
     mvae.set_budget(1 << 20)
     expect_raises("budget too small (MONOLOAD_VAE_BUDGET) -> MonoloadError naming what is needed", MonoloadError,
-                  lambda: managed_decode(v, lat), "MONOLOAD_VAE_BUDGET", "需要")
+                  lambda: managed_decode(v, lat), "MONOLOAD_VAE_BUDGET", "needs")
     mvae.set_budget(None)
 
     orig_run = eng.run_stripes
@@ -361,7 +361,7 @@ def budget_oom_tests(v, lat):
         eng.run_stripes = oom_above(0)
         with Spy() as spy:
             expect_raises("OOM even with the smallest stripes -> MonoloadVAEOOMError", MonoloadVAEOOMError,
-                          lambda: managed_decode(v, lat), "不会退回到 tiled", "第二层")
+                          lambda: managed_decode(v, lat), "never falls back to the approximate tiled", "nor to layer 2")
         check("... neither tiled nor layer 2 was called, no override left", spy.tiled == 0 and calls_l2[0] == 0 and no_overrides(v.first_stage_model))
     finally:
         eng.run_stripes = orig_run

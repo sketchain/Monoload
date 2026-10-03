@@ -22,6 +22,7 @@ This module imports neither torch nor ComfyUI.
 import uuid
 
 from . import settings
+from .messages import label, msg
 
 KEY = "monoload_lora"
 
@@ -46,7 +47,7 @@ def used():
 def _choice(name, value, choices):
     v = str(value or "default").strip().lower()
     if v not in choices:
-        raise ValueError("{} {!r} is not one of {}".format(name, value, "/".join(choices)))
+        raise ValueError(msg("node.bad_choice", item=name, value=value, choices="/".join(choices)))
     return v
 
 
@@ -132,12 +133,12 @@ def note(eff, src):
     """The log's account of the settings and where each came from."""
     def s(item):
         if item == "after_prompt" and eff.get("after_from_mode"):
-            return "as mode native, " + s("mode")
+            return msg("lora.src_native", src=s("mode"))
         if src[item] == "env":
-            return "env {}".format(ENV_NAMES[item])
-        return src[item]
-    return "LoRA settings: mode {} ({}), merge {} ({}), after prompt {} ({})".format(
-        eff["mode"], s("mode"), eff["merge"], s("merge"), eff["after_prompt"], s("after_prompt"))
+            return "{} {}".format(label("env"), ENV_NAMES[item])
+        return label(src[item])
+    return msg("lora.note", mode=label(eff["mode"]), mode_src=s("mode"), merge=label(eff["merge"]), merge_src=s("merge"),
+               after=label(eff["after_prompt"]), after_src=s("after_prompt"))
 
 
 # ---------------------------------------------------------------------------

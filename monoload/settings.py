@@ -41,7 +41,8 @@ def _master_from_env():
         return True
     if raw in FALSE:
         return False
-    logging.warning("[Monoload] MONOLOAD={!r} not understood (1 = on, 0 = native ComfyUI); Monoload stays on".format(raw))
+    from .messages import msg
+    logging.warning(msg("settings.master_bad", raw=raw))
     return True
 
 
@@ -88,4 +89,5 @@ def disabled():
 
 
 def master_note():
-    return "on" if master() else "off (MONOLOAD=0): native ComfyUI unless a Monoload node enables Monoload for its model / VAE"
+    from .messages import msg
+    return msg("settings.master_on") if master() else msg("settings.master_off")

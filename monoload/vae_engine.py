@@ -541,11 +541,10 @@ class Plan:
         return seq
 
     def describe(self):
-        d = "{} stripes of {} rows (core), recompute {:.2f}x, checkpoint {}".format(
-            len(self.stripes), max(b - a for a, b in self.stripes), self.recompute, fmt_bytes(self.ckpt_bytes))
+        from .messages import msg
+        d = msg("vae.plan", n=len(self.stripes), rows=max(b - a for a, b in self.stripes), rec=self.recompute, ckpt=fmt_bytes(self.ckpt_bytes))
         if self.passes:
-            d += "; {} statistics passes, saves {}".format(
-                len(self.passes), "+".join(fmt_bytes(self.save_bytes[p]) for p in self.saves) or "none")
+            d += msg("vae.plan_passes", n=len(self.passes), saves="+".join(fmt_bytes(self.save_bytes[p]) for p in self.saves) or msg("vae.none"))
         return d
 
 

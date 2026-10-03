@@ -12,7 +12,9 @@ Master switch MONOLOAD (monoload/settings.py): unset or 1 -> Monoload's
 default strategy for every model and VAE; 0 -> native ComfyUI everywhere
 (the hooks pass every call through), except for what a Monoload node
 explicitly switches on for its own model / VAE. MONOLOAD_DISABLE=1 installs
-nothing at all. The advanced variables (MONOLOAD_EXACT, MONOLOAD_KEEP_LORA,
+nothing at all. MONOLOAD_LANG=zh: log and error messages in Chinese
+(monoload/messages.py; the node UI follows ComfyUI's language through
+locales/). The advanced variables (MONOLOAD_EXACT, MONOLOAD_KEEP_LORA,
 MONOLOAD_DISABLE_VAE, MONOLOAD_DISABLE_VAE_STRIPE, MONOLOAD_VAE_*) are global
 defaults that a node's explicit choice overrides for its model / VAE.
 
@@ -30,8 +32,11 @@ from .monoload import settings
 
 WEB_DIRECTORY = "./web"   # web/monoload_info.js: the Monoload Info node's text in the node box
 
+from .monoload.messages import msg, warn_bad_lang
+
+warn_bad_lang()
 if settings.disabled():
-    logging.info("[Monoload] MONOLOAD_DISABLE is set: nothing installed, ComfyUI stays native and the Monoload nodes pass their input through")
+    logging.info(msg("entry.disabled"))
 else:
     from .monoload import hotpatch, release, vae
     from .monoload.vae_ops import fmt_bytes
@@ -44,32 +49,25 @@ else:
         from .monoload import lora_overrides
         lora_overrides.install_names(_comfy_nodes.LoraLoader)   # LoRA file names for the Monoload Info node
     except Exception:
-        logging.warning("[Monoload] LoRA names for the Monoload Info node not available (LoraLoader not found)")
-    logging.info("[Monoload] master switch MONOLOAD: {}".format(settings.master_note()))
+        logging.warning(msg("entry.names_missing"))
+    logging.info(msg("entry.master", state=settings.master_note()))
     if settings.master():
-        logging.info("[Monoload] LoRA: runtime merge (no in-place LoRA, no weight backups), merge {}; {}".format(
-            "bit-exact (MONOLOAD_EXACT=1)" if hotpatch.is_exact() else "fused fp16 addmm / relaxed (MONOLOAD_EXACT=1 for bit-exact)",
-            "kept between prompts (MONOLOAD_KEEP_LORA=1)" if release.keep() else "released after every prompt (base models stay loaded)"))
+        logging.info(msg("entry.lora", merge=msg("entry.merge_exact") if hotpatch.is_exact() else msg("entry.merge_fused"),
+                         after=msg("entry.after_keep") if release.keep() else msg("entry.after_release")))
     if installed_vae:
         mode, var = vae.global_mode()
         if mode == "native":
-            logging.info("[Monoload] VAE decode: native by default ({}); a Monoload VAE Settings node with mode auto manages "
-                         "its VAE".format(var))
+            logging.info(msg("entry.vae_native", var=var))
         else:
-            logging.info("[Monoload] VAE decode managed: op-level chunking (conv row blocks, attention query blocks), workspace {} "
-                         "(MONOLOAD_VAE_WORKSPACE), own memory estimate, OOM -> smaller blocks, never tiled; "
-                         "images only (4D / 5D T=1), set MONOLOAD_DISABLE_VAE=1 for native".format(fmt_bytes(vae.workspace())))
+            logging.info(msg("entry.vae_managed", workspace=fmt_bytes(vae.workspace())))
             if mode == "auto":
-                logging.info("[Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae single frame; "
-                             "LDM Decoder of SD1.5 / SDXL / SD3 / Flux ae with whole-image GroupNorm statistics, scheme {}; "
-                             "self-tested on first use): {}{}; other decoders use layer 2; "
-                             "set MONOLOAD_DISABLE_VAE_STRIPE=1 to use layer 2 everywhere".format(
-                                 "{} (forced, MONOLOAD_VAE_GN_SCHEME)".format(vae.gn_scheme()) if vae.gn_scheme_forced() else "{} (default)".format(vae.gn_scheme()),
-                                 "peak budget {} (MONOLOAD_VAE_BUDGET): the fastest of layer 2 and the layer-1 configurations whose estimate "
-                                 "fits it".format(fmt_bytes(vae.budget())) if vae.budget() else
-                                 "default stripe policy: the peak of {}-row stripes, tallest stripes within it (MONOLOAD_VAE_BUDGET to choose a budget)".format(vae.DEFAULT_POLICY_ROWS),
-                                 ", stripe height forced to {} rows (MONOLOAD_VAE_STRIPE_ROWS)".format(vae.stripe_rows()) if vae.stripe_rows() else ""))
+                scheme = (msg("entry.scheme_forced", scheme=vae.gn_scheme()) if vae.gn_scheme_forced()
+                          else msg("entry.scheme_default", scheme=vae.gn_scheme()))
+                policy = (msg("entry.policy_budget", budget=fmt_bytes(vae.budget())) if vae.budget()
+                          else msg("entry.policy_default", rows=vae.DEFAULT_POLICY_ROWS))
+                rows = msg("entry.rows_forced", rows=vae.stripe_rows()) if vae.stripe_rows() else ""
+                logging.info(msg("entry.vae_layer1", scheme=scheme, policy=policy, rows=rows))
             else:
-                logging.info("[Monoload] VAE layer 1 (stripe decoding) off (MONOLOAD_DISABLE_VAE_STRIPE): every managed decode uses layer 2")
+                logging.info(msg("entry.vae_layer2_only"))
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
