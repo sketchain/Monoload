@@ -13,7 +13,7 @@ runtime.
     MONOLOAD_DISABLE_VAE_STRIPE=1 python tests/test_entry.py  # VAE layer 1 off, layer 2 on
     MONOLOAD_VAE_BUDGET=2G MONOLOAD_VAE_STRIPE_ROWS=64 python tests/test_entry.py
     MONOLOAD_VAE_GN_SCHEME=D python tests/test_entry.py   # LDM layer-1 GroupNorm scheme
-The Monoload VAE Settings node is registered in every combination.
+The Monoload nodes (LoRA Settings, VAE Settings) are registered in every combination.
 """
 
 import asyncio
@@ -36,10 +36,10 @@ keep = os.environ.get("MONOLOAD_KEEP_LORA", "") == "1"
 release_hooked = execution.PromptExecutor.execute_async is not native_exec
 vae_hooked = comfy.sd.VAE.decode is not native_vae_decode
 check("VAE.decode_tiled / decode_tiled_ never touched", (comfy.sd.VAE.decode_tiled, comfy.sd.VAE.decode_tiled_) == native_vae_tiled)
-node_cls = nodes.NODE_CLASS_MAPPINGS.get("MonoloadVAESettings")
-check("node registered by ComfyUI's loader in every switch combination: MonoloadVAESettings ({}, category {})".format(
-      nodes.NODE_DISPLAY_NAME_MAPPINGS.get("MonoloadVAESettings"), getattr(node_cls, "CATEGORY", None)),
-      node_cls is not None and nodes.NODE_DISPLAY_NAME_MAPPINGS.get("MonoloadVAESettings") == "Monoload VAE Settings" and node_cls.CATEGORY == "Monoload")
+want_nodes = {"MonoloadLoRASettings": "Monoload LoRA Settings", "MonoloadVAESettings": "Monoload VAE Settings"}
+got_nodes = {k: (nodes.NODE_DISPLAY_NAME_MAPPINGS.get(k), getattr(nodes.NODE_CLASS_MAPPINGS.get(k), "CATEGORY", None)) for k in want_nodes}
+check("nodes registered by ComfyUI's loader in every switch combination: {}".format(got_nodes),
+      all(got_nodes[k] == (want_nodes[k], "Monoload") for k in want_nodes))
 flag = lambda n: os.environ.get(n, "").strip().lower() in ("1", "true", "yes", "on")
 now = {n: comfy.model_patcher.ModelPatcher.__dict__[n] for n in native}
 changed = [n for n in native if now[n] is not native[n]]
