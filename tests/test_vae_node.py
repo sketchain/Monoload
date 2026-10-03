@@ -65,10 +65,11 @@ def registration():
           cls is not None and NODE_DISPLAY_NAME_MAPPINGS.get(NODE) == "Monoload VAE Settings")
     it = cls.INPUT_TYPES()["required"]
     check("interface: category {}, inputs {}, returns {}, function {}".format(cls.CATEGORY, list(it), cls.RETURN_TYPES, cls.FUNCTION),
-          cls.CATEGORY == "Monoload" and list(it) == ["vae", "budget_gib", "gn_scheme", "stripe_rows", "mode", "budget"] and cls.RETURN_TYPES == ("VAE",)
+          cls.CATEGORY == "Monoload" and list(it) == ["vae", "budget", "budget_gib", "gn_scheme", "stripe_rows", "mode"] and cls.RETURN_TYPES == ("VAE",)
           and it["gn_scheme"][0] == ["default", "A", "B", "C", "D"] and it["mode"][0] == ["default", "auto", "layer 2 only", "native"]
           and it["budget"][0] == ["default", "unlimited", "custom"] and it["budget"][1]["default"] == "default"
-          and it["budget_gib"][1]["default"] == 0.0 and it["stripe_rows"][1]["default"] == 0)
+          and it["budget_gib"][1]["default"] == 0.0 and it["budget_gib"][1]["step"] == 0.01 and it["budget_gib"][1]["round"] == 0.01
+          and it["stripe_rows"][1]["default"] == 0)
     return cls
 
 

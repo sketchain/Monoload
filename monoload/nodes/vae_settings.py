@@ -20,10 +20,10 @@ on for this VAE even when it is globally off (MONOLOAD=0 included).
 MONOLOAD_DISABLE=1 (nothing installed): the node returns its input unchanged
 and says so once.
 
-Widget order: `budget` (the dropdown) comes after `budget_gib` and `mode` so
-that workflows saved with the first version of the node (budget_gib,
-gn_scheme, stripe_rows, mode) still load; budget_gib only counts with budget
-"custom".
+Widget order: budget (the dropdown) right before budget_gib, which only
+counts with budget "custom"; budget_gib keeps 0.01 GiB (step / round 0.01:
+the frontend derives the stored precision from the step). Workflows saved
+before this order load with shifted values (no compatibility, by decision).
 """
 
 import logging
@@ -49,7 +49,10 @@ class MonoloadVAESettings:
     def INPUT_TYPES(cls):
         return {"required": {
             "vae": ("VAE", {"tooltip": "The VAE; it is not changed, the output is a copy that shares its weights."}),
-            "budget_gib": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 4096.0, "step": 0.25,
+            "budget": (list(BUDGET_CHOICES), {"default": "default",
+                                              "tooltip": "default: follow the global setting (MONOLOAD_VAE_BUDGET); unlimited: no "
+                                                         "budget for this VAE (Monoload's default stripe policy); custom: budget_gib."}),
+            "budget_gib": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 4096.0, "step": 0.01, "round": 0.01,
                                      "tooltip": "Peak budget in GiB, used only when budget is custom: the fastest decode whose "
                                                 "estimate fits it (error naming what is needed when none fits)."}),
             "gn_scheme": (list(SCHEME_CHOICES), {"default": "default",
@@ -63,9 +66,6 @@ class MonoloadVAESettings:
                                                      "managed decode for this VAE (layer 1 stripes where the decoder is recognized, "
                                                      "else layer 2), also when it is globally off; layer 2 only: no stripes; "
                                                      "native: ComfyUI's own decode for this VAE."}),
-            "budget": (list(BUDGET_CHOICES), {"default": "default",
-                                              "tooltip": "default: follow the global setting (MONOLOAD_VAE_BUDGET); unlimited: no "
-                                                         "budget for this VAE (Monoload's default stripe policy); custom: budget_gib."}),
         }}
 
     def apply(self, vae, budget_gib=0.0, gn_scheme="default", stripe_rows=0, mode="default", budget="default"):

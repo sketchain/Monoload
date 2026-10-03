@@ -108,15 +108,15 @@ docker logs comfyui 2>&1 | grep -i monoload
 
 | 选项 | 取值 | 含义 |
 |---|---|---|
-| `mode` | `default` / `auto` / `layer 2 only` / `native` | `default`：跟随全局（默认开启时是 `auto`；`MONOLOAD=0`、`MONOLOAD_DISABLE_VAE=1`、`MONOLOAD_EXACT=1` 时是原生；`MONOLOAD_DISABLE_VAE_STRIPE=1` 时是 `layer 2 only`）；`auto`：**为这个 VAE 打开**解码管理，认得的 decoder 走第一层（条带），其余走第二层——全局关着（包括 `MONOLOAD=0`）也打开；`layer 2 only`：只用第二层；`native`：这个 VAE 用 ComfyUI 自己的解码 |
 | `budget` | `default` / `unlimited` / `custom` | 峰值预算。`default`：跟随全局（`MONOLOAD_VAE_BUDGET`，没设就是默认策略）；`unlimited`：这个 VAE 不限预算（默认策略），即使全局设了预算；`custom`：用 `budget_gib`——估算不超过它的做法里选预计最快的，一个都放不下就报错并写明各需要多少 |
-| `budget_gib` | GiB | 只在 `budget` 选 `custom` 时生效（这时必须大于 0）；选别的时填了也不用，日志里说明 |
+| `budget_gib` | GiB，精度 0.01 | 只在 `budget` 选 `custom` 时生效（这时必须大于 0）；选别的时填了也不用，日志里说明 |
 | `gn_scheme` | `default` / `A` / `B` / `C` / `D` | 强制 LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae`）第一层的 GroupNorm 方案（§12.8）；`default` 跟随全局 |
 | `stripe_rows` | 输出行数，`0` = 跟随全局 | 强制第一层的条带高度 |
+| `mode` | `default` / `auto` / `layer 2 only` / `native` | `default`：跟随全局（默认开启时是 `auto`；`MONOLOAD=0`、`MONOLOAD_DISABLE_VAE=1`、`MONOLOAD_EXACT=1` 时是原生；`MONOLOAD_DISABLE_VAE_STRIPE=1` 时是 `layer 2 only`）；`auto`：**为这个 VAE 打开**解码管理，认得的 decoder 走第一层（条带），其余走第二层——全局关着（包括 `MONOLOAD=0`）也打开；`layer 2 only`：只用第二层；`native`：这个 VAE 用 ComfyUI 自己的解码 |
 
 节点上留在 `default` / `0` 的项跟随全局设置（高级选项，§13），全局也没设就用内置默认。例如 compose 里设了 `MONOLOAD_VAE_GN_SCHEME=D`，节点只把 `budget` 设成 `custom`、`budget_gib = 3`：预算来自节点，方案来自环境变量（强制 D），条带高度和模式用默认值。`MONOLOAD_DISABLE=1` 时节点原样输出输入的 VAE。
 
-**旧工作流：** 第一版节点（9b30154）只有 `budget_gib`（`0` = 不设）。新加的 `budget` 下拉框排在最后，旧工作流照常打开、控件值对得上；但旧工作流里 `budget_gib` 大于 0 的，现在 `budget` 是 `default`，预算不再生效（日志 `budget_gib ... not used`），要把 `budget` 改成 `custom`。
+**控件顺序：** `budget` 下拉框紧挨在 `budget_gib` 前面。`budget_gib` 精度 0.01 GiB（填 0.25 就存 0.25）。dev 不做旧工作流兼容：之前存的用到这个节点的工作流，控件值会错位，要重新设一次。
 
 **日志**：每次解码的那一行末尾写明设置和来源，例如 `settings: budget 3.00 GiB (node), GroupNorm scheme chosen by the budget (default), stripe rows auto (default), mode auto (default)`；`last_decode()` 里是 `settings` / `settings_source`。
 
