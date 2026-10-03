@@ -670,7 +670,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 
 看什么：
 
-* 每一行的日志先有一行 `VAE MONOLOAD_VAE_BUDGET ... -> ...: <为什么>; others: <其他候选各要多少>`，选中的配置与上表一致；**reserved / GTT ≤ 估算 ≤ 预算**。
+* 每一行的日志先有一行 `VAE budget ... (from ...) -> ...: <为什么>; others: <其他候选各要多少>`，选中的配置与上表一致；**reserved / GTT ≤ 估算 ≤ 预算**。
 * 耗时：第一层各行的实测与「约 x s」对比，看耗时模型在 B / C / D 和 1344 / 2688 上准不准（它只用 4K 和 A 的三档拟合）。如果某个预算下实测比没被选中的候选慢很多，就是模型排错了。
 * 精度：所有行 `vs native` 与以前同一水平（PSNR 约 60 dB）。1344 的 `-b3` 只有一条带、不跑统计遍，就是整图解码。
 * 把输出和 JSON 发给我。
@@ -1120,6 +1120,7 @@ docs/HANDOFF.md             交接说明（当前状态、提交记录、规矩�
 
 * 预算比的是**估算**（上界），所以实际峰值通常比预算低 10–30%。有存档的方案（B / C / D）的估算在 vae-estimate-fix 之后收紧了：存档在 arena 里的位置有保证，不再当成「可能被挤出 arena 的那一块」算进估算（4K 默认 B 3.17 → 2.68 GiB），所以 4K 设 `3G` 能选 B 了（以前选 D，实测更慢、峰值更高）。
 * `qwen_image_vae`（只有一种第一层配置）：`20G` → 第二层（2.1 / 5.1 / 9.6 GiB）；`3G` → 第一层预算内最高的条带（1 条 768 行 / 2 条 768 行 / 4 条 540 行，1.3 / 2.0 / 2.1 GiB）；`1.5G` → 1.06 / 1.08 / 1.12 GiB；`1G` → 0.58 / 0.72 GiB，4K 报错（最少约 1.09 GiB）。
-* 日志写明选了什么、为什么、其他候选各要多少：`[Monoload] VAE MONOLOAD_VAE_BUDGET 3.00 GiB -> layer 1 scheme B 180 rows (workspace 128 MiB) 2.96 GiB, ~41.1 s: the fastest predicted that fits; others: layer 2 17.91 GiB (over); ...`。
+* 日志写明选了什么、为什么、其他候选各要多少：`[Monoload] VAE budget 3.00 GiB (from environment variable MONOLOAD_VAE_BUDGET) -> layer 1 scheme B 180 rows (workspace 128 MiB) 2.96 GiB, ~41.1 s: the fastest predicted that fits; others: layer 2 17.91 GiB (over); ...`。
+* 预算的来源写在括号里：`(from environment variable MONOLOAD_VAE_BUDGET)` 或 `(from the Monoload VAE Settings node)`；放不下时的报错也按来源给建议（来自节点：改节点上的预算，或改成跟随全局 / 不限；来自环境变量：改 `MONOLOAD_VAE_BUDGET`）。强制的条带高度、方案、「只用第二层」同样写明来源。
 * 工作区也是候选的一维：依次试 预算/8、128 MiB、64 MiB，取耗时模型预测最快的（工作区越小分块越多、越慢，但估算也越低）。
 * 想固定某个方案或高度：再设 `MONOLOAD_VAE_GN_SCHEME` / `MONOLOAD_VAE_STRIPE_ROWS`，它们优先于预算。

@@ -159,7 +159,7 @@ def _native_from_env():
 
 
 _GN_ENV = _gn_scheme_from_env()
-_SETTINGS = {"native": _native_from_env(), "workspace": _workspace_from_env(), "budget": _budget_from_env(),
+_SETTINGS = {"src": {}, "native": _native_from_env(), "workspace": _workspace_from_env(), "budget": _budget_from_env(),
              "stripe": not _env_flag("MONOLOAD_DISABLE_VAE_STRIPE"), "stripe_rows": _rows_from_env(),
              "gn_scheme": _GN_ENV[0], "gn_forced": _GN_ENV[1]}
 vae_ldm.set_scheme(_SETTINGS["gn_scheme"])
@@ -301,14 +301,15 @@ class _Applied:
     decode reads them from _SETTINGS / vae_ldm's scheme); restored on exit.
     ComfyUI runs one prompt at a time, so one decode at a time."""
 
-    def __init__(self, eff, note):
+    def __init__(self, eff, note, src=None):
         self.eff = eff
         self.note = note
+        self.src = src or {}
 
     def __enter__(self):
         self.saved = dict(_SETTINGS), vae_ldm.scheme(), _NOTE[0]
         eff = self.eff
-        _SETTINGS.update({"budget": eff["budget"], "stripe": eff["mode"] != "layer2", "stripe_rows": eff["stripe_rows"],
+        _SETTINGS.update({"src": dict(self.src), "budget": eff["budget"], "stripe": eff["mode"] != "layer2", "stripe_rows": eff["stripe_rows"],
                           "gn_scheme": eff["gn_scheme"], "gn_forced": eff["gn_forced"]})
         vae_ldm.set_scheme(eff["gn_scheme"])
         _NOTE[0] = self.note
@@ -433,10 +434,29 @@ STRIPE_ADAPTERS = [vae_wan, vae_ldm]
 _L1_NOTED = weakref.WeakKeyDictionary()   # first_stage_model -> last logged layer-1 reason
 
 
+_ENV_VARS = {"budget": "MONOLOAD_VAE_BUDGET", "stripe_rows": "MONOLOAD_VAE_STRIPE_ROWS", "gn_scheme": "MONOLOAD_VAE_GN_SCHEME",
+             "mode": "MONOLOAD_DISABLE_VAE_STRIPE=1"}
+
+
+def _from(item):
+    """Where the decode in progress got `item` from, for messages: the node or the environment variable."""
+    if _SETTINGS["src"].get(item) == "node":
+        return msg("vae.src_node")
+    return msg("vae.src_env", var=_ENV_VARS[item])
+
+
+def _budget_advice(layer2=False):
+    node = _SETTINGS["src"].get("budget") == "node"
+    a = msg("vae.advice_node") if node else msg("vae.advice_env")
+    if layer2:
+        a += msg("vae.advice_l2_node") if node else msg("vae.advice_l2_env")
+    return a
+
+
 def _select_layer1(vae, samples, vae_options):
     """(bound, None) or (None, why layer 1 is not used)."""
     if not _SETTINGS["stripe"]:
-        return None, msg("vae.l1_disabled")
+        return None, msg("vae.l1_disabled", src=_from("mode"))
     reasons = []
     for a in STRIPE_ADAPTERS:
         bound, why = a.match(vae, samples, vae_options)
@@ -644,7 +664,7 @@ def _decode(self, samples_in, vae_options={}):
         _record(self)
         return out
     probe = _MemProbe(getattr(self, "device", None))
-    with _Applied(eff, note):
+    with _Applied(eff, note, src):
         try:
             with probe:
                 return _managed_decode(self, samples_in, vae_options)
@@ -707,16 +727,17 @@ def choose_plan(vae, samples_in, bound, out_bytes):
     forced = _SETTINGS["stripe_rows"]
     if forced:
         plan = bound.plan(vae, samples_in, bud or 0, ws, rows=forced, out_bytes=out_bytes)
-        return plan, bud or plan.estimate, ws, msg("vae.policy_forced_rows", rows=forced,
+        return plan, bud or plan.estimate, ws, msg("vae.policy_forced_rows", rows=forced, src=_from("stripe_rows"),
                                                    over=msg("vae.over_budget_note") if bud and plan.estimate > bud else "")
     if bud:
         plan = bound.plan(vae, samples_in, bud, ws, out_bytes=out_bytes)
         if plan is None:
             smallest = bound.smallest_plan(vae, samples_in, ws, out_bytes=out_bytes)
-            raise MonoloadError(msg("vae.err_l1_budget", budget=fmt_bytes(bud), shape=list(samples_in.shape), need=fmt_bytes(smallest.estimate),
+            raise MonoloadError(msg("vae.err_l1_budget", budget=fmt_bytes(bud), src=_from("budget"), advice=_budget_advice(layer2=True),
+                                    shape=list(samples_in.shape), need=fmt_bytes(smallest.estimate),
                                     rows=max(b - a for a, b in smallest.stripes), prefix=fmt_bytes(smallest.prefix_bytes),
                                     stripes=fmt_bytes(smallest.stripe_bytes)))
-        return plan, bud, ws, "MONOLOAD_VAE_BUDGET"
+        return plan, bud, ws, msg("vae.budget_head", budget=fmt_bytes(bud), src=_from("budget"))
     ref = bound.plan(vae, samples_in, 0, ws, rows=DEFAULT_POLICY_ROWS, out_bytes=out_bytes)
     target = ref.arena
     plan = bound.plan(vae, samples_in, target, ws, out_bytes=out_bytes, measure="arena") or ref
@@ -763,7 +784,7 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
         selftest = lambda b: _layer1_self_test(vae, b)   # noqa: E731
     rows = _SETTINGS["stripe_rows"]
     scheme = gn_scheme() if gn_scheme_forced() else None
-    head = msg("vae.budget_head", budget=fmt_bytes(bud))
+    head = msg("vae.budget_head", budget=fmt_bytes(bud), src=_from("budget"))
     considered = []
 
     def layer2(policy, why, note):
@@ -776,7 +797,7 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
 
     bound, l1_note = _select_layer1(vae, samples_in, vae_options)
     if not _SETTINGS["stripe"]:
-        return layer2(msg("vae.l2_forced_policy"), msg("vae.l2_forced_why"), l1_note)[1]
+        return layer2(msg("vae.l2_forced_policy", src=_from("mode")), msg("vae.l2_forced_why", src=_from("mode")), l1_note)[1]
     variants = []
     if bound is not None:
         variants = [v for v in bound.variants(scheme if bound.schemes else None) if not _selftest_failed(v)]
@@ -784,9 +805,9 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
             l1_note = msg("vae.selftest_failed_short")
     forced = []
     if variants and rows:
-        forced.append(msg("vae.forced_rows", rows=rows))
+        forced.append(msg("vae.forced_rows", rows=rows, src=_from("stripe_rows")))
     if variants and scheme and bound.schemes:
-        forced.append(msg("vae.forced_scheme", scheme=scheme))
+        forced.append(msg("vae.forced_scheme", scheme=scheme, src=_from("gn_scheme")))
     if not forced:
         c, d = layer2(msg("vae.l2_fits_policy"),
                       msg("vae.l2_fits_why", l1=msg("vae.l1_unavailable_note", why=l1_note) if l1_note else ""), l1_note)
@@ -853,7 +874,8 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
                              failed=msg("vae.need_failed") if c.get("selftest") else ""))
     if not variants:
         needs.append(msg("vae.need_l1_unavailable", why=l1_note))
-    raise MonoloadError(msg("vae.err_budget", budget=fmt_bytes(bud), shape=list(samples_in.shape), needs=msg("vae.need_sep").join(needs)))
+    raise MonoloadError(msg("vae.err_budget", budget=fmt_bytes(bud), src=_from("budget"), advice=_budget_advice(),
+                            shape=list(samples_in.shape), needs=msg("vae.need_sep").join(needs)))
 
 
 def _decode_budget(self, samples_in, vae_options, t0, bud):
