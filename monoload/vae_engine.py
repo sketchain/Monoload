@@ -150,6 +150,8 @@ def conv_io(m):
 # tests/alloc_sim.py (DESIGN §9.13.4: stripes needed at most live + 2.2 %, a
 # single whole-image stripe up to live + 12 %); the estimate is the arena plus
 # the largest single allocation plus ESTIMATE_PAD for the small-block pool.
+# Allocations whose place in the arena is guaranteed (the GroupNorm saves, see
+# saves_fit) are not candidates for that largest allocation.
 
 ARENA_DIV = 32               # arena = live peak + live peak / ARENA_DIV + ARENA_PAD, rounded up to 2 MiB
 ARENA_DIV_SINGLE = 8         # ... with one stripe (whole-image planes of 1-2 GiB fragment more)
@@ -158,6 +160,57 @@ ARENA_PAD = 64 * MIB
 ESTIMATE_PAD = 16 * MIB      # small-block pool (<= 1 MiB requests come from their own 2 MiB segments; 2-6 MiB seen)
 CONTIGUOUS_INPUT = (UP,)     # units whose row slice is made contiguous before the call
 ARENA_ENABLED = True         # bench --no-arena: off, to measure the tensors' own peak (the arena block counts as allocated)
+
+
+ALLOC_ROUND = 512            # the caching allocator rounds requests up to 512 bytes
+SMALL_ALLOC = MIB            # requests up to this size come from the small-block pool, never from the arena
+
+
+def place(arena, seq):
+    """Replay `seq` in an arena of `arena` bytes the way the caching allocator
+    places blocks (best fit: the smallest free block that is large enough, the
+    lowest address on a tie, carved from its start; freed blocks merge with
+    free neighbours). seq: the long-lived allocations of a decode with saves,
+    in order, as ("alloc", key, bytes) / ("free", key); every
+    other tensor is freed whenever seq moves on (statistics passes free all
+    their temporaries before the next pass starts, and a save is allocated at
+    the start of the pass that builds it), so these are the only blocks in the
+    arena at those moments. -> whether every alloc found a free block."""
+    free = [(0, int(arena))]                      # (start, size), merged
+    where = {}
+    for op in seq:
+        if op[0] == "alloc":
+            size = -(-int(op[2]) // ALLOC_ROUND) * ALLOC_ROUND
+            if size <= SMALL_ALLOC:
+                continue
+            fits = [(sz, st) for st, sz in free if sz >= size]
+            if not fits:
+                return False
+            sz, st = min(fits)
+            free.remove((st, sz))
+            if sz > size:
+                free.append((st + size, sz - size))
+            where[op[1]] = (st, size)
+        elif op[1] in where:
+            st, size = where.pop(op[1])
+            free.append((st, size))
+            free.sort()
+            merged = []
+            for b in free:
+                if merged and merged[-1][0] + merged[-1][1] == b[0]:
+                    merged[-1] = (merged[-1][0], merged[-1][1] + b[1])
+                else:
+                    merged.append(b)
+            free = merged
+    return True
+
+
+def saves_fit(arena, seq):
+    """Whether every allocation of `seq` finds a free block in an arena of
+    `arena` bytes (place). A request that does fit is never stranded outside
+    the arena. (A request the allocator places in a free block outside the
+    arena only leaves the arena emptier.)"""
+    return place(arena, seq)
 
 
 def conv_extra(cin, cout, k, r_in, r_out, w_in, w_out, e, ws, contiguous=True):
@@ -281,8 +334,11 @@ class Plan:
         self.needs, self.order, strip_live, lg, final_levels = _chain_cost(
             bound, self.final_units, self.final_heights, widths[sf:], self.stripes, elem, ws)
         largest = max(largest, lg)
+        # with saves, the checkpoint is a buffer allocated before the prefix (the front of the arena) and the
+        # prefix's output is copied into it, so that the saves' places are known (saves_fit): the prefix holds it too
+        self.ckpt_front = bool(saves)
         self.prefix_live, self.stripe_live = prefix_live, strip_live
-        self.prefix_bytes = prefix_live
+        self.prefix_bytes = prefix_live + (self.ckpt_bytes if saves else 0)
         self.stripe_bytes = strip_live + self.ckpt_bytes if sf == 0 else None   # with saves: set by the save layout below
 
         # statistics passes: the peak none of them can avoid is the saves they hold plus their smallest stripes;
@@ -382,13 +438,16 @@ class Plan:
             ps.alive, ps.rows, ps.stripes, ps.needs, ps.order, ps.live = a, r, st, needs, order, live
             ps.work_levels, ps.work = work, sum(work.values())
             largest = max(largest, plg, norm_temp(ps.norm.channels, max(b - a_ for a_, b in st), ps.widths[-1], ws))
-        largest = max(largest, save_alloc)
         self.persistent = persistent
+        self.saves_guaranteed = bool(saves) and saves_fit(self.arena, self.long_lived(out_bytes))
+        if saves and not self.saves_guaranteed:
+            largest = max(largest, save_alloc)
         if not self.passes:
             self.live_peak = int(self.persistent + max(self.prefix_bytes, self.stripe_bytes))
             self.arena = arena_bytes(self.live_peak, len(self.stripes))
         self.largest = int(largest)
-        # reserved = the arena, unless fragmentation strands one request outside it (then that request's own segment)
+        # reserved = the arena, unless fragmentation strands one request outside it (then that request's own segment);
+        # the saves are not among the candidates when saves_fit guarantees their place
         self.estimate = self.arena + self.largest + ESTIMATE_PAD
         work_prefix = sum(bound.prefix_macs(m) for _, m in bound.prefix) * h8 * w8
         work_whole = work_prefix + sum(heights[i + 1] * widths[i + 1] * u.macs_row for i, u in enumerate(units))
@@ -401,6 +460,32 @@ class Plan:
             for w_out, m in d.items():
                 levels[w_out // w8] = levels.get(w_out // w8, 0) + m
         self.work_levels = levels
+
+    def long_lived(self, out_bytes):
+        """The long-lived allocations of one sample of a decode with saves, in
+        order (for saves_fit): the checkpoint buffer (before the prefix), the
+        output buffer (after it), each save (or the pool) at the start of the
+        pass that builds it, a save freed after the pass from which nothing
+        starts from it any more (the checkpoint too)."""
+        seq = [("alloc", 0, self.ckpt_bytes), ("alloc", "out", out_bytes)]
+        alive = {0}
+        pool = False
+        for ps in self.passes:
+            for p in ps.builds:
+                if self.save_layout == "pool":
+                    if not pool:
+                        seq.append(("alloc", "pool", self.pool_bytes))
+                        pool = True
+                else:
+                    seq.append(("alloc", p, self.save_bytes[p]))
+                alive.add(p)
+            if ps.builds:
+                for q in sorted(alive):
+                    if q < max(ps.builds):
+                        alive.discard(q)
+                        if q == 0 or self.save_layout != "pool":
+                            seq.append(("free", q))
+        return seq
 
     def describe(self):
         d = "{} stripes of {} rows (core), recompute {:.2f}x, checkpoint {}".format(
@@ -780,9 +865,19 @@ class StripeAdapter:
         pixel_samples = None
         with OpChunking(self.module, budget_ws, stats):
             for i in range(n):
+                buf = None
+                if plan.ckpt_front:
+                    # the checkpoint at the front of the arena (Plan.long_lived), allocated before the prefix
+                    shape = list(samples_in.shape)
+                    shape[0], shape[1] = 1, self.ckpt_channels
+                    buf = torch.empty(shape, device=vae.device, dtype=vae.vae_dtype)
                 z = samples_in[i:i + 1].to(device=vae.device, dtype=vae.vae_dtype)
                 ckpt = self.prefix_pass(z)
                 del z
+                if buf is not None:
+                    buf.copy_(ckpt)
+                    ckpt = buf
+                    del buf
                 if pixel_samples is None:
                     pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
                 dst = pixel_samples[i:i + 1]

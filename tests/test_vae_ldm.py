@@ -587,7 +587,7 @@ def budget_plan_tests():
     import alloc_sim
     G = float(1 << 30)
     v = alloc_sim.meta_vae(torch.bfloat16, "sdxl")
-    want = {(1344, 768): ("L2", "L1 1 stripe", "C"), (2688, 1536): ("L2", "B", "D"), (3840, 2160): ("L2", "D", "A")}
+    want = {(1344, 768): ("L2", "L1 1 stripe", "C"), (2688, 1536): ("L2", "C", "B"), (3840, 2160): ("L2", "B", "A")}
     for (w, h), exp in want.items():
         lat = torch.empty(1, 4, h // 8, w // 8, device="meta")
         with vae_ops.OpChunking(v.first_stage_model, 1 << 30, vae_ops.OpStats()):
@@ -609,9 +609,41 @@ def budget_plan_tests():
                 fit = [c for c in d["candidates"] if c["layer"] == 1 and c["fits"]]
                 ok = ok and d["bound"].predict_seconds(p) == min(c["seconds"] for c in fit)
         check("SDXL {}x{} budget 20 / 3 / 1.5 GiB -> {} (expected {})".format(w, h, " | ".join(got), " / ".join(exp)), ok)
-    i = alloc_sim.decode_trace(3840, 2160, "bf16", 309, model="sdxl", scheme="D", ws=64 << 20)
-    check("SDXL 4K budget 3 GiB plan (D, 309 rows, workspace 64 MiB): simulated reserved {:.2f} GiB <= estimate {:.2f} GiB".format(
+    i = alloc_sim.decode_trace(3840, 2160, "bf16", 180, model="sdxl", scheme="B", ws=128 << 20)
+    check("SDXL 4K budget 3 GiB plan (B, 180 rows, workspace 128 MiB): simulated reserved {:.2f} GiB <= estimate {:.2f} GiB".format(
         i["reserved"] / G, i["estimate"] / G), i["reserved"] <= i["estimate"] <= 3 * G)
+
+
+def estimate_tests():
+    """Saves whose place in the arena is guaranteed (vae_engine.saves_fit) are not in the estimate's largest."""
+    import alloc_sim
+    G = float(1 << 30)
+    M = 1 << 20
+    check("saves_fit: fits / does not fit / a freed block is reused / freed neighbours merge",
+          eng.saves_fit(100 * M, [("alloc", 0, 10 * M), ("alloc", 1, 80 * M)])
+          and not eng.saves_fit(100 * M, [("alloc", 0, 30 * M), ("alloc", 1, 80 * M)])
+          and eng.saves_fit(100 * M, [("alloc", 0, 30 * M), ("free", 0), ("alloc", 1, 80 * M)])
+          and eng.saves_fit(100 * M, [("alloc", 0, 30 * M), ("alloc", 1, 30 * M), ("alloc", 2, 30 * M), ("free", 0), ("free", 1),
+                                      ("alloc", 3, 55 * M)])
+          and not eng.saves_fit(100 * M, [("alloc", 0, 30 * M), ("alloc", 1, 30 * M), ("alloc", 2, 30 * M), ("free", 0), ("free", 2),
+                                          ("alloc", 3, 55 * M)]))
+    v = alloc_sim.meta_vae(torch.bfloat16, "sdxl")
+    lat = torch.empty(1, 4, 270, 480, device="meta")
+    res = []
+    ok = True
+    for scheme in "ADBC":
+        b = vl.LDMStripe(v.first_stage_model, v.first_stage_model.post_quant_conv, gn_scheme=scheme)
+        p, _, _, _ = mvae.choose_plan(v, lat, b, b.output_bytes(v, lat))
+        biggest = max([0] + [p.save_bytes[q] for q in p.saves])
+        res.append("{} arena {:.2f} largest {:.2f} estimate {:.2f}{}".format(scheme, p.arena / G, p.largest / G, p.estimate / G,
+                                                                           " (saves guaranteed)" if p.saves_guaranteed else ""))
+        # D's largest is a statistics-pass temporary exactly as large as its H/4 save; B's and C's saves are larger than any temporary
+        ok = ok and p.ckpt_front == bool(p.saves) and (not p.saves or p.saves_guaranteed)
+        if scheme in "BC":
+            ok = ok and p.largest < max(biggest, p.pool_bytes if p.save_layout == "pool" else 0)
+        if scheme == "B":
+            ok = ok and p.estimate < 2.75 * G
+    check("SDXL 4K default plans: the checkpoint is allocated first, the saves' places are guaranteed, largest is not a save: " + "; ".join(res), ok)
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +683,7 @@ def main():
     plan_tests(sd, lat4)
     budget_tests(sd, lat4)
     budget_plan_tests()
+    estimate_tests()
     allocator_tests()
     finish()
 
