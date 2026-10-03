@@ -150,14 +150,79 @@ def conv_io(m):
 # tests/alloc_sim.py (DESIGN §9.13.4: stripes needed at most live + 2.2 %, a
 # single whole-image stripe up to live + 12 %); the estimate is the arena plus
 # the largest single allocation plus ESTIMATE_PAD for the small-block pool.
+# Allocations whose place in the arena is guaranteed (the GroupNorm saves, see
+# saves_fit) are not candidates for that largest allocation.
 
 ARENA_DIV = 32               # arena = live peak + live peak / ARENA_DIV + ARENA_PAD, rounded up to 2 MiB
 ARENA_DIV_SINGLE = 8         # ... with one stripe (whole-image planes of 1-2 GiB fragment more)
 ARENA_DIV_SAVES = 16         # ... with GroupNorm saves (the pool splits the arena: tests/alloc_sim.py measured up to live + 9.5 %)
+ARENA_FEW_STRIPES = 3        # ... with saves and at most this many stripes: live / ARENA_DIV_SINGLE
+ARENA_WS_FREE = 128 * MIB    # ... with saves and a larger workspace: at least the workspace
 ARENA_PAD = 64 * MIB
 ESTIMATE_PAD = 16 * MIB      # small-block pool (<= 1 MiB requests come from their own 2 MiB segments; 2-6 MiB seen)
 CONTIGUOUS_INPUT = (UP,)     # units whose row slice is made contiguous before the call
 ARENA_ENABLED = True         # bench --no-arena: off, to measure the tensors' own peak (the arena block counts as allocated)
+
+
+FRONT_DIV = 8                # room above the live saves: the phase's temporaries + 1/FRONT_DIV (Plan, see front_arena)
+ALLOC_ROUND = 512            # the caching allocator rounds requests up to 512 bytes
+SMALL_ALLOC = MIB            # requests up to this size come from the small-block pool, never from the arena
+
+
+def place(arena, seq):
+    """Replay `seq` in an arena of `arena` bytes the way the caching allocator
+    places blocks (best fit: the smallest free block that is large enough, the
+    lowest address on a tie, carved from its start; freed blocks merge with
+    free neighbours). seq: the long-lived allocations of a decode with saves,
+    in order, as ("alloc", key, bytes) / ("free", key) / ("mark", key); every
+    other tensor is freed whenever seq moves on (statistics passes free all
+    their temporaries before the next pass starts, and a save is allocated at
+    the start of the pass that builds it), so these are the only blocks in the
+    arena at those moments. -> (every alloc found a free block, {mark key:
+    (top, hole, holes)}): top = the end of the highest live block, hole / holes
+    = the largest / all free bytes below it, at that mark."""
+    free = [(0, int(arena))]                      # (start, size), merged
+    where = {}
+    marks = {}
+    for op in seq:
+        if op[0] == "alloc":
+            size = -(-int(op[2]) // ALLOC_ROUND) * ALLOC_ROUND
+            if size <= SMALL_ALLOC:
+                continue
+            fits = [(sz, st) for st, sz in free if sz >= size]
+            if not fits:
+                return False, marks
+            sz, st = min(fits)
+            free.remove((st, sz))
+            if sz > size:
+                free.append((st + size, sz - size))
+            where[op[1]] = (st, size)
+        elif op[0] == "free":
+            if op[1] not in where:
+                continue
+            st, size = where.pop(op[1])
+            free.append((st, size))
+            free.sort()
+            merged = []
+            for b in free:
+                if merged and merged[-1][0] + merged[-1][1] == b[0]:
+                    merged[-1] = (merged[-1][0], merged[-1][1] + b[1])
+                else:
+                    merged.append(b)
+            free = merged
+        else:
+            top = max([st + size for st, size in where.values()] + [0])
+            below = [size for st, size in free if st < top]
+            marks[op[1]] = (top, max(below + [0]), sum(below))
+    return True, marks
+
+
+def saves_fit(arena, seq):
+    """Whether every allocation of `seq` finds a free block in an arena of
+    `arena` bytes (place). A request that does fit is never stranded outside
+    the arena. (A request the allocator places in a free block outside the
+    arena only leaves the arena emptier.)"""
+    return place(arena, seq)[0]
 
 
 def conv_extra(cin, cout, k, r_in, r_out, w_in, w_out, e, ws, contiguous=True):
@@ -174,9 +239,22 @@ def conv_extra(cin, cout, k, r_in, r_out, w_in, w_out, e, ws, contiguous=True):
     return rb * per_row + (rb + k - 1) * w_in * cin * e + rb * w_out * cout * e + wcopy
 
 
-def arena_bytes(live, stripes=2, saves=False):
-    a = live + live // (ARENA_DIV_SINGLE if stripes <= 1 else ARENA_DIV_SAVES if saves else ARENA_DIV) + ARENA_PAD
+def arena_bytes(live, stripes=2, saves=False, ws=0):
+    if not saves:
+        slack = live // (ARENA_DIV_SINGLE if stripes <= 1 else ARENA_DIV)
+    else:
+        # with saves (tests/alloc_sim.py, DESIGN §9.14.11): a few very tall stripes fragment like one (live / 8), and
+        # conv column blocks larger than the default workspace fragment like a block of their own size
+        slack = max(live // (ARENA_DIV_SINGLE if stripes <= ARENA_FEW_STRIPES else ARENA_DIV_SAVES), ws if ws > ARENA_WS_FREE else 0)
+    a = live + slack + ARENA_PAD
     return -(-a // (2 * MIB)) * (2 * MIB)
+
+
+CALLS = "calls"    # key of the conv GEMM call count in a work dict (_chain_cost)
+
+
+def _macs(work):
+    return sum(v for k, v in work.items() if k != CALLS)
 
 
 class Pass:
@@ -190,11 +268,13 @@ class Pass:
 
 
 def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
-    """(needs, order, live, largest, work by output width) of running `chain` on `stripes` (rows at
+    """(needs, order, live, largest, work) of running `chain` on `stripes` (rows at
     the chain's output level). live: the largest unit peak (the first unit reads a
     slice of a save, counted on its own); tail(rows, s) -> the peak after the chain
     (the statistics of a pass). The peaks depend only on the rows each unit runs
-    on, so each distinct pattern of rows is evaluated once."""
+    on, so each distinct pattern of rows is evaluated once. work: conv MACs by
+    output width (identifies the resolution level), and under the key CALLS the
+    number of conv GEMM calls (row blocks under the workspace; bound.unit_calls)."""
     needs_all = [stripe_needs(chain, heights, a, b) for a, b in stripes]
     # the stripe with the largest slices runs first: the blocks it leaves in the allocator's cache fit every later stripe
     size = [sum(n[1] - n[0] for n in needs) for needs in needs_all]
@@ -205,7 +285,8 @@ def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
         key = tuple(n[1] - n[0] for n in needs)
         patterns[key] = patterns.get(key, 0) + 1
     live = largest = 0
-    work = {}   # output width (identifies the resolution level) -> conv MACs
+    work = {CALLS: 0}
+    unit_calls = getattr(bound, "unit_calls", None)
     for rows, count in patterns.items():
         s = 0
         for i, u in enumerate(chain):
@@ -215,6 +296,8 @@ def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
             s = r * u.scale * widths[i + 1] * u.cout * elem
             w_out = widths[i + 1]
             work[w_out] = work.get(w_out, 0) + count * r * u.scale * w_out * u.macs_row
+            if unit_calls is not None:
+                work[CALLS] += count * unit_calls(u, r, widths[i], elem, ws)
         if tail is not None:
             live = max(live, tail(rows[-1], s))
     return needs_all, order, live, largest, work
@@ -281,8 +364,11 @@ class Plan:
         self.needs, self.order, strip_live, lg, final_levels = _chain_cost(
             bound, self.final_units, self.final_heights, widths[sf:], self.stripes, elem, ws)
         largest = max(largest, lg)
+        # with saves, the checkpoint is a buffer allocated before the prefix (the front of the arena) and the
+        # prefix's output is copied into it, so that the saves' places are known (saves_fit): the prefix holds it too
+        self.ckpt_front = bool(saves)
         self.prefix_live, self.stripe_live = prefix_live, strip_live
-        self.prefix_bytes = prefix_live
+        self.prefix_bytes = prefix_live + (self.ckpt_bytes if saves else 0)
         self.stripe_bytes = strip_live + self.ckpt_bytes if sf == 0 else None   # with saves: set by the save layout below
 
         # statistics passes: the peak none of them can avoid is the saves they hold plus their smallest stripes;
@@ -374,33 +460,85 @@ class Plan:
         for name, alive, final_bytes, extra, save_alloc in variants:
             fb, pb, rows = layout(alive, final_bytes)
             live = int(persistent + max(self.prefix_bytes, fb, pb))
-            arena = arena_bytes(live, len(self.stripes), bool(saves)) + extra
+            arena = arena_bytes(live, len(self.stripes), bool(saves), ws) + extra
             if best_v is None or arena < best_v[0]:
                 best_v = (arena, name, alive, fb, pb, rows, live, save_alloc, extra)
         self.arena, self.save_layout, alive, self.stripe_bytes, self.pass_bytes, rows, self.live_peak, save_alloc, self.save_slack = best_v
         for ps, a, (r, (st, (needs, order, live, plg, work))) in zip(self.passes, alive, rows):
-            ps.alive, ps.rows, ps.stripes, ps.needs, ps.order, ps.live = a, r, st, needs, order, live
-            ps.work_levels, ps.work = work, sum(work.values())
+            ps.alive, ps.rows, ps.stripes, ps.needs, ps.order, ps.live, ps.largest = a, r, st, needs, order, live, plg
+            ps.work_levels, ps.work = work, _macs(work)
             largest = max(largest, plg, norm_temp(ps.norm.channels, max(b - a_ for a_, b in st), ps.widths[-1], ws))
-        largest = max(largest, save_alloc)
         self.persistent = persistent
+        self.front_arena = 0
+        if saves:
+            # Saves that died leave holes below the live ones (the checkpoint, B's H/4 save under the H/2 save). A
+            # phase whose largest temporary is larger than every such hole cannot use them; when they are more than
+            # the rule's slack, its temporaries need the room above the live saves (tests/alloc_sim.py: very tall
+            # stripes, 4K B with 540 / 768 rows, stranded several requests outside the arena of the rule above)
+            seq = self.long_lived(out_bytes)
+            _, marks = place(self.arena, seq)
+            slack_rule = self.arena - self.live_peak
+            phases = [(k, ps.live, ps.largest) for k, ps in enumerate(self.passes)] + [("final", strip_live, lg)]
+            for key, temps, big in phases:
+                top, hole, holes = marks.get(key, (0, 0, 0))
+                if big > hole and holes > slack_rule:
+                    self.front_arena = max(self.front_arena, top + temps + temps // FRONT_DIV + ARENA_PAD)
+            if self.front_arena > self.arena:
+                self.arena = -(-self.front_arena // (2 * MIB)) * (2 * MIB)
+        self.saves_guaranteed = bool(saves) and saves_fit(self.arena, self.long_lived(out_bytes))
+        if saves and not self.saves_guaranteed:
+            largest = max(largest, save_alloc)
         if not self.passes:
             self.live_peak = int(self.persistent + max(self.prefix_bytes, self.stripe_bytes))
             self.arena = arena_bytes(self.live_peak, len(self.stripes))
         self.largest = int(largest)
-        # reserved = the arena, unless fragmentation strands one request outside it (then that request's own segment)
+        # reserved = the arena, unless fragmentation strands one request outside it (then that request's own segment);
+        # the saves are not among the candidates when saves_fit guarantees their place
         self.estimate = self.arena + self.largest + ESTIMATE_PAD
         work_prefix = sum(bound.prefix_macs(m) for _, m in bound.prefix) * h8 * w8
         work_whole = work_prefix + sum(heights[i + 1] * widths[i + 1] * u.macs_row for i, u in enumerate(units))
-        work_stripes = sum(final_levels.values())
+        work_stripes = _macs(final_levels)
         self.work_passes = sum(ps.work for ps in self.passes)
         self.recompute = (work_prefix + work_stripes + self.work_passes) / max(1, work_whole)
         # conv MACs by resolution level (output width / latent width: 1 = the prefix at H/8, 2, 4, 8), for the time model
         levels = {1: work_prefix}
+        calls = 0
         for d in [final_levels] + [ps.work_levels for ps in self.passes]:
             for w_out, m in d.items():
-                levels[w_out // w8] = levels.get(w_out // w8, 0) + m
+                if w_out == CALLS:
+                    calls += m
+                else:
+                    levels[w_out // w8] = levels.get(w_out // w8, 0) + m
         self.work_levels = levels
+        self.conv_calls = calls   # conv GEMM calls of the stripes and passes (the prefix's are the same for every plan)
+
+    def long_lived(self, out_bytes):
+        """The long-lived allocations of one sample of a decode with saves, in
+        order (for saves_fit): the checkpoint buffer (before the prefix), the
+        output buffer (after it), each save (or the pool) at the start of the
+        pass that builds it, a save freed after the pass from which nothing
+        starts from it any more (the checkpoint too)."""
+        seq = [("alloc", 0, self.ckpt_bytes), ("alloc", "out", out_bytes)]
+        alive = {0}
+        pool = False
+        for k, ps in enumerate(self.passes):
+            for p in ps.builds:
+                if self.save_layout == "pool":
+                    if not pool:
+                        seq.append(("alloc", "pool", self.pool_bytes))
+                        pool = True
+                else:
+                    seq.append(("alloc", p, self.save_bytes[p]))
+                alive.add(p)
+            seq.append(("mark", k))
+            if ps.builds:
+                for q in sorted(alive):
+                    if q < max(ps.builds):
+                        alive.discard(q)
+                        if q == 0 or self.save_layout != "pool":
+                            seq.append(("free", q))
+        seq.append(("mark", "final"))
+        return seq
 
     def describe(self):
         d = "{} stripes of {} rows (core), recompute {:.2f}x, checkpoint {}".format(
@@ -780,9 +918,19 @@ class StripeAdapter:
         pixel_samples = None
         with OpChunking(self.module, budget_ws, stats):
             for i in range(n):
+                buf = None
+                if plan.ckpt_front:
+                    # the checkpoint at the front of the arena (Plan.long_lived), allocated before the prefix
+                    shape = list(samples_in.shape)
+                    shape[0], shape[1] = 1, self.ckpt_channels
+                    buf = torch.empty(shape, device=vae.device, dtype=vae.vae_dtype)
                 z = samples_in[i:i + 1].to(device=vae.device, dtype=vae.vae_dtype)
                 ckpt = self.prefix_pass(z)
                 del z
+                if buf is not None:
+                    buf.copy_(ckpt)
+                    ckpt = buf
+                    del buf
                 if pixel_samples is None:
                     pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
                 dst = pixel_samples[i:i + 1]
