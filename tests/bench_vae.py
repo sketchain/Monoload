@@ -13,6 +13,9 @@ Runs, in one process with one loaded VAE, every resolution x mode:
             (what monoload was in phase 1), for comparison.
   monoload-r<N>  monoload with the layer-1 stripe core height forced to N
             output rows (--stripe-rows adds these for a sweep).
+  monoload-g<S>  monoload with the GroupNorm scheme S (A / B / C / D) of an LDM
+            layer-1 decode (--gn-schemes adds these for a sweep; with
+            --stripe-rows too, every scheme x height: monoload-r<N>-g<S>).
   native2   native again: how much the GPU differs from itself.
 and reports per run (printed as it happens) and in summary tables:
   time      cold = first run of that mode at that resolution, warm = median
@@ -388,17 +391,23 @@ def decode_once(vae, latent, capture, sampler_interval):
 
 _DEFAULT_ROWS = mvae.stripe_rows()
 _DEFAULT_WS = []
+_DEFAULT_GN = mvae.gn_scheme()
 
 
 def configure(mode):
-    """Install / uninstall Monoload's VAE wrapper and set layer 1 / the workspace for `mode`
-    (a "-w<MiB>" suffix sets MONOLOAD_VAE_WORKSPACE for that mode, e.g. monoload-w128, monoload-l2-w256)."""
+    """Install / uninstall Monoload's VAE wrapper and set layer 1 / the workspace / the GroupNorm scheme for `mode`
+    (a "-w<MiB>" suffix sets MONOLOAD_VAE_WORKSPACE for that mode, e.g. monoload-w128, monoload-l2-w256; a "-g<S>"
+    suffix before it sets MONOLOAD_VAE_GN_SCHEME, e.g. monoload-gD, monoload-r32-gA, monoload-gB-w256)."""
     if not _DEFAULT_WS:
         _DEFAULT_WS.append(mvae.workspace())   # --workspace / MONOLOAD_VAE_WORKSPACE
     w = re.search(r"-w(\d+)$", mode)
     mvae.set_workspace(int(w.group(1)) * vae_ops.MIB if w else _DEFAULT_WS[0])
     if w:
         mode = mode[:w.start()]
+    g = re.search(r"-g([A-Da-d])$", mode)
+    mvae.set_gn_scheme(g.group(1) if g else _DEFAULT_GN)
+    if g:
+        mode = mode[:g.start()]
     if not mode.startswith("monoload"):
         mvae.uninstall()
         return
@@ -420,9 +429,13 @@ def mono_line(m):
     if m.get("strategy") == "layer1":
         e = m["estimate"]
         st = m.get("stats", {})
-        return ("layer 1 ({}): {} stripes of {} rows, recompute {:.2f}x, checkpoint {}, {} (target {}), workspace {}, {} OOM retries; "
+        gn = ""
+        if m.get("passes"):
+            gn = "{} GroupNorm statistics passes (rows {}), saves {}, ".format(
+                m["passes"], ",".join(str(r) for r in m.get("pass_rows", [])), "+".join(vae_ops.fmt_bytes(b) for b in m.get("saves") or []) or "none")
+        return ("layer 1 ({}): {} stripes of {} rows, recompute {:.2f}x, checkpoint {}, {}{} (target {}), workspace {}, {} OOM retries; "
                 "estimate {} GiB (live peak {}: prefix {} / checkpoint + stripes {} / persistent {}; native {}); {} Conv3d calls as conv2d, arena {}").format(
-            m.get("adapter"), m["stripes"], m["rows"], m["recompute"], vae_ops.fmt_bytes(m["checkpoint_bytes"]), m.get("policy"), vae_ops.fmt_bytes(m["budget"]),
+            m.get("adapter"), m["stripes"], m["rows"], m["recompute"], vae_ops.fmt_bytes(m["checkpoint_bytes"]), gn, m.get("policy"), vae_ops.fmt_bytes(m["budget"]),
             vae_ops.fmt_bytes(m["workspace"]), m["retries"], gib(e["total"]).strip(), vae_ops.fmt_bytes(e.get("live")), vae_ops.fmt_bytes(e["prefix"]), vae_ops.fmt_bytes(e["stripes"]),
             vae_ops.fmt_bytes(e["persistent"]), gib(m.get("native_estimate")).strip(), st.get("conv3d_as_2d"), vae_ops.fmt_bytes(st.get("arena")) if st.get("arena") else "none")
     st = m.get("stats", {})
@@ -824,6 +837,11 @@ def main():
                         "monoload-l2 (layer 2 only), monoload-r<N> (layer 1 with N-row stripes), native2; "
                         "a -w<MiB> suffix on a monoload mode sets the workspace for it (monoload-w128, monoload-l2-w256)")
     p.add_argument("--stripe-rows", help="comma list of layer-1 stripe core heights to sweep (adds a monoload-r<N> mode per value)")
+    p.add_argument("--gn-schemes", help="GroupNorm schemes of an LDM layer-1 decode to sweep, e.g. ADBC (adds a monoload-g<S> mode per "
+                   "scheme, and monoload-r<N>-g<S> for every --stripe-rows value)")
+    p.add_argument("--fp32-chunked", default="l1", choices=("l1", "l2"),
+                   help="how the chunked fp32 reference decodes: l1 = as the plugin (layer 1 where recognized), l2 = layer 2 only "
+                        "(independent of the stripes and the GroupNorm statistics)")
     p.add_argument("--warm", type=int, default=3, help="warm runs after the cold one (median reported)")
     p.add_argument("--workspace", help="Monoload workspace for this run (e.g. 1G, 512M); default MONOLOAD_VAE_WORKSPACE or 1G")
     p.add_argument("--sample-ms", type=float, default=10.0, help="GTT / VRAM / cgroup sampling interval (5-20 ms)")
@@ -885,8 +903,13 @@ def main():
             return
 
     modes = a.modes.split(",")
-    if a.stripe_rows:
-        modes += ["monoload-r{}".format(int(r)) for r in a.stripe_rows.split(",") if r.strip()]
+    rows_sweep = [int(r) for r in (a.stripe_rows or "").split(",") if r.strip()]
+    gn_sweep = [g.strip().upper() for g in (a.gn_schemes or "").replace(",", "") if g.strip()]
+    if gn_sweep:
+        modes += ["monoload-g{}".format(g) for g in gn_sweep]
+        modes += ["monoload-r{}-g{}".format(r, g) for g in gn_sweep for r in rows_sweep]
+    else:
+        modes += ["monoload-r{}".format(r) for r in rows_sweep]
     results = []
     accuracy = []
     outlier_info = []
@@ -918,7 +941,7 @@ def main():
             for mode, want in (("native-fp32", a.fp32_impl in ("both", "native")), ("monoload-fp32", True)):
                 if not want or (mode == "monoload-fp32" and a.fp32_impl == "native" and "native-fp32" in got):
                     continue
-                s32, raw, px = run_mode(vae32, lat, mode, a0, label)
+                s32, raw, px = run_mode(vae32, lat, "monoload-l2-fp32" if mode == "monoload-fp32" and a.fp32_chunked == "l2" else mode, a0, label)
                 results.append(s32)
                 if s32["status"] == "ok" and px is not None:
                     got[mode] = (raw, px)
@@ -959,6 +982,9 @@ def main():
         nat = mvae._native_estimate(vae32 if s["mode"].endswith("fp32") else vae, next(l for lb, l, _ in inputs if lb == s["res"]).shape)
         if m.get("strategy") == "layer1":
             layer = "L1 {}x{} rows, recompute {:.2f}x, ckpt {}".format(m["stripes"], m["rows"], m["recompute"], vae_ops.fmt_bytes(m["checkpoint_bytes"]))
+            if m.get("passes"):
+                layer += ", GN {} ({} passes, saves {})".format(m.get("gn_scheme"), m["passes"],
+                                                                "+".join(vae_ops.fmt_bytes(b) for b in m.get("saves") or []) or "none")
         elif m.get("strategy") == "layer2":
             layer = "L2"
         else:

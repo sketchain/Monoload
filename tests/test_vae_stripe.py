@@ -14,8 +14,8 @@ random weights, fp32 on the CPU.
      inside the stripes, bf16; errors near stripe boundaries no larger than
      elsewhere;
   3. recognition: a Dropout in training mode / a forward hook / layer 1
-     switched off -> layer 2; SDXL / Flux structures keep layer 2 with the same
-     result as before;
+     switched off -> layer 2; SDXL / Flux structures are not the Wan adapter's
+     (they go to the LDM adapter, tests/test_vae_ldm.py);
   4. self-test: a halo one row short (caught by the per-unit validity check) and
      a halo one row short with a matching wrong validity rule (caught
      numerically) both fail the self-test and the decode falls back to layer 2;
@@ -249,9 +249,10 @@ def recognition_tests(v, lat):
         last = mvae.last_decode()
         ref = native_decode(vv, l4, raw=True)
         mvae.set_workspace(mvae.DEFAULT_WORKSPACE)
-        check("{} (LDM Decoder) keeps layer 2: {} chunked conv calls, max|Δ| vs native {:.2g} ({})".format(
-            label, last["stats"]["conv_chunked"], float((out - ref).abs().max()), last.get("layer1")),
-            last.get("strategy") == "layer2" and "not comfy.ldm.wan.vae.WanVAE" in (last.get("layer1") or "")
+        why = vw.match(vv, l4, {})[1]
+        check("{} (LDM Decoder) is not the Wan adapter's ({}); decoded by {}: {} chunked conv calls, max|Δ| vs native {:.2g}".format(
+            label, why, last.get("adapter") or last.get("strategy"), last["stats"]["conv_chunked"], float((out - ref).abs().max())),
+            "not comfy.ldm.wan.vae.WanVAE" in (why or "") and last.get("strategy") == "layer1" and "LDM" in (last.get("adapter") or "")
             and last["stats"]["conv_chunked"] > 0 and float((out - ref).abs().max()) <= 1e-4)
 
 

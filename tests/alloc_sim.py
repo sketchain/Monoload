@@ -78,8 +78,12 @@ class AllocatorSim:
         self.live = set()
         self.peak_blocks = []   # sizes of the live blocks at the allocation peak
         self.tag = ""           # what is running (for the peak report)
+        self.ctx = ""           # the layer-1 unit / prefix module running (decode_trace(units=True))
         self.heads = []         # first block of every segment
         self.peak_segments = [] # segment layout when reserved peaked: [(segment size, [(block size, tag or None if free)])]
+        self.watch = None       # (start address, end address) of a segment whose high-water mark is tracked
+        self.hwm = 0            # highest end offset of a block allocated in it
+        self.hwm_at = None      # (request tag, size, [(offset, size, tag) of the blocks live in it]) when it was reached
 
     @staticmethod
     def round_size(n):
@@ -131,6 +135,10 @@ class AllocatorSim:
             self._insert(r)
         b.free = False
         b.requested = (nbytes, self.tag)
+        if self.watch is not None and self.watch[0] <= b.addr < self.watch[1] and b.addr + size - self.watch[0] > self.hwm:
+            self.hwm = b.addr + size - self.watch[0]
+            self.hwm_at = (self.tag, size, sorted(((x.addr - self.watch[0], x.size, x.requested[1]) for x in self.live
+                                                   if self.watch[0] <= x.addr < self.watch[1]), key=lambda t: t[0]))
         self.allocated += b.size
         self.live.add(b)
         if self.allocated > self.peak_allocated:
@@ -244,7 +252,7 @@ def make_tracer(sim):
             self.poll()
             temps, after = [], []
             name = func.name()
-            sim.tag = name
+            sim.tag = (sim.ctx + ":" if sim.ctx else "") + name
             if name in CONV_OPS:
                 x, w = args[0], args[1]
                 e = x.element_size()
@@ -276,6 +284,12 @@ def make_tracer(sim):
 
 WAN_QWEN = dict(dim=96, z_dim=16, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_scales=[],
                 temperal_downsample=[False, True, True], dropout=0.0)
+# the LDM ddconfig comfy.sd.VAE builds for SDXL / SD1.5 (z 4, AutoencoderKL with post_quant_conv) and Flux ae /
+# SD3 (z 16, AutoencodingEngine, no post_quant_conv)
+LDM_DDCONFIG = {'double_z': True, 'z_channels': 4, 'resolution': 256, 'in_channels': 3, 'out_ch': 3, 'ch': 128,
+                'ch_mult': [1, 2, 4, 4], 'num_res_blocks': 2, 'attn_resolutions': [], 'dropout': 0.0}
+# model name -> (latent channels, latent dims)
+LATENT = {"qwen": (16, 5), "sdxl": (4, 4), "flux": (16, 4)}
 
 
 class _MetaVAE:
@@ -296,15 +310,31 @@ class _MetaVAE:
 _MODELS = {}
 
 
-def meta_vae(dtype):
+def _build(model):
+    """The full-size first-stage model (on the meta device: no memory)."""
+    if model == "qwen":
+        import comfy.ldm.wan.vae as wan
+        return wan.WanVAE(**WAN_QWEN)
+    from comfy.ldm.models.autoencoder import AutoencoderKL, AutoencodingEngine
+    if model == "sdxl":
+        return AutoencoderKL(ddconfig=dict(LDM_DDCONFIG), embed_dim=4)
+    if model == "flux":
+        dd = dict(LDM_DDCONFIG, z_channels=16)
+        return AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
+                                  encoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Encoder", 'params': dd},
+                                  decoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Decoder", 'params': dd})
+    raise ValueError(model)
+
+
+def meta_vae(dtype, model="qwen"):
     import torch
-    import comfy.ldm.wan.vae as wan
-    if dtype not in _MODELS:
+    key = (dtype, model)
+    if key not in _MODELS:
         with torch.device("meta"):
-            fsm = wan.WanVAE(**WAN_QWEN)
+            fsm = _build(model)
         fsm.to(dtype).eval()
-        _MODELS[dtype] = _MetaVAE(fsm, dtype)
-    return _MODELS[dtype]
+        _MODELS[key] = _MetaVAE(fsm, dtype)
+    return _MODELS[key]
 
 
 @contextlib.contextmanager
@@ -318,7 +348,7 @@ def _patched(obj, name, value):
 
 
 def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, order="largest", conv2d=True, arena=None, batch=1, out_first=True,
-                 layer1_ws=None, contiguous=True):
+                 layer1_ws=None, contiguous=True, model="qwen", scheme=None, arena_need=False, units=False):
     """alloc / reserved deltas (bytes) of one decode of a w x h image, as bench_vae measures them
     (cache emptied and peaks reset right before the decode, the weights already loaded).
 
@@ -330,13 +360,19 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     out_first  a row-blocked conv allocates its output before the first block (False: after it, up to 725a010)
     layer1_ws  monoload.vae.LAYER1_WORKSPACE for this decode (384 MiB up to 5d668b6, 128 MiB since)
     contiguous the row slice into a Resample is made contiguous first (False: up to 725a010)
+    model   "qwen" (Wan 2.1, qwen_image_vae), "sdxl" (LDM AutoencoderKL, z 4), "flux" (LDM AutoencodingEngine, z 16)
+    scheme  GroupNorm scheme of an LDM layer-1 decode (None: the current setting)
+    units   tag every allocation with the layer-1 unit / prefix module that made it (for --peak)
+    arena_need  run in an arena 4x the plan's live peak and report (info["arena_need"]) the highest offset any
+            block reached in it: the smallest arena with the same placements (best fit keeps choosing the same
+            blocks while the arena's tail is the largest free block), i.e. the arena this plan needs
     """
     import torch
     import comfy.model_management as mm
     from monoload import vae as mvae, vae_ops, vae_engine as eng
 
     dt = {"bf16": torch.bfloat16, "fp32": torch.float32, "fp16": torch.float16}[dtype] if isinstance(dtype, str) else dtype
-    v = meta_vae(dt)
+    v = meta_vae(dt, model)
     fsm = v.first_stage_model
     sim = AllocatorSim()
     sim.tag = "weights"
@@ -347,7 +383,8 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     sim.empty_cache()
     sim.reset_peak()
     base_alloc, base_res = sim.allocated, sim.reserved
-    lat = torch.empty(batch, 16, 1, h // 8, w // 8, device="meta")   # the bench's latent is on the CPU: not counted, its copy is
+    zc, nd = LATENT[model]
+    lat = torch.empty((batch, zc, 1, h // 8, w // 8) if nd == 5 else (batch, zc, h // 8, w // 8), device="meta")   # the bench's latent is on the CPU: not counted, its copy is
     tracer = make_tracer(sim)
     tracer.static.update(t.untyped_storage()._cdata for t in itertools.chain(fsm.parameters(), fsm.buffers(), [lat]))
     events = {"empty_cache": 0}
@@ -376,9 +413,28 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
             es.enter_context(_patched(eng, "CONTIGUOUS_INPUT", ()))
         if clear:
             es.enter_context(_patched(eng, "run_prefix", run_prefix_clear))
+        if scheme:
+            from monoload import vae_ldm
+            es.enter_context(_patched(vae_ldm, "_SCHEME", [scheme]))
         if layer == 1:
             bound, why = mvae._select_layer1(v, lat, {})
             assert bound is not None, why
+            if units:
+                def tagged(fn, label):
+                    def run(x):
+                        old = sim.ctx
+                        sim.ctx = label
+                        try:
+                            return fn(x)
+                        finally:
+                            sim.ctx = old
+                    return run
+                for u in bound.units:
+                    u.module = tagged(u.module, u.name.replace("decoder.", ""))
+                    for nr in u.norms:
+                        if nr.partial is not None:
+                            nr.partial.module = tagged(nr.partial.module, nr.partial.name.replace("decoder.", ""))
+                bound.prefix_pass = tagged(bound.prefix_pass, "prefix")
             outb = batch * 3 * h * w * 4
             if rows:
                 ws_ = ws or mvae.layer1_workspace()
@@ -389,6 +445,16 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
                 plan.order = list(range(len(plan.stripes)))
             if arena is not None:
                 plan.arena = arena
+            if arena_need:
+                plan.arena = 4 * plan.live_peak
+                orig_reserve = eng.reserve_arena
+
+                def reserve(device, nbytes):
+                    seg = sim.allocation_size(sim.round_size(nbytes))
+                    sim.watch = (sim.next_addr, sim.next_addr + seg)
+                    orig_reserve(device, nbytes)
+                    sim.hwm = 0   # the arena block itself (freed before the next op's first allocation)
+                es.enter_context(_patched(eng, "reserve_arena", reserve))
             info.update(plan=plan, stripes=len(plan.stripes), rows=max(b - a for a, b in plan.stripes), estimate=plan.estimate,
                         arena=plan.arena, live_peak=plan.live_peak)
             stats = vae_ops.OpStats()
@@ -411,7 +477,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     info["peak_blocks"] = [x for x in sim.peak_blocks if x[1] != "weights"]
     info["peak_segments"] = [sg for sg in sim.peak_segments if not all(t == "weights" for _, t in sg[1] if t is not None) or len(sg[1]) == 1 and sg[1][0][1] is None and False]
     info.update(alloc=sim.peak_allocated - base_alloc, reserved=sim.peak_reserved - base_res, mallocs=sim.mallocs,
-                empty_cache=events["empty_cache"])
+                empty_cache=events["empty_cache"], arena_need=sim.hwm, arena_need_at=sim.hwm_at)
     return info
 
 
@@ -457,6 +523,26 @@ MEASURED = [
     ("1344 layer 2", 1344, 768, "bf16", None, 2, "v1", 1.82, 2.12),
     ("2688 layer 2", 2688, 1536, "bf16", None, 2, "v1", 3.80, 5.07),
     ("4K layer 2", 3840, 2160, "bf16", None, 2, "v1", 6.45, 9.61),
+    # SDXL / Flux layer 2 (README §10.1, af9abc6: the row-blocked conv allocated its output after the first block)
+    ("SDXL 1344 layer 2", 1344, 768, "bf16", None, 2, "v1", 2.41, 3.72, dict(model="sdxl")),
+    ("SDXL 2688 layer 2", 2688, 1536, "bf16", None, 2, "v1", 6.15, 9.25, dict(model="sdxl")),
+    ("SDXL 4K layer 2", 3840, 2160, "bf16", None, 2, "v1", 11.17, 14.86, dict(model="sdxl")),
+    ("Flux 1344 layer 2", 1344, 768, "bf16", None, 2, "v1", 2.41, 3.72, dict(model="flux")),
+    ("Flux 2688 layer 2", 2688, 1536, "bf16", None, 2, "v1", 6.15, 9.24, dict(model="flux")),
+    ("Flux 4K layer 2", 3840, 2160, "bf16", None, 2, "v1", 11.18, 14.89, dict(model="flux")),
+    # SDXL layer 2, workspace experiment K (5d668b6; GTT, the reserved peak plus <= 0.02 GiB of the rest of the machine)
+    ("SDXL 1344 l2 1G", 1344, 768, "bf16", None, 2, "cur", None, 3.72, dict(model="sdxl", ws=1024 * MIB)),
+    ("SDXL 2688 l2 1G", 2688, 1536, "bf16", None, 2, "cur", None, 9.23, dict(model="sdxl", ws=1024 * MIB)),
+    ("SDXL 4K l2 1G", 3840, 2160, "bf16", None, 2, "cur", None, 14.99, dict(model="sdxl", ws=1024 * MIB)),
+    ("SDXL 1344 l2 512M", 1344, 768, "bf16", None, 2, "cur", None, 2.68, dict(model="sdxl", ws=512 * MIB)),
+    ("SDXL 2688 l2 512M", 2688, 1536, "bf16", None, 2, "cur", None, 7.47, dict(model="sdxl", ws=512 * MIB)),
+    ("SDXL 4K l2 512M", 3840, 2160, "bf16", None, 2, "cur", None, 15.86, dict(model="sdxl", ws=512 * MIB)),
+    ("SDXL 1344 l2 256M", 1344, 768, "bf16", None, 2, "cur", None, 2.30, dict(model="sdxl", ws=256 * MIB)),
+    ("SDXL 2688 l2 256M", 2688, 1536, "bf16", None, 2, "cur", None, 7.91, dict(model="sdxl", ws=256 * MIB)),
+    ("SDXL 4K l2 256M", 3840, 2160, "bf16", None, 2, "cur", None, 15.42, dict(model="sdxl", ws=256 * MIB)),
+    ("SDXL 1344 l2 128M", 1344, 768, "bf16", None, 2, "cur", None, 1.87, dict(model="sdxl", ws=128 * MIB)),
+    ("SDXL 2688 l2 128M", 2688, 1536, "bf16", None, 2, "cur", None, 7.67, dict(model="sdxl", ws=128 * MIB)),
+    ("SDXL 4K l2 128M", 3840, 2160, "bf16", None, 2, "cur", None, 15.32, dict(model="sdxl", ws=128 * MIB)),
 ]
 
 
@@ -477,6 +563,10 @@ def main():
     ap.add_argument("--rows", default=None)
     ap.add_argument("--dtype", default="bf16")
     ap.add_argument("--version", default="current", help="current / v1 / v2 / v3")
+    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux")
+    ap.add_argument("--scheme", default=None, help="GroupNorm scheme of an LDM layer-1 decode: A / B / C / D")
+    ap.add_argument("--layer", type=int, default=1)
+    ap.add_argument("--ws", default=None, help="workspace MiB (layer 2: default 1024; layer 1: the layer-1 default)")
     ap.add_argument("--peak", action="store_true", help="list the live blocks at the allocation peak")
     ap.add_argument("--segments", action="store_true", help="the segments (>= 2 MiB) and their blocks when reserved peaked")
     a = ap.parse_args()
@@ -484,9 +574,20 @@ def main():
     if a.res:
         w, h = (int(x) for x in a.res.lower().split("x"))
         for r in ([int(x) for x in a.rows.split(",")] if a.rows else [None]):
-            i = decode_trace(w, h, a.dtype, r, **_version(a.version))
-            print("{} {} rows {}: {} x {} rows, estimate {:.2f} | sim alloc {:.2f} reserved {:.2f} GiB, {} device mallocs, cache emptied {}x".format(
-                a.res, a.dtype, r or "default", i["stripes"], i["rows"], i["estimate"] / G, i["alloc"] / G, i["reserved"] / G, i["mallocs"], i["empty_cache"]))
+            kw = dict(_version(a.version), model=a.model, scheme=a.scheme, layer=a.layer, units=a.layer == 1)
+            if a.ws:
+                kw["ws"] = int(float(a.ws) * MIB)
+            i = decode_trace(w, h, a.dtype, r, **kw)
+            if a.layer == 1:
+                p = i["plan"]
+                print("{} {} {} rows {}: {} x {} rows{}, recompute {:.2f}x, live {:.2f} arena {:.2f} estimate {:.2f} | sim alloc {:.2f} reserved {:.2f} GiB, "
+                      "{} device mallocs, cache emptied {}x".format(
+                          a.model, a.res, a.dtype, r or "default", i["stripes"], i["rows"],
+                          ", {} statistics passes (scheme {})".format(len(p.passes), a.scheme or "default") if p.passes else "", p.recompute,
+                          p.live_peak / G, p.arena / G, i["estimate"] / G, i["alloc"] / G, i["reserved"] / G, i["mallocs"], i["empty_cache"]))
+            else:
+                print("{} {} {} layer 2: sim alloc {:.2f} reserved {:.2f} GiB, {} device mallocs".format(
+                    a.model, a.res, a.dtype, i["alloc"] / G, i["reserved"] / G, i["mallocs"]))
             if a.segments:
                 for size, blocks in i["peak_segments"]:
                     if size >= (2 << 20) and not any(t == "weights" for _, t in blocks):
@@ -495,9 +596,9 @@ def main():
             if a.peak:
                 print("   live at the alloc peak:", ", ".join("{:.0f} MiB {}".format(sz / MIB, t) for sz, t in sorted(i["peak_blocks"], reverse=True) if sz >= MIB))
         return
-    print("{:24s} {:>13s} {:>13s} {:>9s}".format("case", "alloc m/sim", "resv m/sim", "estimate"))
-    for label, w, h, dt, rows, layer, ver, ma, mr in MEASURED:
-        i = decode_trace(w, h, dt, rows, layer=layer, **_version(ver))
+    print("{:24s} {:>13s} {:>13s} {:>9s}".format("case", "alloc m/sim", "resv m/sim", "estimate"))   # resv m: reserved, or GTT where only that was read
+    for label, w, h, dt, rows, layer, ver, ma, mr, *kw in MEASURED:
+        i = decode_trace(w, h, dt, rows, layer=layer, **dict(_version(ver), **(kw[0] if kw else {})))
         est = i.get("estimate")
         print("{:24s} {:>5s} / {:5.2f} {:5.2f} / {:5.2f} {:>9s}".format(label, "{:.2f}".format(ma) if ma is not None else "-", i["alloc"] / G,
                                                                     mr, i["reserved"] / G, "{:.2f}".format(est / G) if est else ""))
