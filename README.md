@@ -110,11 +110,11 @@ docker logs comfyui 2>&1 | grep -i monoload
 |---|---|---|
 | `budget` | `default` / `unlimited` / `custom` | 峰值预算。`default`：跟随全局（`MONOLOAD_VAE_BUDGET`，没设就是默认策略）；`unlimited`：这个 VAE 不限预算（默认策略），即使全局设了预算；`custom`：用 `budget_gib`——估算不超过它的做法里选预计最快的，一个都放不下就报错并写明各需要多少 |
 | `budget_gib` | GiB，精度 0.01 | 只在 `budget` 选 `custom` 时生效（这时必须大于 0）；选别的时填了也不用，日志里说明 |
-| `gn_scheme` | `default` / `A` / `B` / `C` / `D` | 强制 LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae`）第一层的 GroupNorm 方案（§12.8）；`default` 跟随全局 |
+| `gn_scheme` | `default` / `A` / `B` / `C` / `D` | 强制 LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae` / Flux 2）第一层的 GroupNorm 方案（§12.8）；`default` 跟随全局 |
 | `stripe_rows` | 输出行数，`0` = 跟随全局 | 强制第一层的条带高度 |
 | `mode` | `default` / `auto` / `layer 2 only` / `native` | `default`：跟随全局（默认开启时是 `auto`；`MONOLOAD=0`、`MONOLOAD_DISABLE_VAE=1`、`MONOLOAD_EXACT=1` 时是原生；`MONOLOAD_DISABLE_VAE_STRIPE=1` 时是 `layer 2 only`）；`auto`：**为这个 VAE 打开**解码管理，认得的 decoder 走第一层（条带），其余走第二层——全局关着（包括 `MONOLOAD=0`）也打开；`layer 2 only`：只用第二层；`native`：这个 VAE 用 ComfyUI 自己的解码 |
 
-**GroupNorm 方案（`gn_scheme`）是什么：** 只对 LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae`）的第一层（条带解码）有意义。GroupNorm 要用整张图的统计量，所以第一层在出图之前要先跑几遍「统计遍」；方案决定把哪些中间结果整张存下来，让这几遍从存档出发，而不必每遍都从 H/8 的存档重算：
+**GroupNorm 方案（`gn_scheme`）是什么：** 只对 LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae` / Flux 2）的第一层（条带解码）有意义。GroupNorm 要用整张图的统计量，所以第一层在出图之前要先跑几遍「统计遍」；方案决定把哪些中间结果整张存下来，让这几遍从存档出发，而不必每遍都从 H/8 的存档重算：
 
 | 方案 | 存什么 | 取舍 | SDXL 4K 实测（GTT / 耗时） |
 |---|---|---|---|
@@ -271,6 +271,7 @@ MODELS=/path/to/models tests/run_all.sh
 | `tests/test_lora_hot.py` | 两条管线：`CheckpointLoaderSimple`；`UNETLoader` + `CLIPLoader`。同一串 LoRA 组合先用原生跑、再装上 Monoload 连续切换着跑。`EXACT=1`：TE 输出和采样结果与原生逐位一致。默认路径：UNet 和 TE 所有被 patch 的权重与原生合并的差异在容差以内（DESIGN.md §5.5），同样的 key 上重算逐位一致路径与原生逐位一致；latent 差异只报告。两种模式都检查无备份、权重不变、撤掉 LoRA 后逐位一致，加上 Hook LoRA、模型合并和报错场景 |
 | `tests/test_quant.py` | fp8 scaled UNet + LoRA：与「先反量化被改到的层 + 同一合并路径」逐位一致、无备份、fp8 权重不变；与原生的误差只报告 |
 | `tests/test_vae.py` | VAE 解码管理（§12），不需要模型文件：分块卷积 / 分块注意力与不分块的结果一致（含各种 kernel、stride、dilation、groups、padding、cast 路径 + weight_function、Wan CausalConv3d）；用 ComfyUI 自己的 LDM `Decoder` / `WanVAE`（小通道、随机权重）构造 SDXL 式、Flux 式、Qwen 式 VAE，受管理的解码与原生 `VAE.decode` 比较；多帧交给原生、OOM 缩小分块重试、下限时报错、绝不调用 tiled；SVD / 2D latent 的音频 / 像素空间交给原生（DESIGN §9.17） |
+| `tests/test_vae_flux2.py` | Flux 2 VAE 走第一层（DESIGN §9.18），不需要模型文件：识别、latent 步骤与原生逐位相同、四种方案 × 条带高度与原生比较、自检和注入错误、OOM、预算、VAE 设置 / Info 节点、alloc_sim 上 reserved ≤ 估算 |
 | `tests/test_vae_stripe.py` | VAE 第一层（§12.7），不需要模型文件：区间倒推对照暴力依赖展开；每个单元（残差块、上采样、head 卷积）在任意切片上「有效行」与整图逐行一致、紧邻的下一行不一致；用 ComfyUI 的 `WanVAE`（小通道、随机权重）在 fp32 下比较第一层与原生整图解码（条带 1 行、不整除、等于整图、按预算自动、默认策略、奇数尺寸、很小的 latent、batch 2、条带内再分块、bf16），块边界附近的误差不比其他区域大；识别（Dropout 训练态、forward hook、开关）；故意少算一行 halo 时自检能抓到并回退第二层；预算报错；OOM 缩小条带、到下限报错、不退回 tiled 也不退回第二层；默认策略（128 行条带的估算为目标）和开关的优先级；内存模型单调、最大的条带先跑；自检后和前缀 / 条带之间清空缓存；SDXL / Flux 结构不归 Wan 适配器（归 LDM 适配器）；单帧 Conv3d 改走 conv2d 与模块原样一致、只在该改的时候改 |
 | `tests/test_master_switch.py` | 总开关和全局默认（§4），不需要模型文件：`MONOLOAD` 的解析；`MONOLOAD=0` 且没有节点时，挂 LoRA 的模型（整体加载、lowvram 部分加载、Hook LoRA）和 VAE 解码与卸掉钩子的原版 ComfyUI 逐位一致，备份也和原生一样；释放不运行；包装每次调用的开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `mode auto` 打开管理、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 时节点原样透传 |
 | `tests/test_lora_node.py` | Monoload LoRA Settings 节点（§4.2），需要 `tests/make_synthetic_checkpoint.py $MODELS` 生成的随机权重 SD1.5 checkpoint 和 LoRA（约 2 GiB）：接口；逐项优先级和来源；clone 共享权重、输入不变、设置不同时换 uuid；节点放在 `LoraLoader` 前面设置也保留；串联；`LoraLoader` / `LoraLoaderModelOnly`（不接 CLIP）/ 两个串联的 `LoraLoader`：`exact` 和 `native` 与卸掉钩子的原版逐位一致（`native` 的备份数也一样），`fused` = 不加节点的默认路径；同一底模的不同设置交替加载各得各的结果、底模权重逐位还原；`MONOLOAD=0` 下 `enable`；prompt 结束后的释放 / 保留；`MONOLOAD_DISABLE` 透传 |
@@ -807,6 +808,67 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_mod
 
 云端用的两个盘点脚本（不需要模型文件，锁定镜像里跑）：`tests/vae_inventory.py`（每种 VAE 的结构、现在的路、原生 / 第二层 / 第一层的模拟峰值）、`tests/probe_vae_gaps.py`（现有缺口的小解码、第二层在多帧视频上的精度）。结果见 DESIGN.md §9.16。
 
+### 9.12 Flux 2 VAE 走第一层：真机 bench（命令 X / Y / Z）
+
+**先放 VAE 文件**（只需要 VAE，不需要 Flux 2 的扩散模型和文本编码器）：
+
+* 文件：`flux2-vae.safetensors`，336,213,556 字节，sha256 `d64f3a68e1cc4f9f4e29b6e0da38a0204fe9a49f2d4053f0ec1fa1ca02f9c4b5`（ComfyUI 官方打包的 Flux 2 VAE，不用登录 Hugging Face）。
+* 放到 CT 700 的 `/models/comfy/vae/`（compose 里映射成容器的 `/opt/ComfyUI/models/vae/`），不用重启容器：
+
+```bash
+cd /models/comfy/vae
+wget -O flux2-vae.safetensors https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors
+sha256sum flux2-vae.safetensors   # d64f3a68e1cc4f9f4e29b6e0da38a0204fe9a49f2d4053f0ec1fa1ca02f9c4b5
+# 拉新代码后（插件改了，要重启容器）确认识别：命令 W 里应有
+#   flux2-vae.safetensors
+#      VAE: AutoencoderKL / decoder Decoder | latent 128 ch, latent_dim 2, x16 | 84 M params
+#         1344x768 latent [1, 128, 48, 84]: Monoload layer 1 (LDM stripes (batch-norm latent), GroupNorm scheme B)
+```
+
+```bash
+# X. Flux 2 三档：原生 / 默认（第一层方案 B）/ 只用第二层，带 fp32 参照
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae flux2-vae.safetensors --modes native,monoload,monoload-l2 --warm 1 --fp32-ref \
+  --json /opt/ComfyUI/output/bench_vae_flux2.json 2>&1 | tee bench_vae_flux2.txt
+# Y. Flux 2 4K：四种 GroupNorm 方案
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae flux2-vae.safetensors --res 3840x2160 --modes native --gn-schemes ADBC --warm 1 \
+  --json /opt/ComfyUI/output/bench_vae_flux2_schemes.json 2>&1 | tee bench_vae_flux2_schemes.txt
+# Z. Flux 2 预算 3G / 1.5G（按预算选），以及 VAE 设置节点
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae flux2-vae.safetensors --modes native --budgets 3,1.5 --warm 1 \
+  --json /opt/ComfyUI/output/bench_vae_flux2_budget.json 2>&1 | tee bench_vae_flux2_budget.txt
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae_node.py \
+  --vae flux2-vae.safetensors --res 3840x2160 --budget 3 2>&1 | tee check_vae_node_flux2.txt
+```
+
+**预测依据：** Flux 2 的 decoder 和 Flux `ae` 是同一个（z 32 对 16，只差 `conv_in` 的输入通道），只在前缀最前面多了 latent 的反归一化和 2×2 还原（H/16 → H/8，几 MiB）。模拟器里 Flux 2 和 Flux `ae` 的计划完全相同、reserved 相差 ≤ 0.01 GiB，所以 GTT 和耗时直接用 Flux `ae` 的 CT 700 实测（README §10.3、§10.4）。
+
+**X 的逐行预测**（GTT 增量 GiB / 热启动 s；估算是 Monoload 交给 `load_models_gpu` 的值）：
+
+| 行 | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| `native` | 8.36 / 0.9 | 42.8 / 4.7 | 52.5 / 11.9（原生在分配器里先 OOM 一次、清缓存后成功） |
+| `monoload`（第一层 B） | 0.62 / 4.7，6 条 128 行，估算 0.76 | 1.33 / 19.6，12 条 128 行，估算 1.61 | 2.18 / 42，17 条 128 行，估算 2.69 |
+| `monoload-l2` | 3.72 / 0.9，估算 3.98 | 9.25 / 4.0，估算 9.92 | 15.05 / 9.9，估算 17.92 |
+
+* 每个 `monoload` 行的日志是 `layer 1 (LDM stripes (batch-norm latent), GroupNorm scheme B)`；第一次多一次自检（`self-test passed ... 6e-07` 量级），冷启动会慢几秒。
+* GTT ≤ 估算；精度：`monoload vs native` 的 PSNR 61–62 dB，`monoload vs fp32` 与 `native vs fp32` 同一水平（bf16 固有噪声），条带边界附近不比其他行差。
+* `native est`（ComfyUI 自己的估算）：Flux 2 的公式在 LDM 的基础上 ×4，但按 H/16 的 latent 面积算，结果与 Flux `ae` 相同：11.4 / 45.7 / 91.9 GiB；`unload` 应为 0。
+
+**Y 的逐行预测**（4K，GTT GiB / 热启动 s；17 条 128 行，C 是 13 条 167 行）：A 1.11 / 75、D 1.53 / 58、B 2.18 / 42、C 4.71 / 36。
+
+**Z 的逐行预测：**
+
+| 行 | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| `monoload-b3` | 第一层整图 1 条 768 行（工作区 384 MiB），1.98 / 估算 2.48，约 0.8–1.0 s | C，4 条 384 行，2.74 / 3.00，约 12 s | B，12 条 180 行，2.44 / 2.97，约 41 s |
+| `monoload-b1.5` | C，2 条 384 行（192 MiB），1.05 / 1.25，约 2.9 s | B，16 条 96 行，1.22 / 1.48，约 21 s | A，17 条 128 行，1.11 / 1.49，约 75 s |
+
+`check_vae_node.py`：`node copy` → 第一层 B 12 条 180 行，`budget 3.00 GiB [node]`，GTT 约 2.44 / 估算 2.97；`original` → B 17 条 128 行，全部 `[default]`，约 2.18 / 2.69；`node copy again` 同第一行。
+
+把 X / Y / Z 的输出和 JSON 发给我。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
@@ -1009,7 +1071,7 @@ monoload/vae.py             VAE 解码管理入口（包装 VAE.decode：内存�
 monoload/vae_ops.py         逐算子分块（卷积按输出行、注意力按 query；受管理期间的实例属性替换）
 monoload/vae_engine.py      第一层的引擎（与 decoder 无关）：区间倒推、执行计划和估算、条带执行、arena、自检流程、适配器基类
 monoload/vae_wan.py         第一层的 Wan 2.1 VAE 单帧适配器（结构识别、单元、按 forward 数的内存模型、fp32 副本）
-monoload/vae_ldm.py         第一层的 LDM decoder 适配器（SD1.5 / SDXL / SD3 / Flux ae；结构识别、单元、GroupNorm 方案、内存模型、fp32 副本）
+monoload/vae_ldm.py         第一层的 LDM decoder 适配器（SD1.5 / SDXL / SD3 / Flux ae / Flux 2；结构识别、单元、GroupNorm 方案、内存模型、fp32 副本）
 monoload/settings.py        总开关 MONOLOAD、MONOLOAD_DISABLE（不导入 torch / ComfyUI）
 monoload/lora_overrides.py  单个模型的 LoRA 设置（存在 model_options 里，逐项取值和来源；LoraLoader 的包装记下 LoRA 文件名；不导入 torch / ComfyUI）
 monoload/messages.py        所有用户可见的日志 / 报错 / Info 文字的消息表（英文默认，MONOLOAD_LANG=zh 中文）
@@ -1138,6 +1200,16 @@ docs/HANDOFF.md             交接说明（当前状态、提交记录、规矩�
 
 **限制：** 只认 2D 图像的 LDM decoder；3D / 视频 decoder、up 级带注意力、`tanh_out`、Flux 2 的 `batch_norm_latent` 走第二层。统计量与原生 GroupNorm 内核不逐位一致（累加顺序不同）。arena 和估算是模拟器验证的，不是证明。
 
+
+### 12.9 第四阶段：推广到全部 VAE
+
+**4a 盘点**（DESIGN.md §9.16）：列出了 ComfyUI 0.31.0 能构造的每种 VAE、现在走哪条路、模拟的原生 / 第二层峰值。你在用的 SDXL、Flux `ae`、`qwen_image_vae` 早已走第一层。
+
+**4b-0 修缺口**（§9.17）：SVD 的 `VideoDecoder`（batch 就是时间轴）、2D latent 的音频 VAE（ACE-Step、LTX 2 音频、MiniMax 音频）、像素空间「VAE」改成原生。
+
+**4b-1 Flux 2 走第一层**（§9.18）：Flux 2 VAE（Flux 2、Ideogram 4、Lens、Ernie-Image 都用它）与 Flux `ae` 是同一个 LDM decoder，只多了 latent 的 BatchNorm 反归一化和 2×2 还原，作为前缀的第一步。模拟：4K 原生 52.5 → 第二层 15.05 → 第一层（默认 B）2.18 GiB，与 Flux `ae` 相同。真机命令 §9.12（X / Y / Z）。
+
+视频（多帧）的第二层、Wan 2.2 / HunyuanImage 2.1 的第一层等以后定。
 ## 13. 高级选项（环境变量）
 
 一般不用设。它们都是**全局默认值**：`MONOLOAD` 开启（默认）时作用于所有模型 / VAE；`MONOLOAD=0` 时只作用于节点开启了的那个模型 / VAE 上节点没设的项。节点上明确选的值对那一个模型 / VAE 总是压过它们（§4 的优先级）。基准和测试脚本仍然用这些环境变量来配置。
@@ -1152,7 +1224,7 @@ docs/HANDOFF.md             交接说明（当前状态、提交记录、规矩�
 | `MONOLOAD_DISABLE_VAE_STRIPE=1` | 只关掉第一层，所有受管理的 VAE 解码都走第二层（设了预算也一样，超出预算时日志注明） |
 | `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（输出行数），用于扫参和调试，优先于默认策略和预算（有预算时方案仍按预算选；放不下也照跑，日志注明） |
 | `MONOLOAD_LANG` | 日志、报错和 Monoload Info 节点文字的语言：不设 / `en` = 英文（默认），`zh` = 中文。节点界面不看它，跟随 ComfyUI 自己的语言设置 |
-| `MONOLOAD_VAE_GN_SCHEME` | 强制 SDXL / SD1.5 / SD3 / Flux `ae`（LDM decoder）第一层的 GroupNorm 整图统计量方案：`A`（不存中间结果，峰值最低、重算最多）、`D`、`B`（**默认**）、`C`（存得越多峰值越高、越快），见 §12.8。设了它，有预算时也只用这个方案（条带高度仍按预算取） |
+| `MONOLOAD_VAE_GN_SCHEME` | 强制 SDXL / SD1.5 / SD3 / Flux `ae` / Flux 2（LDM decoder）第一层的 GroupNorm 整图统计量方案：`A`（不存中间结果，峰值最低、重算最多）、`D`、`B`（**默认**）、`C`（存得越多峰值越高、越快），见 §12.8。设了它，有预算时也只用这个方案（条带高度仍按预算取） |
 
 **`MONOLOAD_VAE_BUDGET` 的例子**（SDXL / Flux `ae`，bf16；「估算」是交给 `load_models_gpu` 的上界，峰值是模拟的 reserved（实测与它一致）；耗时：第二层和默认 B 是实测，其余是 CT 700 上耗时模型的预测；DESIGN.md §9.14.10–11）：
 
