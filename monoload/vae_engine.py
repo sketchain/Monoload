@@ -171,6 +171,7 @@ ARENA_PAD = 64 * MIB
 ESTIMATE_PAD = 16 * MIB      # small-block pool (<= 1 MiB requests come from their own 2 MiB segments; 2-6 MiB seen)
 CONTIGUOUS_INPUT = (UP,)     # units whose row slice is made contiguous before the call
 ARENA_ENABLED = True         # bench --no-arena: off, to measure the tensors' own peak (the arena block counts as allocated)
+CKPT_LOW = True              # a checkpoint that is not at the front of the arena moves into a free block below it if one fits
 OUTPUT_IN_ARENA = False      # True: the layout up to 6324592 (tests/alloc_sim.py replays the readings of those versions):
                              # no cache emptied before / after, the output allocated after the first prefix, in the arena
 
@@ -848,6 +849,37 @@ def reserve_arena(device, nbytes):
     del t
 
 
+def block_addr(t):
+    """Device address of t's storage (the caching allocator's block)."""
+    return t.untyped_storage().data_ptr()
+
+
+def device_reserved(device):
+    return torch.cuda.memory_reserved(device) if torch.device(device).type == "cuda" else 0
+
+
+def move_low(t, device):
+    """t, or a copy of it in a free block below it when the caching allocator
+    has one that fits (DESIGN §9.22). The prefix's last temporaries leave a
+    hole in front of its output, the checkpoint; only requests up to the
+    hole's size can use it (the output buffer did, when it was in the arena:
+    without it, a column block 1 MiB too large for it was stranded outside the
+    arena). Best fit takes the smallest free block that is large enough: if
+    that is the hole, the checkpoint moves into it and the rest of the arena
+    is one piece; if it is above t (the arena's tail) or a new segment, the
+    trial block is freed at once, merging back where it came from."""
+    before = device_reserved(device)
+    buf = torch.empty_like(t)
+    if device_reserved(device) == before and block_addr(buf) < block_addr(t):
+        buf.copy_(t)
+        return buf
+    grew = device_reserved(device) != before
+    del buf
+    if grew:
+        mm.soft_empty_cache()   # the new segment, free again
+    return t
+
+
 class StripeAdapter:
     """What every layer-1 adapter shares: planning and running a decode. A
     subclass binds to one decoder instance and provides the structure and the
@@ -975,6 +1007,8 @@ class StripeAdapter:
                     buf.copy_(ckpt)
                     ckpt = buf
                     del buf
+                elif arena and CKPT_LOW and not OUTPUT_IN_ARENA:
+                    ckpt = move_low(ckpt, vae.device)
                 if pixel_samples is None:
                     pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
                 dst = pixel_samples[i:i + 1]
