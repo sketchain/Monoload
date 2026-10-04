@@ -20,8 +20,11 @@ around first_stage_model.decode:
   * output: device, dtype, process_output (to [0, 1], clamped) and the
     channels-last layout exactly as native.
 
-Everything else -- multi-frame video latents (for now), 1D/audio latents, VAEs
-with their own chunked output path (comfy_has_chunked_io), and explicit
+Everything else -- multi-frame video latents (for now), audio VAEs (1D latents,
+and 2D ones such as ACE-Step / LTX audio / MiniMax audio), VAEs with their own
+chunked output path (comfy_has_chunked_io), decoders that mix frames across the
+batch (SVD's VideoDecoder: a sample-by-sample decode would change the result),
+models with nothing layer 2 chunks (the pixel-space VAE), and explicit
 VAEDecodeTiled / VAE.decode_tiled -- stays native (logged).
 
 Layer 1 (stripe decoding for recognized decoders) plugs in through
@@ -65,7 +68,7 @@ import comfy.ops
 import comfy.sd
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
-from . import settings, vae_engine, vae_ldm, vae_overrides, vae_wan
+from . import settings, vae_engine, vae_ldm, vae_ops, vae_overrides, vae_wan
 from .errors import MonoloadError, MonoloadVAEOOMError
 from .messages import label, msg
 from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
@@ -488,27 +491,87 @@ def _select_layer1(vae, samples, vae_options):
 # what is managed
 # ---------------------------------------------------------------------------
 
+AUDIO_MIN_RATIO = 64   # an upscale ratio above this is latent frames -> audio samples (images: 1 / 4 / 8 / 16 / 32)
+
+
+def _batch_time_modules():
+    """Module classes that mix frames across the batch (the batch is their time axis): SVD's VideoDecoder."""
+    try:
+        from comfy.ldm.modules import temporal_ae
+    except Exception:
+        return ()
+    return tuple(c for c in (getattr(temporal_ae, n, None) for n in ("VideoResBlock", "AE3DConv", "AttnVideoBlock")) if isinstance(c, type))
+
+
+_TRAITS = weakref.WeakKeyDictionary()   # first_stage_model -> (mixes frames across the batch, has a conv / known attention)
+
+
+def _model_traits(fsm):
+    """(mixes frames across the batch, has something layer 2 chunks), from the model's modules (cached per model)."""
+    try:
+        hit = _TRAITS.get(fsm)
+    except TypeError:
+        hit = None
+    if hit is not None:
+        return hit
+    batch_time = _batch_time_modules()
+    known = vae_ops.known_attention()
+    mixes = ops = False
+    modules = fsm.modules() if isinstance(fsm, torch.nn.Module) else ()
+    for m in modules:
+        if batch_time and isinstance(m, batch_time):
+            mixes = True
+        if isinstance(m, (torch.nn.Conv2d, torch.nn.Conv3d)) or m.__dict__.get("optimized_attention") in known:
+            ops = True
+    hit = (mixes, ops)
+    try:
+        _TRAITS[fsm] = hit
+    except TypeError:
+        pass
+    return hit
+
+
+def _audio_ratio(vae):
+    """The latent -> samples ratio of an audio VAE with a 2D latent, else None.
+    ComfyUI marks most of them with extra_1d_channel (ACE-Step, LTX audio); the
+    others (MiniMax H3 audio) have an upscale ratio no image VAE has."""
+    r = getattr(vae, "upscale_ratio", None)
+    if getattr(vae, "extra_1d_channel", None) is not None:
+        return r if isinstance(r, (int, float)) else "?"
+    if isinstance(r, (int, float)) and not isinstance(r, bool) and r > AUDIO_MIN_RATIO:
+        return r
+    return None
+
+
 def _native_reason(vae, samples):
     """None if this decode is managed, else why it stays native."""
     fsm = getattr(vae, "first_stage_model", None)
     if fsm is None:
-        return "no VAE model"
+        return msg("vae.nr_no_model")
     if getattr(samples, "is_nested", False):
-        return "nested latent"
+        return msg("vae.nr_nested")
+    model = type(fsm).__name__
     if getattr(fsm, "comfy_has_chunked_io", False):
-        return "{} decodes into its own preallocated output (comfy_has_chunked_io)".format(type(fsm).__name__)
+        return msg("vae.nr_chunked_io", model=model)
     ld = getattr(vae, "latent_dim", 2)
-    if ld == 2:
-        if samples.ndim in (4, 5):
-            return None  # native takes frame 0 of a 5D latent for a 2D VAE; so do we
-        return "latent with {} dims for a 2D VAE".format(samples.ndim)
+    if ld not in (2, 3):
+        return msg("vae.nr_1d", ld=ld)
+    ratio = _audio_ratio(vae)
+    if ratio is not None:
+        return msg("vae.nr_audio", model=model, ndim=samples.ndim, ratio=ratio)
+    if ld == 2 and samples.ndim not in (4, 5):   # native takes frame 0 of a 5D latent for a 2D VAE; so do we
+        return msg("vae.nr_dims", ndim=samples.ndim, ld=ld)
     if ld == 3:
-        if samples.ndim == 5 and samples.shape[2] == 1:
-            return None
-        if samples.ndim == 5:
-            return "multi-frame video latent (T={}): not managed yet, phase 1 covers images (4D, and 5D with T=1)".format(samples.shape[2])
-        return "latent with {} dims for a 3D VAE".format(samples.ndim)
-    return "latent_dim {} (audio / 1D) is not managed".format(ld)
+        if samples.ndim != 5:
+            return msg("vae.nr_dims", ndim=samples.ndim, ld=ld)
+        if samples.shape[2] != 1:
+            return msg("vae.nr_multiframe", t=samples.shape[2])
+    mixes, ops = _model_traits(fsm)
+    if mixes:
+        return msg("vae.nr_batch_time", model=model)
+    if not ops:
+        return msg("vae.nr_no_ops", model=model)
+    return None
 
 
 # ---------------------------------------------------------------------------
