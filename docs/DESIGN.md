@@ -498,6 +498,9 @@ loop:
 | 5D、T=1 给 3D VAE（Wan 2.1 / `qwen_image_vae` 等） | 第二层 |
 | 多帧视频（5D、T>1） | **暂时**交给原生，打日志。这是第一阶段暂时不做，不是永远不做：多帧需要按时空分别规划（时间 cache、首帧特例），留到第一层之后 |
 | 1D / 音频 latent、`comfy_has_chunked_io` 的 VAE（LTX、MiniMax：自己往预分配输出里写） | 原生，打日志 |
+| 2D latent 的音频 VAE（ACE-Step、LTX 2 音频、MiniMax H3 音频；`extra_1d_channel` 已设，或放大倍数大于 64，图像 VAE 是 1 / 4 / 8 / 16 / 32） | 原生，打日志（第四阶段 4b-0 起，§9.17） |
+| decoder 在 batch 的各帧之间混合（SVD 的 `VideoDecoder`：batch 就是时间轴，逐样本解码会改变结果） | 原生，打日志（4b-0 起；以后做视频第二层时改成整批一次） |
+| first-stage model 里没有卷积也没有 ComfyUI 的 VAE 注意力（像素空间「VAE」） | 原生，打日志（4b-0 起：第二层没有可做的） |
 | 用户显式用 `VAEDecodeTiled` 节点或 `VAE.decode_tiled` | 不经过 `VAE.decode`，保持原生（用户自己选择了 tiled 的语义） |
 | 直接调用 `first_stage_model.decode` 的第三方代码 | 不经过 `VAE.decode`，原生 |
 
@@ -1192,7 +1195,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 **第二层在多帧视频上可以直接用**（`probe_vae_gaps.py` 第 4 项）：小尺寸随机权重的 Wan 2.1（5 个 latent 帧）、Wan 2.2、HunyuanVideo 1.0、HunyuanVideo 1.5、CogVideoX（全尺寸），各自的 `decode`（带时间因果缓存）在 16 KiB 工作区下几乎所有卷积按行分块，与不分块相比相对误差 ≤ 2.3e-6。原因：分块只在 H 方向，时间维的缓存拼接发生在卷积调用之前，每次调用拿到的已经是拼好的输入。
 
-**现有缺口（现在的代码，这一步只报告不修）：**
+**现有缺口（4a 时的代码；1–3 已在 4b-0 修掉，§9.17）：**
 
 1. **SVD 的结果被改变**：`VideoDecoder` 的时间混合以整个 batch 为时间轴（`timesteps` 默认等于 batch 大小），第二层逐样本解码，等于每帧单独解码。4 帧的小解码：与原生 max|Δ| = 1、平均 0.13（像素值 [0,1]），与「原生逐帧单独解码」逐位相同。（原生自己也按空闲内存切 batch，`batch_number = free / memory_used_decode`，切了同样会变；但通常一次装得下。）
 2. **2D latent 的音频 VAE 被管理**：ACE-Step（`[B,8,16,T]`）、LTX 2 音频、MiniMax H3 音频的 `latent_dim` 是 2，`_native_reason` 只看 `latent_dim`，于是走第二层。输出与原生相同，但 ACE 的形状探测（8×8 latent）失败，退回静态上界时用的放大倍数是 4096，交给 `load_models_gpu` 的估算约 **1 PiB**——每次解码都会把其他模型全部卸载。设计上（§9.8）音频应该原生。
@@ -1213,6 +1216,21 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 不建议做：TAE 系列、Stage A / C、Mage、MiniMax H3 视频（自己分块）、SeedVR2 的第一层（自带切片）、音频和 3D。
 
 **待真机确认：** LTX 原生的碎片（模拟 reserved 30–59 GiB 而 alloc 只有 5–6 GiB）；命令 W 的输出（用户两个看不出类型的模型用哪个 VAE）。
+
+### 9.17 第四阶段 4b-0：修盘点发现的缺口（vae-coverage-fixes）
+
+用户定的顺序：① 修缺口 1–3 → ② Flux 2 第一层 → ③ 视频以后再定。SVD 先走原生，以后做视频第二层时再做 SVD 整批第二层。
+
+**改动（`vae._native_reason`）：** 判断按真实结构和 VAE 对象的属性，结果按模型缓存（`_TRAITS`，弱引用）：
+
+* **2D latent 的音频 VAE → 原生**（`_audio_ratio`）：ComfyUI 给 ACE-Step、LTX 2 音频设了 `extra_1d_channel`；MiniMax H3 音频没设，但它的 `upscale_ratio` 是 800（latent 帧 → 采样点），图像 VAE 只有 1 / 4 / 8 / 16 / 32，所以阈值取 64（`AUDIO_MIN_RATIO`）。
+* **在 batch 的各帧之间混合的 decoder → 原生**（`_model_traits`）：模型里有 `comfy.ldm.modules.temporal_ae` 的 `VideoResBlock` / `AE3DConv` / `AttnVideoBlock`（SVD 的 `VideoDecoder` 用它们，`timesteps` 默认等于 batch 大小）。
+* **没有可分块的算子 → 原生**：模型里既没有 `torch.nn.Conv2d` / `Conv3d`，也没有 ComfyUI 三个 VAE 注意力函数之一（像素空间 VAE 是恒等变换，以前白报 2 GiB 估算）。
+* `_native_reason` 的所有理由都改走消息表（`vae.nr_*`，英文 / 中文）；以前是写死的英文。英文措辞不变（如 `multi-frame video latent (T=...)`）。
+
+缺口 4（TAESD 小图第二层反而高）不在用户定的范围里，没动。
+
+**验证：** `tests/test_vae.py` 第 5 部分：全尺寸随机权重的 SVD `VideoDecoder`，3 帧一个 batch：走原生、与原生逐位相同，而逐帧单独解码与原生差 0.82（像素）；ACE 式（`extra_1d_channel` + 4096）、MiniMax 式（800）走原生，比例 4 / 8 / 16 / 32 照常管理；真实的像素空间 VAE 走原生、结果相同、`load_models_gpu` 收到 ComfyUI 自己的估算；SDXL / Wan 单帧照常管理。`tests/probe_vae_gaps.py` 用真实的 ACE（MusicDCAE）和 MiniMax 音频重跑：都走原生，结果与原生相同，不再有 1 PiB 的估算。`tests/vae_inventory.py --no-trace`：图像 VAE 的路一个没变。
 
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 

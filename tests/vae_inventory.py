@@ -285,9 +285,9 @@ UNTRACED = [
     ("oobleck", "Stable Audio 1（AudioOobleckVAE）", dict(latent_dim=1)),
     ("sa3", "Stable Audio 3", dict(latent_dim=1)),
     ("mmaudio", "MMAudio", dict(latent_dim=1)),
-    ("ace", "ACE-Step 音频（MusicDCAE，[B, 8, 16, T]）", dict(latent_dim=2, extra_1d_channel=16)),
-    ("ltx_audio", "LTX 2 音频（AudioVAE）", dict(latent_dim=2, extra_1d_channel=16)),
-    ("minimax_audio", "MiniMax H3 音频（[B, 32, 2, T]）", dict(latent_dim=2, extra_1d_channel=None)),
+    ("ace", "ACE-Step 音频（MusicDCAE，[B, 8, 16, T]）", dict(latent_dim=2, extra_1d_channel=16, upscale_ratio=4096)),
+    ("ltx_audio", "LTX 2 音频（AudioVAE）", dict(latent_dim=2, extra_1d_channel=16, upscale_ratio=4096)),
+    ("minimax_audio", "MiniMax H3 音频（[B, 32, 2, T]）", dict(latent_dim=2, extra_1d_channel=None, upscale_ratio=800)),
     ("hunyuan3d", "Hunyuan3D 2.0 / 2.1（ShapeVAE）", dict(latent_dim=1)),
     ("triposplat", "TripoSplat（OctreeGaussianDecoder，VAE.decode 直接报错）", dict(latent_dim=1)),
 ]
@@ -573,6 +573,7 @@ def main():
         v.first_stage_model = torch.nn.Identity()
         v.latent_dim = attrs["latent_dim"]
         v.extra_1d_channel = attrs.get("extra_1d_channel")
+        v.upscale_ratio = attrs.get("upscale_ratio", 8)
         shape = (1, 8, 16, 64) if v.latent_dim == 2 else (1, 64, 256)
         reason = mvae._native_reason(v, torch.empty(shape, device="meta"))
         p = "native" if reason else "managed (layer 2)"
