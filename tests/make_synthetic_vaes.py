@@ -7,6 +7,7 @@ numbers mean nothing beyond exercising the code paths).
   synthetic_kl_z4.safetensors     SDXL-style AutoencoderKL (post_quant_conv, 4 latent channels)
   synthetic_kl_z16.safetensors    Flux ae-style AutoencodingEngine (16 latent channels)
   synthetic_wan.safetensors       Wan 2.1 / qwen_image_vae-style WanVAE (16 latent channels, 5D)
+  synthetic_flux2.safetensors     Flux 2-style AutoencoderKL with a batch-norm latent (z 32, 128 latent channels at 1/16)
 Default decoder width is small (ch 32 / dim 16); --full uses the real widths
 (ch 128 / dim 96). Only the decoder (and what VAE detection needs) is written.
 """
@@ -49,6 +50,16 @@ def kl(z, ch, post_quant_conv):
     return sd
 
 
+def flux2(ch):
+    """kl(32) plus the latent BatchNorm statistics: comfy.sd.VAE builds Flux 2's AutoencoderKL(batch_norm_latent)."""
+    sd = kl(32, ch, True)
+    g = torch.Generator().manual_seed(3)
+    sd["bn.running_mean"] = torch.randn(128, generator=g) * 0.3
+    sd["bn.running_var"] = torch.rand(128, generator=g) * 2 + 0.2
+    sd["bn.num_batches_tracked"] = torch.tensor(1000)
+    return sd
+
+
 def wan(dim):
     m = init_random(wan_vae.WanVAE(dim=dim, z_dim=16, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_scales=[],
                                    temperal_downsample=[False, True, True], image_channels=3, conv_out_channels=3, dropout=0.0))
@@ -58,9 +69,10 @@ def wan(dim):
 def main(out_dir, full):
     os.makedirs(out_dir, exist_ok=True)
     ch, dim = (128, 96) if full else (32, 16)
-    for name, sd in (("synthetic_kl_z4", kl(4, ch, True)), ("synthetic_kl_z16", kl(16, ch, False)), ("synthetic_wan", wan(dim))):
+    for name, sd in (("synthetic_kl_z4", kl(4, ch, True)), ("synthetic_kl_z16", kl(16, ch, False)), ("synthetic_wan", wan(dim)),
+                     ("synthetic_flux2", flux2(ch))):
         p = os.path.join(out_dir, name + ".safetensors")
-        save_file({k: v.float() for k, v in sd.items()}, p)
+        save_file({k: v.float() if v.is_floating_point() else v for k, v in sd.items()}, p)
         print("wrote {} ({} tensors, {:.1f} MB)".format(p, len(sd), sum(v.numel() * 4 for v in sd.values()) / 1e6))
 
 

@@ -288,8 +288,8 @@ WAN_QWEN = dict(dim=96, z_dim=16, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_
 # SD3 (z 16, AutoencodingEngine, no post_quant_conv)
 LDM_DDCONFIG = {'double_z': True, 'z_channels': 4, 'resolution': 256, 'in_channels': 3, 'out_ch': 3, 'ch': 128,
                 'ch_mult': [1, 2, 4, 4], 'num_res_blocks': 2, 'attn_resolutions': [], 'dropout': 0.0}
-# model name -> (latent channels, latent dims)
-LATENT = {"qwen": (16, 5), "sdxl": (4, 4), "flux": (16, 4)}
+# model name -> (latent channels, latent dims[, spatial ratio (default 8)])
+LATENT = {"qwen": (16, 5), "sdxl": (4, 4), "flux": (16, 4), "flux2": (128, 4, 16)}
 
 
 class _MetaVAE:
@@ -318,6 +318,9 @@ def _build(model):
     from comfy.ldm.models.autoencoder import AutoencoderKL, AutoencodingEngine
     if model == "sdxl":
         return AutoencoderKL(ddconfig=dict(LDM_DDCONFIG), embed_dim=4)
+    if model == "flux2":
+        # Flux 2: AutoencoderKL with a batch-norm latent (z 32, latent 128 channels at H/16), as comfy.sd.VAE builds it
+        return AutoencoderKL(ddconfig=dict(LDM_DDCONFIG, z_channels=32, batch_norm_latent=True), embed_dim=32)
     if model == "flux":
         dd = dict(LDM_DDCONFIG, z_channels=16)
         return AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
@@ -360,7 +363,8 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     out_first  a row-blocked conv allocates its output before the first block (False: after it, up to 725a010)
     layer1_ws  monoload.vae.LAYER1_WORKSPACE for this decode (384 MiB up to 5d668b6, 128 MiB since)
     contiguous the row slice into a Resample is made contiguous first (False: up to 725a010)
-    model   "qwen" (Wan 2.1, qwen_image_vae), "sdxl" (LDM AutoencoderKL, z 4), "flux" (LDM AutoencodingEngine, z 16)
+    model   "qwen" (Wan 2.1, qwen_image_vae), "sdxl" (LDM AutoencoderKL, z 4), "flux" (LDM AutoencodingEngine, z 16),
+            "flux2" (LDM AutoencoderKL with a batch-norm latent, z 32, latent 128 x H/16)
     scheme  GroupNorm scheme of an LDM layer-1 decode (None: the current setting)
     units   tag every allocation with the layer-1 unit / prefix module that made it (for --peak)
     arena_need  run in an arena 4x the plan's live peak and report (info["arena_need"]) the highest offset any
@@ -383,8 +387,8 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     sim.empty_cache()
     sim.reset_peak()
     base_alloc, base_res = sim.allocated, sim.reserved
-    zc, nd = LATENT[model]
-    lat = torch.empty((batch, zc, 1, h // 8, w // 8) if nd == 5 else (batch, zc, h // 8, w // 8), device="meta")   # the bench's latent is on the CPU: not counted, its copy is
+    zc, nd, r = (LATENT[model] + (8,))[:3]
+    lat = torch.empty((batch, zc, 1, h // r, w // r) if nd == 5 else (batch, zc, h // r, w // r), device="meta")   # the bench's latent is on the CPU: not counted, its copy is
     tracer = make_tracer(sim)
     tracer.static.update(t.untyped_storage()._cdata for t in itertools.chain(fsm.parameters(), fsm.buffers(), [lat]))
     events = {"empty_cache": 0}
@@ -563,7 +567,7 @@ def main():
     ap.add_argument("--rows", default=None)
     ap.add_argument("--dtype", default="bf16")
     ap.add_argument("--version", default="current", help="current / v1 / v2 / v3")
-    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux")
+    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux / flux2")
     ap.add_argument("--scheme", default=None, help="GroupNorm scheme of an LDM layer-1 decode: A / B / C / D")
     ap.add_argument("--layer", type=int, default=1)
     ap.add_argument("--ws", default=None, help="workspace MiB (layer 2: default 1024; layer 1: the layer-1 default)")
