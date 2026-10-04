@@ -351,7 +351,8 @@ def _patched(obj, name, value):
 
 
 def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, order="largest", conv2d=True, arena=None, batch=1, out_first=True,
-                 layer1_ws=None, contiguous=True, model="qwen", scheme=None, arena_need=False, units=False):
+                 layer1_ws=None, contiguous=True, model="qwen", scheme=None, arena_need=False, units=False, output_in_arena=False,
+                 probe=False):
     """alloc / reserved deltas (bytes) of one decode of a w x h image, as bench_vae measures them
     (cache emptied and peaks reset right before the decode, the weights already loaded).
 
@@ -367,6 +368,12 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
             "flux2" (LDM AutoencoderKL with a batch-norm latent, z 32, latent 128 x H/16)
     scheme  GroupNorm scheme of an LDM layer-1 decode (None: the current setting)
     units   tag every allocation with the layer-1 unit / prefix module that made it (for --peak)
+    output_in_arena  the layer-1 layout up to 6324592 (vae_engine.OUTPUT_IN_ARENA): no cache emptied before / after the
+            decode, the output buffer allocated after the first prefix, in the arena (False: the current layout, DESIGN §9.22)
+    probe   run choose_budget's layer-2 shape probe (vae._probe, 8 x 8) right before a layer-1 decode, its blocks left
+            in the cache: the first decode with a budget (DESIGN §9.21)
+    info["stays"]  reserved after the decode with its output still alive and the cache emptied (check_selftest_mem's
+            "stays reserved after empty_cache")
     arena_need  run in an arena 4x the plan's live peak and report (info["arena_need"]) the highest offset any
             block reached in it: the smallest arena with the same placements (best fit keeps choosing the same
             blocks while the arena's tail is the largest free block), i.e. the arena this plan needs
@@ -411,6 +418,11 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
         es.enter_context(_patched(vae_ops, "OUT_FIRST", out_first))
         es.enter_context(_patched(mm, "soft_empty_cache", soft_empty_cache))
         es.enter_context(_patched(eng, "arena_supported", lambda device: True))
+        es.enter_context(_patched(eng, "OUTPUT_IN_ARENA", output_in_arena))
+        es.enter_context(_patched(eng, "block_addr", lambda t: tracer.live[t.untyped_storage()._cdata][1].addr))
+        es.enter_context(_patched(eng, "device_reserved", lambda device: sim.reserved))
+        if probe:   # the probe's attention (not under OpChunking) asks for the free memory
+            es.enter_context(_patched(mm, "get_free_memory", lambda dev=None, torch_free_too=False: (48 << 30, 48 << 30) if torch_free_too else 48 << 30))
         if layer1_ws:
             es.enter_context(_patched(mvae, "LAYER1_WORKSPACE", layer1_ws))
         if not contiguous:
@@ -463,7 +475,14 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
                         arena=plan.arena, live_peak=plan.live_peak)
             stats = vae_ops.OpStats()
             with torch.inference_mode(), tracer:
+                if probe:
+                    mvae._PROBES.clear()
+                    mvae._probe(v, lat, {})
+                    tracer.poll()
                 out = bound.run(v, lat, plan, ws_, stats)
+                tracer.poll()
+                sim.empty_cache()
+                info["stays"] = sim.reserved - base_res
                 del out
                 tracer.poll()
             info["stats"] = stats
@@ -550,8 +569,9 @@ def selftest_trace(model, dtype="bf16"):
 
 # (label, w, h, dtype, rows, layer, version, measured alloc GiB or None, measured reserved GiB)
 # version "v1" = 4e54d20 (SlowDilated3d, no cache emptied, top-to-bottom), "v2" = 725a010, "v3" = 85a5c6f
-# (arena, layer-1 workspace 384 MiB), "cur" = the current code (layer-1 workspace 128 MiB; GTT readings of
-# the -w128 runs of the workspace experiment). rows None = the default plan.
+# (arena, layer-1 workspace 384 MiB), "w128" = 5d668b6..6324592 (layer-1 workspace 128 MiB, the output in the
+# arena; GTT readings of the -w128 runs of the workspace experiment), "cur" = the current code (layer 2: unchanged
+# since 5d668b6). v1..w128 replay the layer-1 layout of their time (output_in_arena). rows None = the default plan.
 MEASURED = [
     ("4K r32 v2", 3840, 2160, "bf16", 32, 1, "v2", 0.94, 1.07),
     ("4K r64 v2", 3840, 2160, "bf16", 64, 1, "v2", 0.94, 1.14),
@@ -580,9 +600,22 @@ MEASURED = [
     ("4K r256 v3", 3840, 2160, "bf16", 256, 1, "v3", 1.35, 1.35),
     ("4K r512 v3", 3840, 2160, "bf16", 512, 1, "v3", 1.82, 1.82),
     ("fp32 4K default v3", 3840, 2160, "fp32", None, 1, "v3", 1.70, 1.70),
-    ("1344 default cur", 1344, 768, "bf16", None, 1, "cur", None, 0.36),
-    ("2688 default cur", 2688, 1536, "bf16", None, 1, "cur", None, 0.56),
-    ("4K default cur", 3840, 2160, "bf16", None, 1, "cur", None, 0.87),
+    ("1344 default w128", 1344, 768, "bf16", None, 1, "w128", None, 0.36),
+    ("2688 default w128", 2688, 1536, "bf16", None, 1, "w128", None, 0.56),
+    ("4K default w128", 3840, 2160, "bf16", None, 1, "w128", None, 0.87),
+    # Flux 2 layer 1 (README §10.5, 4fbaa22; GTT): X default (B), Y schemes at 4K, Z the budgets' choices
+    ("F2 1344 default w128", 1344, 768, "bf16", None, 1, "w128", None, 0.62, dict(model="flux2")),
+    ("F2 2688 default w128", 2688, 1536, "bf16", None, 1, "w128", None, 1.33, dict(model="flux2")),
+    ("F2 4K default w128", 3840, 2160, "bf16", None, 1, "w128", None, 2.18, dict(model="flux2")),
+    ("F2 4K A w128", 3840, 2160, "bf16", None, 1, "w128", None, 1.11, dict(model="flux2", scheme="A")),
+    ("F2 4K D w128", 3840, 2160, "bf16", None, 1, "w128", None, 1.53, dict(model="flux2", scheme="D")),
+    ("F2 4K C w128", 3840, 2160, "bf16", None, 1, "w128", None, 4.71, dict(model="flux2", scheme="C")),
+    ("F2 1344 b3 w128", 1344, 768, "bf16", 768, 1, "w128", None, 1.98, dict(model="flux2", scheme="B", ws=384 * MIB)),
+    ("F2 2688 b3 w128", 2688, 1536, "bf16", 384, 1, "w128", None, 2.74, dict(model="flux2", scheme="C", ws=128 * MIB)),
+    ("F2 4K b3 w128", 3840, 2160, "bf16", 180, 1, "w128", None, 2.44, dict(model="flux2", scheme="B", ws=128 * MIB)),
+    ("F2 1344 b1.5 w128", 1344, 768, "bf16", 384, 1, "w128", None, 1.05, dict(model="flux2", scheme="C", ws=192 * MIB)),
+    ("F2 2688 b1.5 w128", 2688, 1536, "bf16", 96, 1, "w128", None, 1.22, dict(model="flux2", scheme="B", ws=128 * MIB)),
+    ("F2 4K b1.5 w128", 3840, 2160, "bf16", 128, 1, "w128", None, 1.11, dict(model="flux2", scheme="A", ws=128 * MIB)),
     ("1344 layer 2", 1344, 768, "bf16", None, 2, "v1", 1.82, 2.12),
     ("2688 layer 2", 2688, 1536, "bf16", None, 2, "v1", 3.80, 5.07),
     ("4K layer 2", 3840, 2160, "bf16", None, 2, "v1", 6.45, 9.61),
@@ -611,11 +644,15 @@ MEASURED = [
 
 def _version(version):
     if version == "v1":
-        return dict(clear=False, order="natural", conv2d=False, arena=0, out_first=False, layer1_ws=384 * MIB, contiguous=False)
+        return dict(clear=False, order="natural", conv2d=False, arena=0, out_first=False, layer1_ws=384 * MIB, contiguous=False,
+                    output_in_arena=True)
     if version == "v2":
-        return dict(clear=True, order="largest", conv2d=True, arena=0, out_first=False, layer1_ws=384 * MIB, contiguous=False)
+        return dict(clear=True, order="largest", conv2d=True, arena=0, out_first=False, layer1_ws=384 * MIB, contiguous=False,
+                    output_in_arena=True)
     if version == "v3":
-        return dict(layer1_ws=384 * MIB)
+        return dict(layer1_ws=384 * MIB, output_in_arena=True)
+    if version == "w128":
+        return dict(output_in_arena=True)
     return {}
 
 
@@ -625,11 +662,12 @@ def main():
     ap.add_argument("--res", default=None)
     ap.add_argument("--rows", default=None)
     ap.add_argument("--dtype", default="bf16")
-    ap.add_argument("--version", default="current", help="current / v1 / v2 / v3")
+    ap.add_argument("--version", default="current", help="current / v1 / v2 / v3 / w128")
     ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux / flux2")
     ap.add_argument("--scheme", default=None, help="GroupNorm scheme of an LDM layer-1 decode: A / B / C / D")
     ap.add_argument("--layer", type=int, default=1)
     ap.add_argument("--ws", default=None, help="workspace MiB (layer 2: default 1024; layer 1: the layer-1 default)")
+    ap.add_argument("--probe", action="store_true", help="layer 1: the budget's shape probe right before the decode")
     ap.add_argument("--peak", action="store_true", help="list the live blocks at the allocation peak")
     ap.add_argument("--segments", action="store_true", help="the segments (>= 2 MiB) and their blocks when reserved peaked")
     a = ap.parse_args()
@@ -638,16 +676,19 @@ def main():
         w, h = (int(x) for x in a.res.lower().split("x"))
         for r in ([int(x) for x in a.rows.split(",")] if a.rows else [None]):
             kw = dict(_version(a.version), model=a.model, scheme=a.scheme, layer=a.layer, units=a.layer == 1)
+            if a.probe:
+                kw["probe"] = True
             if a.ws:
                 kw["ws"] = int(float(a.ws) * MIB)
             i = decode_trace(w, h, a.dtype, r, **kw)
             if a.layer == 1:
                 p = i["plan"]
                 print("{} {} {} rows {}: {} x {} rows{}, recompute {:.2f}x, live {:.2f} arena {:.2f} estimate {:.2f} | sim alloc {:.2f} reserved {:.2f} GiB, "
-                      "{} device mallocs, cache emptied {}x".format(
+                      "stays {:.2f} GiB, {} device mallocs, cache emptied {}x".format(
                           a.model, a.res, a.dtype, r or "default", i["stripes"], i["rows"],
                           ", {} statistics passes (scheme {})".format(len(p.passes), a.scheme or "default") if p.passes else "", p.recompute,
-                          p.live_peak / G, p.arena / G, i["estimate"] / G, i["alloc"] / G, i["reserved"] / G, i["mallocs"], i["empty_cache"]))
+                          p.live_peak / G, p.arena / G, i["estimate"] / G, i["alloc"] / G, i["reserved"] / G, i["stays"] / G, i["mallocs"],
+                          i["empty_cache"]))
             else:
                 print("{} {} {} layer 2: sim alloc {:.2f} reserved {:.2f} GiB, {} device mallocs".format(
                     a.model, a.res, a.dtype, i["alloc"] / G, i["reserved"] / G, i["mallocs"]))
