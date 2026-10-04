@@ -58,9 +58,9 @@ M = {
         "自己估算内存，OOM 时缩小分块，绝不退回 tiled；只管图像（4D / T=1 的 5D），设 MONOLOAD_DISABLE_VAE=1 恢复原生"),
     "entry.vae_layer1": (
         "[Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae single frame; LDM Decoder of "
-        "SD1.5 / SDXL / SD3 / Flux ae with whole-image GroupNorm statistics, scheme {scheme}; self-tested on first use): {policy}{rows}; "
+        "SD1.5 / SDXL / SD3 / Flux ae / Flux 2 with whole-image GroupNorm statistics, scheme {scheme}; self-tested on first use): {policy}{rows}; "
         "other decoders use layer 2; set MONOLOAD_DISABLE_VAE_STRIPE=1 to use layer 2 everywhere",
-        "[Monoload] VAE 第一层（条带解码）对认得的 decoder 开启（Wan 2.1 / qwen_image_vae 单帧；SD1.5 / SDXL / SD3 / Flux ae 的 LDM "
+        "[Monoload] VAE 第一层（条带解码）对认得的 decoder 开启（Wan 2.1 / qwen_image_vae 单帧；SD1.5 / SDXL / SD3 / Flux ae / Flux 2 的 LDM "
         "Decoder，GroupNorm 用整图统计量，方案 {scheme}；第一次使用时自检）：{policy}{rows}；其他 decoder 走第二层；"
         "设 MONOLOAD_DISABLE_VAE_STRIPE=1 全部走第二层"),
     "entry.scheme_forced": ("{scheme} (forced, MONOLOAD_VAE_GN_SCHEME)", "{scheme}（强制，MONOLOAD_VAE_GN_SCHEME）"),
