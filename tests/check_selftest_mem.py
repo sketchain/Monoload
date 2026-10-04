@@ -103,8 +103,9 @@ def main():
         m = mvae.last_decode()
         print("           {}, estimate {} GiB".format(m.get("adapter") or m.get("strategy"), gib((m.get("estimate") or {}).get("total")).strip()),
               flush=True)
-    print("\nexpected (Flux 2 / SDXL VAE): self-test reserved peak ~0.74 GiB, nothing stays; without --warmup the first GPU work "
-          "of the process happens inside the self-test (some reserved and GTT stay); decode 1 == decode 2.")
+    print("\nexpected (Flux 2 / SDXL VAE, README §9.13): self-test reserved peak ~0.40 GiB (~0.47 without --warmup: the first GPU work "
+          "of the process happens inside it, ~0.07 stays); decode 1 == decode 2 (4K budget 3G: ~2.44), after each only the output "
+          "stays (4K: ~0.09 GiB).")
 
 
 if __name__ == "__main__":
