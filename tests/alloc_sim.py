@@ -485,6 +485,65 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     return info
 
 
+def selftest_trace(model, dtype="bf16"):
+    """Reserved peak (bytes) of the first-use layer-1 self-test on the full-size decoder (meta device), the steps
+    of vae_engine._self_test_run: the fp32 copy, the reference whole-image decode under layer-2 chunking
+    (SELFTEST_REF_WORKSPACE), the forced small stripes (SELFTEST_ROWS, SELFTEST_WORKSPACE); the VAE's own weights
+    loaded before. Returns (peak reserved, reserved left after the copy and every tensor are freed, the bound's
+    selftest_memory())."""
+    import gc
+    import torch
+    import comfy.model_management as mm
+    from monoload import vae as mvae, vae_ops, vae_engine as eng
+
+    dt = {"bf16": torch.bfloat16, "fp32": torch.float32, "fp16": torch.float16}[dtype]
+    v = meta_vae(dt, model)
+    fsm = v.first_stage_model
+    zc, nd, r = (LATENT[model] + (8,))[:3]
+    lat = torch.empty((1, zc, 1, 64, 64) if nd == 5 else (1, zc, 64, 64), device="meta")
+    bound, why = mvae._select_layer1(v, lat, {})
+    assert bound is not None, why
+    sim = AllocatorSim()
+    sim.tag = "weights"
+    for p in itertools.chain(fsm.parameters(), fsm.buffers()):
+        sim.malloc(p.numel() * p.element_size())
+    sim.empty_cache()
+    sim.reset_peak()
+    base = sim.reserved
+    tracer = make_tracer(sim)
+    tracer.static.update(t.untyped_storage()._cdata for t in itertools.chain(fsm.parameters(), fsm.buffers()))
+
+    def soft_empty_cache(force=False):
+        tracer.poll()
+        sim.empty_cache()
+
+    free = 48 << 30
+    with contextlib.ExitStack() as es:
+        es.enter_context(_patched(vae_ops, "slow_dilated3d", lambda x: True))
+        es.enter_context(_patched(mm, "soft_empty_cache", soft_empty_cache))
+        es.enter_context(_patched(mm, "get_free_memory", lambda dev=None, torch_free_too=False: (free, free) if torch_free_too else free))
+        es.enter_context(torch.inference_mode())
+        es.enter_context(tracer)
+        dev = torch.device("meta")
+        tb = bound.fp32_copy(dev)
+        z = torch.empty(list(bound.selftest_latent(eng.SELFTEST_LATENT)), device=dev)
+        with vae_ops.OpChunking(tb.module, eng.SELFTEST_REF_WORKSPACE, vae_ops.OpStats()):
+            ref = tb.reference_decode(z)
+        n = eng.SELFTEST_LATENT
+        plan = eng.Plan(tb, n, n, eng.SELFTEST_ROWS, eng.SELFTEST_WORKSPACE, 4, 0, 0)
+        out = torch.empty_like(ref)
+
+        def write(o0, o1, rows):
+            out.narrow(tb.hdim, o0, o1 - o0).copy_(rows)
+        with vae_ops.OpChunking(tb.module, eng.SELFTEST_WORKSPACE, vae_ops.OpStats()):
+            tb.stripe_pass({0: tb.prefix_pass(z)}, plan, write)
+        del tb, z, ref, out, plan
+        gc.collect()
+        tracer.poll()
+    sim.empty_cache()
+    return sim.peak_reserved - base, sim.reserved - base, bound.selftest_memory()
+
+
 # ---------------------------------------------------------------------------
 # validation against CT 700
 # ---------------------------------------------------------------------------
