@@ -1024,7 +1024,7 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
     total = max(plan.estimate, st)   # the first use ran the self-test before the decode: the call's peak is the larger
     _LAST.update({"strategy": "layer1", "adapter": bound.name, "estimate": {"total": total, "plan": plan.estimate, "selftest": st, "first": first_est,
                   "prefix": plan.prefix_bytes, "stripes": plan.stripe_bytes, "checkpoint": plan.ckpt_bytes, "persistent": plan.persistent,
-                  "live": plan.live_peak, "arena": plan.arena},
+                  "live": plan.live_peak, "arena": plan.arena, "output": plan.out_segment},
                   "native_estimate": native_est, "budget": bud, "policy": policy, "workspace": ws, "retries": retries, "seconds": dt,
                   "stripes": len(plan.stripes), "rows": max(b - a for a, b in plan.stripes), "recompute": plan.recompute,
                   "checkpoint_bytes": plan.ckpt_bytes, "boundaries": boundaries, "forced_rows": forced, "selftest": selftest,

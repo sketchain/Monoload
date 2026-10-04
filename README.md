@@ -882,7 +882,62 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_sel
 
 预期：`self-test` 一行 reserved 峰值约 0.74 GiB；第一条命令里 `self-test` 之后 `stays reserved` / `GTT after` 不为 0（这个进程的第一批 GPU 计算落在自检里），第二条命令里这部分出现在 `warm-up` 一行、`self-test` 之后为 0；两条命令的 `decode 1` / `decode 2` 都约 2.44（估算 2.97）。
 
-**AA 的实测（0a4e177）与改动后的预测（vae-selftest-budget，DESIGN §9.20）：** 当时自检 reserved 峰值 0.85（不加 warm-up）/ 0.78（加 warm-up），报给 `load_models_gpu` 0.45；第一批 GPU 计算留下 0.07。改动后重跑同样两条命令，预期：`self-test` 一行 reserved 峰值约 0.40（加 warm-up）/ 0.47（不加），`passed to load_models_gpu for it: 0.42 GiB`；`decode 1` 仍约 2.57、`decode 2` 2.44、两者之后仍留 2.44（DESIGN §9.21 的两个现象，这一步没改）。bench X 的 1344×768 第一次（含自检）reserved 应为 0.62（不再高于估算 0.76）。
+**AA 的实测（0a4e177）与改动后的预测（vae-selftest-budget，DESIGN §9.20）：** 当时自检 reserved 峰值 0.85（不加 warm-up）/ 0.78（加 warm-up），报给 `load_models_gpu` 0.45；第一批 GPU 计算留下 0.07。改动后重跑同样两条命令，预期：`self-test` 一行 reserved 峰值约 0.40（加 warm-up）/ 0.47（不加），`passed to load_models_gpu for it: 0.42 GiB`；`decode 1` 仍约 2.57、`decode 2` 2.44、两者之后仍留 2.44（DESIGN §9.21 的两个现象，这一步没改）。bench X 的 1344×768 第一次（含自检）reserved 应为 0.62（不再高于估算 0.76）。**这两项现在和 §9.22 的改动一起验收，合并后的预测见 §9.13。**
+
+### 9.13 合并验收：自检缩小（B + A，DESIGN §9.20）+ 解码前后清缓存、输出单独一段（DESIGN §9.22）
+
+**状态：待在 CT 700 上验收。** 拉新代码后重启容器（插件改了）。命令都是 §9.12 里的原样，不用改：AA 两条、X、Y、Z（`bench_vae.py` 和 `check_vae_node.py` 两条）。W 不用重跑（识别没变）。
+
+**这次改了什么、预期看到什么：**
+
+* 自检峰值约 0.85 → 0.40–0.47 GiB，并算进第一次的估算。
+* 第一次解码（设了预算）不再比第二次高 0.13 GiB。
+* 解码完只留输出（4K 0.09 GiB），不再留整个 arena（2.2–2.4 GiB）。
+* 峰值、预算的选择、条带、精度、耗时都不变（最多低 0.01 GiB）。
+* 估算低几 MiB（例如 4K B 2.69 → 2.68）。
+
+下面的数字是 alloc_sim 的 reserved 加上 CT 700 上 GTT 比 reserved 多的 0–0.02。
+
+**AA（每条命令一个新进程；GiB）：**
+
+| 行 | 不加 `--warmup` | 加 `--warmup` |
+|---|---|---|
+| `warm-up` | — | reserved 峰值约 0.07，stays 约 0.07 |
+| `self-test` | reserved 峰值约 0.47，stays 约 0.07（这个进程的第一批 GPU 计算）；`passed to load_models_gpu for it: 0.42 GiB` | 峰值约 0.40，stays 0 |
+| `decode 1` | reserved 峰值 2.43–2.44，**stays 约 0.09**（输出），GTT after 约 0.10；下一行 `LDM stripes ..., estimate 2.96 GiB` | 同左 |
+| `decode 2` | **与 decode 1 相同**（2.43–2.44，stays 约 0.09） | 同左 |
+
+以前：decode 1 2.57、decode 2 2.44，两者之后都留 2.44。
+
+**X（GTT GiB / 热启动 s；估算）：** 只有 `monoload` 一行变了，`native` / `monoload-l2` 与 §10.5 相同。
+
+| | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| `monoload`（第一层 B） | 0.61 / 4.6，6 × 128，估算 0.76 | 1.33 / 19.7，12 × 128，估算 1.61 | 2.18 / 42，17 × 128，估算 2.68 |
+
+* 1344×768 的**第一次**（含自检）：以前 reserved 0.78 / GTT 0.81、高于估算 0.76；现在自检约 0.40 < 解码 0.61，第一次也是 **0.61，≤ 估算**。日志里第一次的估算后面多一句「解码前的首次自检最多 0.42 GiB」。
+* 精度与 §10.5 相同。算术没有变：检查点下移只是原样拷贝。
+
+**Y（4K，GTT / 热启动 s）：** A 1.10–1.11 / 75、D 1.52–1.53 / 58、B 2.18 / 42、C 4.70–4.71 / 36，与 §10.5 相同。A 用到了检查点下移（DESIGN §9.22）：不挪的话会是 1.23。
+
+**Z（预算选择不变；GTT / 估算）：**
+
+| | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| 预算 3G | B 整图 1 × 768（384 MiB），1.97 / 2.48 | C 4 × 384，2.74 / 3.00 | B 12 × 180，2.43–2.44 / 2.96 |
+| 预算 1.5G | C 2 × 384（192 MiB），1.04 / 1.25 | B 16 × 96，1.22 / 1.48 | A 17 × 128，1.10–1.11 / 1.49 |
+
+**`check_vae_node.py`（4K，节点预算 3G）：**
+
+| 行 | 预测 | 以前 |
+|---|---|---|
+| `node copy` | 第一层 B 12 × 180、`budget 3.00 GiB [node]`，估算 2.96 | 2.97 |
+| `original` | B 17 × 128，全部 `[default]`，2.18 / 估算 2.68 | 2.69 |
+| `node copy again` | 2.43–2.44 / 2.96 | — |
+
+* `node copy` 的第一次仍约 reserved 2.67 / GTT 2.95。这个进程的第一批 GPU 计算落在这次里，它的持久工作区钉住了一段（DESIGN §9.19 的第 2 种现象，ComfyUI 服务里采样早就付过）。这次的改动不影响这一项。
+
+把 AA、X、Y、Z 的输出和 JSON 发给我。
 
 ## 10. 真机验收结果（CT 700，2026-10）
 
