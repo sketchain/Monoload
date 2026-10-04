@@ -30,8 +30,8 @@ VAEDecodeTiled / VAE.decode_tiled -- stays native (logged).
 Layer 1 (stripe decoding for recognized decoders) plugs in through
 STRIPE_ADAPTERS: the engine (monoload/vae_engine.py) plus one adapter per
 decoder structure (monoload/vae_wan.py: the Wan 2.1 VAE single frame;
-monoload/vae_ldm.py: the LDM Decoder of SD1.5 / SDXL / SD3 / Flux ae, with
-GroupNorm statistics gathered across stripes). A recognized, self-tested
+monoload/vae_ldm.py: the LDM Decoder of SD1.5 / SDXL / SD3 / Flux ae / Flux 2,
+with GroupNorm statistics gathered across stripes). A recognized, self-tested
 decoder is decoded in
 stripes of output rows from a low-resolution checkpoint instead of the
 whole-image activations; everything else keeps layer 2. Default stripe height:

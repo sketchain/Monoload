@@ -1195,7 +1195,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 **第二层在多帧视频上可以直接用**（`probe_vae_gaps.py` 第 4 项）：小尺寸随机权重的 Wan 2.1（5 个 latent 帧）、Wan 2.2、HunyuanVideo 1.0、HunyuanVideo 1.5、CogVideoX（全尺寸），各自的 `decode`（带时间因果缓存）在 16 KiB 工作区下几乎所有卷积按行分块，与不分块相比相对误差 ≤ 2.3e-6。原因：分块只在 H 方向，时间维的缓存拼接发生在卷积调用之前，每次调用拿到的已经是拼好的输入。
 
-**现有缺口（4a 时的代码；1–3 已在 4b-0 修掉，§9.17）：**
+**现有缺口（4a 时的代码；1–3 已在 4b-0 修掉，§9.17；Flux 2 第一层见 §9.18）：**
 
 1. **SVD 的结果被改变**：`VideoDecoder` 的时间混合以整个 batch 为时间轴（`timesteps` 默认等于 batch 大小），第二层逐样本解码，等于每帧单独解码。4 帧的小解码：与原生 max|Δ| = 1、平均 0.13（像素值 [0,1]），与「原生逐帧单独解码」逐位相同。（原生自己也按空闲内存切 batch，`batch_number = free / memory_used_decode`，切了同样会变；但通常一次装得下。）
 2. **2D latent 的音频 VAE 被管理**：ACE-Step（`[B,8,16,T]`）、LTX 2 音频、MiniMax H3 音频的 `latent_dim` 是 2，`_native_reason` 只看 `latent_dim`，于是走第二层。输出与原生相同，但 ACE 的形状探测（8×8 latent）失败，退回静态上界时用的放大倍数是 4096，交给 `load_models_gpu` 的估算约 **1 PiB**——每次解码都会把其他模型全部卸载。设计上（§9.8）音频应该原生。
@@ -1231,6 +1231,22 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 缺口 4（TAESD 小图第二层反而高）不在用户定的范围里，没动。
 
 **验证：** `tests/test_vae.py` 第 5 部分：全尺寸随机权重的 SVD `VideoDecoder`，3 帧一个 batch：走原生、与原生逐位相同，而逐帧单独解码与原生差 0.82（像素）；ACE 式（`extra_1d_channel` + 4096）、MiniMax 式（800）走原生，比例 4 / 8 / 16 / 32 照常管理；真实的像素空间 VAE 走原生、结果相同、`load_models_gpu` 收到 ComfyUI 自己的估算；SDXL / Wan 单帧照常管理。`tests/probe_vae_gaps.py` 用真实的 ACE（MusicDCAE）和 MiniMax 音频重跑：都走原生，结果与原生相同，不再有 1 PiB 的估算。`tests/vae_inventory.py --no-trace`：图像 VAE 的路一个没变。
+
+### 9.18 第四阶段 4b-1：Flux 2 VAE 走第一层（vae-flux2-layer1）
+
+**结构核对（0.31.0）：** `comfy.sd.VAE` 看到 `bn.running_mean` 就给 ddconfig 加 `batch_norm_latent`，建 `AutoencoderKL`（z 32，embed 32，有 `post_quant_conv`），latent 128 通道、比例 16。`AutoencodingEngineLegacy.decode` 先 `z = z * sqrt(running_var + bn_eps) + running_mean`（BatchNorm 反归一化，`bn_eps` 1e-4，buffer 每次 `cast_to` 成 latent 的 dtype），再 `rearrange("... (c pi pj) i j -> ... c (i pi) (j pj)", pi=2, pj=2)`（128 × H/16 → 32 × H/8），然后是和 Flux `ae` 相同的 `post_quant_conv` + LDM `Decoder`（ch 128，ch_mult [1,2,4,4]）。真实文件 `flux2-vae.safetensors`（Comfy-Org/flux2-dev，sha256 d64f3a68…）用命令 W 核对过：`AutoencoderKL / Decoder | latent 128 ch, x16`。
+
+**做法（`vae_ldm.py`）：**
+
+* `ldm_structure` 接受这个 BatchNorm（`_check_bn_latent`）：`torch.nn.BatchNorm2d`、非 affine、有 running 统计量、`ps == [2, 2]`、有 `bn_eps`、特征数 = 4 × `post_quant_conv` 的输入通道；其他样子的 BatchNorm 仍走第二层并写明原因。
+* latent 这一步是前缀的第一个模块 `LatentUnpatch`：用模型自己的 buffer、同样的运算和顺序，所以与原生给 `post_quant_conv` 的输入逐位相同（测试核对）。这一步在原生里也不是模块调用，是 `decode` 里的几行运算，所以这里照抄运算；fp32 自检把整条路（含这一步）与模型类自己的 `decode` 对比兜底。
+* 引擎加一个钩子 `StripeAdapter.decoder_hw(samples)`：计划在 decoder 的分辨率（H/8）上做（`plan` / `smallest_plan` / 存档缓冲的形状），LDM 适配器在有 BatchNorm latent 时返回 latent 尺寸的 2 倍；其余适配器不变。`LatentUnpatch` 的内存模型：输出和一个临时量各一份 latent 大小（`prefix_peak`），没有卷积量。
+* 结构签名多了 `bn` 一项，第一次使用单独做 fp32 自检；fp32 副本带上 BatchNorm 的 buffer、`bn_eps`、`ps`，参照解码就是 `AutoencoderKL.decode` 本身。自检的 latent 是 decoder 24 × 24 对应的 12 × 12（几何与其他 LDM 相同）。
+* 名字 `LDM stripes (batch-norm latent), GroupNorm scheme B`；方案、条带、预算、耗时模型（decoder 相同，`TIME_COEF` 照用）、VAE 设置节点、Info 节点都不用改。启动日志、节点 tooltip（两份 nodeDefs.json）、README 的列表加上 Flux 2。
+
+**模拟（`tests/alloc_sim.py --model flux2`，bf16，GiB）：** 默认 B：1344×768 reserved 0.62 / 估算 0.76，2688×1536 1.33 / 1.61，4K 2.18 / 2.69；4K 的 A 1.11 / 1.49、D 1.53 / 2.04、C 4.71 / 5.22；预算 3G 选 4K B 12 × 180（2.44 / 2.97），1.5G 选 A。都与 Flux `ae` 相差 ≤ 0.01 GiB，计划（条带数、高度、方案、按预算的选择、预测耗时）完全相同。第二层 3.72 / 9.25 / 15.05，原生 8.36 / 42.8（实测 Flux）/ 52.50。
+
+**测试：** `tests/test_vae_flux2.py`（46 项）：识别（含 3 种不认的 BatchNorm → 第二层 == 原生）；`LatentUnpatch` 与原生逐位相同；四种方案 × 条带高度 7 / 40 / 默认、奇数和 1×1 latent、batch 2、16 KiB 工作区、bf16 对 fp32 真值（RMSE 0.00983，原生 0.00996），fp32 与原生差 ≤ 4.5e-6；自检通过并与 SDXL 式分开缓存，注入错误的 latent 步骤 / 条带内统计 → 自检失败、第二层、== 原生；模拟 OOM → 缩条带，到底 → `MonoloadVAEOOMError`，不走 tiled 也不走第二层；预算：等于第二层估算选第二层、稍低选第一层、1 KiB 报错列出各自需要；VAE 设置节点（副本强制方案 C、16 行；`layer 2 only`）和 Info 节点直接生效；alloc_sim 上 reserved ≤ 估算（6 种）。真实权重：下载的 `flux2-vae.safetensors` 在 CPU 上 768×512 解码，A / D / B / C 都走第一层，与原生 max|Δ| ≤ 1.6e-6（fp32）。`tests/make_synthetic_vaes.py` 多一个 `synthetic_flux2`，bench / 节点检查脚本 CPU 冒烟通过。真机命令与逐行预测：README §9.12（X / Y / Z）。
 
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 

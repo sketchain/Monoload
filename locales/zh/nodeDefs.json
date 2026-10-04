@@ -71,7 +71,7 @@
       },
       "gn_scheme": {
         "name": "GroupNorm 方案",
-        "tooltip": "LDM decoder（SDXL / SD1.5 / SD3 / Flux ae）第一层（条带解码）的 GroupNorm 方案：把哪些中间结果整张存下来，让统计整图 GroupNorm 统计量的那几遍从存档出发，而不必每遍都从 H/8 存档重算。A：什么都不存——内存最低、重算最多、最慢；D：存 H/4 级的输出；B：存 H/4 和 H/2 级的输出——内置默认；C：再加上全分辨率每个块的输入——内存最高、最快。SDXL 4K 实测：A 约 1.1 GiB / 75 s，D 约 1.5 / 58，B 约 2.2 / 42，C 约 4.7 / 36。跟随全局：看 MONOLOAD_VAE_GN_SCHEME；没设时用 B，设了预算时选放得下的里面最快的方案。",
+        "tooltip": "LDM decoder（SDXL / SD1.5 / SD3 / Flux ae / Flux 2）第一层（条带解码）的 GroupNorm 方案：把哪些中间结果整张存下来，让统计整图 GroupNorm 统计量的那几遍从存档出发，而不必每遍都从 H/8 存档重算。A：什么都不存——内存最低、重算最多、最慢；D：存 H/4 级的输出；B：存 H/4 和 H/2 级的输出——内置默认；C：再加上全分辨率每个块的输入——内存最高、最快。SDXL 4K 实测：A 约 1.1 GiB / 75 s，D 约 1.5 / 58，B 约 2.2 / 42，C 约 4.7 / 36。跟随全局：看 MONOLOAD_VAE_GN_SCHEME；没设时用 B，设了预算时选放得下的里面最快的方案。",
         "options": {
           "default": "跟随全局",
           "A": "A（不存，内存最低）",

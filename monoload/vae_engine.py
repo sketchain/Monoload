@@ -31,7 +31,10 @@ The adapter interface (StripeAdapter):
   units                [Unit] the stripe part
   ckpt_channels        channels of the checkpoint
   hdim                 the row dimension of the tensors (5D Wan: 3, 4D: 2)
-  scale                output rows per latent row
+  scale                output rows per checkpoint row (per row of the decoder's input)
+  decoder_hw(samples)  rows / cols the decoder works at below the prefix (the plan's
+                       h8 x w8): the latent's, unless the first prefix step changes the
+                       resolution (Flux 2's 2x2 un-patchify of the latent)
   out_channels         channels of the decoder output
   output_shape(samples)            the native-layout shape of the decoded batch
   cost model           prefix_peak / prefix_largest / prefix_out_channels /
@@ -834,7 +837,7 @@ class StripeAdapter:
         bound handed to load_models_gpu, or "arena", what is reserved) fits the
         budget (None if no height fits: MIN_ROWS, doubled up to the image height);
         else exactly `rows`."""
-        h8, w8 = int(samples.shape[-2]), int(samples.shape[-1])
+        h8, w8 = self.decoder_hw(samples)
         elem = mm.dtype_size(vae.vae_dtype)
         lat = samples[0:1].numel() * elem
         if rows is not None:
@@ -865,7 +868,7 @@ class StripeAdapter:
         """The plan with the lowest estimate among the heights plan() tries first
         (MIN_ROWS, doubled up to the image height): what the error names when
         nothing fits a budget."""
-        h_out = int(samples.shape[-2]) * self.scale
+        h_out = self.decoder_hw(samples)[0] * self.scale
         r, best = min(MIN_ROWS, h_out), None
         while True:
             p = self.plan(vae, samples, 0, ws, rows=r, out_bytes=out_bytes)
@@ -874,6 +877,10 @@ class StripeAdapter:
             if r >= h_out:
                 return best
             r = min(h_out, r * 2)
+
+    def decoder_hw(self, samples):
+        """(rows, cols) of the decoder below the prefix for this latent: the latent's own."""
+        return int(samples.shape[-2]), int(samples.shape[-1])
 
     def variants(self, scheme=None):
         """The layer-1 configurations of this decoder the budget policy chooses
@@ -922,6 +929,7 @@ class StripeAdapter:
                     # the checkpoint at the front of the arena (Plan.long_lived), allocated before the prefix
                     shape = list(samples_in.shape)
                     shape[0], shape[1] = 1, self.ckpt_channels
+                    shape[-2], shape[-1] = self.decoder_hw(samples_in)
                     buf = torch.empty(shape, device=vae.device, dtype=vae.vae_dtype)
                 z = samples_in[i:i + 1].to(device=vae.device, dtype=vae.vae_dtype)
                 ckpt = self.prefix_pass(z)

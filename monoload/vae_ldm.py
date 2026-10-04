@@ -1,6 +1,14 @@
 """Layer-1 adapter: the LDM decoder (comfy.ldm.modules.diffusionmodules.model.Decoder)
 -- the VAEs of SD1.5 / SDXL (AutoencoderKL, with post_quant_conv), SD3 and
-Flux `ae` (AutoencodingEngine) -- decoding an image (docs/DESIGN.md §9.14).
+Flux `ae` (AutoencodingEngine), and Flux 2 (AutoencoderKL with a batch-norm
+latent) -- decoding an image (docs/DESIGN.md §9.14, §9.18).
+
+Flux 2: AutoencodingEngineLegacy.decode first undoes the latent's BatchNorm
+(z * sqrt(running_var + eps) + running_mean) and un-patchifies it 2x2
+([B, 4C, H/16, W/16] -> [B, C, H/8, W/8]), then runs post_quant_conv and the
+same Decoder. That step is the first prefix module here (LatentUnpatch, the
+same operations in the same order on the model's own buffers); the plan works
+at the decoder's resolution (decoder_hw).
 
 In 62b3c94 a 4D decode of a 2D Decoder (conv3d off, so not carried) is a plain
 sequence of module calls ([post_quant_conv] then Decoder.forward):
@@ -30,7 +38,9 @@ with the reason logged. Tensors are 4D [B, C, H, W].
 """
 
 import torch
+from einops import rearrange
 
+import comfy.model_management
 from comfy.ldm.models import autoencoder as ae
 from comfy.ldm.modules.diffusionmodules import model as ldm
 
@@ -148,14 +158,15 @@ def ldm_structure(fsm):
     if type(dec) is not ldm.Decoder:
         return "decoder is {}, not comfy.ldm.modules.diffusionmodules.model.Decoder".format(type(dec).__name__), None
     pqc = None
-    if isinstance(fsm, _Shim):
-        pqc = fsm.post_quant_conv
-    elif type(fsm) is not ae.AutoencodingEngine:
-        if getattr(fsm, "bn", None) is not None:
-            return "batch_norm_latent (bn) before the decoder", None
+    if type(fsm) is not ae.AutoencodingEngine:
         pqc = fsm.post_quant_conv
     if pqc is not None:
         e = _conv2d(pqc, 1, "post_quant_conv")
+        if e:
+            return e, None
+    bn = getattr(fsm, "bn", None) if type(fsm) is not ae.AutoencodingEngine else None
+    if bn is not None:
+        e = _check_bn_latent(fsm, bn, pqc)
         if e:
             return e, None
     if getattr(dec, "carried", False):
@@ -213,7 +224,43 @@ def ldm_structure(fsm):
     h = eng.hooked_module(fsm)
     if h:
         return "module {} has a forward hook or an instance-level forward".format(h), None
-    return None, {"post_quant_conv": pqc}
+    return None, {"post_quant_conv": pqc, "bn": bn is not None}
+
+
+def _check_bn_latent(fsm, bn, pqc):
+    """None if the batch-norm latent is the one AutoencodingEngineLegacy.decode undoes (Flux 2), else why not."""
+    if type(bn) is not torch.nn.BatchNorm2d:
+        return "bn is {}, not a BatchNorm2d".format(type(bn).__name__)
+    if bn.affine or not bn.track_running_stats or bn.running_mean is None or bn.running_var is None:
+        return "bn: affine {} / running statistics {}".format(bn.affine, bn.track_running_stats)
+    ps = getattr(fsm, "ps", None)
+    if not isinstance(ps, (list, tuple)) or [int(p) for p in ps] != [2, 2]:
+        return "bn: patch size {} (expected [2, 2])".format(ps)
+    if not isinstance(getattr(fsm, "bn_eps", None), float):
+        return "bn: no bn_eps"
+    if pqc is None:
+        return "bn without post_quant_conv"
+    if bn.num_features != 4 * conv_io(pqc)[0]:
+        return "bn has {} features, post_quant_conv takes {} channels (expected 4x)".format(bn.num_features, conv_io(pqc)[0])
+    return None
+
+
+class LatentUnpatch:
+    """Flux 2's latent step at the start of AutoencodingEngineLegacy.decode, on
+    the model's own buffers, same operations and order: undo the BatchNorm
+    (z * sqrt(running_var + eps) + running_mean), then un-patchify 2x2
+    ([B, 4C, h, w] -> [B, C, 2h, 2w]). A prefix module of the LDM adapter."""
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.zc = owner.bn.num_features // 4
+
+    def __call__(self, z):
+        o = self.owner
+        s = torch.sqrt(comfy.model_management.cast_to(o.bn.running_var.view(1, -1, 1, 1), dtype=z.dtype, device=z.device) + o.bn_eps)
+        m = comfy.model_management.cast_to(o.bn.running_mean.view(1, -1, 1, 1), dtype=z.dtype, device=z.device)
+        z = z * s + m
+        return rearrange(z, "... (c pi pj) i j -> ... c (i pi) (j pj)", pi=o.ps[0], pj=o.ps[1])
 
 
 def _resnet_macs(rb):
@@ -228,11 +275,12 @@ def _partial(rb):
     return run
 
 
-def build_units(fsm, pqc):
+def build_units(fsm, pqc, bn=False):
     """(prefix modules, stripe units)."""
     dec = fsm.decoder
     levels = len(dec.up)
-    prefix = [("post_quant_conv", pqc)] if pqc is not None else []
+    prefix = [("bn_latent", LatentUnpatch(fsm))] if bn else []
+    prefix += [("post_quant_conv", pqc)] if pqc is not None else []
     prefix += [("decoder.conv_in", dec.conv_in), ("decoder.mid.block_1", dec.mid.block_1),
                ("decoder.mid.attn_1", dec.mid.attn_1), ("decoder.mid.block_2", dec.mid.block_2)]
     top = dec.up[levels - 1]
@@ -363,7 +411,11 @@ def unit_largest(u, r, w, e, ws):
 
 
 def prefix_peak(m, h, w, e, ws, s):
-    """Peak bytes while prefix module m runs on the whole h x w image (native GroupNorm), input storage s."""
+    """Peak bytes while prefix module m runs on the whole h x w image (native GroupNorm), input storage s.
+    LatentUnpatch (h x w: the decoder's resolution, its input the same number of elements): z * s, then
+    + m (the product freed after it), then the un-patchified copy -- two latent-sized tensors at a time."""
+    if isinstance(m, LatentUnpatch):
+        return s + 2 * m.zc * h * w * e
     if isinstance(m, ldm.AttnBlock):
         return attention_peak(m.in_channels, h, w, e, ws, s, attn_split(m))
     if isinstance(m, ldm.ResnetBlock):
@@ -374,6 +426,8 @@ def prefix_peak(m, h, w, e, ws, s):
 
 
 def prefix_largest(m, h, w, e, ws):
+    if isinstance(m, LatentUnpatch):
+        return m.zc * h * w * e
     if isinstance(m, ldm.AttnBlock):
         return 3 * h * w * m.in_channels * e      # as vae_wan (q / k / v; score blocks are <= ws / 2 each)
     if isinstance(m, ldm.ResnetBlock):
@@ -385,6 +439,8 @@ def prefix_largest(m, h, w, e, ws):
 
 
 def prefix_out_channels(m):
+    if isinstance(m, LatentUnpatch):
+        return m.zc
     if isinstance(m, ldm.AttnBlock):
         return m.in_channels
     if isinstance(m, ldm.ResnetBlock):
@@ -393,6 +449,8 @@ def prefix_out_channels(m):
 
 
 def prefix_macs(m):
+    if isinstance(m, LatentUnpatch):
+        return 0
     if isinstance(m, ldm.AttnBlock):
         return 4 * m.in_channels * m.in_channels
     if isinstance(m, ldm.ResnetBlock):
@@ -413,11 +471,12 @@ class LDMStripe(eng.StripeAdapter):
     hdim = 2                 # rows in [B, C, H, W]
     schemes = SCHEMES
 
-    def __init__(self, fsm, pqc, gn_scheme=None, module=None):
+    def __init__(self, fsm, pqc, gn_scheme=None, module=None, bn=False):
         self.fsm = fsm
         self.module = fsm if module is None else module
         self.pqc = pqc
-        self.prefix, self.units = build_units(fsm, pqc)
+        self.bn = bool(bn)
+        self.prefix, self.units = build_units(fsm, pqc, self.bn)
         self.scale = 1
         for u in self.units:
             self.scale *= u.scale
@@ -425,10 +484,10 @@ class LDMStripe(eng.StripeAdapter):
         self.out_channels = self.units[-1].cout
         self.gn_scheme = gn_scheme or scheme()
         self.saves = scheme_positions(self.units, self.gn_scheme)
-        self.name = "LDM stripes, GroupNorm scheme {}".format(self.gn_scheme)
+        self.name = "LDM stripes{}, GroupNorm scheme {}".format(" (batch-norm latent)" if self.bn else "", self.gn_scheme)
         dec = fsm.decoder
         self.key = ("LDM", type(fsm).__name__ if not isinstance(fsm, _Shim) else fsm.kind, pqc is not None, conv_io(dec.conv_in)[0],
-                    int(dec.ch), int(dec.num_res_blocks), tuple((u.kind, u.cin, u.cout) for u in self.units), self.gn_scheme)
+                    int(dec.ch), int(dec.num_res_blocks), tuple((u.kind, u.cin, u.cout) for u in self.units), self.gn_scheme, self.bn)
 
     unit_peak = staticmethod(unit_peak)
     unit_calls = staticmethod(unit_calls)
@@ -445,7 +504,7 @@ class LDMStripe(eng.StripeAdapter):
         """One adapter per GroupNorm scheme (only `scheme` when it is forced); this one
         (the default scheme) first, so it wins ties (e.g. one stripe: no passes, all the same)."""
         names = [scheme] if scheme else [self.gn_scheme] + [n for n in SCHEMES if n != self.gn_scheme]
-        return [self if n == self.gn_scheme else LDMStripe(self.fsm, self.pqc, gn_scheme=n) for n in names]
+        return [self if n == self.gn_scheme else LDMStripe(self.fsm, self.pqc, gn_scheme=n, bn=self.bn) for n in names]
 
     def predict_seconds(self, plan):
         top = TIME_COEF[max(TIME_COEF)]
@@ -453,8 +512,14 @@ class LDMStripe(eng.StripeAdapter):
         tokens = plan.heights[0] * plan.widths[0]
         return macs / 1e12 + TIME_PER_CALL * plan.conv_calls + TIME_ATTN * 2 * self.ckpt_channels * tokens * tokens / 1e12
 
+    def decoder_hw(self, samples):
+        """The decoder's input rows / cols: the latent's, or twice them after Flux 2's 2x2 un-patchify."""
+        f = 2 if self.bn else 1
+        return int(samples.shape[-2]) * f, int(samples.shape[-1]) * f
+
     def output_shape(self, samples):
-        return (samples.shape[0], self.out_channels, int(samples.shape[-2]) * self.scale, int(samples.shape[-1]) * self.scale)
+        h, w = self.decoder_hw(samples)
+        return (samples.shape[0], self.out_channels, h * self.scale, w * self.scale)
 
     # self-test
 
@@ -462,7 +527,13 @@ class LDMStripe(eng.StripeAdapter):
         return sum(p.numel() for p in self.fsm.decoder.parameters()) + (self.pqc.weight.numel() if self.pqc is not None else 0)
 
     def selftest_latent(self, n):
-        return (1, conv_io(self.pqc if self.pqc is not None else self.fsm.decoder.conv_in)[0], n, n)
+        """The latent whose decoder input is n x n (the self-test plans at the decoder's resolution)."""
+        c = conv_io(self.pqc if self.pqc is not None else self.fsm.decoder.conv_in)[0]
+        if self.bn:
+            if n % 2:
+                raise eng.StripeError("self-test size {} is odd: no batch-norm latent un-patchifies to it".format(n))
+            return (1, 4 * c, n // 2, n // 2)
+        return (1, c, n, n)
 
     def fp32_copy(self, device):
         """[post_quant_conv +] decoder rebuilt from the model's configuration in
@@ -491,20 +562,27 @@ class LDMStripe(eng.StripeAdapter):
         if pqc is not None:
             pqc.load_state_dict(self.pqc.state_dict(), strict=True)
         holder.bn = None
+        if self.bn:
+            bn = fsm.bn
+            holder.bn = torch.nn.BatchNorm2d(bn.num_features, eps=bn.eps, momentum=bn.momentum, affine=False, track_running_stats=True)
+            holder.bn.to(device=device, dtype=torch.float32)
+            holder.bn.load_state_dict(bn.state_dict(), strict=True)
+            holder.bn_eps = fsm.bn_eps
+            holder.ps = list(fsm.ps)
         holder.max_batch_size = None
         holder.eval()
         shim = _Shim(holder, pqc, type(fsm).__name__)
         reason, info = ldm_structure(shim)
         if reason:
             raise eng.StripeError("fp32 copy does not match: " + reason)
-        return _CopyStripe(shim, pqc, self.gn_scheme, holder, type(fsm))
+        return _CopyStripe(shim, pqc, self.gn_scheme, holder, type(fsm), info["bn"])
 
 
 class _CopyStripe(LDMStripe):
     """The adapter on the fp32 copy; its reference is the model class' own decode."""
 
-    def __init__(self, shim, pqc, gn_scheme, holder, cls):
-        super().__init__(shim, pqc, gn_scheme, module=holder)
+    def __init__(self, shim, pqc, gn_scheme, holder, cls, bn=False):
+        super().__init__(shim, pqc, gn_scheme, module=holder, bn=bn)
         self.cls = cls
 
     def reference_decode(self, z):
@@ -522,10 +600,10 @@ def match(vae, samples, vae_options):
     if samples.ndim != 4:
         return None, "latent has {} dims".format(samples.ndim)
     pqc = info["post_quant_conv"]
-    zc = conv_io(pqc if pqc is not None else fsm.decoder.conv_in)[0]
+    zc = fsm.bn.num_features if info["bn"] else conv_io(pqc if pqc is not None else fsm.decoder.conv_in)[0]
     if samples.shape[1] != zc:
         return None, "latent has {} channels, the decoder takes {}".format(samples.shape[1], zc)
-    return LDMStripe(fsm, pqc), None
+    return LDMStripe(fsm, pqc, bn=info["bn"]), None
 
 
 class _Shim:
@@ -536,6 +614,9 @@ class _Shim:
         self.post_quant_conv = pqc
         self.kind = kind
         self._holder = holder
+        self.bn = getattr(holder, "bn", None)
+        if self.bn is not None:
+            self.bn_eps, self.ps = holder.bn_eps, holder.ps
 
     def named_modules(self):
         return self._holder.named_modules()
