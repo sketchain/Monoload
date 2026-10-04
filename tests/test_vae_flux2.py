@@ -395,6 +395,40 @@ def allocator_tests():
         check("Flux 2 {}x{} scheme {}: {} x {} rows, simulated reserved {:.3f} GiB <= estimate {:.3f} GiB (Flux ae: {:.3f} / {:.3f})".format(
             w, h, scheme or "default (B)", i["stripes"], i["rows"], i["reserved"] / G, i["estimate"] / G, f["reserved"] / G, f["estimate"] / G),
             i["reserved"] <= i["estimate"] and abs(i["reserved"] - f["reserved"]) <= 0.02 * G)
+    # CT 700 command AA (DESIGN §9.21, §9.22): 4K, the budget-3G plan (B, 12 x 180 rows, workspace 128 MiB). The first
+    # decode with a budget runs the layer-2 shape probe first; its blocks, left cached, took the decode's first requests
+    # (2.57 GiB measured vs 2.44); and the output in the arena kept all of it reserved after the decode (2.44 measured).
+    # Now the cache is emptied before the output and the arena are allocated, and again after the decode.
+    kw = dict(w=3840, h=2160, dtype="bf16", rows=180, model="flux2", scheme="B", ws=128 << 20)
+    o1 = alloc_sim.decode_trace(probe=True, **dict(kw, **alloc_sim._version("w128")))
+    o2 = alloc_sim.decode_trace(**dict(kw, **alloc_sim._version("w128")))
+    n1 = alloc_sim.decode_trace(probe=True, **kw)
+    n2 = alloc_sim.decode_trace(**kw)
+    check("Flux 2 4K B 12 x 180 (budget 3G): decode 1 (after the shape probe) {:.3f} / decode 2 {:.3f} GiB, {:.3f} stays (output {:.3f}), "
+          "estimate {:.3f}; up to 6324592 {:.3f} / {:.3f}, {:.3f} stayed (measured 2.57 / 2.44, 2.44; bench Z 4K -b3 GTT 2.44)".format(
+              n1["reserved"] / G, n2["reserved"] / G, n2["stays"] / G, n2["plan"].out_segment / G, n2["estimate"] / G,
+              o1["reserved"] / G, o2["reserved"] / G, o2["stays"] / G),
+          abs(n1["reserved"] - n2["reserved"]) <= 0.005 * G and n1["stays"] == n2["stays"] <= n2["plan"].out_segment
+          and n2["reserved"] <= n2["estimate"] and n2["reserved"] <= o2["reserved"] + 0.01 * G
+          and o1["reserved"] > o2["reserved"] + 0.05 * G and o2["stays"] >= o2["arena"] - 0.01 * G
+          and abs(o1["reserved"] / G - 2.57) <= 0.03 and abs(o2["reserved"] / G - 2.44) <= 0.03)
+    # scheme A (no saves), 4K, 17 x 128 rows, workspace 128 MiB (budget 1.5G): the prefix leaves a hole of the checkpoint's
+    # size (127 MiB) in front of it, which the output used to fill; without it a 128 MiB column block was stranded outside
+    # the arena. move_low puts the checkpoint into the hole.
+    from monoload import vae_engine as eng
+    kw = dict(w=3840, h=2160, dtype="bf16", rows=128, model="flux2", scheme="A", ws=128 << 20)
+    o = alloc_sim.decode_trace(**dict(kw, **alloc_sim._version("w128")))
+    eng.CKPT_LOW = False
+    try:
+        off = alloc_sim.decode_trace(**kw)
+    finally:
+        eng.CKPT_LOW = True
+    i = alloc_sim.decode_trace(**kw)
+    check("Flux 2 4K A 17 x 128 (budget 1.5G): reserved {:.3f} GiB = output {:.3f} + arena {:.3f} (estimate {:.3f}); up to 6324592 {:.3f}; "
+          "without moving the checkpoint {:.3f} (bench Z 4K -b1.5 GTT 1.11)".format(i["reserved"] / G, i["plan"].out_segment / G, i["arena"] / G, i["estimate"] / G,
+                                                        o["reserved"] / G, off["reserved"] / G),
+          i["reserved"] <= o["reserved"] + 0.005 * G and i["reserved"] <= i["plan"].out_segment + i["arena"] + 0.005 * G
+          and off["reserved"] > i["reserved"] + 0.1 * G and abs(o["reserved"] / G - 1.11) <= 0.03)
 
 
 def main():

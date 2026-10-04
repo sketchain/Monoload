@@ -402,39 +402,62 @@ def policy_memory_tests(v):
         mono = all(a.estimate <= b.estimate for a, b in zip(plans, plans[1:]))
         parts = all(q.live_peak == q.persistent + max(q.prefix_bytes, q.stripe_bytes) and q.prefix_bytes == q.prefix_live
                     and q.stripe_bytes == q.ckpt_bytes + q.stripe_live and q.arena == eng.arena_bytes(q.live_peak, len(q.stripes))
-                    and q.estimate == q.arena + q.largest + eng.ESTIMATE_PAD for q in plans)
+                    and q.out_segment == eng.out_segment(outb) and q.estimate == q.out_segment + q.arena + q.largest + eng.ESTIMATE_PAD
+                    for q in plans)
         order = True
         for q in plans:
             size = [sum(n[1] - n[0] for n in needs) for needs in q.needs]
             order = order and sorted(q.order) == list(range(len(q.stripes))) and size[q.order[0]] == max(size)
         check("workspace {}: estimate monotone in the stripe height ({} .. {}), live peak = persistent + max(prefix, stripes), "
-              "estimate = arena + largest allocation + small-pool pad, largest stripe first".format(vae_ops.fmt_bytes(w), vae_ops.fmt_bytes(plans[0].estimate), vae_ops.fmt_bytes(plans[-1].estimate)),
+              "estimate = output segment + arena + largest allocation + small-pool pad, largest stripe first".format(vae_ops.fmt_bytes(w), vae_ops.fmt_bytes(plans[0].estimate), vae_ops.fmt_bytes(plans[-1].estimate)),
               mono and parts and order)
-    # allocator: cache emptied after the self-test, not during the decode; the arena is reserved where supported
-    calls, arenas = [], []
+    # allocator: cache emptied after the self-test, and before / after each decode (DESIGN §9.22: the output buffer
+    # allocated in between, before the arena, which is reserved where supported)
+    calls, arenas, events = [], [], []
     orig = comfy.model_management.soft_empty_cache
     orig_sup, orig_res = eng.arena_supported, eng.reserve_arena
-    comfy.model_management.soft_empty_cache = lambda force=False: calls.append(force)
+    orig_shape = type(bound).output_shape
+
+    def empty(force=False):
+        calls.append(force)
+        events.append("empty")
+
+    def shape(self, samples):
+        events.append("output")
+        return orig_shape(self, samples)
+    comfy.model_management.soft_empty_cache = empty
+    type(bound).output_shape = shape
     try:
         eng._SELFTEST.clear()
         ok, _ = eng.self_test(bound, v)
         n_selftest = len(calls)
         mvae.set_stripe_rows(40)
         lat2 = torch.randn(2, 16, 1, 12, 10, generator=g)
+        del events[:]
         managed_decode(v, lat2)
         last_cpu = mvae.last_decode()
+        ev_cpu = list(events)
         eng.arena_supported = lambda device: True
-        eng.reserve_arena = lambda device, n: (arenas.append(n), orig_res(device, n))
+        eng.reserve_arena = lambda device, n: (arenas.append(n), events.append("arena"), orig_res(device, n))
+        del events[:]
         out = managed_decode(v, lat2, raw=True)
         last = mvae.last_decode()
+        ev = list(events)
         mvae.set_stripe_rows(None)
     finally:
         comfy.model_management.soft_empty_cache = orig
         eng.arena_supported, eng.reserve_arena = orig_sup, orig_res
+        type(bound).output_shape = orig_shape
     ref = native_decode(v, lat2, raw=True)
-    check("allocator: cache emptied once after the self-test ({} call), never during a decode; arena {} reserved once for a batch of 2 where "
-          "supported (CPU: none), result unchanged (max|Δ| {:.2g})".format(n_selftest, vae_ops.fmt_bytes(last["stats"]["arena"]), float((out - ref).abs().max())),
-          ok and n_selftest == 1 and len(calls) == 1 and all(calls) and last_cpu["stats"]["arena"] == 0
+
+    def run_order(e):   # from the decode's first cache emptying on (output_shape is also called for the estimate before)
+        return e[e.index("empty"):] if "empty" in e else e
+    check("allocator: cache emptied once after the self-test ({} call); a decode: {} (CPU: {}); arena {} reserved once for a batch of 2 "
+          "where supported (CPU: none), result unchanged (max|Δ| {:.2g})".format(
+              n_selftest, " -> ".join(run_order(ev)), " -> ".join(run_order(ev_cpu)), vae_ops.fmt_bytes(last["stats"]["arena"]),
+              float((out - ref).abs().max())),
+          ok and n_selftest == 1 and len(calls) == 5 and run_order(ev) == ["empty", "output", "arena", "empty"]
+          and run_order(ev_cpu) == ["empty", "output", "empty"] and last_cpu["stats"]["arena"] == 0
           and arenas == [last["stats"]["arena"]] and last["stats"]["arena"] == last["estimate"]["arena"]
           and float((out - ref).abs().max()) <= 1e-5)
     import os
@@ -452,6 +475,24 @@ def policy_memory_tests(v):
                 os.environ[k] = val
     check("arena only with the default allocator config: not on the CPU, not with max_split_size_mb / expandable_segments",
           not eng.arena_supported(torch.device("cpu")) and not no_split and not no_exp)
+    # move_low (DESIGN §9.22): the checkpoint moves only into a block below it, never into a new segment
+    t = torch.arange(6.0)
+    st = {}
+    orig_low = eng.block_addr, eng.device_reserved, comfy.model_management.soft_empty_cache
+    eng.block_addr = lambda x: 5 if x is t else st["addr"]
+    eng.device_reserved = lambda device: st.setdefault("calls", []).append(1) or (100 if len(st["calls"]) == 1 else 100 + st["grow"])
+    comfy.model_management.soft_empty_cache = lambda force=False: st.__setitem__("empty", st.get("empty", 0) + 1)
+    res = []
+    try:
+        for addr, grow in ((0, 0), (10, 0), (0, 2)):
+            st.clear()
+            st.update(addr=addr, grow=grow)
+            r = eng.move_low(t, torch.device("cpu"))
+            res.append((r is not t and torch.equal(r, t), st.get("empty", 0)))
+    finally:
+        eng.block_addr, eng.device_reserved, comfy.model_management.soft_empty_cache = orig_low
+    check("move_low: a copy when the free block is below the checkpoint; the checkpoint itself when the block is above it, or a new "
+          "segment (then emptied again): {}".format(res), res == [(True, 0), (False, 0), (False, 1)])
 
 
 # ---------------------------------------------------------------------------
@@ -514,11 +555,23 @@ def allocator_tests():
             ("725a010, fp32 2688, 12 x 128 rows", dict(w=2688, h=1536, dtype="fp32", rows=128, **alloc_sim._version("v2")), 1.41),
             ("85a5c6f (arena, workspace 384 MiB), 4K default", dict(w=3840, h=2160, **alloc_sim._version("v3")), 1.13),
             ("85a5c6f, 4K, 5 x 432 rows", dict(w=3840, h=2160, rows=512, **alloc_sim._version("v3")), 1.82),
-            ("current (workspace 128 MiB), 4K default", dict(w=3840, h=2160), 0.87),
-            ("current (workspace 128 MiB), 1344 default", dict(w=1344, h=768), 0.36)):
+            ("5d668b6..6324592 (workspace 128 MiB, output in the arena), 4K default", dict(w=3840, h=2160, **alloc_sim._version("w128")), 0.87),
+            ("5d668b6..6324592, 1344 default", dict(w=1344, h=768, **alloc_sim._version("w128")), 0.36)):
         i = alloc_sim.decode_trace(**kw)
         check("allocator simulator reproduces CT 700: {}: reserved {:.2f} GiB (measured {:.2f})".format(label, i["reserved"] / G, mres),
               abs(i["reserved"] / G - mres) <= 0.03)
+    # the output in a segment of its own before the arena, the cache emptied before and after (DESIGN §9.22): the peak
+    # unchanged, the arena returned after the decode (with the output in it, the whole arena stayed reserved)
+    for w, h in ((1344, 768), (2688, 1536), (3840, 2160)):
+        o = alloc_sim.decode_trace(w, h, **alloc_sim._version("w128"))
+        i = alloc_sim.decode_trace(w, h)
+        seg = i["plan"].out_segment
+        check("{}x{} default, output before the arena: {} x {} rows (was {} x {}), reserved {:.3f} GiB (was {:.3f}), after the decode {:.3f} GiB "
+              "stays (was {:.3f}; the output's segment {:.3f}), cache emptied {}x (was {}x)".format(
+                  w, h, i["stripes"], i["rows"], o["stripes"], o["rows"], i["reserved"] / G, o["reserved"] / G, i["stays"] / G, o["stays"] / G,
+                  seg / G, i["empty_cache"], o["empty_cache"]),
+              i["reserved"] <= o["reserved"] + 0.01 * G and i["stays"] <= seg and o["stays"] >= min(o["arena"], o["reserved"]) - 0.01 * G
+              and i["empty_cache"] == o["empty_cache"] + 2 and i["rows"] == o["rows"])
     for w, h, dt, rows in ((1344, 768, "bf16", None), (1344, 768, "bf16", 768), (1920, 1088, "bf16", None), (2688, 1536, "bf16", None),
                            (3840, 2160, "bf16", None), (3840, 2160, "bf16", 32), (3840, 2160, "bf16", 512), (3840, 2160, "fp32", None),
                            (7680, 4320, "bf16", None)):
