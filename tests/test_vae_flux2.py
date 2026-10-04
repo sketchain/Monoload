@@ -16,7 +16,9 @@ comfy.sd.VAE (it builds an AutoencoderKL with batch_norm_latent from the
      of native bf16;
   4. self-test: passes, cached separately from an SDXL-like decoder; an injected
      bug in the latent step / stripe-local statistics -> self-test fails,
-     layer 2, == native;
+     layer 2, == native; its reference decode runs in layer-2 row blocks of its
+     own size; the first decode's estimate includes it, a budget below a pending
+     self-test keeps layer 1 out of the first decode only (DESIGN §9.20);
   5. OOM -> smaller stripes, at the floor MonoloadVAEOOMError, never tiled or
      layer 2; MONOLOAD_VAE_BUDGET picks among layer 2 and the layer-1 schemes;
   6. the Monoload VAE Settings node (forced scheme / rows on a copy) and the
@@ -224,6 +226,60 @@ def selftest_tests(v, lat):
     eng._SELFTEST.clear()
 
 
+def selftest_memory_tests(v, lat):
+    """DESIGN §9.20: the self-test's reference decode runs in layer-2 row blocks of its own size; a pending self-test
+    is part of the first decode's estimate and of the budget comparison."""
+    bound, _ = vl.match(v, lat, {})
+    seen = set()
+    orig = vae_ops._ConvChunker.__call__
+
+    def spy(self, *a, **kw):
+        seen.add(self.budget)
+        return orig(self, *a, **kw)
+    eng._SELFTEST.clear()
+    vae_ops._ConvChunker.__call__ = spy
+    try:
+        ok, _ = eng.self_test(bound, v)
+    finally:
+        vae_ops._ConvChunker.__call__ = orig
+    check("self-test: the reference decode runs under layer-2 chunking with its own workspace ({}) besides the stripes' ({}); passes".format(
+        vae_ops.fmt_bytes(eng.SELFTEST_REF_WORKSPACE), vae_ops.fmt_bytes(eng.SELFTEST_WORKSPACE)),
+        ok and seen == {eng.SELFTEST_REF_WORKSPACE, eng.SELFTEST_WORKSPACE})
+
+    # the first decode's record: estimate = max(plan, self-test); a later decode: the plan's
+    eng._SELFTEST.clear()
+    managed_decode(v, lat)
+    e1 = mvae.last_decode()["estimate"]
+    managed_decode(v, lat)
+    e2 = mvae.last_decode()["estimate"]
+    st = bound.selftest_memory()
+    check("first decode records the self-test ({} -> estimate {} = max(plan {}, self-test)); the next one does not (estimate {})".format(
+        vae_ops.fmt_bytes(e1.get("selftest")), vae_ops.fmt_bytes(e1["total"]), vae_ops.fmt_bytes(e1["plan"]), vae_ops.fmt_bytes(e2["total"])),
+        e1.get("selftest") == st and e1["total"] == max(e1["plan"], st) and e2.get("selftest") == 0 and e2["total"] == e2["plan"])
+
+    # budget: a pending self-test larger than the budget keeps layer 1 out of the first decode, not of later ones
+    est2 = mvae._layer2_estimate(v, lat, {}, mvae.workspace())[0]["total"]
+    bud = est2 - 1                                   # layer 2 does not fit
+    orig_sm = vl.LDMStripe.selftest_memory
+    vl.LDMStripe.selftest_memory = lambda self: bud + 1
+    eng._SELFTEST.clear()
+    mvae.set_budget(bud)
+    try:
+        expect_raises("budget below a pending self-test (and layer 2): MonoloadError naming the self-test", MonoloadError,
+                      lambda: managed_decode(v, lat), "self-test")
+        for b in bound.variants():
+            eng._SELFTEST[b.key] = (True, "stub")
+        out = managed_decode(v, lat, raw=True)
+        last = mvae.last_decode()
+    finally:
+        vl.LDMStripe.selftest_memory = orig_sm
+        mvae.set_budget(None)
+        eng._SELFTEST.clear()
+    ref = native_decode(v, lat, raw=True)
+    check("... once the self-tests have run, the same budget gives layer 1 ({}), == native (max|Δ| {:.2g})".format(
+        last.get("adapter"), float((out - ref).abs().max())), last.get("strategy") == "layer1" and float((out - ref).abs().max()) <= 1e-5)
+
+
 # ---------------------------------------------------------------------------
 # 5. OOM, budget
 # ---------------------------------------------------------------------------
@@ -328,6 +384,11 @@ def node_tests(v, lat):
 def allocator_tests():
     import alloc_sim
     G = float(1 << 30)
+    for model in ("flux2", "sdxl"):
+        pk, left, bound = alloc_sim.selftest_trace(model)
+        check("{} self-test (full size, meta): simulated reserved peak {:.0f} MiB <= selftest_memory {:.0f} MiB, nothing left ({:.0f} MiB); "
+              "was ~740 MiB with the reference unchunked".format(model, pk / 2 ** 20, bound / 2 ** 20, left / 2 ** 20),
+              pk <= bound and left == 0 and pk <= 0.45 * G)
     for w, h, scheme in ((1344, 768, None), (2688, 1536, None), (3840, 2160, None), (3840, 2160, "A"), (3840, 2160, "C"), (3840, 2160, "D")):
         i = alloc_sim.decode_trace(w, h, "bf16", None, model="flux2", scheme=scheme)
         f = alloc_sim.decode_trace(w, h, "bf16", None, model="flux", scheme=scheme)
@@ -343,6 +404,7 @@ def main():
     v = recognition_tests()
     lat = decoder_tests(v)
     selftest_tests(v, lat)
+    selftest_memory_tests(v, lat)
     oom_budget_tests(v, lat)
     node_tests(v, lat)
     allocator_tests()

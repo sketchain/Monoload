@@ -494,8 +494,13 @@ def budget_tests(sd, lat4):
         bud = floor
         while bud < 8 * floor and pick is None:
             mvae.set_budget(bud)
-            d = mvae.choose_budget(sd, lat4, {}, bud, selftest=_stub_selftest)
-            mvae.set_budget(None)
+            try:
+                d = mvae.choose_budget(sd, lat4, {}, bud, selftest=_stub_selftest)
+            except MonoloadError:      # nothing fits yet (a scheme not self-tested yet counts its self-test, DESIGN §9.20)
+                bud = int(bud * 1.03) + 1
+                continue
+            finally:
+                mvae.set_budget(None)
             fit1 = [c for c in d["candidates"] if c["layer"] == 1 and c["fits"]]
             if d["layer"] == 1 and len(d["plan"].stripes) > 1 and len(fit1) >= 3 and len({c["gn_scheme"] for c in fit1}) >= 3:
                 pick = bud
