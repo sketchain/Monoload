@@ -882,6 +882,8 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_sel
 
 预期：`self-test` 一行 reserved 峰值约 0.74 GiB；第一条命令里 `self-test` 之后 `stays reserved` / `GTT after` 不为 0（这个进程的第一批 GPU 计算落在自检里），第二条命令里这部分出现在 `warm-up` 一行、`self-test` 之后为 0；两条命令的 `decode 1` / `decode 2` 都约 2.44（估算 2.97）。
 
+**AA 的实测（0a4e177）与改动后的预测（vae-selftest-budget，DESIGN §9.20）：** 当时自检 reserved 峰值 0.85（不加 warm-up）/ 0.78（加 warm-up），报给 `load_models_gpu` 0.45；第一批 GPU 计算留下 0.07。改动后重跑同样两条命令，预期：`self-test` 一行 reserved 峰值约 0.40（加 warm-up）/ 0.47（不加），`passed to load_models_gpu for it: 0.42 GiB`；`decode 1` 仍约 2.57、`decode 2` 2.44、两者之后仍留 2.44（DESIGN §9.21 的两个现象，这一步没改）。bench X 的 1344×768 第一次（含自检）reserved 应为 0.62（不再高于估算 0.76）。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
