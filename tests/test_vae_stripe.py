@@ -503,6 +503,9 @@ def conv2d_route_tests(v, lat):
 def allocator_tests():
     import alloc_sim
     G = float(1 << 30)
+    pk, left, bound = alloc_sim.selftest_trace("qwen")
+    check("Wan self-test (qwen_image_vae size, meta): simulated reserved peak {:.0f} MiB <= selftest_memory {:.0f} MiB, nothing left".format(
+        pk / 2 ** 20, bound / 2 ** 20), pk <= bound and left == 0)
     for label, kw, mres in (
             ("4e54d20, 4K, 128-row stripes", dict(w=3840, h=2160, rows=128, **alloc_sim._version("v1")), 1.07),
             ("4e54d20, 4K, 5 x 432 rows", dict(w=3840, h=2160, rows=512, **alloc_sim._version("v1")), 2.66),
