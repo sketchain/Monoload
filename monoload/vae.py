@@ -746,7 +746,11 @@ def _decode(self, samples_in, vae_options={}):
             _record(self, probe.result)
 
 
+_SELFTEST_IN_DECODE = [0]   # selftest_memory() of a first-use self-test run inside the decode in progress (0: none)
+
+
 def _managed_decode(self, samples_in, vae_options):
+    _SELFTEST_IN_DECODE[0] = 0
     self.throw_exception_if_invalid()
     if self.latent_dim == 2 and samples_in.ndim == 5:
         samples_in = samples_in[:, :, 0]
@@ -769,8 +773,10 @@ def _layer1_self_test(vae, bound):
     hit = vae_engine._SELFTEST.get(bound.key)
     if hit is None:
         # the self-test copies the decoder's weights: they must be loaded
-        mm.load_models_gpu([vae.patcher], memory_required=bound.selftest_memory(), force_full_load=vae.disable_offload)
+        need = bound.selftest_memory()
+        mm.load_models_gpu([vae.patcher], memory_required=need, force_full_load=vae.disable_offload)
         hit = vae_engine.self_test(bound, vae)
+        _SELFTEST_IN_DECODE[0] = max(_SELFTEST_IN_DECODE[0], need)
         if hit[0]:
             logging.info(msg("vae.selftest_ok", name=bound.name, detail=hit[1]))
         else:
@@ -822,11 +828,20 @@ def _selftest_failed(bound):
     return hit is not None and not hit[0]
 
 
+def _selftest_pending(bound):
+    """What the first-use self-test of this structure will reserve before the decode, 0 once it has run (DESIGN §9.20)."""
+    return 0 if bound.key in vae_engine._SELFTEST else bound.selftest_memory()
+
+
+def _selftest_note(c):
+    return msg("vae.cand_selftest", st=fmt_bytes(c["selftest"]), plan=fmt_bytes(c["plan_estimate"])) if c.get("selftest") else ""
+
+
 def _candidate_label(c):
     if c["layer"] == 2:
         return msg("vae.cand_layer2", est=fmt_bytes(c["estimate"]))
     return msg("vae.cand_layer1", scheme=msg("vae.cand_scheme", scheme=c["gn_scheme"]) if c["gn_scheme"] else "", rows=c["rows"],
-               ws=fmt_bytes(c["workspace"]), est=fmt_bytes(c["estimate"]),
+               ws=fmt_bytes(c["workspace"]), est=fmt_bytes(c["estimate"]) + _selftest_note(c),
                secs=msg("vae.cand_secs", secs=c["seconds"]) if c["seconds"] is not None else "")
 
 
@@ -893,10 +908,11 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
     fits, over = [], []
     for v in variants:
         outb = v.output_bytes(vae, samples_in)
+        st = _selftest_pending(v)   # a first use runs the self-test before the decode: it must fit the budget too
         p = None
         for w in ws_opts:
             q = v.plan(vae, samples_in, bud, w, rows=rows, out_bytes=outb)
-            if q is None or q.estimate > bud:
+            if q is None or max(q.estimate, st) > bud:
                 continue
             if p is None:
                 p = q
@@ -907,9 +923,10 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
         if p is None:
             p = (v.plan(vae, samples_in, bud, ws_opts[-1], rows=rows, out_bytes=outb) if rows
                  else v.smallest_plan(vae, samples_in, ws_opts[-1], out_bytes=outb))
+        est = max(p.estimate, st)
         c = {"layer": 1, "adapter": v.name, "gn_scheme": getattr(v, "gn_scheme", None), "rows": max(b - a for a, b in p.stripes),
-             "estimate": p.estimate, "seconds": v.predict_seconds(p), "fits": p.estimate <= bud, "workspace": p.workspace,
-             "prefix": p.prefix_bytes, "stripes": p.stripe_bytes}
+             "estimate": est, "plan_estimate": p.estimate, "selftest": st if st > p.estimate else 0, "seconds": v.predict_seconds(p),
+             "fits": est <= bud, "workspace": p.workspace, "prefix": p.prefix_bytes, "stripes": p.stripe_bytes}
         considered.append(c)
         (fits if c["fits"] else over).append((v, p, c))
     fits.sort(key=lambda x: (x[2]["seconds"] is None, x[2]["seconds"] or 0.0))
@@ -920,7 +937,7 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
     for v, p, c in pick:
         ok, detail = selftest(v)
         if not ok:
-            c["selftest"] = "failed"
+            c["selftest_result"] = "failed"
             continue
         if over_budget:
             reason = pre + msg("vae.reason_over")
@@ -943,8 +960,8 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
             needs.append(msg("vae.need_layer2", est=fmt_bytes(c["estimate"])))
         else:
             needs.append(msg("vae.need_layer1", scheme=msg("vae.need_scheme", scheme=c["gn_scheme"]) if c["gn_scheme"] else "", rows=c["rows"],
-                             est=fmt_bytes(c["estimate"]), prefix=fmt_bytes(c["prefix"]), stripes=fmt_bytes(c["stripes"]),
-                             failed=msg("vae.need_failed") if c.get("selftest") else ""))
+                             est=fmt_bytes(c["estimate"]) + _selftest_note(c), prefix=fmt_bytes(c["prefix"]), stripes=fmt_bytes(c["stripes"]),
+                             failed=msg("vae.need_failed") if c.get("selftest_result") else ""))
     if not variants:
         needs.append(msg("vae.need_l1_unavailable", why=l1_note))
     raise MonoloadError(msg("vae.err_budget", budget=fmt_bytes(bud), src=_from("budget"), advice=_budget_advice(),
@@ -1003,7 +1020,9 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
     native_est = _native_estimate(self, samples_in.shape)
     boundaries = [(plan.h_out, a) for a, _ in plan.stripes[1:]]
     _LAST.clear()
-    _LAST.update({"strategy": "layer1", "adapter": bound.name, "estimate": {"total": plan.estimate, "first": first_est,
+    st = _SELFTEST_IN_DECODE[0]
+    total = max(plan.estimate, st)   # the first use ran the self-test before the decode: the call's peak is the larger
+    _LAST.update({"strategy": "layer1", "adapter": bound.name, "estimate": {"total": total, "plan": plan.estimate, "selftest": st, "first": first_est,
                   "prefix": plan.prefix_bytes, "stripes": plan.stripe_bytes, "checkpoint": plan.ckpt_bytes, "persistent": plan.persistent,
                   "live": plan.live_peak, "arena": plan.arena},
                   "native_estimate": native_est, "budget": bud, "policy": policy, "workspace": ws, "retries": retries, "seconds": dt,
@@ -1014,7 +1033,8 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
                   "predicted_seconds": bound.predict_seconds(plan), "stats": stats.as_dict()})
     logging.info(msg("vae.log_layer1", shape="x".join(str(d) for d in samples_in.shape), name=bound.name, plan=plan.describe(), policy=policy,
                      ws=fmt_bytes(ws), retries=msg("vae.retries", n=retries) if retries else "",
-                     arena=fmt_bytes(stats.arena) if stats.arena else msg("vae.none"), est=fmt_bytes(plan.estimate),
+                     arena=fmt_bytes(stats.arena) if stats.arena else msg("vae.none"),
+                     est=fmt_bytes(plan.estimate) + (msg("vae.est_selftest", st=fmt_bytes(st)) if st else ""),
                      native=fmt_bytes(native_est), secs=dt, note=_NOTE[0]))
     return pixel_samples
 
