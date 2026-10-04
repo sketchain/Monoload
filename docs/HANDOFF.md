@@ -1,6 +1,6 @@
-# Monoload 交接说明（准备第四阶段：VAE 解码管理推广到全部 VAE，2026-10）
+# Monoload 交接说明（第四阶段：VAE 解码管理推广到全部 VAE；4a 盘点已完成，等用户定优先级，2026-10）
 
-给下一个对话用。到这里为止的功能都已在 CT 700 上验收；这份文档讲：现在是什么状态（§1）、节点和设置体系（§2）、必须遵守的规矩（§3）、第四阶段从哪里入手（§4）、环境和工具（§5）、代码地图（§6）、提交记录（§7）。细节在 README.md（使用、真机结果、bench 命令）和 docs/DESIGN.md（§9 VAE 设计，§10–§13 总开关 / LoRA 节点 / Info 节点 / 多语言）。
+给下一个对话用。到这里为止的功能都已在 CT 700 上验收；这份文档讲：现在是什么状态（§1）、节点和设置体系（§2）、必须遵守的规矩（§3）、第四阶段的盘点结果和下一步（§4）、环境和工具（§5）、代码地图（§6）、提交记录（§7）。细节在 README.md（使用、真机结果、bench 命令）和 docs/DESIGN.md（§9 VAE 设计，§10–§13 总开关 / LoRA 节点 / Info 节点 / 多语言）。
 
 ## 1. 当前状态
 
@@ -22,7 +22,9 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | SDXL / Flux `ae` | 52.5 GiB / 11.9 s | 15.0 GiB / 9.9 s | 默认 B 2.17 GiB / 42 s（A 1.10 / 75，D 1.52 / 58，C 4.70 / 36） |
 | `qwen_image_vae` | 59.2 GiB / 7.9 s | 9.6 GiB / 6.9 s | 0.87 GiB / 8.5 s |
 
-验收情况：VAE 三个阶段、预算策略、VAE 节点、总开关、LoRA 节点、Info 节点、多语言都已在 CT 700 上通过（最近一次 19d7694：命令 V / U、网页检查）。polish-after-ui-test（本文件所在的合并）修了 UI 实测发现的六处问题，待 CT 700 复测（README §9.10）。
+验收情况：VAE 三个阶段、预算策略、VAE 节点、总开关、LoRA 节点、Info 节点、多语言都已在 CT 700 上通过（最近一次 19d7694：命令 V / U、网页检查）。polish-after-ui-test（05ded8d）修了 UI 实测发现的六处问题，待 CT 700 复测（README §9.10）。
+
+**第四阶段 4a（vae-inventory，本文件所在的合并）**：只加了盘点脚本和文档，插件行为没变。结论：用户实际在用的三个 VAE（SDXL、Flux `ae`、`qwen_image_vae`）的图像解码**已经全部走第一层**；其余 VAE 的结构、现在的路、模拟峰值和建议顺序见 §4 和 DESIGN §9.16；发现现有代码的 4 处缺口（SVD 结果被改变、2D latent 的音频 VAE 被管理且 ACE 的估算约 1 PiB、像素空间被管理、TAESD 小图第二层反而更高）。等用户定优先级，命令 W（README §9.11）待用户在 CT 700 上跑。
 
 ## 2. 节点和设置体系
 
@@ -62,7 +64,19 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * 文档和报告用中文。报告写明合并提交、小测试结果、与要求不同之处及原因、要用户决定的事。冲突时以用户的最新要求为准。
 * 提交信息结尾加 Co-Authored-By / Claude-Session 两行（见会话里的 attribution 提示）。
 
-## 4. 第四阶段入口：VAE 解码管理推广到全部 VAE
+## 4. 第四阶段：VAE 解码管理推广到全部 VAE
+
+### 4.0 4a 盘点的结果（详见 DESIGN §9.16）
+
+* **方法**：`tests/vae_inventory.py` 在 meta 上建出 sd.py 能构造的每种 VAE（交给 `comfy.sd.VAE` 本身识别），统计结构、判断 Monoload 现在的路、用 alloc_sim 追踪原生 / 第二层 / 第一层的 reserved 峰值。追踪加了 60 GiB 设备上限（OOM 时先释放缓存再试），SDXL 4K 原生模拟 52.48 GiB = 实测。`tests/probe_vae_gaps.py` 用随机权重的小解码确认缺口和第二层在多帧上的精度。`tests/check_models.py`（命令 W）给 CT 700 识别模型文件用哪个 VAE。
+* **用户在用的**：SDXL（checkpoint 内置）、Flux `ae`（Z-Image 也用）、`qwen_image_vae`（Krea 2、Anima）——图像解码都已是第一层。`novaAnimeAM`、`luciddreamerZ` 等命令 W 的结果确认。
+* **还走第二层的图像 VAE**：Flux 2（4K 原生 52.5 → 第二层 15.05，第一层预计 2.18，与 Flux `ae` 同一个 decoder，**最容易**）、Wan 2.2 单帧（4K 34.2 → 19.8，第二层不够）、HunyuanImage 2.1（38.1 → 11.1）、HunyuanImage 2.1 Refiner（1344 原生 50.3 → 4.4）、HunyuanVideo 1.0 / 1.5 单帧、SeedVR2、TAE 系列、Stage A / C、Mage、像素空间。
+* **还走原生的多帧视频**：第二层在多帧上**数值精确**（Wan 2.1 / 2.2、HunyuanVideo 1.0 / 1.5、CogVideoX 的小解码，相对误差 ≤ 2.3e-6），模拟峰值：Wan 2.1 480p 81 帧 8.7 → 5.0、Wan 2.2 704p 121 帧 39.4 → 10.4、HunyuanVideo 1.0 480p 73 帧 62（原生 OOM → tiled）→ 15.2、HunyuanVideo 1.5 720p 121 帧 113（OOM）→ 21.6、CogVideoX 35.0 → 11.7、Cosmos 30.2 → 13.0、Mochi 362 → 59.3（第二层不够）、LTX 30.6 / 59.3（模拟碎片，待确认）→ 6.7 / 5.0（要走 `output_buffer`）。要做的是 `_native_reason` 放开、`_probe` / `estimate` 认识 5D 多帧。
+* **现有缺口**（这一步只报告）：① SVD 的 `VideoDecoder` 以 batch 为时间轴，第二层逐样本解码改变了结果；② ACE-Step / LTX 2 音频 / MiniMax 音频（2D latent）被管理，ACE 的估算约 1 PiB（`load_models_gpu` 会卸载一切）；③ 像素空间被管理（估算 2 GiB）；④ TAESD 1344 第二层 2.66 > 原生 1.77 GiB。
+* **建议顺序**：0 修缺口 ① – ③ → 1 Flux 2 第一层 → 2 多帧视频第二层（通用）→ 3 Wan 2.2 单帧第一层 → 4 HunyuanImage 2.1 第一层 → 5 视频第一层（等有需要）。不建议做：TAE 系列、Stage A / C、Mage、MiniMax 视频、SeedVR2 第一层、音频、3D。
+* **要用户定的**：先做哪几种（用户现在的模型都已覆盖，第四阶段对现有工作流没有直接的峰值收益；要看是否打算用 Flux 2 / 视频模型）；缺口 ① 的修法（SVD 暂时原生，或第二层整批一次解码）。
+
+### 4.1 入口和做法（4a 之前写的，仍然适用）
 
 **现在的覆盖范围**（`vae._native_reason`、`STRIPE_ADAPTERS`）：
 
@@ -93,6 +107,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * **CT 700 的事实**：`--gpu-only --bf16-vae`；AMD 上 `cudnn.enabled = False`，4D 卷积走 Slow2d（im2col + GEMM），5D 走 SlowDilated3d；VAE 注意力是 split；统一内存，看 GTT。用户终端是 `LANG=C`，中文日志显示成下划线（字节是正确的 UTF-8，不用改）。
 * **`tests/bench_vae.py`**（README §9.7）：`--checkpoint` / `--vae`；`--res`；`--modes native,monoload,monoload-l2,monoload-r<N>,native2`，模式名后缀 `-g<S>`（方案）、`-b<GiB>`（预算）、`-w<MiB>`（工作区）；`--stripe-rows`；`--budgets`；`--gn-schemes`；`--fp32-ref`；`--profile-only`；`--json`。
 * **`tests/alloc_sim.py`**（DESIGN §9.13.10、§9.14.6）：meta 设备上跑全尺寸 decoder，按缓存分配器的规则重放，复现了 51 个 CT 700 读数（≤ 0.02 GiB）。改内存相关代码先用它看。
+* **盘点脚本**（DESIGN §9.16）：`tests/vae_inventory.py`（`--only` / `--no-trace` / `--json`；每种 VAE 的结构、路径、原生 / 第二层 / 第一层模拟峰值，带 60 GiB 设备上限；新适配器的 meta 构造可以从这里的 `KINDS` 抄）、`tests/probe_vae_gaps.py`（缺口和多帧第二层精度的小解码）、`tests/check_models.py`（CT 700 的命令 W）。
 * **检查脚本**：`tests/check_vae_node.py`（命令 U）、`tests/check_lora_node.py`（命令 V，不带 `--lora` 时列文件）。
 
 ## 6. 代码地图
@@ -122,6 +137,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | 默认 B、预算内最快 / 估算收紧 | 01377c4 / cc3b9d9 |
 | VAE 节点 | 9b30154 |
 | 总开关 / LoRA 节点 / Info 节点 / 多语言 | 7482eec / 48c9e54 / a7e187c / 19d7694 |
-| UI 实测后的修正（控件顺序和精度、Info 全局表和不生效标注、方案说明、预算来源措辞、泄漏警告、首次解码测量） | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
+| UI 实测后的修正（控件顺序和精度、Info 全局表和不生效标注、方案说明、预算来源措辞、泄漏警告、首次解码测量） | 05ded8d |
+| 第四阶段 4a：全部 VAE 的盘点（只有脚本和文档） | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。
