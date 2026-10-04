@@ -13,7 +13,7 @@ Flux-like AutoencodingEngine), fp32 on the CPU unless noted.
      weight path (weight_function), refuses a norm without statistics;
   2. recognition: SDXL-like / Flux-like recognized; attention in an up level,
      tanh_out, give_pre_end, carried 3D convs, a non-2x upsample, an upsample
-     without conv, batch_norm_latent, a 3x3 conv shortcut, Dropout in training,
+     without conv, a batch-norm latent unlike Flux 2's (tests/test_vae_flux2.py), a 3x3 conv shortcut, Dropout in training,
      a forward hook, an instance forward, vae_options, wrong latent channels
      -> layer 2 with the reason, result == native;
   3. whole decoder vs native VAE.decode: schemes A / D / B / C x stripe heights
@@ -191,8 +191,10 @@ def recognition_tests():
     setattr_case("upsample without conv", up, "with_conv", False, "without conv")
     setattr_case("3x3 conv shortcut", rb, "use_conv_shortcut", True, "conv shortcut", decode=False)
     fsm = sd.first_stage_model
-    bn = torch.nn.BatchNorm2d(16).eval()
-    case("batch_norm_latent", lambda: fsm.__dict__.__setitem__("bn", bn), lambda: fsm.__dict__.__setitem__("bn", None), "bn", decode=False)
+    bn = torch.nn.BatchNorm2d(16, affine=False).eval()
+    # a BatchNorm latent that is not Flux 2's (no 2x2 patch size, 16 features for a z 4 decoder): Flux 2 itself, tests/test_vae_flux2.py
+    case("batch_norm_latent without Flux 2's patch size", lambda: fsm.__dict__.__setitem__("bn", bn), lambda: fsm.__dict__.__setitem__("bn", None),
+         "bn: patch size", decode=False)
     c1 = dec.up[1].block[-1].out_channels
     atts = [init_random(ldm.AttnBlock(c1)) for _ in dec.up[1].block]
     case("attention in an up level", lambda: dec.up[1].attn.extend(atts), lambda: [dec.up[1].attn.__delitem__(0) for _ in atts], "has attention")
