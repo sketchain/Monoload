@@ -1119,6 +1119,101 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 **测试：** `tests/test_vae_node.py`（README §8）；ComfyUI 加载器的注册在 `tests/test_entry.py` 的 8 种开关组合里检查。真机验证：`tests/check_vae_node.py`（README §9.7 的 U）。
 
+### 9.16 第四阶段 4a：全部 VAE 的盘点（vae-inventory）
+
+目的：把 VAE 解码管理推广到全部 VAE 之前，先弄清楚锁定镜像（ComfyUI 0.31.0）的 `comfy/sd.py` 能构造哪些 VAE、各自的结构、现在 Monoload 怎么处理、原生和第二层的峰值，再由用户定先做哪几种。这一步不改插件行为。
+
+**方法（三个脚本，都不需要模型文件）：**
+
+* `tests/vae_inventory.py`：每种 VAE 按 sd.py 的配置在 meta 设备上建出全尺寸的 first-stage model，把它的 state dict（meta 张量）交给 `comfy.sd.VAE` 本身（bf16，`is_amd()` 为真），所以分支、`latent_dim`、比例、`memory_used_decode` 都是 ComfyUI 自己的。然后：结构统计（GroupNorm / RMS / Pixel / Layer / Batch norm、带 `optimized_attention` 的注意力、Conv2d / Conv3d / ConvTranspose、Linear）、Monoload 现在的路（`_native_reason`、各适配器的 `match`）、`tests/alloc_sim.py` 的追踪（CT 700 的后端：4D 卷积 Slow2d im2col、5D 卷积 SlowDilated3d vol2col、缓存分配器）：原生、第二层（1 GiB 工作区）、有适配器的第一层。追踪新加了**设备上限**：一次申请需要新段而超过 60 GiB（62.5 GiB GTT 减去权重和机器其余部分）时，先释放全部缓存的空闲段再试（CUDA / HIP 分配器 OOM 时就是这样做的），还超过就记一次真 OOM（原生这时会退回 tiled）。加上这条之后，SDXL 4K 原生的模拟值是 52.48 GiB，与 CT 700 实测（§9.12）完全一致；其余已测的读数（SDXL / Flux 1344 原生 8.36、第二层 3.71–3.72，Qwen 4K 原生 59.14、第二层 9.59，各第一层）也都在 0.02 GiB 以内。
+* `tests/probe_vae_gaps.py`：CPU 上随机权重的真实小解码，确认下面的「现有缺口」，以及第二层在多帧视频 decoder 上是否精确。
+* `tests/check_models.py`：给 CT 700 用，只读 safetensors 头（加上 64 KiB 以下的小张量），在 meta 上识别 `models/` 下每个文件：VAE 是哪一种、checkpoint 内置的 VAE、diffusion model 是什么模型、要哪种 latent（因此要哪个 VAE）、`models/vae` 里哪个文件对得上（README §9.11 的命令 W）。
+
+**用户实际在用的（CT 700 上的文件）：** `models/vae/ae.safetensors`（Flux `ae`，Z-Image / Lumina 2 也用它）、`models/vae/qwen_image_vae.safetensors`（Wan 2.1 结构；Krea 2、Anima、Qwen-Image 都用它，ComfyUI 的 `Krea2` / `Anima` 配置的 latent 格式都是 `Wan21`）、`waiIllustriousSDXL_v170` 内置的 SDXL VAE（`wai_v17_fp8_test` 是 SDXL UNet，也用它）。这三种**图像解码现在都已经走第一层**。`novaAnimeAM_v5029B`、`luciddreamerZ_*` 从文件名看不出模型类型，命令 W 会给出答案（按命名推测分别是 Anima → `qwen_image_vae`、Z-Image → `ae`）。
+
+**表一：结构与现在的路**（✔ = 有；「整图统计」= 需要整张图统计量的归一化）
+
+| VAE（用在哪些模型） | first-stage model / decoder，latent | 整图统计的归一化 | 时间维因果缓存 | 注意力 | 特殊输出 | 现在走 | 为什么 |
+|---|---|---|---|---|---|---|---|
+| SD1.x / SD2.x / SDXL（Pony、Illustrious…）**用户在用** | `AutoencoderKL` / LDM `Decoder`，4D `[B,4,H/8,W/8]` | ✔ GroupNorm ×52（整图） | — | H/8 全局（mid） | — | 第一层 LDM | 已支持 |
+| Flux.1 / Z-Image / Lumina 2 / Chroma / HiDream / SD3（`ae`）**用户在用** | `AutoencodingEngine` / LDM `Decoder`，4D z16 | ✔ 同上 | — | 同上 | — | 第一层 LDM | 已支持 |
+| Flux 2 / Ideogram 4 / Lens / Ernie-Image | `AutoencoderKL`（`batch_norm_latent`）/ LDM `Decoder`，4D `[B,128,H/16,W/16]` → 反归一化 + 2×2 还原成 z32 `[B,32,H/8,W/8]` | ✔ 同上 | — | 同上 | — | 第二层 | `ldm_structure` 拒绝 `bn` |
+| SD x4 upscaler | `AutoencoderKL` / LDM `Decoder`（ch_mult [1,2,4]，4x） | ✔ | — | H/4 全局 | — | 第一层 LDM | 已支持（3 级） |
+| SVD img2vid | `AutoencodingEngine` / `VideoDecoder`，4D，**batch 当时间轴** | ✔ GroupNorm ×80 | 时间混合（Conv3d 核 [3,1,1]、时间注意力）跨整个 batch | H/8 | — | 第二层 | **现有缺口 1** |
+| HunyuanImage 2.1 | `AutoencodingEngine` / `hunyuan_video.vae.Decoder`，4D z64，32x | ✔ GroupNorm ×72 | — | H/32 全局 | 上采样是先卷积再 2×2 depth-to-space（`PixelUnshuffle2D`）+ 重复通道的残差 | 第二层 | 不认识的结构 |
+| HunyuanImage 2.1 Refiner | `AutoencodingEngine` / `vae_refiner.Decoder`（`refiner_vae=False`），5D T=1，16x | ✔ GroupNorm 在 C×T×H×W 上（一张图内部解成 4 帧，取最后一帧） | 非因果 Conv3d（时间补零） | 3D 全局 | — | 第二层 | 不认识 |
+| HunyuanVideo 1.5 | `AutoencodingEngine` / `vae_refiner.Decoder`（RMS），5D z32，16x，时间 4x | — RMS（逐位置） | ✔ CarriedConv3d：每 2 个 latent 帧一段，带 2 帧 carry | 3D 全局（T×H/16×W/16 个 token） | 首帧特例（时间上采样） | T=1 第二层；多帧原生 | 多帧未放开 |
+| HunyuanVideo 1.0 / Kandinsky 5 视频 | `AutoencoderKL` / LDM `Decoder`（conv3d，`CarriedConv3d`），5D z16，8x | ✔ GroupNorm：mid 在全视频上，up 级每个时间段各自统计 | ✔ 每 2 帧一段带 carry | 3D 全局（T×H/8×W/8） | — | T=1 第二层；多帧原生 | `post_quant_conv` 是 Conv3d；多帧未放开 |
+| Wan 2.1 / Qwen-Image / Krea 2 / Anima / Cosmos Predict 2 / JoyImage（`qwen_image_vae`）**用户在用** | `WanVAE` / `Decoder3d`，5D z16，8x，时间 4x | — RMS | ✔ `feat_cache`（CACHE_T=2）；首帧单独，之后每段 2 个 latent 帧 | 每帧 2D（mid） | — | T=1 第一层 Wan；多帧原生 | 多帧未放开 |
+| Wan 2.2 5B | `vae2_2.WanVAE` / `Decoder3d`（dec_dim 256），5D z48，16x（patchify 2） | — RMS | ✔ `feat_cache`，每个 latent 帧一段；输出逐帧 `torch.cat` | 每帧 2D | up 级的 `DupUp3D` 捷径、`unpatchify` | T=1 第二层；多帧原生 | 不认识（类名同为 WanVAE，但不是 2.1 的类） |
+| Mochi | `VideoVAE` / genmo `Decoder`，5D z12，8x，时间 6x | ✔ GroupNorm **逐帧**（`GroupNormSpatial`） | 因果 Conv3d（`PConv3d`），**整段视频一次算** | 只有时间维 1D 注意力（ComfyUI 通用 `optimized_attention`，第二层不分块） | `DepthToSpaceTime` | 原生 | 多帧未放开 |
+| LTX-Video 0.9.0 / 0.9.5+ / LTX 2 | `VideoVAE` / lightricks `Decoder`，5D z128，32x，时间 8x | — PixelNorm | ✔ 因果 Conv3d，按时间块解码 | — | `comfy_has_chunked_io`：写进预分配输出 | 原生 | chunked io |
+| CogVideoX | `AutoencoderKLCogVideoX` / `Decoder3D`，5D z16，8x | ✔ GroupNorm（`SpatialNorm3D`，在每个时间块上统计） | ✔ `conv_cache`；低分辨率级整段算，高分辨率级按时间块滚动 | — | 解完的块先放到 CPU | 原生 | 多帧未放开 |
+| Cosmos 1.0（CV8x8x8） | `CausalContinuousVideoTokenizer` / `DecoderFactorized`，5D z16 | ✔ GroupNorm（num_groups=1，整段） | 因果 Conv3d（复制补边），整段一次算 | 空间注意力（已知函数）+ 时间注意力 | 小波 `unpatcher3d` | 原生 | 多帧未放开 |
+| SeedVR2 | `VideoAutoencoderKLWrapper` / `Decoder3D`，5D z16 | ✔ GroupNorm 逐帧 | ✔ 因果，自带 `memory_limit` 切片 | diffusers 式（第二层不分块） | `handles_tiling` | T=1 第二层 | 不认识 |
+| MiniMax H3 视频 | `MiniMaxH3VideoVAE` / `ViT3DDecoder`，5D z24，16x | GroupNorm / RMS（transformer） | 内部按 17 帧 / 256 px 分块 | 内部 | chunked io + 自己分块 | 原生 | chunked io |
+| Mage-VAE | `MageVAE`（一步扩散 codec），4D z128，16x | 少量 | — | 有 | — | 第二层 | 不认识 |
+| TAESD / TAEF1 / TAEF2 | `TAESD`，4D | TAEF2 低分辨率级有 4 组 GroupNorm | — | — | — | 第二层 | 不认识 |
+| TAEHV / TAEW2.2 / lighttae | `TAEHV`，5D | — | 帧间 memblock | — | 输出逐帧搬到 intermediate device | 多帧原生 | 多帧未放开 |
+| Stable Cascade Stage A / Stage C previewer | `StageA`（ConvTranspose、depthwise、LayerNorm 逐像素）/ `Previewer`（BatchNorm） | — | — | — | — | 第二层 | 不认识 |
+| 像素空间（Chroma Radiance、Z-Image pixel、PixelDiT、HiDream O1） | `PixelspaceConversionVAE`（恒等） | — | — | — | — | 第二层 | **现有缺口 3** |
+| ACE-Step 音频 / LTX 2 音频 / MiniMax H3 音频 | `MusicDCAE` / `AudioVAE` / `MiniMaxH3AudioVAE`，**2D latent**（`latent_dim` 2） | — | — | — | 输出是波形 | 第二层 | **现有缺口 2** |
+| Stable Audio 1 / 3、MMAudio、Hunyuan3D、TripoSplat | 1D latent | — | — | — | — | 原生 | `latent_dim` 1 |
+
+**表二：峰值（alloc_sim，CT 700，bf16，GiB，GTT / reserved 增量；图像为「1344×768 / 3840×2160」）与第一层的预期**
+
+| VAE | 原生 | 第二层 | 第一层 | ComfyUI 估算（AMD） | 难度 / 风险 |
+|---|---|---|---|---|---|
+| SDXL / Flux `ae` | 8.36 / 52.48（实测一致） | 3.71 / 14.97 | 0.62 / 2.17（已实现） | 11.4 / 91.9 | — |
+| Flux 2 | 8.36 / 52.50 | 3.72 / 15.05 | **预计 0.62 / 2.18**：decoder 与 Flux `ae` 相同，只多了 latent 级的反归一化和 2×2 还原（放进前缀，H/16 级，几 MiB） | 11.4 / 91.9 | **低**：`vae_ldm` 接受 `bn`，前缀加一步；自检、方案、耗时模型照用 |
+| SD x4 upscaler（输出 1344×768） | 16.25 | 3.30 | 已走第一层（未单独模拟） | 45.7 | — |
+| HunyuanImage 2.1（输出 3840×2176） | 4.66 / 38.11 | 2.34 / 11.10 | 粗估 4K 2–3 GiB（全分辨率 128 通道、GroupNorm，与 SDXL 相近；未模拟） | 1.35 / 10.9 | 中：新单元「先卷积再 depth-to-space」，区间倒推要新写；GroupNorm 统计照用 |
+| HunyuanImage 2.1 Refiner（1344×768） | **50.29** | 4.43 | 粗估 1–2 GiB（未模拟） | 5.38（低估约 10 倍，原生实际会 OOM → tiled） | 高：内部 4 帧、GroupNorm 跨帧、非因果时间补零 |
+| Wan 2.1 / `qwen_image_vae` 单帧 | 6.09 / 59.14（实测一致） | 2.10 / 9.59 | 0.36 / 0.87（已实现） | 4.2 / 34.0 | — |
+| Wan 2.2 单帧 | 5.21 / 34.23 | 4.01 / **19.78**（第二层不够：全分辨率级 256 通道，激活本身大） | 粗估 4K 0.5–1.5 GiB（未模拟） | 15.4 / **123.6**（`load_models_gpu` 会卸载一切） | 中：照 `vae_wan` 写，多 `DupUp3D` 捷径、patchify |
+| HunyuanVideo 1.5 单帧 / HunyuanVideo 1.0 单帧 | 12.94 / 23.50（1344） | 3.31 / 5.38 | 未估 | 27.7 / 5.4 | 中 |
+| SeedVR2 单帧（1920×1080） | 26.26 | 9.12 | 未估 | 0.31 | 高（自带切片机制） |
+| Mage-VAE / Stage A | 0.62 / 1.44 | 相同（没有可分块的大卷积） | 不需要 | — | 不做 |
+| TAESD（1344 / 4K） | 1.77 / 14.23 | **2.66** / 4.88（1344 时第二层反而高，**现有缺口 4**） | 不需要 | 11.4 / 91.9 | — |
+| Stage C previewer（1024²） | 3.27 | 2.02 | 不需要 | 11.6 | — |
+| SVD（1024×576，14 帧） | 25.71 | 2.75（**结果错**，缺口 1） | — | 6.5 | — |
+| 视频（多帧） | | | | | |
+| Wan 2.1，832×480×81 | 8.72 | 4.96 | 粗估 1–2 GiB（按时间段条带；未模拟） | 5.2 | 第二层：低；第一层：高 |
+| Wan 2.2，1280×704×121 | 39.38 | 10.39 | 同上 | 13.4 | 第二层：低 |
+| HunyuanVideo 1.0，848×480×73 | 62.2（**超上限 → 原生退回 tiled**） | 15.21 | 未估 | 17.0 | 第二层：低 |
+| HunyuanVideo 1.5，1280×720×121 | 113（**OOM → tiled**） | 21.64 | 未估 | 24.7 | 第二层：低 |
+| CogVideoX，720×480×49 | 35.02 | 11.66 | 未估 | **88.3** | 第二层：低（解完的块放 CPU，见注） |
+| Cosmos 1.0，1280×704×121 | 30.18 | 12.99 | 未估 | 10.7 | 第二层：低 |
+| Mochi，848×480×85 | 362（OOM → tiled） | **59.3（仍在上限，第二层不够）** | 要第一层（整段视频一次算，单个激活 8.5 GiB） | 68.2 | 高 |
+| LTX 0.9.0 / LTX 2，768×512×97 | 30.6 / 59.3（**模拟里碎片严重**：alloc 只有 5.5 / 6.1，待真机确认） | 6.70 / 4.97 | 未估 | 5.7 | 中：要支持 `output_buffer`（chunked io） |
+| TAEHV / TAEW2.2 / MiniMax H3 视频 | 1.31 / 3.04 / 0.99 | 相同 | 不需要 | — | 不做 |
+
+注：模拟值都是「权重已加载、解码前清空缓存」之后的增量，输出缓冲（fp32）按 `--gpu-only` 算在设备上；CogVideoX 放到 CPU 的块不计。第二层的数字假设逐样本解码、1 GiB 工作区，估算（`estimate` / `_probe`）还没有为多帧做，这是 4b 的工作。
+
+**第二层在多帧视频上可以直接用**（`probe_vae_gaps.py` 第 4 项）：小尺寸随机权重的 Wan 2.1（5 个 latent 帧）、Wan 2.2、HunyuanVideo 1.0、HunyuanVideo 1.5、CogVideoX（全尺寸），各自的 `decode`（带时间因果缓存）在 16 KiB 工作区下几乎所有卷积按行分块，与不分块相比相对误差 ≤ 2.3e-6。原因：分块只在 H 方向，时间维的缓存拼接发生在卷积调用之前，每次调用拿到的已经是拼好的输入。
+
+**现有缺口（现在的代码，这一步只报告不修）：**
+
+1. **SVD 的结果被改变**：`VideoDecoder` 的时间混合以整个 batch 为时间轴（`timesteps` 默认等于 batch 大小），第二层逐样本解码，等于每帧单独解码。4 帧的小解码：与原生 max|Δ| = 1、平均 0.13（像素值 [0,1]），与「原生逐帧单独解码」逐位相同。（原生自己也按空闲内存切 batch，`batch_number = free / memory_used_decode`，切了同样会变；但通常一次装得下。）
+2. **2D latent 的音频 VAE 被管理**：ACE-Step（`[B,8,16,T]`）、LTX 2 音频、MiniMax H3 音频的 `latent_dim` 是 2，`_native_reason` 只看 `latent_dim`，于是走第二层。输出与原生相同，但 ACE 的形状探测（8×8 latent）失败，退回静态上界时用的放大倍数是 4096，交给 `load_models_gpu` 的估算约 **1 PiB**——每次解码都会把其他模型全部卸载。设计上（§9.8）音频应该原生。
+3. **像素空间「VAE」被管理**：恒等变换，没有卷积，却报 2 GiB 估算（原生 24 KiB），可能白白腾出 2 GiB。
+4. **小 decoder 第二层反而更高**：TAESD 1344×768 原生 1.77、第二层 2.66 GiB（第二层的 1 GiB 工作区块和预分配输出比原生最大的 columns 1.1 GiB 还占地方）。4K 时第二层仍然好得多（14.2 → 4.9）。影响小（TAESD 一般用于预览，不经过 `VAE.decode`）。
+
+另外看到 ComfyUI 自己的估算对很多 VAE 偏差很大（Wan 2.2 4K 单帧 123.6 GiB、CogVideoX 88 GiB → 卸载一切；Refiner 5.4 GiB 而实际 50 GiB → 真 OOM 后退回 tiled），被 Monoload 管理之后用的是 Monoload 的估算，这本身也是推广的收益之一。
+
+**建议的实施顺序**（等用户定）：
+
+0. **修缺口 1–3**（一个分支，小，纯正确性）：SVD 这类跨 batch 耦合的 decoder 暂时走原生（或者第二层整批一次解码，峰值仍远低于原生，但估算要按 batch 算）；音频（`extra_1d_channel` 已设、或放大倍数是音频量级）走原生；没有卷积和注意力的 first-stage model 走原生。缺口 4 可选（例如原生最大的 columns 不超过工作区时直接原生）。
+1. **Flux 2 第一层**：几乎就是改 `ldm_structure` 和前缀；4K 15.05 → 约 2.2 GiB。Flux 2 系列（Flux 2、Ideogram 4、Lens、Ernie-Image 都用这个 VAE）是现在的主流新模型。
+2. **多帧视频第二层（通用）**：放开 `_native_reason` 的多帧限制（按 VAE 类型逐个放开，先 Wan 2.1 / 2.2、HunyuanVideo 1.0 / 1.5、CogVideoX、Cosmos），`_probe` / `estimate` 认识 5D 多帧（激活和 T 不成正比：Wan / HunyuanVideo / CogVideoX 都按时间段解码，探测要用能覆盖一段的帧数，输出缓冲按全长算）；LTX 需要走 `output_buffer`。HunyuanVideo 1.0 / 1.5 原生在 CT 700 上会 OOM 退回 tiled，这里变成整段精确解码。用户的 `qwen_image_vae` 就是 Wan 2.1 VAE，将来做 Wan 2.1 视频就用得上。
+3. **Wan 2.2 单帧第一层**（照 `vae_wan` 写）：4K 19.8 → 约 1 GiB（粗估）。
+4. **HunyuanImage 2.1 第一层**：4K 11.1 → 约 2–3 GiB（粗估）。
+5. **视频第一层**（按时间段的条带，GroupNorm 按时间段统计）：工作量大，等真有需要再说；Mochi 只有这条路能降下来。
+
+不建议做：TAE 系列、Stage A / C、Mage、MiniMax H3 视频（自己分块）、SeedVR2 的第一层（自带切片）、音频和 3D。
+
+**待真机确认：** LTX 原生的碎片（模拟 reserved 30–59 GiB 而 alloc 只有 5–6 GiB）；命令 W 的输出（用户两个看不出类型的模型用哪个 VAE）。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
