@@ -801,7 +801,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_mod
 * `== models/diffusion_models`：每个文件一行 `model: <ComfyUI 的模型配置> | latent format <...> | VAE files that fit: <对得上的 VAE> [<怎么识别的>]`。识别步骤与 ComfyUI 的 UNETLoader 相同（旧量化格式转换、有前缀就去掉，没有就按原样识别）；对得上的 VAE 包括 `models/vae` 里的文件和 checkpoint 内置的 VAE。预期：
   * `krea2_turbo_bf16` → `model: Krea2 | latent format Wan21 (16 ch, 3D) | VAE files that fit: qwen_image_vae.safetensors [keys without a prefix]`
   * 两个 `luciddreamerZ_*` → `model: ZImage | latent format Flux (16 ch, 2D) | VAE files that fit: ae.safetensors [keys without a prefix]`（若是 Lumina 2 结构则显示 `Lumina2`，VAE 一样是 `ae`）
-  * `novaAnimeAM_v5029B` → `model: Anima | latent format Wan21 (16 ch, 3D) | VAE files that fit: qwen_image_vae.safetensors [prefix 'net.' removed]`
+  * `novaAnimeAM_v5029B` → `model: Anima | latent format Wan21 (16 ch, 3D) | VAE files that fit: qwen_image_vae.safetensors [prefix 'model.diffusion_model.' removed]`（CT 700 实测）
   * `wai_v17_fp8_test` → `model: SDXL | latent format SDXL (4 ch, 2D) | VAE files that fit: waiIllustriousSDXL_v170.safetensors (built-in VAE) [keys without a prefix]`
   * 不完整的文件（0 字节、下载中断）显示 `unreadable: file too small (...)` 或 `unreadable: incomplete file: ...`，不再是 struct 的原始报错。
 * 仍出现 `failed: ...` 或 `model not detected` 的文件，把那几行发给我。
@@ -809,6 +809,8 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_mod
 云端用的两个盘点脚本（不需要模型文件，锁定镜像里跑）：`tests/vae_inventory.py`（每种 VAE 的结构、现在的路、原生 / 第二层 / 第一层的模拟峰值）、`tests/probe_vae_gaps.py`（现有缺口的小解码、第二层在多帧视频上的精度）。结果见 DESIGN.md §9.16。
 
 ### 9.12 Flux 2 VAE 走第一层：真机 bench（命令 X / Y / Z）
+
+**状态：已在 CT 700 上验收（4fbaa22，结果见 §10.5）。**
 
 **先放 VAE 文件**（只需要 VAE，不需要 Flux 2 的扩散模型和文本编码器）：
 
@@ -868,6 +870,17 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae
 `check_vae_node.py`：`node copy` → 第一层 B 12 条 180 行，`budget 3.00 GiB [node]`，GTT 约 2.44 / 估算 2.97；`original` → B 17 条 128 行，全部 `[default]`，约 2.18 / 2.69；`node copy again` 同第一行。
 
 把 X / Y / Z 的输出和 JSON 发给我。
+
+**AA（可选，诊断第一次使用时的自检峰值，DESIGN §9.19）：** 两条命令各开一个新进程，不影响正在运行的 ComfyUI 之外的东西：
+
+```bash
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_selftest_mem.py \
+  --vae flux2-vae.safetensors --res 3840x2160 --budget 3 2>&1 | tee check_selftest_mem.txt
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_selftest_mem.py \
+  --vae flux2-vae.safetensors --res 3840x2160 --budget 3 --warmup 2>&1 | tee check_selftest_mem_warmup.txt
+```
+
+预期：`self-test` 一行 reserved 峰值约 0.74 GiB；第一条命令里 `self-test` 之后 `stays reserved` / `GTT after` 不为 0（这个进程的第一批 GPU 计算落在自检里），第二条命令里这部分出现在 `warm-up` 一行、`self-test` 之后为 0；两条命令的 `decode 1` / `decode 2` 都约 2.44（估算 2.97）。
 
 ## 10. 真机验收结果（CT 700，2026-10）
 
@@ -1057,6 +1070,31 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae
 * **问题与处理：** 4K 3G 选中的 D 比默认 B 更慢（63.2 对 42.0 s）、峰值更高（2.33 对 2.17）。B 落选是因为估算 3.17 GiB 里含了 1 GiB 的存档。已收紧估算（存档位置有保证时不算进 largest，4K B 2.68 GiB），耗时模型加了工作区（卷积调用数）和前缀注意力项（DESIGN.md §9.14.11）；验证命令 T。
 * **用户确认：** 不认识的 decoder 在预算连第二层都放不下时报错，保持现状。
 
+### 10.5 第四阶段：Flux 2 VAE 走第一层（`bench_vae_flux2*`、`check_vae_node_flux2`，2026-10，4fbaa22）
+
+命令 W / X / Y / Z（§9.11、§9.12）。全部与预测一致，**验收通过**。
+
+* **W：** `flux2-vae.safetensors` → `AutoencoderKL / Decoder | latent 128 ch, x16`，两个尺寸都是 `layer 1 (LDM stripes (batch-norm latent), GroupNorm scheme B)`；diffusion model 全部识别（Krea2 / ZImage ×2 / Anima / SDXL），对得上的 VAE 正确（`novaAnimeAM` 的前缀是 `model.diffusion_model.`）。
+* **X（GTT 增量 GiB / 热启动 s；估算）：**
+
+| | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| 原生 | 8.37 / 0.86 | 42.88 / 4.65 | 52.50 / 11.87 |
+| 第一层 B | 0.62 / 4.64（估算 0.76） | 1.33 / 19.70（1.61） | 2.18 / 42.07（2.69） |
+| 第二层 | 3.72 / 0.88（3.98） | 9.27 / 4.01（9.92） | 15.05 / 9.88（17.92） |
+
+  精度：第一层对原生 PSNR 64.4–64.6 dB，对 fp32 与原生对 fp32 相同（60.8–61.0 dB），差异大于 0.01 的像素里 Monoload 和原生各有一半更接近 fp32（bf16 固有噪声），条带边界附近不比别处差。fp32 解码：4K 原生 fp32 在分配器里 OOM 退回 tiled（53.8 GiB），Monoload fp32 第一层 4.03 GiB 正常完成。
+* **Y（4K 四种方案，GTT / 热启动 s）：** A 1.11 / 74.9、D 1.53 / 57.8、B 2.18 / 42.2、C 4.71 / 35.7；耗时模型 74.1 / 58.5 / 42.7 / 35.7（误差 ≤ 1.2%）；各方案 PSNR 64.5 dB。
+* **Z（按预算选，GTT / 估算 / 热启动 s）：**
+
+| | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| 预算 3G | 整图 1 条 768 行，1.98 / 2.48 / 1.0 | C 4 × 384，2.74 / 3.00 / 12.8 | B 12 × 180，2.44 / 2.97 / 41.3 |
+| 预算 1.5G | C 2 × 384，1.05 / 1.25 / 2.9 | B 16 × 96，1.22 / 1.48 / 20.4 | A 17 × 128，1.11 / 1.49 / 75.5 |
+
+  `check_vae_node.py`（4K，节点预算 3G）：副本 B 12 × 180、`budget 3.00 GiB [node]`，再次 2.44 / 2.97；原 VAE B 17 × 128、全部 `[default]`，2.18 / 2.69。
+* **发现的问题（DESIGN §9.19，待用户决定）：** 第一次使用时的自检峰值不在估算里。1344×768 第一次（含自检）reserved +0.78 / GTT +0.81，估算 0.76；节点副本 4K 预算 3G 第一次 reserved +2.68 / GTT +2.96，估算 2.97、预算 3.00。
+
 ## 11. 仓库结构
 
 ```
@@ -1083,7 +1121,8 @@ monoload/vae_overrides.py   单个 VAE 的设置（节点做的副本带的设�
 monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），lora_settings.py = Monoload LoRA Settings，vae_settings.py = Monoload VAE Settings，info.py = Monoload Info
 tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
                             bench_vae.py、check_vae_node.py、make_synthetic_vaes.py、alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10；
-                            第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16）
+                            第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16；Flux 2：test_vae_flux2.py；
+                            自检峰值诊断：check_selftest_mem.py，DESIGN.md §9.19）
 tools/watch_mem.sh          GTT / cgroup 内存监视
 tools/compare_images.py     两张图逐像素比较
 docs/DESIGN.md              设计说明
