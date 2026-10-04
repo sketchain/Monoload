@@ -63,6 +63,9 @@ MIN_ROWS = 8                 # smallest automatic / OOM-retry stripe core height
 SELFTEST_LATENT = 24         # latent rows/cols of the self-test
 SELFTEST_ROWS = 40           # forced stripe core height in the self-test (192 output rows -> 5 stripes, the last one shorter)
 SELFTEST_WORKSPACE = 8 * MIB # small workspace: the big convs inside the stripes also run in layer-2 row blocks
+SELFTEST_REF_WORKSPACE = 32 * MIB  # the reference whole-image decode under layer-2 chunking too (other row blocks than the
+                             # stripes'): without it its fp32 im2col columns made the self-test peak ~0.74 GiB (DESIGN §9.19)
+SELFTEST_MARGIN = 32 * MIB   # allocator rounding / fragmentation on top of the self-test's tensors (selftest_memory)
 SELFTEST_TOL = 1e-4          # max|stripes - whole| / max(1, max|whole|), fp32
 
 
@@ -962,9 +965,26 @@ class StripeAdapter:
         return n * mm.dtype_size(vae.vae_output_dtype())
 
     def selftest_memory(self):
-        """What the self-test needs on the device (load_models_gpu): the fp32
-        copy of the weights, the workspace, a margin."""
-        return int(self.selftest_params() * 4 + 2 * SELFTEST_WORKSPACE + 256 * MIB)
+        """Upper bound of what the self-test reserves on the device (load_models_gpu,
+        and the first decode's estimate / budget, DESIGN §9.20): the fp32 copy of
+        the weights, then the larger of the reference decode (whole image, layer-2
+        chunked at SELFTEST_REF_WORKSPACE: 4 x its largest activation + 2 x the
+        workspace, the layer-2 bound of vae.estimate) and the stripe pass (its
+        plan's estimate), the reference's output alive through both, a margin.
+        All fp32, at the self-test's geometry: the same for every image."""
+        key = ("selftest_memory", self.key)
+        hit = _PASS_COST.get(key)
+        if hit is not None:
+            return hit
+        n = SELFTEST_LATENT
+        plan = Plan(self, n, n, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0)
+        act = max(c * h * w for c, h, w in zip(plan.channels, plan.heights, plan.widths))
+        act = max(act, max(self.prefix_out_channels(m) for _, m in self.prefix) * n * n) * 4
+        out = self.out_channels * plan.h_out * plan.w_out * 4
+        ref = 4 * act + 2 * SELFTEST_REF_WORKSPACE + out
+        need = int(self.selftest_params() * 4 + max(ref, plan.estimate + out) + out + SELFTEST_MARGIN)
+        _PASS_COST[key] = need
+        return need
 
 
 # ---------------------------------------------------------------------------
@@ -977,8 +997,10 @@ _SELFTEST = {}   # structure key -> (ok, detail)
 def self_test(bound, vae):
     """First use of a structure in this process: decode a small latent with
     forced small stripes (several inner boundaries, layer-2 conv blocks inside)
-    and with the decoder's own whole-image decode, both on an fp32 copy of the
-    decoder; pass if they agree to SELFTEST_TOL. Cached per structure; the RNG
+    and with the decoder's own whole-image decode (its convs in layer-2 row
+    blocks of another size, SELFTEST_REF_WORKSPACE, which bounds its memory),
+    both on an fp32 copy of the decoder; pass if they agree to SELFTEST_TOL.
+    What it reserves is bounded by bound.selftest_memory(). Cached per structure; the RNG
     state is preserved. Afterwards the fp32 copy and every tensor of the test
     are freed and the allocator's cache is emptied, so the decode that follows
     starts from the same memory state as any later one. Returns (ok, detail)."""
@@ -1012,7 +1034,8 @@ def _self_test_run(bound, vae):
             raise StripeError("fp32 copy has structure {} instead of {}".format(tb.key, bound.key))
         g = torch.Generator().manual_seed(0)
         z = torch.randn(bound.selftest_latent(SELFTEST_LATENT), generator=g).to(dev)
-        ref = tb.reference_decode(z)
+        with OpChunking(tb.module, SELFTEST_REF_WORKSPACE, OpStats()):
+            ref = tb.reference_decode(z)
         plan = Plan(tb, SELFTEST_LATENT, SELFTEST_LATENT, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0)
         out = torch.empty_like(ref)
         stats = OpStats()
