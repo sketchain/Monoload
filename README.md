@@ -784,6 +784,24 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_lor
 
 把第 2、3、5 步的日志 / Info 文字发给我。
 
+### 9.11 第四阶段盘点：机器上的模型各用哪个 VAE（`tests/check_models.py`）
+
+只读 safetensors 文件头（和 64 KiB 以下的小张量），在 meta 设备上识别，不占内存、不碰 GPU，可以在 ComfyUI 正常运行时跑；不用重启容器（只需要 `git pull` 后的脚本）。
+
+```
+# W. 每个模型文件：是什么模型、要哪种 latent / 哪个 VAE、Monoload 现在怎么解码
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_models.py
+```
+
+预期（每个文件一段）：
+
+* `== models/vae`：`ae.safetensors` → `VAE: AutoencodingEngine / decoder Decoder | latent 16 ch, latent_dim 2, x8`，1344×768 和 3840×2160 都是 `Monoload layer 1 (LDM stripes, GroupNorm scheme B)`；`qwen_image_vae.safetensors` → `WanVAE / decoder Decoder3d | latent 16 ch, latent_dim 3, x8`，两个图像尺寸 `layer 1 (Wan 2.1 stripes)`，81 帧视频 `native: multi-frame video latent ...`。
+* `== models/checkpoints`：`waiIllustriousSDXL_v170` → `model: SDXL (latent format SDXL)`，内置 VAE `AutoencoderKL`，`layer 1`。
+* `== models/diffusion_models`：每个文件一行 `model: <ComfyUI 的模型配置> | latent format <...> | VAE files that fit: <models/vae 里对得上的文件>`。预期 `krea2_turbo_bf16` → `Krea2`、`Wan21`、`qwen_image_vae.safetensors`；`smoothmixUltimateAnima_animaV20` → `Anima`、`Wan21`、`qwen_image_vae`；`wai_v17_fp8_test` → `SDXL`（`models/vae` 里没有对得上的文件，VAE 来自 checkpoint）。**要看的是 `novaAnimeAM_v5029B` 和两个 `luciddreamerZ_*`**：文件名看不出来，推测是 Anima（→ `qwen_image_vae`）和 Z-Image（`Lumina2` / `ZImage`、`Flux` 格式 → `ae`）。
+* 出现 `failed: ...` 或 `model not detected` 的文件，把那几行发给我。
+
+云端用的两个盘点脚本（不需要模型文件，锁定镜像里跑）：`tests/vae_inventory.py`（每种 VAE 的结构、现在的路、原生 / 第二层 / 第一层的模拟峰值）、`tests/probe_vae_gaps.py`（现有缺口的小解码、第二层在多帧视频上的精度）。结果见 DESIGN.md §9.16。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
@@ -997,7 +1015,8 @@ web/monoload_i18n.js        前端扩展：下拉选项的显示文字按语言�
 monoload/vae_overrides.py   单个 VAE 的设置（节点做的副本带的设置；不导入 torch / ComfyUI）
 monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），lora_settings.py = Monoload LoRA Settings，vae_settings.py = Monoload VAE Settings，info.py = Monoload Info
 tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
-                            bench_vae.py、check_vae_node.py、make_synthetic_vaes.py、alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10）
+                            bench_vae.py、check_vae_node.py、make_synthetic_vaes.py、alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10；
+                            第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16）
 tools/watch_mem.sh          GTT / cgroup 内存监视
 tools/compare_images.py     两张图逐像素比较
 docs/DESIGN.md              设计说明
