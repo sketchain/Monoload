@@ -17,7 +17,10 @@ channel counts and random weights.
      passed to load_models_gpu, RNG untouched;
   4. what stays native (multi-frame video, ...), OOM retry with smaller
      blocks, MonoloadVAEOOMError at the floor, decode_tiled_ never called,
-     every per-instance override removed afterwards.
+     every per-instance override removed afterwards;
+  5. coverage fixes: SVD's VideoDecoder (frames mixed across the batch), audio
+     VAEs with a 2D latent and the pixel-space VAE stay native; the result is
+     native's and load_models_gpu gets ComfyUI's own estimate.
 
     python tests/test_vae.py           # COMFY_ARGS default: --cpu --fp16-unet
 """
@@ -428,6 +431,68 @@ def timing_sync_test(v):
     check("managed decode synchronizes the device before starting and before stopping the clock ({} calls)".format(len(calls)), len(calls) == 2)
 
 
+# ---------------------------------------------------------------------------
+# 5. coverage fixes (phase 4b-0): what must stay native
+# ---------------------------------------------------------------------------
+
+def svd_vae():
+    """comfy.sd.VAE of SVD's structure (sd.py builds it full size from the mix_factor key), random weights."""
+    from comfy.ldm.models.autoencoder import AutoencodingEngine
+    enc = {'double_z': True, 'z_channels': 4, 'resolution': 256, 'in_channels': 3, 'out_ch': 3, 'ch': 128, 'ch_mult': [1, 2, 4, 4],
+           'num_res_blocks': 2, 'attn_resolutions': [], 'dropout': 0.0}
+    m = AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
+                           encoder_config={'target': "comfy.ldm.modules.diffusionmodules.model.Encoder", 'params': enc},
+                           decoder_config={'target': "comfy.ldm.modules.temporal_ae.VideoDecoder",
+                                           'params': dict(enc, video_kernel_size=[3, 1, 1], alpha=0.0)})
+    init_random(m)
+    sd = m.state_dict()
+    del m
+    return comfy.sd.VAE(sd=sd, dtype=torch.float32)
+
+
+def coverage_tests(sdxl, wan):
+    g = torch.Generator().manual_seed(11)
+    mvae.set_workspace(16 * 1024)
+    # SVD: 3 frames as a batch; a frame-by-frame (managed) decode would differ
+    v = svd_vae()
+    lat = torch.randn(3, 4, 6, 8, generator=g)
+    with Spy() as spy:
+        out = comfy.sd.VAE.decode(v, lat)
+    last = mvae.last_decode()
+    ref = native_decode(v, lat)
+    alone = torch.cat([native_decode(v, lat[i:i + 1]) for i in range(lat.shape[0])])
+    check("SVD VideoDecoder (frames as the batch): left native, result == native ({}), not the frame-by-frame decode (max|Δ| {:.2g})".format(
+        last.get("reason", "")[:90], (alone - ref).abs().max().item()),
+        last.get("strategy") == "native" and "batch" in last.get("reason", "") and torch.equal(out, ref)
+        and (alone - ref).abs().max().item() > 1e-3 and spy.tiled == 0)
+    del v
+
+    # audio VAEs with a 2D latent: marked by extra_1d_channel (ACE-Step, LTX audio) or by an audio upscale ratio (MiniMax audio)
+    def fake(**kw):
+        return type("V", (), dict({"first_stage_model": torch.nn.Conv2d(1, 1, 3), "latent_dim": 2, "upscale_ratio": 8, "extra_1d_channel": None}, **kw))()
+    ace = mvae._native_reason(fake(extra_1d_channel=16, upscale_ratio=4096), torch.zeros(1, 8, 16, 32))
+    mmx = mvae._native_reason(fake(upscale_ratio=800), torch.zeros(1, 32, 2, 40))
+    img = [mvae._native_reason(fake(upscale_ratio=r), torch.zeros(1, 4, 8, 8)) for r in (4, 8, 16, 32)]
+    check("audio VAEs with a 2D latent stay native (ACE-like: {}; MiniMax-like: {}); image ratios 4 / 8 / 16 / 32 do not".format(ace, mmx),
+          ace is not None and "audio" in ace and mmx is not None and "audio" in mmx and img == [None] * 4)
+
+    # pixel space: an identity, nothing to chunk
+    px = comfy.sd.VAE(sd={"pixel_space_vae": torch.tensor(1.0)}, dtype=torch.float32)
+    lat = torch.rand(1, 3, 16, 24, generator=g) * 2 - 1
+    with Spy() as spy:
+        out = comfy.sd.VAE.decode(px, lat)
+    last = mvae.last_decode()
+    ref = native_decode(px, lat)
+    native_est = px.memory_used_decode(lat.shape, px.vae_dtype)
+    check("pixel-space VAE: left native ({}), result == native, load_models_gpu got ComfyUI's estimate {} (not Monoload's 2 GiB)".format(
+        last.get("reason", "")[:80], spy.loads), last.get("strategy") == "native" and "nothing to manage" in last.get("reason", "")
+        and torch.equal(out, ref) and spy.loads == [native_est])
+
+    # image VAEs are still managed
+    check("image VAEs still managed: SDXL-like 4D, Wan-like 5D T=1",
+          mvae._native_reason(sdxl, torch.zeros(1, 4, 8, 8)) is None and mvae._native_reason(wan, torch.zeros(1, 16, 1, 8, 8)) is None)
+
+
 def main():
     if not mvae.is_installed():
         check("vae.install() on this ComfyUI", mvae.install())
@@ -436,6 +501,7 @@ def main():
     attention_tests()
     sdxl, wan = decoder_tests()
     fallback_and_oom_tests(sdxl, wan)
+    coverage_tests(sdxl, wan)
     timing_sync_test(sdxl)
     misc_tests()
     finish()
