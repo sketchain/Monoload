@@ -9,7 +9,8 @@ MonoloadRuntimePatch in its weight_function/bias_function list, and
 comfy.ops' cast_bias_weight merges it into a temporary copy of that one layer
 when the layer runs.
 
-Two merge paths (switch: MONOLOAD_EXACT, read at import; set_exact() at runtime):
+Two merge paths (global default: MONOLOAD_EXACT, read at import; set_exact()
+at runtime; a model's Monoload LoRA Settings node may choose its own):
   default         plain LoRA / LoCon patches are added with one fused
                   addmm_ into the compute-dtype temporary (C); every other
                   patch type goes through comfy.lora.calculate_weight with the
@@ -18,11 +19,17 @@ Two merge paths (switch: MONOLOAD_EXACT, read at import; set_exact() at runtime)
                   a native (baked) merge; see docs/DESIGN.md for the error.
   MONOLOAD_EXACT=1  bit-identical to native ComfyUI.
 
+Which patchers Monoload drives (_enabled): a patcher whose Monoload LoRA
+Settings mode is enable / native (monoload/lora_overrides.py, carried in
+model_options), else the master switch (monoload/settings.py). For one it
+does not drive (MONOLOAD=0, or mode native) every replaced method passes the
+call straight to ComfyUI's original (_active() is False), so it behaves
+exactly as native; the installed methods only cost one check per call.
+
 uninstall() restores the original methods (models should be unloaded first).
 """
 
 import logging
-import os
 import weakref
 
 import torch
@@ -36,28 +43,25 @@ import comfy.utils
 import comfy.weight_adapter
 from comfy.model_patcher import LowVramPatch, ModelPatcher, get_key_weight
 
+from . import lora_overrides, settings
 from .errors import MonoloadError, MonoloadUnsupportedError
+from .messages import msg
 
 _ORIG = {}
 _ORIG_DYNAMIC = {}
 _WARNED = set()
 
 
-def _env_flag(name):
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
-
-
-_MODE = {"exact": _env_flag("MONOLOAD_EXACT")}
-
-
 def set_exact(on):
-    """True: bit-exact merge (= native ComfyUI). False: fused/relaxed default.
-    Takes effect at the next layer call; nothing has to be reloaded."""
-    _MODE["exact"] = bool(on)
+    """True: bit-exact merge (= native ComfyUI) as the global default. False:
+    fused/relaxed default. Takes effect at the next layer call; nothing has to
+    be reloaded. A model whose Monoload LoRA Settings node chose a merge keeps it."""
+    settings.set_exact(on)
 
 
 def is_exact():
-    return _MODE["exact"]
+    """The global default merge (MONOLOAD_EXACT at import)."""
+    return settings.exact()
 
 
 _MATH_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
@@ -166,8 +170,9 @@ class MonoloadRuntimePatch(LowVramPatch):
 
     is_monoload_patch = True
 
-    def __init__(self, key, patches, module, attr, state):
+    def __init__(self, key, patches, module, attr, state, exact=None):
         super().__init__(key, patches)
+        self.exact = exact   # the model's own merge (Monoload LoRA Settings), None = the global default
         self._module = weakref.ref(module)
         self.attr = attr
         self.state = state
@@ -214,7 +219,7 @@ class MonoloadRuntimePatch(LowVramPatch):
         if not base and not hooks:
             return weight
         param = getattr(self._module(), self.attr)
-        if not _MODE["exact"]:
+        if not (settings.exact() if self.exact is None else self.exact):
             return self._call_fast(weight, param, base, hooks)
         device = weight.device
         pdt = param.dtype  # for a QuantizedTensor: its dequantized dtype
@@ -317,16 +322,25 @@ def _is_runtime_patch(f):
 # helpers on a patcher
 # ---------------------------------------------------------------------------
 
+def _enabled(patcher):
+    """Monoload drives this patcher's LoRA: its Monoload LoRA Settings mode
+    (enable / native), else the master switch (MONOLOAD)."""
+    return lora_overrides.enabled(patcher)
+
+
 def _active(patcher):
-    """Monoload only drives patchers whose class still uses ModelPatcher's own
-    patch_weight_to_device. Subclasses with their own weight patching (e.g.
-    ComfyUI-GGUF) keep their native behaviour."""
+    """Monoload drives this patcher: it is enabled (_enabled) and its class
+    still uses ModelPatcher's own patch_weight_to_device. Subclasses with
+    their own weight patching (e.g. ComfyUI-GGUF) keep their native
+    behaviour. Not active -> every replaced method is the native one."""
+    if not _enabled(patcher):
+        return False
     cls = type(patcher)
     if cls.patch_weight_to_device is _patch_weight_to_device:
         return True
     if cls not in _WARNED:
         _WARNED.add(cls)
-        logging.warning("[Monoload] {}.{} overrides patch_weight_to_device; Monoload leaves it native".format(cls.__module__, cls.__qualname__))
+        logging.warning(msg("lora.subclass_native", cls="{}.{}".format(cls.__module__, cls.__qualname__)))
     return False
 
 
@@ -342,29 +356,22 @@ def _first_key(patcher):
 
 def _check_dynamic(patcher):
     if comfy.memory_management.aimdo_enabled and _has_patches(patcher):
-        raise MonoloadUnsupportedError(
-            "dynamic_vram",
-            "ComfyUI 开启了 DynamicVRAM（comfy-aimdo），Monoload 不支持在这种模式下打 LoRA。"
-            "请用 --gpu-only / --highvram / --disable-dynamic-vram 启动，或设 MONOLOAD_DISABLE=1 关闭 Monoload。",
-            key=_first_key(patcher))
+        raise MonoloadUnsupportedError("dynamic_vram", msg("lora.dynamic_vram"), key=_first_key(patcher))
 
 
 def _module_for_key(patcher, key):
     parts = key.rsplit(".", 1)
     if len(parts) != 2:
-        raise MonoloadUnsupportedError("lora_non_comfy_ops_param", "patch 的目标不是某个层的参数", key=key)
+        raise MonoloadUnsupportedError("lora_non_comfy_ops_param", msg("lora.not_layer_param"), key=key)
     return comfy.utils.get_attr(patcher.model, parts[0]), parts[1]
 
 
 def _install_runtime_patch(patcher, key):
     st = _state(patcher)
+    patcher.model.__dict__["_monoload_runtime"] = True   # runtime patches may live on this model's modules
     module, attr = _module_for_key(patcher, key)
     if not hasattr(module, "comfy_cast_weights") or attr not in ("weight", "bias"):
-        raise MonoloadUnsupportedError(
-            "lora_non_comfy_ops_param",
-            "被 LoRA/patch 修改的参数所在的模块 {} 不是 comfy.ops 层，没有运行时合并路径；"
-            "Monoload 不会退回到「改权重+备份」。".format(type(module).__name__),
-            key=key)
+        raise MonoloadUnsupportedError("lora_non_comfy_ops_param", msg("lora.non_comfy_ops", module=type(module).__name__), key=key)
     # Quantized weights (mixed-precision ops, set_/convert_ functions) are
     # handled in relaxed mode: merged on the dequantized temporary and never
     # re-quantized (see MonoloadRuntimePatch._source).
@@ -372,15 +379,12 @@ def _install_runtime_patch(patcher, key):
     patches = list(patcher.patches.get(key, [])) + list(st.hook_patches.get(key, []))
     new_shape = comfy.lora.calculate_shape(patches, weight, key)
     if tuple(new_shape) != tuple(weight.shape):
-        raise MonoloadUnsupportedError(
-            "lora_shape_change",
-            "patch 会把权重形状从 {} 改成 {}，运行时合并无法支持".format(list(weight.shape), list(new_shape)),
-            key=key)
+        raise MonoloadUnsupportedError("lora_shape_change", msg("lora.shape_change", old=list(weight.shape), new=list(new_shape)), key=key)
     fn_attr = attr + "_function"
     funcs = [f for f in getattr(module, fn_attr, []) if not (_is_runtime_patch(f) and f.key == key)]
     # LoRA first: under a native full load it is baked into the weight, so it
     # comes before any weight_wrapper_patches.
-    funcs.insert(0, MonoloadRuntimePatch(key, patcher.patches, module, attr, st))
+    funcs.insert(0, MonoloadRuntimePatch(key, patcher.patches, module, attr, st, exact=lora_overrides.merge_exact(patcher)))
     setattr(module, fn_attr, funcs)
 
 
@@ -402,6 +406,8 @@ def _remove_runtime_patches(patcher, keep=None):
                 touched = True
         if touched and hasattr(m, "comfy_patched_weights"):
             del m.comfy_patched_weights
+    if keep is None:
+        patcher.model.__dict__.pop("_monoload_runtime", None)
 
 
 def _drop_shadowed_runtime_patches(patcher):
@@ -423,7 +429,7 @@ def _drop_shadowed_runtime_patches(patcher):
 
 def _assert_no_backup(patcher):
     if len(patcher.backup) > 0 or len(patcher.hook_backup) > 0:
-        raise MonoloadError("[Monoload] 内部错误：出现了权重备份 {}".format(list(patcher.backup)[:5] + list(patcher.hook_backup)[:5]))
+        raise MonoloadError(msg("lora.internal_backup", keys=list(patcher.backup)[:5] + list(patcher.hook_backup)[:5]))
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +437,7 @@ def _assert_no_backup(patcher):
 # ---------------------------------------------------------------------------
 
 def _patch_weight_to_device(self, key, device_to=None, inplace_update=False, return_weight=False, force_cast=False):
-    if key not in self.patches or return_weight:
+    if key not in self.patches or return_weight or not _enabled(self):
         # Unpatched keys are a no-op natively; return_weight only computes a
         # temporary merged tensor and never writes or backs up.
         return _ORIG["patch_weight_to_device"](self, key, device_to=device_to, inplace_update=inplace_update,
@@ -445,11 +451,7 @@ def _load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=Fals
         return _ORIG["load"](self, device_to, lowvram_model_memory=lowvram_model_memory, force_patch_weights=force_patch_weights, full_load=full_load)
     _check_dynamic(self)
     if force_patch_weights and len(self.patches) > 0:
-        raise MonoloadUnsupportedError(
-            "force_patch_weights",
-            "有节点要求把 LoRA/patch 直接烘焙进权重（force_patch_weights，常见于保存/合并模型）。"
-            "Monoload 只做运行时临时合并，不改权重、不备份；需要保存合并结果时请设 MONOLOAD_DISABLE=1 后运行。",
-            key=_first_key(self))
+        raise MonoloadUnsupportedError("force_patch_weights", msg("lora.force_patch"), key=_first_key(self))
     # Native load() wipes weight_function on every fully-loaded comfy.ops
     # module but skips modules already flagged comfy_patched_weights (natively
     # their patches are baked in). Ours are not, so make every patched module
@@ -472,7 +474,7 @@ def _partially_unload(self, device_to, memory_to_free=0, force_patch_weights=Fal
     if not _active(self):
         return _ORIG["partially_unload"](self, device_to, memory_to_free=memory_to_free, force_patch_weights=force_patch_weights)
     if force_patch_weights and len(self.patches) > 0:
-        raise MonoloadUnsupportedError("force_patch_weights", "Monoload 模型不支持 force_patch_weights", key=_first_key(self))
+        raise MonoloadUnsupportedError("force_patch_weights", msg("lora.force_patch_unload"), key=_first_key(self))
     freed = _ORIG["partially_unload"](self, device_to, memory_to_free=memory_to_free, force_patch_weights=force_patch_weights)
     _drop_shadowed_runtime_patches(self)
     _assert_no_backup(self)
@@ -481,9 +483,14 @@ def _partially_unload(self, device_to, memory_to_free=0, force_patch_weights=Fal
 
 def _unpatch_model(self, device_to=None, unpatch_weights=True):
     r = _ORIG["unpatch_model"](self, device_to=device_to, unpatch_weights=unpatch_weights)
-    if unpatch_weights and _active(self):
+    # runtime patches are removed whoever installed them (the model's flag:
+    # e.g. the switch changed while it was loaded); without any, nothing to do
+    if unpatch_weights and self.model.__dict__.get("_monoload_runtime", False):
         _remove_runtime_patches(self)
-        _state(self).device_cache.clear()
+    if unpatch_weights:
+        st = self.__dict__.get("_monoload_state")
+        if st is not None:
+            st.device_cache.clear()
     return r
 
 
@@ -533,17 +540,18 @@ def _patch_hook_weight_to_device(self, hooks, combined_patches, key, original_we
         return _ORIG["patch_hook_weight_to_device"](self, hooks, combined_patches, key, original_weights, memory_counter)
     if key not in combined_patches:
         return
-    raise MonoloadError("[Monoload] 内部错误：hook 不应走写权重的路径（key={}）".format(key))
+    raise MonoloadError(msg("lora.internal_hook_write", key=key))
 
 
 def _patch_cached_hook_weights(self, cached_weights, key, memory_counter):
     if not _active(self):
         return _ORIG["patch_cached_hook_weights"](self, cached_weights, key, memory_counter)
-    raise MonoloadError("[Monoload] 内部错误：hook 不应走缓存权重的路径（key={}）".format(key))
+    raise MonoloadError(msg("lora.internal_hook_cache", key=key))
 
 
 def _dynamic_load(self, *args, **kwargs):
-    _check_dynamic(self)
+    if _enabled(self):
+        _check_dynamic(self)
     return _ORIG_DYNAMIC["load"](self, *args, **kwargs)
 
 

@@ -1,0 +1,127 @@
+{
+  "MonoloadLoRASettings": {
+    "display_name": "Monoload LoRA 设置",
+    "description": "这个模型（和 CLIP）的 LoRA 由 Monoload 怎么处理：输出一个 clone（共享权重，输入不变），带自己的设置。留在「跟随全局」的项跟随全局设置（环境变量），再没有就用内置默认。放在 LoRA 加载器前后都可以。",
+    "inputs": {
+      "model": {
+        "name": "模型",
+        "tooltip": "扩散模型（通常接在 LoRA 加载器后面）；不会被修改，输出是 clone。"
+      },
+      "mode": {
+        "name": "模式",
+        "tooltip": "跟随全局：MONOLOAD=0 时原生；启用：这个模型用 Monoload 的运行时合并（不留权重备份），全局关闭时也启用；原生：这个模型用 ComfyUI 自己的 LoRA 处理。",
+        "options": {
+          "default": "跟随全局",
+          "enable": "启用",
+          "native": "原生"
+        }
+      },
+      "merge": {
+        "name": "合并方式",
+        "tooltip": "跟随全局：看 MONOLOAD_EXACT；默认融合：普通 LoRA 一次融合的 fp16 addmm（快，差异在舍入量级）；逐位一致：与原版 ComfyUI 逐位一致（每步更慢）。",
+        "options": {
+          "default": "跟随全局",
+          "fused": "默认（融合 addmm）",
+          "exact": "逐位一致"
+        }
+      },
+      "after_prompt": {
+        "name": "prompt 结束后",
+        "tooltip": "跟随全局：释放（MONOLOAD_KEEP_LORA=1 时保留；原生的模型保留）；释放 LoRA：每个 prompt 结束后丢掉这个模型的 LoRA 状态（底模保持加载）；保留：留到下一个 prompt。",
+        "options": {
+          "default": "跟随全局",
+          "release": "释放 LoRA",
+          "keep": "保留"
+        }
+      },
+      "clip": {
+        "name": "CLIP",
+        "tooltip": "可选：要用同样设置的 CLIP（文本编码器）。"
+      }
+    },
+    "outputs": {
+      "0": {
+        "name": "模型"
+      },
+      "1": {
+        "name": "CLIP"
+      }
+    }
+  },
+  "MonoloadVAESettings": {
+    "display_name": "Monoload VAE 设置",
+    "description": "输出这个 VAE 的副本（共享权重，输入不变），带 Monoload 解码管理的单独设置。留在「跟随全局」的项跟随全局设置（环境变量），再没有就用内置默认。",
+    "inputs": {
+      "vae": {
+        "name": "VAE",
+        "tooltip": "要设置的 VAE；不会被修改，输出是共享权重的副本。"
+      },
+      "budget": {
+        "name": "预算",
+        "tooltip": "跟随全局：MONOLOAD_VAE_BUDGET；不限：这个 VAE 不限预算（Monoload 的默认条带策略）；自定义：用「预算 (GiB)」。",
+        "options": {
+          "default": "跟随全局",
+          "unlimited": "不限",
+          "custom": "自定义"
+        }
+      },
+      "budget_gib": {
+        "name": "预算 (GiB)",
+        "tooltip": "峰值预算，只在「预算」选「自定义」时生效：在估算不超过它的做法里选预计最快的（一个都放不下时报错，写明各需要多少）。"
+      },
+      "gn_scheme": {
+        "name": "GroupNorm 方案",
+        "tooltip": "LDM decoder（SDXL / SD1.5 / SD3 / Flux ae）第一层（条带解码）的 GroupNorm 方案：把哪些中间结果整张存下来，让统计整图 GroupNorm 统计量的那几遍从存档出发，而不必每遍都从 H/8 存档重算。A：什么都不存——内存最低、重算最多、最慢；D：存 H/4 级的输出；B：存 H/4 和 H/2 级的输出——内置默认；C：再加上全分辨率每个块的输入——内存最高、最快。SDXL 4K 实测：A 约 1.1 GiB / 75 s，D 约 1.5 / 58，B 约 2.2 / 42，C 约 4.7 / 36。跟随全局：看 MONOLOAD_VAE_GN_SCHEME；没设时用 B，设了预算时选放得下的里面最快的方案。",
+        "options": {
+          "default": "跟随全局",
+          "A": "A（不存，内存最低）",
+          "B": "B（内置默认）",
+          "C": "C（存最多，最快）",
+          "D": "D（存 H/4）"
+        }
+      },
+      "stripe_rows": {
+        "name": "条带高度（行）",
+        "tooltip": "第一层的条带高度（输出行数）：强制使用。0 = 跟随全局（MONOLOAD_VAE_STRIPE_ROWS）。"
+      },
+      "mode": {
+        "name": "模式",
+        "tooltip": "跟随全局：MONOLOAD=0 时原生；自动：为这个 VAE 打开 Monoload 的解码管理（认得的 decoder 走第一层条带，其余走第二层），全局关闭时也打开；只用第二层：不用条带；原生：这个 VAE 用 ComfyUI 自己的解码。",
+        "options": {
+          "default": "跟随全局",
+          "auto": "自动（启用）",
+          "layer 2 only": "只用第二层",
+          "native": "原生"
+        }
+      }
+    },
+    "outputs": {
+      "0": {
+        "name": "VAE"
+      }
+    }
+  },
+  "MonoloadInfo": {
+    "display_name": "Monoload 信息",
+    "description": "Monoload 在做什么：版本、总开关和全局默认值；接 VAE 时显示它的解码设置和上一次解码；接 MODEL 时显示它的 LoRA 和处理方式。每次运行都刷新。",
+    "inputs": {
+      "vae": {
+        "name": "VAE",
+        "tooltip": "显示这个 VAE 的解码设置（带来源）和它上一次解码的记录。"
+      },
+      "model": {
+        "name": "模型",
+        "tooltip": "显示这个模型上的 LoRA 以及 Monoload 怎么处理它们。"
+      },
+      "images": {
+        "name": "图像",
+        "tooltip": "不读取内容：接上 VAE Decode 的输出，让这个节点在解码之后运行。"
+      }
+    },
+    "outputs": {
+      "0": {
+        "name": "文本"
+      }
+    }
+  }
+}

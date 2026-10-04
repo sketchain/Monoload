@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full CPU test suite in the locked image. Needs, under $MODELS:
+# Full CPU test suite in the locked image (tests/test_vae.py needs no model files). Needs, under $MODELS:
 #   checkpoints/v1-5-pruned-emaonly-fp16.safetensors        (CheckpointLoaderSimple)
 #   diffusion_models/v1-5-pruned-emaonly-fp16.safetensors   (UNETLoader; same file, a hard link is fine)
 #   diffusion_models/sd15_unet_fp8_scaled.safetensors       (tests/make_fp8_unet.py)
@@ -18,9 +18,21 @@ step() { echo; echo "######## $*"; }
 run() { "$@" 2>&1 | grep -vE "agent.cpp|sysfs nodes|comfy_kitchen backend|it/s\]|s/it\]|nodes_replacements" ; local rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { echo "!!! exit $rc"; fails=$((fails+1)); }; }
 
 step "plugin entry (installed)";            run $R python tests/test_entry.py
+step "plugin entry (MONOLOAD=0)";          run env MONOLOAD=0 $R python tests/test_entry.py
+step "plugin entry (MONOLOAD_LANG=zh)";   run env MONOLOAD_LANG=zh $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_DISABLE=1)";   run env MONOLOAD_DISABLE=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_KEEP_LORA=1)"; run env MONOLOAD_KEEP_LORA=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_EXACT=1)";     run env MONOLOAD_EXACT=1 $R python tests/test_entry.py
+step "plugin entry (MONOLOAD_DISABLE_VAE=1)"; run env MONOLOAD_DISABLE_VAE=1 $R python tests/test_entry.py
+step "plugin entry (MONOLOAD_DISABLE_VAE_STRIPE=1)"; run env MONOLOAD_DISABLE_VAE_STRIPE=1 $R python tests/test_entry.py
+step "messages and translations (no model files)"; run $R python tests/test_messages.py
+step "release with a chain of patch-free clones (no model files)"; run $R python tests/test_release_chain.py
+step "Info node (no model files)"; run $R python tests/test_info_node.py
+step "master switch: MONOLOAD=0 == native bit for bit, priorities (no model files)"; run $R python tests/test_master_switch.py
+step "LoRA Settings node (synthetic SD1.5: python tests/make_synthetic_checkpoint.py \$MODELS)"
+if [ -f "$MODELS/checkpoints/synthetic_sd15.safetensors" ]; then run $R python tests/test_lora_node.py; else echo "skipped: no synthetic checkpoint"; fi
+step "VAE decode: op-level chunking vs native (synthetic decoders, no model files)"; run $R python tests/test_vae.py
+step "VAE decode: layer 1, Wan 2.1 stripes vs native (synthetic decoder, no model files)"; run $R python tests/test_vae_stripe.py
 # every functional suite runs on both merge paths: bit-exact (MONOLOAD_EXACT=1)
 # and the default (fused / relaxed, checked against native within tolerance)
 for EXACT in 1 ""; do
