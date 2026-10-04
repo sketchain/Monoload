@@ -13,9 +13,14 @@ safe to run next to a working ComfyUI.
                                 image (and an 81-frame video for video VAEs)
   models/checkpoints            the model ComfyUI detects, its latent format, and
                                 the built-in VAE (as above)
-  models/diffusion_models, unet the model ComfyUI detects and its latent format,
-                                i.e. the VAE family it needs, and the files in
-                                models/vae that fit it
+  models/diffusion_models, unet the model ComfyUI detects (the same steps as
+                                its UNETLoader: old quantization formats converted,
+                                a key prefix removed when present) and its latent
+                                format, i.e. the VAE family it needs, and the files in
+                                models/vae (or checkpoints' built-in VAEs) that fit it
+
+A file that is not a complete safetensors file (too small, header or data cut
+short) is reported as unreadable with the reason.
 
 --dir DIR reads a models directory directly instead of ComfyUI's folder paths.
 """
@@ -52,13 +57,33 @@ DTYPES = {"F64": torch.float64, "F32": torch.float32, "F16": torch.float16, "BF1
           "U32": getattr(torch, "uint32", torch.int32), "U64": getattr(torch, "uint64", torch.int64)}
 
 
+class HeaderError(Exception):
+    """The file is not a complete safetensors file."""
+
+
 def read_header(path):
-    """(state dict: meta tensors, real ones for the small entries; metadata dict or None)."""
+    """(state dict: meta tensors, real ones for the small entries; metadata dict or None).
+    HeaderError when the file is too small, its header incomplete or not JSON, or
+    its tensor data cut short (an interrupted download, a 0-byte placeholder)."""
+    size = os.path.getsize(path)
+    if size < 8:
+        raise HeaderError("file too small ({} bytes): not a safetensors file, or an empty / interrupted download".format(size))
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
-        header = json.loads(f.read(n))
+        if n == 0 or 8 + n > size:
+            raise HeaderError("incomplete file: the header says {} bytes, the file has {} after the 8-byte length "
+                              "(interrupted download, or not a safetensors file)".format(n, size - 8))
+        try:
+            header = json.loads(f.read(n))
+        except ValueError as e:
+            raise HeaderError("header is not valid JSON ({}): not a safetensors file, or a damaged one".format(e))
+        if not isinstance(header, dict):
+            raise HeaderError("header is not a JSON object: not a safetensors file")
         base = 8 + n
         meta = header.pop("__metadata__", None)
+        end = max((info["data_offsets"][1] for info in header.values() if isinstance(info, dict) and "data_offsets" in info), default=0)
+        if base + end > size:
+            raise HeaderError("incomplete file: the tensor data ends at byte {}, the file has {} (interrupted download?)".format(base + end, size))
         sd = {}
         for k, info in header.items():
             dt = DTYPES.get(info["dtype"])
@@ -140,14 +165,67 @@ def describe_vae(v, indent="   "):
         print("{}   {}x{}{} latent {}: Monoload {}".format(indent, w, h, " x{} frames".format(fr) if fr > 1 else "", list(s), monoload_path(v, s)))
 
 
-def detect(sd, prefix, meta):
-    cfg = md.model_config_from_unet(sd, prefix, metadata=meta)
-    if cfg is None:
-        return None, None
+def _latent_format(cfg):
     lf = getattr(cfg, "latent_format", None)
     if lf is not None and not isinstance(lf, type):
         lf = type(lf)   # the config holds an instance
-    return cfg, lf
+    return lf
+
+
+class _Quiet:
+    """ComfyUI's info lines during detection (quantization found, ...) would split the report."""
+
+    def __enter__(self):
+        logging.disable(logging.INFO)
+
+    def __exit__(self, *exc):
+        logging.disable(logging.NOTSET)
+        return False
+
+
+def detect_checkpoint(sd, meta):
+    """(config, latent format class) as comfy.sd.load_state_dict_guess_config detects a checkpoint."""
+    with _Quiet():
+        return _detect_checkpoint(sd, meta)
+
+
+def _detect_checkpoint(sd, meta):
+    prefix = md.unet_prefix_from_state_dict(sd)
+    sd, meta = comfy.utils.convert_old_quants(sd, prefix, metadata=meta)
+    cfg = md.model_config_from_unet(sd, prefix, metadata=meta)
+    return cfg, _latent_format(cfg) if cfg is not None else None
+
+
+def detect_diffusion_model(sd, meta):
+    """(config, latent format class, how) as comfy.sd.load_diffusion_model_state_dict
+    detects a diffusion model: old quantization formats converted, the prefix
+    unet_prefix_from_state_dict finds removed when keys carry it (its fallback
+    "model." usually matches nothing: then the keys stay as they are), detection
+    without a prefix; then the diffusers MMDiT and diffusers UNet layouts."""
+    with _Quiet():
+        return _detect_diffusion_model(sd, meta)
+
+
+def _detect_diffusion_model(sd, meta):
+    sd, meta = comfy.utils.convert_old_quants(sd, "", metadata=meta)
+    prefix = md.unet_prefix_from_state_dict(sd)
+    stripped = comfy.utils.state_dict_prefix_replace(sd, {prefix: ""}, filter_keys=True)
+    if stripped:
+        sd = stripped
+        sd, meta = comfy.utils.convert_old_quants(sd, "", metadata=meta)
+        how = "prefix {!r} removed".format(prefix)
+    else:
+        how = "keys without a prefix"
+    cfg = md.model_config_from_unet(sd, "", metadata=meta)
+    if cfg is None:
+        mmdit = md.convert_diffusers_mmdit(sd, "")
+        if mmdit is not None:
+            cfg = md.model_config_from_unet(mmdit, "")
+            how += ", diffusers MMDiT layout"
+        else:
+            cfg = md.model_config_from_diffusers_unet(sd)
+            how += ", diffusers UNet layout"
+    return cfg, _latent_format(cfg) if cfg is not None else None, how
 
 
 def main():
@@ -169,6 +247,8 @@ def main():
                 continue
             vaes[name] = (type(v.first_stage_model).__name__, v.latent_channels, v.latent_dim)
             describe_vae(v)
+        except HeaderError as e:
+            print("   unreadable:", e)
         except Exception as e:
             print("   failed: {}: {}".format(type(e).__name__, str(e)[:300]))
     print("== models/checkpoints")
@@ -178,8 +258,7 @@ def main():
         print(" ", name)
         try:
             sd, meta = read_header(path)
-            prefix = md.unet_prefix_from_state_dict(sd)
-            cfg, lf = detect(sd, prefix, meta)
+            cfg, lf = detect_checkpoint(dict(sd), meta)
             print("   model: {} (latent format {})".format(type(cfg).__name__ if cfg else "not detected", lf.__name__ if lf else "-"))
             vsd = comfy.utils.state_dict_prefix_replace(sd, {"first_stage_model.": ""}, filter_keys=True)
             if not vsd:
@@ -188,31 +267,34 @@ def main():
             if v is None:
                 print("   no built-in VAE")
             else:
+                vaes[name + " (built-in VAE)"] = (type(v.first_stage_model).__name__, v.latent_channels, v.latent_dim)
                 describe_vae(v)
+        except HeaderError as e:
+            print("   unreadable:", e)
         except Exception as e:
             print("   failed: {}: {}".format(type(e).__name__, str(e)[:300]))
     seen = set()
     for folder in ("diffusion_models", "unet"):
+        todo = [(n, p) for n, p in files(folder, a.dir) if n.endswith(".safetensors") and os.path.realpath(p) not in seen]
+        if folder == "unet" and not todo:
+            continue   # folder_paths lists models/unet under diffusion_models too
         print("== models/" + folder)
-        for name, path in files(folder, a.dir):
-            if not name.endswith(".safetensors"):
-                continue
-            if os.path.realpath(path) in seen:
-                continue   # folder_paths lists models/unet under diffusion_models too
+        for name, path in todo:
             seen.add(os.path.realpath(path))
             print(" ", name)
             try:
                 sd, meta = read_header(path)
-                prefix = md.unet_prefix_from_state_dict(sd)
-                cfg, lf = detect(sd, prefix, meta)
+                cfg, lf, how = detect_diffusion_model(sd, meta)
                 if cfg is None:
-                    print("   model not detected (prefix {!r})".format(prefix))
+                    print("   model not detected ({})".format(how))
                     continue
                 inst = lf() if lf else None
                 ch, dims = getattr(inst, "latent_channels", None), getattr(inst, "latent_dimensions", None)
                 fits = [n for n, (cls, c, d) in vaes.items() if c == ch and d == dims]
-                print("   model: {} | latent format {} ({} ch, {}D) | VAE files that fit: {}".format(
-                    type(cfg).__name__, lf.__name__ if lf else "-", ch, dims, ", ".join(fits) or "none in models/vae"))
+                print("   model: {} | latent format {} ({} ch, {}D) | VAE files that fit: {} [{}]".format(
+                    type(cfg).__name__, lf.__name__ if lf else "-", ch, dims, ", ".join(fits) or "none in models/vae or the checkpoints", how))
+            except HeaderError as e:
+                print("   unreadable:", e)
             except Exception as e:
                 print("   failed: {}: {}".format(type(e).__name__, str(e)[:300]))
 

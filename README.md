@@ -797,8 +797,13 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_mod
 
 * `== models/vae`：`ae.safetensors` → `VAE: AutoencodingEngine / decoder Decoder | latent 16 ch, latent_dim 2, x8`，1344×768 和 3840×2160 都是 `Monoload layer 1 (LDM stripes, GroupNorm scheme B)`；`qwen_image_vae.safetensors` → `WanVAE / decoder Decoder3d | latent 16 ch, latent_dim 3, x8`，两个图像尺寸 `layer 1 (Wan 2.1 stripes)`，81 帧视频 `native: multi-frame video latent ...`。
 * `== models/checkpoints`：`waiIllustriousSDXL_v170` → `model: SDXL (latent format SDXL)`，内置 VAE `AutoencoderKL`，`layer 1`。
-* `== models/diffusion_models`：每个文件一行 `model: <ComfyUI 的模型配置> | latent format <...> | VAE files that fit: <models/vae 里对得上的文件>`。预期 `krea2_turbo_bf16` → `Krea2`、`Wan21`、`qwen_image_vae.safetensors`；`smoothmixUltimateAnima_animaV20` → `Anima`、`Wan21`、`qwen_image_vae`；`wai_v17_fp8_test` → `SDXL`（`models/vae` 里没有对得上的文件，VAE 来自 checkpoint）。**要看的是 `novaAnimeAM_v5029B` 和两个 `luciddreamerZ_*`**：文件名看不出来，推测是 Anima（→ `qwen_image_vae`）和 Z-Image（`Lumina2` / `ZImage`、`Flux` 格式 → `ae`）。
-* 出现 `failed: ...` 或 `model not detected` 的文件，把那几行发给我。
+* `== models/diffusion_models`：每个文件一行 `model: <ComfyUI 的模型配置> | latent format <...> | VAE files that fit: <对得上的 VAE> [<怎么识别的>]`。识别步骤与 ComfyUI 的 UNETLoader 相同（旧量化格式转换、有前缀就去掉，没有就按原样识别）；对得上的 VAE 包括 `models/vae` 里的文件和 checkpoint 内置的 VAE。预期：
+  * `krea2_turbo_bf16` → `model: Krea2 | latent format Wan21 (16 ch, 3D) | VAE files that fit: qwen_image_vae.safetensors [keys without a prefix]`
+  * 两个 `luciddreamerZ_*` → `model: ZImage | latent format Flux (16 ch, 2D) | VAE files that fit: ae.safetensors [keys without a prefix]`（若是 Lumina 2 结构则显示 `Lumina2`，VAE 一样是 `ae`）
+  * `novaAnimeAM_v5029B` → `model: Anima | latent format Wan21 (16 ch, 3D) | VAE files that fit: qwen_image_vae.safetensors [prefix 'net.' removed]`
+  * `wai_v17_fp8_test` → `model: SDXL | latent format SDXL (4 ch, 2D) | VAE files that fit: waiIllustriousSDXL_v170.safetensors (built-in VAE) [keys without a prefix]`
+  * 不完整的文件（0 字节、下载中断）显示 `unreadable: file too small (...)` 或 `unreadable: incomplete file: ...`，不再是 struct 的原始报错。
+* 仍出现 `failed: ...` 或 `model not detected` 的文件，把那几行发给我。
 
 云端用的两个盘点脚本（不需要模型文件，锁定镜像里跑）：`tests/vae_inventory.py`（每种 VAE 的结构、现在的路、原生 / 第二层 / 第一层的模拟峰值）、`tests/probe_vae_gaps.py`（现有缺口的小解码、第二层在多帧视频上的精度）。结果见 DESIGN.md §9.16。
 
