@@ -732,18 +732,43 @@ def _decode(self, samples_in, vae_options={}):
         _LAST.clear()
         _LAST.update({"strategy": "native", "reason": reason, "settings": dict(eff), "settings_source": dict(src)})
         t0 = time.perf_counter()
-        out = _ORIG["decode"](self, samples_in, vae_options)
+        try:
+            out = _ORIG["decode"](self, samples_in, vae_options)
+        except Exception as e:
+            _error_record(e)
+            _LAST["settings"], _LAST["settings_source"] = dict(eff), dict(src)
+            _record(self)
+            raise
         _LAST["seconds"] = time.perf_counter() - t0
         _record(self)
         return out
     probe = _MemProbe(getattr(self, "device", None))
+    # this call's record starts empty: a decode that fails before writing its own fields must not leave the fields of
+    # the previous decode (of any VAE) in its record
+    _LAST.clear()
     with _Applied(eff, note, src):
         try:
             with probe:
                 return _managed_decode(self, samples_in, vae_options)
+        except Exception as e:
+            _error_record(e)
+            raise
         finally:
             _LAST["settings"], _LAST["settings_source"] = dict(eff), dict(src)
             _record(self, probe.result)
+
+
+def _error_record(e):
+    """The record of a decode that raised e: strategy "error", kind "budget"
+    (nothing fits the budget, written by _decode_budget), "oom" or "other",
+    and the error's first line. Fields of a run that got further (strategy,
+    plan) are dropped."""
+    if _LAST.get("strategy") != "error":
+        kind = "oom" if isinstance(e, MonoloadVAEOOMError) or mm.is_oom(e) else "other"
+        _LAST.clear()
+        _LAST.update({"strategy": "error", "kind": kind, "budget": budget()})
+    text = str(e).strip().splitlines()
+    _LAST["error"] = "{}: {}".format(type(e).__name__, text[0] if text else "")
 
 
 _SELFTEST_IN_DECODE = [0]   # selftest_memory() of a first-use self-test run inside the decode in progress (0: none)
@@ -973,7 +998,7 @@ def _decode_budget(self, samples_in, vae_options, t0, bud):
         d = choose_budget(self, samples_in, vae_options, bud)
     except MonoloadError:
         _LAST.clear()
-        _LAST.update({"strategy": "error", "budget": bud})
+        _LAST.update({"strategy": "error", "kind": "budget", "budget": bud})
         raise
     logging.info(msg("vae.budget_log", why=d["why"], note=("; " + _NOTE[0]) if _NOTE[0] else ""))
     if d["layer"] == 2:
