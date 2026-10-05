@@ -176,7 +176,7 @@ def runtime_patch_count():
 def device_cache_entries():
     n = 0
     for obj in gc.get_objects():
-        if type(obj).__name__ == "_State" and hasattr(obj, "device_cache"):
+        if type(obj).__name__ == "_Binding" and hasattr(obj, "device_cache"):
             n += len(obj.device_cache)
     return n
 
