@@ -82,6 +82,9 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * **进度**：① 完成（4b-0，DESIGN §9.17）；② 完成并在 CT 700 上**验收通过**（4b-1，DESIGN §9.18，实测 README §10.5：W / X / Y / Z / check_vae_node 都与预测一致）；③ 视频等用户定。
 * **自检峰值（DESIGN §9.19 → §9.20）**：用户选 B + A，已实现（vae-selftest-budget）：参照解码在第二层分块下跑（自检 0.74 → 约 0.38 GiB），自检上界（430 MiB）算进第一次解码的估算和预算比较。
 * **第一次解码多 0.13 GiB / arena 被输出钉住（DESIGN §9.21 → §9.22）**：用户选 ① a、② a + 结束时清缓存，已实现（vae-arena-output）：`StripeAdapter.run` 先清缓存、再分配输出（单独一段）、再预留 arena，解码完清缓存；估算 = 输出段 + arena + largest + 16 MiB。布局变了使方案 A（无存档）4K 128 MiB 工作区高了 0.12 GiB（前缀在检查点前留下的洞以前被输出填上），加了 `move_low`（检查点挪进下面的洞，只在洞放得下时）。alloc_sim：37 个配置峰值都不升、≤ 估算，解码后只留输出；63 个 CT 700 读数（含新加的 Flux 2 的 12 个）按旧布局重放都对得上；预算选择不变。
+* **代码审查（基准 4f140ea，ComfyUI 62b3c94）**，每项一个分支：
+  * 已改：03 解码失败的记录（`vae-record-errors`）；04 `check_selftest_mem` 自检预算选中的方案（`check-selftest-scheme`）；05 `run_all.sh` 加上 `test_vae_ldm` / `test_vae_flux2` / `test_vae_node`（`run-all-vae`）；07 自检模拟补上最后的比较，上界不变（`selftest-trace-tail`）；08 文档（`review08-docs`）。
+  * 待用户定，先分析：01 hook / 运行时 patch 跨 clone 串用（已复现：CLIP 路径用 ComfyUI 自带节点，max|Δ| 0.02）；02 自检失败的首次 / 缓存路径不一致；06 OOM 重试计划超预算（45 个序列里没有复现）。另外分析 01 时发现：lowvram 加载时 hook 和普通 LoRA 在同一个 key 上，普通 LoRA 被加了两次。
 * **已在 CT 700 上验收**（4f140ea，B + A 和这次的改动一起，命令 AA / X / Y / Z，README §10.6）：自检峰值 0.37（加 warm-up，≤ 上界 0.42）/ 0.45（不加，含进程第一批 GPU 计算约 0.07，不在上界里）；decode 1 = decode 2 = 2.43，解码后只留 0.09；X / Y / Z / check_vae_node 的选择和数字都与预测一致。
 
 ### 4.1 入口和做法（4a 之前写的，仍然适用）
@@ -151,6 +154,8 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | 4b-1：Flux 2 VAE 走第一层 | 4fbaa22 |
 | Flux 2 验收结果、自检峰值的分析和诊断脚本 | 0a4e177 |
 | 自检缩小、算进第一次的估算和预算；第一次解码 / arena 钉住的分析 | 6324592 |
-| 解码前后清缓存、输出单独一段、检查点下移；合并验收清单 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
+| 解码前后清缓存、输出单独一段、检查点下移；合并验收清单 / 验收结果 | 4f140ea / 65306c0 |
+| 审查 05 / 04 / 03 / 08 / 07 | 68ed231 / 4f40a69 / 9c70cab / 3730e6d / 2d36fcd |
+| 审查进度记录 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。
