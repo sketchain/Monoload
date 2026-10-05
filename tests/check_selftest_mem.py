@@ -10,9 +10,15 @@ emptied again):
              workspaces, kernels loaded); in a ComfyUI server the sampler has
              paid it long before the VAE decode
   self-test  vae_engine.self_test alone (fp32 copy of the decoder, whole-image
-             fp32 reference decode of a 24 x 24 latent, forced small stripes)
+             fp32 reference decode of a 24 x 24 latent, forced small stripes),
+             of the layer-1 variant the decodes will use: with --budget the
+             budget's choice (which can be another GroupNorm scheme than the
+             default), chosen beforehand without a self-test; the shape probe
+             of that choice is dropped again, so decode 1 runs it as any first
+             decode with a budget does
   decode 1   the decode (default policy, or --budget); its self-test is cached
-             by now, so this is the decode alone
+             by now, so this is the decode alone (each decode line says whether
+             a self-test ran in it after all)
   decode 2   the same again
 
     docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_selftest_mem.py \\
@@ -66,6 +72,27 @@ def warmup():
         torch.nn.functional.conv2d(x, w, padding=1).sum().item()
 
 
+def selected_bound(vae, lat, budget):
+    """(bound, why) of the layer-1 variant a decode of `lat` uses with the
+    current settings: with a budget (set beforehand with mvae.set_budget) the
+    budget's choice, made without running a self-test; the shape probe it ran
+    is dropped (decode 1 runs it again, as a first decode with a budget does).
+    bound None: layer 1 is not used (why says so)."""
+    bound, why = mvae._select_layer1(vae, lat, {})
+    if bound is None or not budget:
+        return bound, why
+    d = mvae.choose_budget(vae, lat, {}, budget, selftest=lambda b: (True, "not run while choosing"))
+    mvae._PROBES.pop(vae.first_stage_model, None)
+    if d["layer"] != 1:
+        return None, "the budget chooses layer 2"
+    return d["bound"], why
+
+
+def selftest_in_decode(m):
+    """Bytes of the self-test bound if the last decode ran a self-test first, else 0."""
+    return (m.get("estimate") or {}).get("selftest") or 0
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = p.add_mutually_exclusive_group(required=True)
@@ -88,7 +115,10 @@ def main():
                                                                   "{} GiB".format(a.budget) if a.budget else "none", a.warmup), flush=True)
     if a.warmup:
         measure("warm-up", warmup)
-    bound, why = mvae._select_layer1(vae, lat, {})
+    budget = int(a.budget * (1 << 30)) if a.budget else 0
+    if budget:
+        mvae.set_budget(budget)
+    bound, why = selected_bound(vae, lat, budget)
     if bound is None:
         raise SystemExit("layer 1 does not apply: " + why)
     vae_engine._SELFTEST.clear()
@@ -96,13 +126,14 @@ def main():
     ok, detail = measure("self-test", lambda: vae_engine.self_test(bound, vae))
     print("           {} ({}): {}; passed to load_models_gpu for it: {} GiB".format(bound.name, "ok" if ok else "FAILED", detail,
                                                                                     gib(bound.selftest_memory()).strip()), flush=True)
-    if a.budget:
-        mvae.set_budget(int(a.budget * (1 << 30)))
     for label in ("decode 1", "decode 2"):
         measure(label, lambda: vae.decode(lat))
         m = mvae.last_decode()
-        print("           {}, estimate {} GiB".format(m.get("adapter") or m.get("strategy"), gib((m.get("estimate") or {}).get("total")).strip()),
-              flush=True)
+        st = selftest_in_decode(m)
+        print("           {}, estimate {} GiB; {}".format(
+            m.get("adapter") or m.get("strategy"), gib((m.get("estimate") or {}).get("total")).strip(),
+            "a self-test ran in this decode too (up to {} GiB): NOT the decode alone".format(gib(st).strip()) if st
+            else "no self-test in this decode"), flush=True)
     print("\nexpected (Flux 2 / SDXL VAE, README §9.13): self-test reserved peak ~0.40 GiB (~0.47 without --warmup: the first GPU work "
           "of the process happens inside it, ~0.07 stays); decode 1 == decode 2 (4K budget 3G: ~2.44), after each only the output "
           "stays (4K: ~0.09 GiB).")
