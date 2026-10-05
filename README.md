@@ -798,11 +798,11 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_mod
 
 * `== models/vae`：`ae.safetensors` → `VAE: AutoencodingEngine / decoder Decoder | latent 16 ch, latent_dim 2, x8`，1344×768 和 3840×2160 都是 `Monoload layer 1 (LDM stripes, GroupNorm scheme B)`；`qwen_image_vae.safetensors` → `WanVAE / decoder Decoder3d | latent 16 ch, latent_dim 3, x8`，两个图像尺寸 `layer 1 (Wan 2.1 stripes)`，81 帧视频 `native: multi-frame video latent ...`。
 * `== models/checkpoints`：`waiIllustriousSDXL_v170` → `model: SDXL (latent format SDXL)`，内置 VAE `AutoencoderKL`，`layer 1`。
-* `== models/diffusion_models`：每个文件一行 `model: <ComfyUI 的模型配置> | latent format <...> | VAE files that fit: <对得上的 VAE> [<怎么识别的>]`。识别步骤与 ComfyUI 的 UNETLoader 相同（旧量化格式转换、有前缀就去掉，没有就按原样识别）；对得上的 VAE 包括 `models/vae` 里的文件和 checkpoint 内置的 VAE。预期：
-  * `krea2_turbo_bf16` → `model: Krea2 | latent format Wan21 (16 ch, 3D) | VAE files that fit: qwen_image_vae.safetensors [keys without a prefix]`
-  * 两个 `luciddreamerZ_*` → `model: ZImage | latent format Flux (16 ch, 2D) | VAE files that fit: ae.safetensors [keys without a prefix]`（若是 Lumina 2 结构则显示 `Lumina2`，VAE 一样是 `ae`）
-  * `novaAnimeAM_v5029B` → `model: Anima | latent format Wan21 (16 ch, 3D) | VAE files that fit: qwen_image_vae.safetensors [prefix 'model.diffusion_model.' removed]`（CT 700 实测）
-  * `wai_v17_fp8_test` → `model: SDXL | latent format SDXL (4 ch, 2D) | VAE files that fit: waiIllustriousSDXL_v170.safetensors (built-in VAE) [keys without a prefix]`
+* `== models/diffusion_models`：每个文件一行 `model: <ComfyUI 的模型配置> | latent format <...> | VAE candidates (same latent channels / dims): <候选 VAE> [<怎么识别的>]`。识别步骤与 ComfyUI 的 UNETLoader 相同（旧量化格式转换、有前缀就去掉，没有就按原样识别）；候选只按 latent 的通道数和维数匹配（`models/vae` 里的文件和 checkpoint 内置的 VAE），不表示语义上兼容、也不保证是这个模型训练时用的 VAE（标签在 review 08 之前是 `VAE files that fit`）。预期：
+  * `krea2_turbo_bf16` → `model: Krea2 | latent format Wan21 (16 ch, 3D) | VAE candidates (same latent channels / dims): qwen_image_vae.safetensors [keys without a prefix]`
+  * 两个 `luciddreamerZ_*` → `model: ZImage | latent format Flux (16 ch, 2D) | VAE candidates (same latent channels / dims): ae.safetensors [keys without a prefix]`（若是 Lumina 2 结构则显示 `Lumina2`，VAE 一样是 `ae`）
+  * `novaAnimeAM_v5029B` → `model: Anima | latent format Wan21 (16 ch, 3D) | VAE candidates (same latent channels / dims): qwen_image_vae.safetensors [prefix 'model.diffusion_model.' removed]`（CT 700 实测）
+  * `wai_v17_fp8_test` → `model: SDXL | latent format SDXL (4 ch, 2D) | VAE candidates (same latent channels / dims): waiIllustriousSDXL_v170.safetensors (built-in VAE) [keys without a prefix]`
   * 不完整的文件（0 字节、下载中断）显示 `unreadable: file too small (...)` 或 `unreadable: incomplete file: ...`，不再是 struct 的原始报错。
 * 仍出现 `failed: ...` 或 `model not detected` 的文件，把那几行发给我。
 
@@ -1354,7 +1354,7 @@ docs/HANDOFF.md             交接说明（当前状态、提交记录、规矩�
 | `MONOLOAD_DISABLE_VAE_STRIPE=1` | 只关掉第一层，所有受管理的 VAE 解码都走第二层（设了预算也一样，超出预算时日志注明） |
 | `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（输出行数），用于扫参和调试，优先于默认策略和预算（有预算时方案仍按预算选；放不下也照跑，日志注明） |
 | `MONOLOAD_LANG` | 日志、报错和 Monoload Info 节点文字的语言：不设 / `en` = 英文（默认），`zh` = 中文。节点界面不看它，跟随 ComfyUI 自己的语言设置 |
-| `MONOLOAD_VAE_GN_SCHEME` | 强制 SDXL / SD1.5 / SD3 / Flux `ae` / Flux 2（LDM decoder）第一层的 GroupNorm 整图统计量方案：`A`（不存中间结果，峰值最低、重算最多）、`D`、`B`（**默认**）、`C`（存得越多峰值越高、越快），见 §12.8。设了它，有预算时也只用这个方案（条带高度仍按预算取） |
+| `MONOLOAD_VAE_GN_SCHEME` | 强制 SDXL / SD1.5 / SD3 / Flux `ae` / Flux 2（LDM decoder）第一层的 GroupNorm 整图统计量方案：`A`（不存中间结果，峰值最低、重算最多）、`D`、`B`（**默认**）、`C`（存得越多峰值越高、越快），见 §12.8。设了它，有预算时也只用这个方案（条带高度仍按预算取；没有高度放得下时报错，不超预算照跑、也不改走第二层，这一点与强制条带高度不同） |
 
 **`MONOLOAD_VAE_BUDGET` 的例子**（SDXL / Flux `ae`，bf16；「估算」是交给 `load_models_gpu` 的上界，峰值是模拟的 reserved（实测与它一致）；耗时：第二层和默认 B 是实测，其余是 CT 700 上耗时模型的预测；DESIGN.md §9.14.10–11）：
 

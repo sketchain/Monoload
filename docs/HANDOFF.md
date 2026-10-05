@@ -74,7 +74,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 
 * **方法**：`tests/vae_inventory.py` 在 meta 上建出 sd.py 能构造的每种 VAE（交给 `comfy.sd.VAE` 本身识别），统计结构、判断 Monoload 现在的路、用 alloc_sim 追踪原生 / 第二层 / 第一层的 reserved 峰值。追踪加了 60 GiB 设备上限（OOM 时先释放缓存再试），SDXL 4K 原生模拟 52.48 GiB = 实测。`tests/probe_vae_gaps.py` 用随机权重的小解码确认缺口和第二层在多帧上的精度。`tests/check_models.py`（命令 W）给 CT 700 识别模型文件用哪个 VAE。
 * **用户在用的**：SDXL（checkpoint 内置）、Flux `ae`（Z-Image 也用）、`qwen_image_vae`（Krea 2、Anima）——图像解码都已是第一层。`novaAnimeAM`、`luciddreamerZ` 等命令 W 的结果确认。
-* **还走第二层的图像 VAE**：Flux 2（4K 原生 52.5 → 第二层 15.05，第一层预计 2.18，与 Flux `ae` 同一个 decoder，**最容易**）、Wan 2.2 单帧（4K 34.2 → 19.8，第二层不够）、HunyuanImage 2.1（38.1 → 11.1）、HunyuanImage 2.1 Refiner（1344 原生 50.3 → 4.4）、HunyuanVideo 1.0 / 1.5 单帧、SeedVR2、TAE 系列、Stage A / C、Mage、像素空间。
+* **还走第二层的图像 VAE**（4a 盘点时的状态；Flux 2 已在 4b-1 改走第一层）：Flux 2（4K 原生 52.5 → 第二层 15.05，第一层预计 2.18，与 Flux `ae` 同一个 decoder，**最容易**）、Wan 2.2 单帧（4K 34.2 → 19.8，第二层不够）、HunyuanImage 2.1（38.1 → 11.1）、HunyuanImage 2.1 Refiner（1344 原生 50.3 → 4.4）、HunyuanVideo 1.0 / 1.5 单帧、SeedVR2、TAE 系列、Stage A / C、Mage、像素空间。
 * **还走原生的多帧视频**：第二层在多帧上**数值精确**（Wan 2.1 / 2.2、HunyuanVideo 1.0 / 1.5、CogVideoX 的小解码，相对误差 ≤ 2.3e-6），模拟峰值：Wan 2.1 480p 81 帧 8.7 → 5.0、Wan 2.2 704p 121 帧 39.4 → 10.4、HunyuanVideo 1.0 480p 73 帧 62（原生 OOM → tiled）→ 15.2、HunyuanVideo 1.5 720p 121 帧 113（OOM）→ 21.6、CogVideoX 35.0 → 11.7、Cosmos 30.2 → 13.0、Mochi 362 → 59.3（第二层不够）、LTX 30.6 / 59.3（模拟碎片，待确认）→ 6.7 / 5.0（要走 `output_buffer`）。要做的是 `_native_reason` 放开、`_probe` / `estimate` 认识 5D 多帧。
 * **现有缺口**（这一步只报告）：① SVD 的 `VideoDecoder` 以 batch 为时间轴，第二层逐样本解码改变了结果；② ACE-Step / LTX 2 音频 / MiniMax 音频（2D latent）被管理，ACE 的估算约 1 PiB（`load_models_gpu` 会卸载一切）；③ 像素空间被管理（估算 2 GiB）；④ TAESD 1344 第二层 2.66 > 原生 1.77 GiB。
 * **建议顺序**：0 修缺口 ① – ③ → 1 Flux 2 第一层 → 2 多帧视频第二层（通用）→ 3 Wan 2.2 单帧第一层 → 4 HunyuanImage 2.1 第一层 → 5 视频第一层（等有需要）。不建议做：TAE 系列、Stage A / C、Mage、MiniMax 视频、SeedVR2 第一层、音频、3D。
@@ -86,13 +86,13 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 
 ### 4.1 入口和做法（4a 之前写的，仍然适用）
 
-**现在的覆盖范围**（`vae._native_reason`、`STRIPE_ADAPTERS`）：
+**现在的覆盖范围**（`vae._native_reason`、`STRIPE_ADAPTERS`；当前代码，4b-0 / 4b-1 之后）：
 
 | ComfyUI 的 VAE（`comfy/sd.py` 按 state dict 识别） | 现在走哪条路 |
 |---|---|
-| SD1.5 / SDXL / SD3 / Flux `ae`（LDM `Decoder`，`AutoencoderKL` / `AutoencodingEngine`） | 第一层（`vae_ldm`） |
+| SD1.5 / SDXL / SD3 / Flux `ae` / Flux 2（LDM `Decoder`，`AutoencoderKL` / `AutoencodingEngine`；Flux 2 带 `batch_norm_latent`，4b-1） | 第一层（`vae_ldm`） |
 | Wan 2.1 / `qwen_image_vae` 单帧（5D，T=1） | 第一层（`vae_wan`） |
-| 其他 2D 图像 VAE（Flux 2 的 `batch_norm_latent` 变体、带注意力的 up 级、TAESD、Stable Cascade Stage A / C、Mage-VAE、SeedVR2 等） | 第二层（逐算子分块），或第一层识别不通过时第二层 |
+| 其他 2D 图像 VAE（带注意力的 up 级、TAESD、Stable Cascade Stage A / C、Mage-VAE、SeedVR2 等） | 第二层（逐算子分块），或第一层识别不通过时第二层 |
 | 多帧视频 latent：Wan 2.1 / 2.2、Hunyuan 系（3D 卷积 `AutoencoderKL` / `AutoencodingEngine`）、Mochi、Cosmos、CogVideoX、MiniMax H3、TAEHV 等 | **原生**（`_native_reason`：multi-frame video latent，第一阶段暂不做） |
 | 自己往预分配输出写的（`comfy_has_chunked_io`，如 LTX） | 原生 |
 | 1D / 音频（Stable Audio、ACE、MMAudio、LTX Audio 等） | 原生 |
