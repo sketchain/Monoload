@@ -346,6 +346,8 @@ M = {
     "info.decode_head": ("last decode ({ago:.0f} s ago): ", "上一次解码（{ago:.0f} 秒前）："),
     "info.decode_native": ("native ComfyUI decode ({reason}){t}", "原版 ComfyUI 解码（{reason}）{t}"),
     "info.decode_error": ("error: no decode fits the budget {budget}", "错误：没有放得下预算 {budget} 的解码方式"),
+    "info.decode_oom": ("error: out of memory ({error})", "错误：显存不足（{error}）"),
+    "info.decode_failed": ("error: the decode failed ({error})", "错误：解码失败（{error}）"),
     "info.decode_l1": ("layer 1 ({adapter}), {n} stripes of {rows} rows", "第一层（{adapter}），{n} 条 {rows} 行的条带"),
     "info.decode_l2": ("layer 2 (op-level chunking)", "第二层（逐算子分块）"),
     "info.decode_line": ("{what}, workspace {ws}, estimate {est}, measured peak {measured}{t}, OOM retries {retries}",
