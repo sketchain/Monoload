@@ -939,6 +939,34 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_sel
 
 把 AA、X、Y、Z 的输出和 JSON 发给我。
 
+### 9.14 审查修正（01 / 02 / 06、lowvram + hook）：真机检查
+
+**状态：待在 CT 700 上跑。** 这几项都是逻辑修正，CPU 上的小测试已经对照原生覆盖（DESIGN §3.2、§4、§9.13.4、§9.14.10）。真机上要看的只有一件事：运行时 LoRA patch 每次调用都多读一次绑定、多查一次同层有没有原生 `LowVramPatch`，每步耗时不能变。拉新代码后重启容器。
+
+```bash
+# AB. LoRA 每步耗时（与 9.1 第三轮同样的设置：WAI v17 SDXL，两个 LoRA 和叠加）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_lora.py \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --width 1344 --height 768 --steps 20 --cfg 6 --scheduler normal \
+  --combo <loraA>.safetensors --combo <loraB>.safetensors --combo <loraA>.safetensors+<loraB>.safetensors --combo none \
+  --modes native,monoload,monoload-exact,native2 --repeat 2 2>&1 | tee bench_lora_review.txt
+```
+
+**预期（与 §10 的 9.1 第三轮比）：**
+
+* 每步：原生约 0.64 s；`monoload` 1.10–1.19 倍；`monoload-exact` 1.33–1.67 倍；`none` 三者相同。CPU 微基准上每次调用多约 3 µs，GPU 上一层的合并是毫秒级，所以应在测量噪声以内（±2%）。
+* `monoload-exact` 与原生 `max|Δ|` 全部为 0；`native2` 与原生为 0；Monoload 两种模式 `backups` 全部为 0。
+* 两个 LoRA 和叠加的 `patch`（切换组合）耗时与以前相同。
+
+**可选：** 新加的 CPU 小测试也可以在容器里跑一遍（不需要模型文件，几分钟）：
+
+```bash
+for t in test_lora_clone_binding test_lora_lowvram_hook test_vae_retry test_vae_selftest_budget; do
+  docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/$t.py 2>&1 | grep -E "^== |FAIL"
+done
+```
+
+预期：`13 / 8 / 5 / 9 checks, 0 failed`。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
