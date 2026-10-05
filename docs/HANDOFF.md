@@ -22,7 +22,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | SDXL / Flux `ae` | 52.5 GiB / 11.9 s | 15.0 GiB / 9.9 s | 默认 B 2.17 GiB / 42 s（A 1.10 / 75，D 1.52 / 58，C 4.70 / 36） |
 | `qwen_image_vae` | 59.2 GiB / 7.9 s | 9.6 GiB / 6.9 s | 0.87 GiB / 8.5 s |
 
-验收情况：VAE 三个阶段、预算策略、VAE 节点、总开关、LoRA 节点、Info 节点、多语言都已在 CT 700 上通过（最近一次 4f140ea：命令 AA / X / Y / Z，README §10.6）。polish-after-ui-test（05ded8d）修了 UI 实测发现的六处问题，待 CT 700 复测（README §9.10）。
+验收情况：VAE 三个阶段、预算策略、VAE 节点、总开关、LoRA 节点、Info 节点、多语言都已在 CT 700 上通过（最近一次 b4c33d5：审查修正后的 `run_all.sh` 和命令 AB，README §10.7）。polish-after-ui-test（05ded8d）修了 UI 实测发现的六处问题，待 CT 700 复测（README §9.10）。
 
 **第四阶段 4a（vae-inventory，575fc46；命令 W 的识别修正 87e6262）**：只加了盘点脚本和文档，插件行为没变。结论：用户实际在用的三个 VAE（SDXL、Flux `ae`、`qwen_image_vae`）的图像解码**已经全部走第一层**；其余 VAE 的结构、现在的路、模拟峰值和建议顺序见 §4 和 DESIGN §9.16；发现现有代码的 4 处缺口（SVD 结果被改变、2D latent 的音频 VAE 被管理且 ACE 的估算约 1 PiB、像素空间被管理、TAESD 小图第二层反而更高）。用户已定顺序（§4.0）。
 
@@ -85,7 +85,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * **代码审查（基准 4f140ea，ComfyUI 62b3c94）**，每项一个分支：
   * 已改：03 解码失败的记录（`vae-record-errors`）；04 `check_selftest_mem` 自检预算选中的方案（`check-selftest-scheme`）；05 `run_all.sh` 加上 `test_vae_ldm` / `test_vae_flux2` / `test_vae_node`（`run-all-vae`）；07 自检模拟补上最后的比较，上界不变（`selftest-trace-tail`）；08 文档（`review08-docs`）。
   * 用户定了之后改的：01 每个模型一个绑定对象，所有运行时 patch 读它，`partially_load` 调原函数之前绑定指向当前 patcher（`lora-runtime-binding`，`tests/test_lora_clone_binding.py`）；02 选 B，强制的第一层配置自检失败时（首次或已缓存，决定相同）第二层也要放得下预算，否则报错（`vae-selftest-fail-budget`）；06 加保险，重试计划的估算超过第一次就跳过这一档（`vae-retry-guard`）；分析 01 时发现的 lowvram + hook 普通 LoRA 加两次，单独修（`lora-lowvram-hook`）。
-  * 待 CT 700：LoRA 每步耗时不变（README §9.14，命令 AB）。
+  * **审查修正全部完成，已在 CT 700 上验收**（b4c33d5，README §10.7）：`run_all.sh` 39 组 1451 项 0 失败；LoRA 每步耗时与 9.1 第三轮相同（默认 1.13 / 1.10 / 1.19×，逐位一致 1.39 / 1.33 / 1.66×，逐位一致 max|Δ| 0，备份 0）。
 * **已在 CT 700 上验收**（4f140ea，B + A 和这次的改动一起，命令 AA / X / Y / Z，README §10.6）：自检峰值 0.37（加 warm-up，≤ 上界 0.42）/ 0.45（不加，含进程第一批 GPU 计算约 0.07，不在上界里）；decode 1 = decode 2 = 2.43，解码后只留 0.09；X / Y / Z / check_vae_node 的选择和数字都与预测一致。
 
 ### 4.1 入口和做法（4a 之前写的，仍然适用）
@@ -159,6 +159,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | 审查 05 / 04 / 03 / 08 / 07 | 68ed231 / 4f40a69 / 9c70cab / 3730e6d / 2d36fcd |
 | 审查进度记录 | 01f3943 |
 | 审查 06 / lowvram + hook / 02 / 01 | 0b5311c / 75f5b6e / 2c28532 / c49960c |
-| 审查修正的文档和真机清单 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
+| 审查修正的文档和真机清单 | b4c33d5 |
+| 审查修正的真机结果 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。

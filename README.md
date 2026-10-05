@@ -303,7 +303,7 @@ MODELS=/path/to/models tests/run_all.sh
 * VAE 第一层的 LDM decoder（`tests/test_vae_ldm.py`，100 项，0 失败）：统计量对 fp64 相对误差 ≤ 1.9e-7（均值 1000、标准差 0.01 时也是，朴素的 E[x²]−E[x]² 在这里差 1.9e3 倍）；冻结统计量的 GroupNorm 与 `F.group_norm` 差 ≤ 7.2e-7（fp32）/ 0（bf16），行切片上也一样；11 种不认的结构都走第二层并与原生一致；SDXL 式 / Flux 式整个 decoder 在四种方案、条带 1 / 7 / 40 / 默认、奇数和很小的 latent、batch 2、ch 64、16 KiB 工作区下与原生整图解码的 raw 差 ≤ 4.6e-6（fp32），条带边界附近不比其他区域差；bf16 对 fp32 真值的 RMSE 与原生相同；自检误差 9e-7，三种注入的错误（条带局部统计量、丢一条带、halo 少一行）都被抓到并回退第二层；全尺寸 SDXL 4K 计划各方案的峰值与重算顺序；OOM 缩条带、到下限报错、不退回 tiled / 第二层；`MONOLOAD_VAE_GN_SCHEME`（强制与默认 B）；预算内最快（第二层放得下就选第二层；否则预测最快的方案，一条带时不跑统计遍、取默认方案；选中的方案自检失败时选下一个；强制高度 / 方案 / 第二层优先于预算；放不下时报错并列出各需要多少；全尺寸 SDXL 三档 × 20 / 3 / 1.5 GiB 选中 README §13 表里的配置）；估算收紧（`saves_fit` 的单元检查、4K 默认计划的存档有保证、largest 不是存档）；很高的 B 条带模拟 reserved ≤ 估算；耗时模型对 4K D 309 行 / 64 MiB 的实测 63.2 s 误差 ≤ 8%；模拟器复现 5 个第二层真机读数、5 个第一层计划 reserved ≤ 估算。「预算内最快」之后：`test_vae_stripe.py` 74 项、`test_vae.py` 131 项、入口测试 8 种开关组合（含 `MONOLOAD_VAE_GN_SCHEME=D` 和预算 + 强制高度）、`test_dtype_paths.py`（198 / 108 项）全过；`tests/alloc_sim.py` 的 51 个真机读数照旧复现（≤ 0.02 GiB）。
 * 总开关（`tests/test_master_switch.py`，18 项，0 失败）：`MONOLOAD=0`、没有节点时，LoRA 模型的整体加载 / lowvram 加载 / Hook LoRA / 撤掉 hook 四种输出与原版 ComfyUI（钩子卸掉）`torch.equal`，备份数相同（2 对 2），撤掉后权重逐位还原；VAE 解码 `torch.equal`，不打 INFO 日志；释放不运行；开销 `patch_weight_to_device` 每次 +0.2 µs、`VAE.decode` 包装每次 3.4 µs；对照组（开启）无备份，与原生差 1.2e-4（快速路径的舍入）。
 * Monoload VAE Settings 节点（`tests/test_vae_node.py`，22 项，0 失败）：逐项优先级（四项各自「节点 > 环境变量 > 默认值」）；副本与原 VAE 共享模型和 patcher、原 VAE 不受影响（预算 1024 GiB 的副本走第二层，原 VAE 紧接着走第一层方案 B）、模型管理里只有一个已加载模型、串联、encode 一致；预算报错并写明各需要多少、报错后全局设置复原；强制 D + 24 行、只用第二层、原生；全局 `MONOLOAD_DISABLE_VAE_STRIPE=1` 时节点的 `auto` 仍走第一层；三个副本交替解码各用各的设置；包装没装上时（ComfyUI 接口不符）副本走原生、不报预算错。`test_entry.py` 各种开关组合下 ComfyUI 的加载器都注册了这个节点（`MONOLOAD_DISABLE=1` 也注册）。
-* `tests/run_all.sh` 合计 826 项检查（入口 18；`MONOLOAD_EXACT=1`：dtype 108、LoRA 80、fp8 8、释放 2 + 42×3 + 22；默认路径：dtype 198、LoRA 106、fp8 8、释放 2 + 42×3 + 22），0 失败。
+* `tests/run_all.sh`：审查修正之后（b4c33d5，CT 700 上跑）39 组、合计 1451 项检查，0 失败（§10.7）。更早的一次合计 826 项检查（入口 18；`MONOLOAD_EXACT=1`：dtype 108、LoRA 80、fp8 8、释放 2 + 42×3 + 22；默认路径：dtype 198、LoRA 106、fp8 8、释放 2 + 42×3 + 22），0 失败。
 
 **CPU 上的基准参考**（`tests/bench_lora.py`，SD1.5，256×256，3 步，只能看相对比例，不代表 GPU）：
 
@@ -340,8 +340,9 @@ curl -X POST http://127.0.0.1:8188/free -H 'Content-Type: application/json' -d '
 ```bash
 # SDXL 整合包（CheckpointLoaderSimple），LoRA 放在 models/loras/
 docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_lora.py \
-  --checkpoint <sdxl>.safetensors --width 1024 --height 1024 --steps 20 --cfg 6 --scheduler normal \
-  --combo <loraA>.safetensors --combo <loraB>.safetensors --combo <loraA>.safetensors+<loraB>.safetensors --combo none \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --width 1024 --height 1024 --steps 20 --cfg 6 --scheduler normal \
+  --combo Smooth_Booster_v5.safetensors --combo AddMicroDetails_Illustrious_v7.safetensors \
+  --combo Smooth_Booster_v5.safetensors+AddMicroDetails_Illustrious_v7.safetensors --combo none \
   --modes native,monoload,monoload-exact,native2 --repeat 2
 
 # Krea 2（UNETLoader + CLIPLoader 分开加载）
@@ -941,13 +942,14 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_sel
 
 ### 9.14 审查修正（01 / 02 / 06、lowvram + hook）：真机检查
 
-**状态：待在 CT 700 上跑。** 这几项都是逻辑修正，CPU 上的小测试已经对照原生覆盖（DESIGN §3.2、§4、§9.13.4、§9.14.10）。真机上要看的只有一件事：运行时 LoRA patch 每次调用都多读一次绑定、多查一次同层有没有原生 `LowVramPatch`，每步耗时不能变。拉新代码后重启容器。
+**状态：已在 CT 700 上验收（b4c33d5，结果见 §10.7）。** 这几项都是逻辑修正，CPU 上的小测试已经对照原生覆盖（DESIGN §3.2、§4、§9.13.4、§9.14.10）。真机上要看的只有一件事：运行时 LoRA patch 每次调用都多读一次绑定、多查一次同层有没有原生 `LowVramPatch`，每步耗时不能变。拉新代码后重启容器。
 
 ```bash
 # AB. LoRA 每步耗时（与 9.1 第三轮同样的设置：WAI v17 SDXL，两个 LoRA 和叠加）
 docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_lora.py \
   --checkpoint waiIllustriousSDXL_v170.safetensors --width 1344 --height 768 --steps 20 --cfg 6 --scheduler normal \
-  --combo <loraA>.safetensors --combo <loraB>.safetensors --combo <loraA>.safetensors+<loraB>.safetensors --combo none \
+  --combo Smooth_Booster_v5.safetensors --combo AddMicroDetails_Illustrious_v7.safetensors \
+  --combo Smooth_Booster_v5.safetensors+AddMicroDetails_Illustrious_v7.safetensors --combo none \
   --modes native,monoload,monoload-exact,native2 --repeat 2 2>&1 | tee bench_lora_review.txt
 ```
 
@@ -1213,6 +1215,28 @@ done
 * **`check_vae_node.py`（4K，节点预算 3G）：**
   * 副本：B 12 × 180，`budget 3.00 GiB [node]`。第一次 reserved 2.67 / GTT 2.95（这个进程的第一批 GPU 计算在这次里，DESIGN §9.19），再次 2.43 / 2.43，估算 2.96。
   * 原 VAE：B 17 × 128，全部 `[default]`，2.18 / 估算 2.68。
+
+### 10.7 审查修正（01 / 02 / 03–08、lowvram + hook）：真机检查（`run_all`、`bench_lora_review`，2026-10，b4c33d5）
+
+§9.14 的命令和 `run_all.sh`，**全部通过**（DESIGN §3.2、§4、§9.13.4、§9.14.10）。
+
+* **`run_all.sh`**（测试素材在 `/models/monoload-test`，真模型从 `/models/comfy` 硬链接过去）：39 组、1451 项检查，`suites failed: 0`。
+  * 新加的测试：`test_lora_clone_binding` 13、`test_lora_lowvram_hook` 8、`test_vae_retry` 5、`test_vae_selftest_budget` 9、`test_check_selftest_mem` 5。
+  * `test_lora_node` 19；VAE：`test_vae` 135、`test_vae_stripe` 79、`test_vae_ldm` 100、`test_vae_flux2` 54、`test_vae_node` 25。
+  * LoRA 功能测试两种合并路径各一遍：`MONOLOAD_EXACT=1` 时 dtype 108、LoRA 80、fp8 8、释放 2 + 42 × 3 + `MONOLOAD_KEEP_LORA` 22；默认路径时 dtype 198、LoRA 106、fp8 8、释放 2 + 42 × 3 + 22。
+* **AB（WAI v17 SDXL，`Smooth_Booster_v5` + `AddMicroDetails_Illustrious_v7`，20 步，CFG 6）：** 运行时 patch 读绑定、查同层原生 `LowVramPatch` 之后，每步耗时与 9.1 第三轮相同。
+
+| 组合 | 原生 | 默认路径 | 逐位一致 | `native2` |
+|---|---|---|---|---|
+| Smooth Booster | 0.641 s | 0.722 s，1.13× | 0.892 s，1.39× | 1.01× |
+| AddMicroDetails | 0.643 s | 0.709 s，1.10× | 0.854 s，1.33× | 1.01× |
+| 两个叠加 | 0.638 s | 0.760 s，1.19× | 1.062 s，1.66× | 1.01× |
+| 不打 LoRA | 0.640 s | 0.642 s，1.00× | 0.646 s，1.01× | 1.01× |
+
+  * 逐位一致与原生、`native2` 与原生的 `max|Δ|` 全部为 0；默认路径与原生的 mean|Δ| 0.556 / 1.28 / 1.82，LoRA 本身的作用 mean 3.81 / 5.91 / 6.12。
+  * 原生备份 788 / 986 / 1052（同 9.1），Monoload 两种模式都是 0；切换组合（patch）原生 0.43–0.67 s，Monoload 0.09–0.11 s。
+  * GTT：Monoload 8.2–8.7 GiB，原生 13.9 GiB。
+  * layer probe 与 9.1 第三轮完全一致：788 层、4.77 GiB；每次模型调用临时拷贝 0.038 s、逐位一致 0.222 s、默认路径 0.052 s；默认路径与逐位一致的权重差异 2.54e-3，在容差 0.0308 以内。
 
 ## 11. 仓库结构
 
