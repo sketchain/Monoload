@@ -91,23 +91,56 @@ def _is_quantized(t):
 
 
 # ---------------------------------------------------------------------------
-# per-patcher state
+# the binding: what the runtime patches of one model compute with
 # ---------------------------------------------------------------------------
 
-class _State:
-    __slots__ = ("hook_patches", "device_cache")
+class _Binding:
+    """One per model (patcher.model), shared by every clone: the runtime
+    patches on the model's modules read it on every call (DESIGN §7, review
+    01). It holds the patches dict and the merge (exact) of the patcher whose
+    weights are active (bind() at load / partially_load / install), the hook
+    patches in effect (written by whichever clone patches or unpatches hooks
+    last: natively the clones share the weights and hook_backup the same way)
+    and the device-side copies of the LoRA tensors."""
+    __slots__ = ("patches", "exact", "hook_patches", "device_cache", "__weakref__")
 
     def __init__(self):
+        self.patches = {}        # the active patcher's patches (key -> patch list)
+        self.exact = None        # its merge (Monoload LoRA Settings), None = the global default
         self.hook_patches = {}   # key -> hook patch list currently in effect
         self.device_cache = {}   # (id(tensor), device) -> (tensor, tensor on device)
 
+    def bind(self, patcher):
+        if self.patches is not patcher.patches:
+            self.patches = patcher.patches
+        self.exact = lora_overrides.merge_exact(patcher)
+
+
+def _binding(patcher):
+    """The model's binding (created on first use, not bound)."""
+    b = patcher.model.__dict__.get("_monoload_binding")
+    if b is None:
+        b = _Binding()
+        patcher.model.__dict__["_monoload_binding"] = b
+    return b
+
 
 def _state(patcher):
-    st = patcher.__dict__.get("_monoload_state")
-    if st is None:
-        st = _State()
-        patcher.__dict__["_monoload_state"] = st
-    return st
+    """The model's binding, bound to `patcher`."""
+    b = _binding(patcher)
+    b.bind(patcher)
+    return b
+
+
+def _release_binding(patcher):
+    """No runtime patch left on the model: drop what the binding holds (the
+    patcher's patches dict, hook patches, device copies), so nothing of a
+    clone that is gone stays reachable from the model."""
+    b = patcher.model.__dict__.get("_monoload_binding")
+    if b is not None:
+        b.patches, b.exact = {}, None
+        b.hook_patches.clear()
+        b.device_cache.clear()
 
 
 def _to_device(value, device, cache, limit, flags):
@@ -170,15 +203,27 @@ class MonoloadRuntimePatch(LowVramPatch):
 
     is_monoload_patch = True
 
-    def __init__(self, key, patches, module, attr, state, exact=None):
-        super().__init__(key, patches)
-        self.exact = exact   # the model's own merge (Monoload LoRA Settings), None = the global default
+    def __init__(self, key, patches, module, attr, binding):
+        # not LowVramPatch.__init__: `patches` is the binding's (the active patcher's), read at every call
+        self.key = key
+        self.convert_func = self.set_func = self.prepared_patches = None
+        self.binding = binding
+        if binding.patches is not patches and not binding.patches:
+            binding.patches = patches
         self._module = weakref.ref(module)
         self.attr = attr
-        self.state = state
+        self._fn_attr = attr + "_function"
         self.seed = comfy.utils.string_to_seed(key)
         self._base_sig = None
         self._base_moved = None
+
+    @property
+    def patches(self):
+        return self.binding.patches
+
+    @property
+    def exact(self):
+        return self.binding.exact
 
     def memory_required(self):
         return 0
@@ -191,7 +236,7 @@ class MonoloadRuntimePatch(LowVramPatch):
         if sig == self._base_sig:
             return self._base_moved
         flags = {"transient": False}
-        moved = _to_device(list(base), device, self.state.device_cache, limit, flags)
+        moved = _to_device(list(base), device, self.binding.device_cache, limit, flags)
         if not flags["transient"]:
             self._base_moved = moved
             self._base_sig = sig
@@ -212,15 +257,28 @@ class MonoloadRuntimePatch(LowVramPatch):
             return weight
         return None
 
+    def _native_base(self):
+        """A native LowVramPatch for this key follows on the module (a lowvram
+        layer): it applies the key's own patches, so this one must not."""
+        module = self._module()
+        funcs = getattr(module, self._fn_attr, ()) if module is not None else ()
+        return any(type(f) is LowVramPatch and f.key == self.key for f in funcs)
+
     def __call__(self, weight):
         key = self.key
-        base = self.patches.get(key)
-        hooks = self.state.hook_patches.get(key)
+        b = self.binding
+        base_all = b.patches.get(key)
+        hooks = b.hook_patches.get(key)
+        if not base_all and not hooks:
+            return weight
+        # on a lowvram layer native's LowVramPatch (after this one) adds the key's patches: only the hooks here, i.e.
+        # native's order (the hook merged into the stored weight, the LoRA added when the layer runs)
+        base = None if base_all and self._native_base() else base_all
         if not base and not hooks:
             return weight
         param = getattr(self._module(), self.attr)
-        if not (settings.exact() if self.exact is None else self.exact):
-            return self._call_fast(weight, param, base, hooks)
+        if not (settings.exact() if b.exact is None else b.exact):
+            return self._call_fast(weight, param, base, hooks, base_all)
         device = weight.device
         pdt = param.dtype  # for a QuantizedTensor: its dequantized dtype
         cdt = weight.dtype
@@ -245,15 +303,15 @@ class MonoloadRuntimePatch(LowVramPatch):
             else:
                 temp = comfy.model_management.cast_to_device(param, device, torch.float32, copy=True)
             orig_param = param.dequantize() if _is_quantized(param) else param
-            original = {key: [(orig_param, _identity)] + list(base or [])}
-            moved_hooks = _to_device(hooks, device, self.state.device_cache, param.numel(), {"transient": False})
+            original = {key: [(orig_param, _identity)] + list(base_all or [])}
+            moved_hooks = _to_device(hooks, device, self.binding.device_cache, param.numel(), {"transient": False})
             out = comfy.lora.calculate_weight(moved_hooks, temp, key, original_weights=original)
             w = comfy.float.stochastic_rounding(out, pdt, seed=self.seed)
             del temp, out
 
         return w.to(dtype=cdt)
 
-    def _call_fast(self, weight, param, base, hooks):
+    def _call_fast(self, weight, param, base, hooks, base_all=None):
         """Default path. The temporary is the one cast_bias_weight made, in the
         compute dtype (the tensor native lowvram LowVramPatch merges into). For
         a quantized parameter whose dequantized dtype differs from the compute
@@ -271,8 +329,8 @@ class MonoloadRuntimePatch(LowVramPatch):
             w = _merge_fast(self._base_on(base, device, param.numel()), w, key)
         if hooks:
             orig_param = param.dequantize() if _is_quantized(param) else param
-            original = {key: [(orig_param, _identity)] + list(base or [])}
-            moved_hooks = _to_device(hooks, device, self.state.device_cache, param.numel(), {"transient": False})
+            original = {key: [(orig_param, _identity)] + list((base if base_all is None else base_all) or [])}
+            moved_hooks = _to_device(hooks, device, self.binding.device_cache, param.numel(), {"transient": False})
             w = _merge_fast(moved_hooks, w, key, original_weights=original)
         return w.to(dtype=cdt)
 
@@ -367,7 +425,7 @@ def _module_for_key(patcher, key):
 
 
 def _install_runtime_patch(patcher, key):
-    st = _state(patcher)
+    st = _binding(patcher)
     patcher.model.__dict__["_monoload_runtime"] = True   # runtime patches may live on this model's modules
     module, attr = _module_for_key(patcher, key)
     if not hasattr(module, "comfy_cast_weights") or attr not in ("weight", "bias"):
@@ -384,7 +442,7 @@ def _install_runtime_patch(patcher, key):
     funcs = [f for f in getattr(module, fn_attr, []) if not (_is_runtime_patch(f) and f.key == key)]
     # LoRA first: under a native full load it is baked into the weight, so it
     # comes before any weight_wrapper_patches.
-    funcs.insert(0, MonoloadRuntimePatch(key, patcher.patches, module, attr, st, exact=lora_overrides.merge_exact(patcher)))
+    funcs.insert(0, MonoloadRuntimePatch(key, patcher.patches, module, attr, st))
     setattr(module, fn_attr, funcs)
 
 
@@ -408,6 +466,7 @@ def _remove_runtime_patches(patcher, keep=None):
             del m.comfy_patched_weights
     if keep is None:
         patcher.model.__dict__.pop("_monoload_runtime", None)
+        _release_binding(patcher)
 
 
 def _drop_shadowed_runtime_patches(patcher):
@@ -442,6 +501,7 @@ def _patch_weight_to_device(self, key, device_to=None, inplace_update=False, ret
         # temporary merged tensor and never writes or backs up.
         return _ORIG["patch_weight_to_device"](self, key, device_to=device_to, inplace_update=inplace_update,
                                                return_weight=return_weight, force_cast=force_cast)
+    _state(self)   # this patcher's weights are being loaded: the runtime patches compute with its patches and merge
     _install_runtime_patch(self, key)
     return None
 
@@ -465,6 +525,7 @@ def _load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=Fals
                 continue
             if hasattr(m, "comfy_patched_weights"):
                 del m.comfy_patched_weights
+    _state(self)
     r = _ORIG["load"](self, device_to, lowvram_model_memory=lowvram_model_memory, force_patch_weights=force_patch_weights, full_load=full_load)
     _assert_no_backup(self)
     return r
@@ -488,16 +549,30 @@ def _unpatch_model(self, device_to=None, unpatch_weights=True):
     if unpatch_weights and self.model.__dict__.get("_monoload_runtime", False):
         _remove_runtime_patches(self)
     if unpatch_weights:
-        st = self.__dict__.get("_monoload_state")
-        if st is not None:
-            st.device_cache.clear()
+        b = self.model.__dict__.get("_monoload_binding")
+        if b is not None:
+            b.device_cache.clear()
     return r
+
+
+def _partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
+    # The runtime patches already on the model compute with whatever the binding holds. A clone with the same
+    # patches_uuid loads without unpatching or calling load() (native returns early when the weights are fully
+    # loaded, only re-applying its forced hooks): bind to it first, so its patches, merge and hook state are the ones
+    # in effect from here on (also inside the original, whose apply_hooks(forced) runs before it returns).
+    if _active(self) and self.model.__dict__.get("_monoload_runtime", False):
+        b = self.model.__dict__.get("_monoload_binding")
+        if b is not None and self.model.current_weight_patches_uuid == self.patches_uuid:
+            b.bind(self)
+    return _ORIG["partially_load"](self, device_to, extra_memory=extra_memory, force_patch_weights=force_patch_weights)
 
 
 def _patch_hooks(self, hooks):
     if not _active(self):
         return _ORIG["patch_hooks"](self, hooks)
-    st = _state(self)
+    st = _binding(self)
+    if self.model.current_weight_patches_uuid in (None, self.patches_uuid):
+        st.bind(self)
     with self.use_ejected():
         st.hook_patches.clear()
         if hooks is not None:
@@ -520,7 +595,7 @@ def _patch_hooks(self, hooks):
 def _unpatch_hooks(self, whitelist_keys_set=None):
     if not _active(self):
         return _ORIG["unpatch_hooks"](self, whitelist_keys_set)
-    st = _state(self)
+    st = _binding(self)
     with self.use_ejected():
         if whitelist_keys_set:
             for k in list(st.hook_patches):
@@ -560,6 +635,7 @@ _REPLACEMENTS = {
     "load": _load,
     "partially_unload": _partially_unload,
     "unpatch_model": _unpatch_model,
+    "partially_load": _partially_load,
     "patch_hooks": _patch_hooks,
     "unpatch_hooks": _unpatch_hooks,
     "patch_hook_weight_to_device": _patch_hook_weight_to_device,

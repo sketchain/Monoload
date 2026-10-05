@@ -58,9 +58,9 @@ M = {
         "自己估算内存，OOM 时缩小分块，绝不退回 tiled；只管图像（4D / T=1 的 5D），设 MONOLOAD_DISABLE_VAE=1 恢复原生"),
     "entry.vae_layer1": (
         "[Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae single frame; LDM Decoder of "
-        "SD1.5 / SDXL / SD3 / Flux ae with whole-image GroupNorm statistics, scheme {scheme}; self-tested on first use): {policy}{rows}; "
+        "SD1.5 / SDXL / SD3 / Flux ae / Flux 2 with whole-image GroupNorm statistics, scheme {scheme}; self-tested on first use): {policy}{rows}; "
         "other decoders use layer 2; set MONOLOAD_DISABLE_VAE_STRIPE=1 to use layer 2 everywhere",
-        "[Monoload] VAE 第一层（条带解码）对认得的 decoder 开启（Wan 2.1 / qwen_image_vae 单帧；SD1.5 / SDXL / SD3 / Flux ae 的 LDM "
+        "[Monoload] VAE 第一层（条带解码）对认得的 decoder 开启（Wan 2.1 / qwen_image_vae 单帧；SD1.5 / SDXL / SD3 / Flux ae / Flux 2 的 LDM "
         "Decoder，GroupNorm 用整图统计量，方案 {scheme}；第一次使用时自检）：{policy}{rows}；其他 decoder 走第二层；"
         "设 MONOLOAD_DISABLE_VAE_STRIPE=1 全部走第二层"),
     "entry.scheme_forced": ("{scheme} (forced, MONOLOAD_VAE_GN_SCHEME)", "{scheme}（强制，MONOLOAD_VAE_GN_SCHEME）"),
@@ -162,6 +162,24 @@ M = {
     "vae.by_budget": ("chosen by the budget", "按预算选"),
     "vae.layer2_only": ("layer 2 only", "只用第二层"),
     "vae.left_native": ("[Monoload] VAE decode left native: {reason}; {note}", "[Monoload] VAE 解码保持原生：{reason}；{note}"),
+    "vae.nr_no_model": ("no VAE model", "没有 VAE 模型"),
+    "vae.nr_nested": ("nested latent", "嵌套的 latent"),
+    "vae.nr_chunked_io": ("{model} decodes into its own preallocated output (comfy_has_chunked_io)",
+                          "{model} 自己往预分配的输出里写（comfy_has_chunked_io）"),
+    "vae.nr_1d": ("latent_dim {ld} (audio / 1D) is not managed", "latent_dim {ld}（音频 / 1D）不管理"),
+    "vae.nr_audio": ("{model} is an audio VAE ({ndim}-dim latent, x{ratio} to samples): audio decodes are not managed",
+                     "{model} 是音频 VAE（{ndim} 维 latent，放大 {ratio} 倍到采样点）：音频解码不管理"),
+    "vae.nr_dims": ("latent with {ndim} dims for a {ld}D VAE", "{ld}D VAE 收到 {ndim} 维的 latent"),
+    "vae.nr_multiframe": ("multi-frame video latent (T={t}): not managed yet, phase 1 covers images (4D, and 5D with T=1)",
+                          "多帧视频 latent（T={t}）：暂不管理，目前只管图像（4D，以及 T=1 的 5D）"),
+    "vae.nr_batch_time": ("{model}'s decoder mixes frames across the batch (the batch is its time axis, e.g. SVD's VideoDecoder): "
+                          "a sample-by-sample decode would change the result",
+                          "{model} 的 decoder 把整个 batch 当时间轴、在帧之间混合（例如 SVD 的 VideoDecoder）：逐样本解码会改变结果"),
+    "vae.nr_no_ops": ("{model} has no convolution or VAE attention to chunk (e.g. the pixel-space VAE): nothing to manage",
+                      "{model} 没有可分块的卷积或 VAE 注意力（例如像素空间 VAE）：没有可管理的"),
+    "vae.cand_selftest": (" (first use: the self-test before it reserves up to {st}; the decode {plan})",
+                          "（首次使用：解码前的自检最多占 {st}；解码本身 {plan}）"),
+    "vae.est_selftest": ("; the first-use self-test before it up to {st}", "；解码前的首次自检最多 {st}"),
     "vae.native_node": ("mode native (Monoload VAE Settings node)", "模式原生（Monoload VAE 设置节点）"),
     "vae.native_global": ("mode native ({var})", "模式原生（{var}）"),
     "vae.l1_not_used": ("[Monoload] VAE layer 1 (stripes) not used for {model}: {why} -> layer 2",
@@ -234,6 +252,11 @@ M = {
     "vae.err_budget": (
         '[Monoload] VAE decode does not fit the peak budget {budget} (from {src}; latent {shape}): {needs}. {advice}',
         '[Monoload] VAE 解码在峰值预算 {budget}（来源：{src}）内放不下（latent {shape}）：{needs}。{advice}'),
+    "vae.err_forced_selftest": (
+        '[Monoload] VAE decode does not fit the peak budget {budget} (from {src}; latent {shape}): the forced layer-1 configuration '
+        '({what}) cannot run, its self-test failed ({failed}); layer 2 needs about {l2}, above the budget. {advice}',
+        '[Monoload] VAE 解码在峰值预算 {budget}（来源：{src}）内放不下（latent {shape}）：强制的第一层配置（{what}）不能用，'
+        '它的自检未通过（{failed}）；第二层需要约 {l2}，超出预算。{advice}'),
     "vae.src_node": ("the Monoload VAE Settings node", "Monoload VAE 设置节点"),
     "vae.src_env": ("environment variable {var}", "环境变量 {var}"),
     "vae.advice_node": (
@@ -253,6 +276,9 @@ M = {
         "[Monoload] VAE 解码显存不足：第一层（条带解码）的条带已缩到 {rows} 行、工作区 {ws}（共重试 {retries} 次）仍然 OOM。"
         "Monoload 不会退回到 tiled 近似解码，也不会退回第二层（第二层峰值更高）。可以先释放其他模型（/free）、降低分辨率，"
         "或把这个 VAE 的模式设成原生（全部原生：MONOLOAD_DISABLE_VAE=1）。latent {shape}，估算需要 {est}。"),
+    "vae.retry_skip": (
+        "[Monoload] VAE OOM retry: {rows}-row stripes, workspace {ws} would need {est}, more than the first plan's {first}; skipped",
+        "[Monoload] VAE 显存不足重试：{rows} 行条带、工作区 {ws} 需要 {est}，比第一次的计划 {first} 还多，跳过这一档"),
     "vae.retry_l1": (
         "[Monoload] VAE decode ran out of memory; retrying layer 1 with {rows}-row stripes, workspace {ws} (retry {retries})",
         "[Monoload] VAE 解码显存不足；第一层改用 {rows} 行的条带、工作区 {ws} 重试（第 {retries} 次）"),
@@ -328,6 +354,8 @@ M = {
     "info.decode_head": ("last decode ({ago:.0f} s ago): ", "上一次解码（{ago:.0f} 秒前）："),
     "info.decode_native": ("native ComfyUI decode ({reason}){t}", "原版 ComfyUI 解码（{reason}）{t}"),
     "info.decode_error": ("error: no decode fits the budget {budget}", "错误：没有放得下预算 {budget} 的解码方式"),
+    "info.decode_oom": ("error: out of memory ({error})", "错误：显存不足（{error}）"),
+    "info.decode_failed": ("error: the decode failed ({error})", "错误：解码失败（{error}）"),
     "info.decode_l1": ("layer 1 ({adapter}), {n} stripes of {rows} rows", "第一层（{adapter}），{n} 条 {rows} 行的条带"),
     "info.decode_l2": ("layer 2 (op-level chunking)", "第二层（逐算子分块）"),
     "info.decode_line": ("{what}, workspace {ws}, estimate {est}, measured peak {measured}{t}, OOM retries {retries}",

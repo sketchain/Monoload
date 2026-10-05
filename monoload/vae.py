@@ -20,15 +20,18 @@ around first_stage_model.decode:
   * output: device, dtype, process_output (to [0, 1], clamped) and the
     channels-last layout exactly as native.
 
-Everything else -- multi-frame video latents (for now), 1D/audio latents, VAEs
-with their own chunked output path (comfy_has_chunked_io), and explicit
+Everything else -- multi-frame video latents (for now), audio VAEs (1D latents,
+and 2D ones such as ACE-Step / LTX audio / MiniMax audio), VAEs with their own
+chunked output path (comfy_has_chunked_io), decoders that mix frames across the
+batch (SVD's VideoDecoder: a sample-by-sample decode would change the result),
+models with nothing layer 2 chunks (the pixel-space VAE), and explicit
 VAEDecodeTiled / VAE.decode_tiled -- stays native (logged).
 
 Layer 1 (stripe decoding for recognized decoders) plugs in through
 STRIPE_ADAPTERS: the engine (monoload/vae_engine.py) plus one adapter per
 decoder structure (monoload/vae_wan.py: the Wan 2.1 VAE single frame;
-monoload/vae_ldm.py: the LDM Decoder of SD1.5 / SDXL / SD3 / Flux ae, with
-GroupNorm statistics gathered across stripes). A recognized, self-tested
+monoload/vae_ldm.py: the LDM Decoder of SD1.5 / SDXL / SD3 / Flux ae / Flux 2,
+with GroupNorm statistics gathered across stripes). A recognized, self-tested
 decoder is decoded in
 stripes of output rows from a low-resolution checkpoint instead of the
 whole-image activations; everything else keeps layer 2. Default stripe height:
@@ -65,7 +68,7 @@ import comfy.ops
 import comfy.sd
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
-from . import settings, vae_engine, vae_ldm, vae_overrides, vae_wan
+from . import settings, vae_engine, vae_ldm, vae_ops, vae_overrides, vae_wan
 from .errors import MonoloadError, MonoloadVAEOOMError
 from .messages import label, msg
 from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
@@ -488,27 +491,87 @@ def _select_layer1(vae, samples, vae_options):
 # what is managed
 # ---------------------------------------------------------------------------
 
+AUDIO_MIN_RATIO = 64   # an upscale ratio above this is latent frames -> audio samples (images: 1 / 4 / 8 / 16 / 32)
+
+
+def _batch_time_modules():
+    """Module classes that mix frames across the batch (the batch is their time axis): SVD's VideoDecoder."""
+    try:
+        from comfy.ldm.modules import temporal_ae
+    except Exception:
+        return ()
+    return tuple(c for c in (getattr(temporal_ae, n, None) for n in ("VideoResBlock", "AE3DConv", "AttnVideoBlock")) if isinstance(c, type))
+
+
+_TRAITS = weakref.WeakKeyDictionary()   # first_stage_model -> (mixes frames across the batch, has a conv / known attention)
+
+
+def _model_traits(fsm):
+    """(mixes frames across the batch, has something layer 2 chunks), from the model's modules (cached per model)."""
+    try:
+        hit = _TRAITS.get(fsm)
+    except TypeError:
+        hit = None
+    if hit is not None:
+        return hit
+    batch_time = _batch_time_modules()
+    known = vae_ops.known_attention()
+    mixes = ops = False
+    modules = fsm.modules() if isinstance(fsm, torch.nn.Module) else ()
+    for m in modules:
+        if batch_time and isinstance(m, batch_time):
+            mixes = True
+        if isinstance(m, (torch.nn.Conv2d, torch.nn.Conv3d)) or m.__dict__.get("optimized_attention") in known:
+            ops = True
+    hit = (mixes, ops)
+    try:
+        _TRAITS[fsm] = hit
+    except TypeError:
+        pass
+    return hit
+
+
+def _audio_ratio(vae):
+    """The latent -> samples ratio of an audio VAE with a 2D latent, else None.
+    ComfyUI marks most of them with extra_1d_channel (ACE-Step, LTX audio); the
+    others (MiniMax H3 audio) have an upscale ratio no image VAE has."""
+    r = getattr(vae, "upscale_ratio", None)
+    if getattr(vae, "extra_1d_channel", None) is not None:
+        return r if isinstance(r, (int, float)) else "?"
+    if isinstance(r, (int, float)) and not isinstance(r, bool) and r > AUDIO_MIN_RATIO:
+        return r
+    return None
+
+
 def _native_reason(vae, samples):
     """None if this decode is managed, else why it stays native."""
     fsm = getattr(vae, "first_stage_model", None)
     if fsm is None:
-        return "no VAE model"
+        return msg("vae.nr_no_model")
     if getattr(samples, "is_nested", False):
-        return "nested latent"
+        return msg("vae.nr_nested")
+    model = type(fsm).__name__
     if getattr(fsm, "comfy_has_chunked_io", False):
-        return "{} decodes into its own preallocated output (comfy_has_chunked_io)".format(type(fsm).__name__)
+        return msg("vae.nr_chunked_io", model=model)
     ld = getattr(vae, "latent_dim", 2)
-    if ld == 2:
-        if samples.ndim in (4, 5):
-            return None  # native takes frame 0 of a 5D latent for a 2D VAE; so do we
-        return "latent with {} dims for a 2D VAE".format(samples.ndim)
+    if ld not in (2, 3):
+        return msg("vae.nr_1d", ld=ld)
+    ratio = _audio_ratio(vae)
+    if ratio is not None:
+        return msg("vae.nr_audio", model=model, ndim=samples.ndim, ratio=ratio)
+    if ld == 2 and samples.ndim not in (4, 5):   # native takes frame 0 of a 5D latent for a 2D VAE; so do we
+        return msg("vae.nr_dims", ndim=samples.ndim, ld=ld)
     if ld == 3:
-        if samples.ndim == 5 and samples.shape[2] == 1:
-            return None
-        if samples.ndim == 5:
-            return "multi-frame video latent (T={}): not managed yet, phase 1 covers images (4D, and 5D with T=1)".format(samples.shape[2])
-        return "latent with {} dims for a 3D VAE".format(samples.ndim)
-    return "latent_dim {} (audio / 1D) is not managed".format(ld)
+        if samples.ndim != 5:
+            return msg("vae.nr_dims", ndim=samples.ndim, ld=ld)
+        if samples.shape[2] != 1:
+            return msg("vae.nr_multiframe", t=samples.shape[2])
+    mixes, ops = _model_traits(fsm)
+    if mixes:
+        return msg("vae.nr_batch_time", model=model)
+    if not ops:
+        return msg("vae.nr_no_ops", model=model)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -669,21 +732,50 @@ def _decode(self, samples_in, vae_options={}):
         _LAST.clear()
         _LAST.update({"strategy": "native", "reason": reason, "settings": dict(eff), "settings_source": dict(src)})
         t0 = time.perf_counter()
-        out = _ORIG["decode"](self, samples_in, vae_options)
+        try:
+            out = _ORIG["decode"](self, samples_in, vae_options)
+        except Exception as e:
+            _error_record(e)
+            _LAST["settings"], _LAST["settings_source"] = dict(eff), dict(src)
+            _record(self)
+            raise
         _LAST["seconds"] = time.perf_counter() - t0
         _record(self)
         return out
     probe = _MemProbe(getattr(self, "device", None))
+    # this call's record starts empty: a decode that fails before writing its own fields must not leave the fields of
+    # the previous decode (of any VAE) in its record
+    _LAST.clear()
     with _Applied(eff, note, src):
         try:
             with probe:
                 return _managed_decode(self, samples_in, vae_options)
+        except Exception as e:
+            _error_record(e)
+            raise
         finally:
             _LAST["settings"], _LAST["settings_source"] = dict(eff), dict(src)
             _record(self, probe.result)
 
 
+def _error_record(e):
+    """The record of a decode that raised e: strategy "error", kind "budget"
+    (nothing fits the budget, written by _decode_budget), "oom" or "other",
+    and the error's first line. Fields of a run that got further (strategy,
+    plan) are dropped."""
+    if _LAST.get("strategy") != "error":
+        kind = "oom" if isinstance(e, MonoloadVAEOOMError) or mm.is_oom(e) else "other"
+        _LAST.clear()
+        _LAST.update({"strategy": "error", "kind": kind, "budget": budget()})
+    text = str(e).strip().splitlines()
+    _LAST["error"] = "{}: {}".format(type(e).__name__, text[0] if text else "")
+
+
+_SELFTEST_IN_DECODE = [0]   # selftest_memory() of a first-use self-test run inside the decode in progress (0: none)
+
+
 def _managed_decode(self, samples_in, vae_options):
+    _SELFTEST_IN_DECODE[0] = 0
     self.throw_exception_if_invalid()
     if self.latent_dim == 2 and samples_in.ndim == 5:
         samples_in = samples_in[:, :, 0]
@@ -706,8 +798,10 @@ def _layer1_self_test(vae, bound):
     hit = vae_engine._SELFTEST.get(bound.key)
     if hit is None:
         # the self-test copies the decoder's weights: they must be loaded
-        mm.load_models_gpu([vae.patcher], memory_required=bound.selftest_memory(), force_full_load=vae.disable_offload)
+        need = bound.selftest_memory()
+        mm.load_models_gpu([vae.patcher], memory_required=need, force_full_load=vae.disable_offload)
         hit = vae_engine.self_test(bound, vae)
+        _SELFTEST_IN_DECODE[0] = max(_SELFTEST_IN_DECODE[0], need)
         if hit[0]:
             logging.info(msg("vae.selftest_ok", name=bound.name, detail=hit[1]))
         else:
@@ -759,11 +853,20 @@ def _selftest_failed(bound):
     return hit is not None and not hit[0]
 
 
+def _selftest_pending(bound):
+    """What the first-use self-test of this structure will reserve before the decode, 0 once it has run (DESIGN §9.20)."""
+    return 0 if bound.key in vae_engine._SELFTEST else bound.selftest_memory()
+
+
+def _selftest_note(c):
+    return msg("vae.cand_selftest", st=fmt_bytes(c["selftest"]), plan=fmt_bytes(c["plan_estimate"])) if c.get("selftest") else ""
+
+
 def _candidate_label(c):
     if c["layer"] == 2:
         return msg("vae.cand_layer2", est=fmt_bytes(c["estimate"]))
     return msg("vae.cand_layer1", scheme=msg("vae.cand_scheme", scheme=c["gn_scheme"]) if c["gn_scheme"] else "", rows=c["rows"],
-               ws=fmt_bytes(c["workspace"]), est=fmt_bytes(c["estimate"]),
+               ws=fmt_bytes(c["workspace"]), est=fmt_bytes(c["estimate"]) + _selftest_note(c),
                secs=msg("vae.cand_secs", secs=c["seconds"]) if c["seconds"] is not None else "")
 
 
@@ -781,11 +884,23 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
                 4K: SDXL 9.9 s vs 35.5 s at best, Qwen 6.9 vs 8.4 s); then the
                 layer-1 variants by bound.predict_seconds (LDM: the time model,
                 vae_ldm.TIME_COEF).
-    forced      outrank the budget: MONOLOAD_DISABLE_VAE_STRIPE -> layer 2;
-                MONOLOAD_VAE_STRIPE_ROWS -> layer 1 at that height (the scheme is
-                still chosen); MONOLOAD_VAE_GN_SCHEME -> layer 1 with that scheme
-                for an LDM decoder (the height is still chosen). A forced
-                configuration that does not fit runs anyway (logged).
+    forced      each has its own relation to the budget (DESIGN §9.14.10):
+                  layer 2 only (MONOLOAD_DISABLE_VAE_STRIPE / node mode): layer
+                    2, also when its estimate is above the budget (logged);
+                  fixed height (MONOLOAD_VAE_STRIPE_ROWS): layer 1 at that
+                    height, layer 2 not considered; the scheme is the fastest
+                    that fits at that height, and when none fits the one with
+                    the lowest estimate runs anyway (logged);
+                  fixed scheme (MONOLOAD_VAE_GN_SCHEME, LDM): layer 1 with that
+                    scheme, layer 2 not considered, the tallest stripes that
+                    fit; when no height fits: MonoloadError (it does not run
+                    over the budget, and does not fall back to layer 2);
+                  fixed height and scheme: that configuration, run anyway.
+                When the forced layer-1 configuration cannot run because its
+                self-test failed (in this decode or cached from an earlier one,
+                the same decision): layer 2 if it fits the budget, else
+                MonoloadError naming the forced setting, the variant(s) that
+                failed and what layer 2 needs.
     none fits   MonoloadError naming what each candidate needs.
 
     selftest(bound) -> (ok, detail): the layer-1 self-test (default: run it,
@@ -808,16 +923,19 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
     bound, l1_note = _select_layer1(vae, samples_in, vae_options)
     if not _SETTINGS["stripe"]:
         return layer2(msg("vae.l2_forced_policy", src=_from("mode")), msg("vae.l2_forced_why", src=_from("mode")), l1_note)[1]
-    variants = []
+    # a forced layer-1 configuration is read from the effective settings, not from the variants left after failed
+    # self-tests: the decision must not depend on whether a failure was cached by an earlier decode (review 02)
+    forced = []
+    if bound is not None and rows:
+        forced.append(msg("vae.forced_rows", rows=rows, src=_from("stripe_rows")))
+    if bound is not None and scheme and bound.schemes:
+        forced.append(msg("vae.forced_scheme", scheme=scheme, src=_from("gn_scheme")))
+    variants, failed = [], []
     if bound is not None:
-        variants = [v for v in bound.variants(scheme if bound.schemes else None) if not _selftest_failed(v)]
+        for v in bound.variants(scheme if bound.schemes else None):
+            (failed if _selftest_failed(v) else variants).append(v)
         if not variants:
             l1_note = msg("vae.selftest_failed_short")
-    forced = []
-    if variants and rows:
-        forced.append(msg("vae.forced_rows", rows=rows, src=_from("stripe_rows")))
-    if variants and scheme and bound.schemes:
-        forced.append(msg("vae.forced_scheme", scheme=scheme, src=_from("gn_scheme")))
     if not forced:
         c, d = layer2(msg("vae.l2_fits_policy"),
                       msg("vae.l2_fits_why", l1=msg("vae.l1_unavailable_note", why=l1_note) if l1_note else ""), l1_note)
@@ -830,10 +948,11 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
     fits, over = [], []
     for v in variants:
         outb = v.output_bytes(vae, samples_in)
+        st = _selftest_pending(v)   # a first use runs the self-test before the decode: it must fit the budget too
         p = None
         for w in ws_opts:
             q = v.plan(vae, samples_in, bud, w, rows=rows, out_bytes=outb)
-            if q is None or q.estimate > bud:
+            if q is None or max(q.estimate, st) > bud:
                 continue
             if p is None:
                 p = q
@@ -844,9 +963,10 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
         if p is None:
             p = (v.plan(vae, samples_in, bud, ws_opts[-1], rows=rows, out_bytes=outb) if rows
                  else v.smallest_plan(vae, samples_in, ws_opts[-1], out_bytes=outb))
+        est = max(p.estimate, st)
         c = {"layer": 1, "adapter": v.name, "gn_scheme": getattr(v, "gn_scheme", None), "rows": max(b - a for a, b in p.stripes),
-             "estimate": p.estimate, "seconds": v.predict_seconds(p), "fits": p.estimate <= bud, "workspace": p.workspace,
-             "prefix": p.prefix_bytes, "stripes": p.stripe_bytes}
+             "estimate": est, "plan_estimate": p.estimate, "selftest": st if st > p.estimate else 0, "seconds": v.predict_seconds(p),
+             "fits": est <= bud, "workspace": p.workspace, "prefix": p.prefix_bytes, "stripes": p.stripe_bytes}
         considered.append(c)
         (fits if c["fits"] else over).append((v, p, c))
     fits.sort(key=lambda x: (x[2]["seconds"] is None, x[2]["seconds"] or 0.0))
@@ -857,7 +977,8 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
     for v, p, c in pick:
         ok, detail = selftest(v)
         if not ok:
-            c["selftest"] = "failed"
+            c["selftest_result"] = "failed"
+            failed.append(v)
             continue
         if over_budget:
             reason = pre + msg("vae.reason_over")
@@ -870,18 +991,24 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
         return {"layer": 1, "bound": v, "plan": p, "workspace": p.workspace, "selftest": detail, "candidates": considered,
                 "policy": msg("vae.policy_join", head=head, policy=msg("vae.policy_forced_over") if over_budget else msg("vae.policy_fastest"), over=""),
                 "why": msg("vae.why_layer1", head=head, cand=_candidate_label(c), reason=reason, others=others)}
-    if forced and pick:
-        # every forced layer-1 variant that fits failed its self-test: layer 2, as without a budget
-        failed = msg("vae.selftest_failed_short")
-        return layer2(msg("vae.l2_after_selftest"), failed, failed)[1]
+    if forced and (pick or not variants):
+        # the forced layer-1 configuration cannot run: its self-test failed, now or earlier in this process. Layer 2,
+        # but only within the budget (DESIGN §9.14.10, review 02); the same decision either way
+        note = msg("vae.selftest_failed_short")
+        c2, d2 = layer2(msg("vae.l2_after_selftest"), note, note)
+        if c2["fits"]:
+            return d2
+        raise MonoloadError(msg("vae.err_forced_selftest", budget=fmt_bytes(bud), src=_from("budget"), what=", ".join(forced),
+                                failed=", ".join(v.name for v in failed), l2=fmt_bytes(c2["estimate"]), shape=list(samples_in.shape),
+                                advice=_budget_advice()))
     needs = []
     for c in considered:
         if c["layer"] == 2:
             needs.append(msg("vae.need_layer2", est=fmt_bytes(c["estimate"])))
         else:
             needs.append(msg("vae.need_layer1", scheme=msg("vae.need_scheme", scheme=c["gn_scheme"]) if c["gn_scheme"] else "", rows=c["rows"],
-                             est=fmt_bytes(c["estimate"]), prefix=fmt_bytes(c["prefix"]), stripes=fmt_bytes(c["stripes"]),
-                             failed=msg("vae.need_failed") if c.get("selftest") else ""))
+                             est=fmt_bytes(c["estimate"]) + _selftest_note(c), prefix=fmt_bytes(c["prefix"]), stripes=fmt_bytes(c["stripes"]),
+                             failed=msg("vae.need_failed") if c.get("selftest_result") else ""))
     if not variants:
         needs.append(msg("vae.need_l1_unavailable", why=l1_note))
     raise MonoloadError(msg("vae.err_budget", budget=fmt_bytes(bud), src=_from("budget"), advice=_budget_advice(),
@@ -893,7 +1020,7 @@ def _decode_budget(self, samples_in, vae_options, t0, bud):
         d = choose_budget(self, samples_in, vae_options, bud)
     except MonoloadError:
         _LAST.clear()
-        _LAST.update({"strategy": "error", "budget": bud})
+        _LAST.update({"strategy": "error", "kind": "budget", "budget": bud})
         raise
     logging.info(msg("vae.budget_log", why=d["why"], note=("; " + _NOTE[0]) if _NOTE[0] else ""))
     if d["layer"] == 2:
@@ -924,14 +1051,22 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
             break
         pixel_samples = None
         mm.soft_empty_cache(True)
+        # halve stripes and workspace; a step whose estimate is above the first plan's (with a budget the first plan
+        # is within it, unless forced rows run above it anyway) is skipped: shorter stripes are not monotone in
+        # every plan (statistics passes, save layouts), and the retry must not need more than was loaded for
         rows = max(b - a for a, b in plan.stripes)
-        if rows <= min_rows and ws <= floor_ws:
-            raise MonoloadVAEOOMError(msg("vae.err_oom_l1", rows=rows, ws=fmt_bytes(ws), retries=retries, shape=list(samples_in.shape),
-                                          est=fmt_bytes(plan.estimate)))
-        rows = max(min_rows, rows // 2)
-        ws = max(floor_ws, ws // 2)
+        while True:
+            if rows <= min_rows and ws <= floor_ws:
+                raise MonoloadVAEOOMError(msg("vae.err_oom_l1", rows=rows, ws=fmt_bytes(ws), retries=retries, shape=list(samples_in.shape),
+                                              est=fmt_bytes(plan.estimate)))
+            rows = max(min_rows, rows // 2)
+            ws = max(floor_ws, ws // 2)
+            cand = bound.plan(self, samples_in, bud, ws, rows=rows, out_bytes=outb)
+            if cand.estimate <= first_est:
+                break
+            logging.warning(msg("vae.retry_skip", rows=rows, ws=fmt_bytes(ws), est=fmt_bytes(cand.estimate), first=fmt_bytes(first_est)))
+        plan = cand
         retries += 1
-        plan = bound.plan(self, samples_in, bud, ws, rows=rows, out_bytes=outb)
         logging.warning(msg("vae.retry_l1", rows=rows, ws=fmt_bytes(ws), retries=retries))
 
     pixel_samples = pixel_samples.to(self.output_device).movedim(1, -1)
@@ -940,9 +1075,11 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
     native_est = _native_estimate(self, samples_in.shape)
     boundaries = [(plan.h_out, a) for a, _ in plan.stripes[1:]]
     _LAST.clear()
-    _LAST.update({"strategy": "layer1", "adapter": bound.name, "estimate": {"total": plan.estimate, "first": first_est,
+    st = _SELFTEST_IN_DECODE[0]
+    total = max(plan.estimate, st)   # the first use ran the self-test before the decode: the call's peak is the larger
+    _LAST.update({"strategy": "layer1", "adapter": bound.name, "estimate": {"total": total, "plan": plan.estimate, "selftest": st, "first": first_est,
                   "prefix": plan.prefix_bytes, "stripes": plan.stripe_bytes, "checkpoint": plan.ckpt_bytes, "persistent": plan.persistent,
-                  "live": plan.live_peak, "arena": plan.arena},
+                  "live": plan.live_peak, "arena": plan.arena, "output": plan.out_segment},
                   "native_estimate": native_est, "budget": bud, "policy": policy, "workspace": ws, "retries": retries, "seconds": dt,
                   "stripes": len(plan.stripes), "rows": max(b - a for a, b in plan.stripes), "recompute": plan.recompute,
                   "checkpoint_bytes": plan.ckpt_bytes, "boundaries": boundaries, "forced_rows": forced, "selftest": selftest,
@@ -951,7 +1088,8 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
                   "predicted_seconds": bound.predict_seconds(plan), "stats": stats.as_dict()})
     logging.info(msg("vae.log_layer1", shape="x".join(str(d) for d in samples_in.shape), name=bound.name, plan=plan.describe(), policy=policy,
                      ws=fmt_bytes(ws), retries=msg("vae.retries", n=retries) if retries else "",
-                     arena=fmt_bytes(stats.arena) if stats.arena else msg("vae.none"), est=fmt_bytes(plan.estimate),
+                     arena=fmt_bytes(stats.arena) if stats.arena else msg("vae.none"),
+                     est=fmt_bytes(plan.estimate) + (msg("vae.est_selftest", st=fmt_bytes(st)) if st else ""),
                      native=fmt_bytes(native_est), secs=dt, note=_NOTE[0]))
     return pixel_samples
 

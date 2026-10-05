@@ -13,7 +13,7 @@ Flux-like AutoencodingEngine), fp32 on the CPU unless noted.
      weight path (weight_function), refuses a norm without statistics;
   2. recognition: SDXL-like / Flux-like recognized; attention in an up level,
      tanh_out, give_pre_end, carried 3D convs, a non-2x upsample, an upsample
-     without conv, batch_norm_latent, a 3x3 conv shortcut, Dropout in training,
+     without conv, a batch-norm latent unlike Flux 2's (tests/test_vae_flux2.py), a 3x3 conv shortcut, Dropout in training,
      a forward hook, an instance forward, vae_options, wrong latent channels
      -> layer 2 with the reason, result == native;
   3. whole decoder vs native VAE.decode: schemes A / D / B / C x stripe heights
@@ -191,8 +191,10 @@ def recognition_tests():
     setattr_case("upsample without conv", up, "with_conv", False, "without conv")
     setattr_case("3x3 conv shortcut", rb, "use_conv_shortcut", True, "conv shortcut", decode=False)
     fsm = sd.first_stage_model
-    bn = torch.nn.BatchNorm2d(16).eval()
-    case("batch_norm_latent", lambda: fsm.__dict__.__setitem__("bn", bn), lambda: fsm.__dict__.__setitem__("bn", None), "bn", decode=False)
+    bn = torch.nn.BatchNorm2d(16, affine=False).eval()
+    # a BatchNorm latent that is not Flux 2's (no 2x2 patch size, 16 features for a z 4 decoder): Flux 2 itself, tests/test_vae_flux2.py
+    case("batch_norm_latent without Flux 2's patch size", lambda: fsm.__dict__.__setitem__("bn", bn), lambda: fsm.__dict__.__setitem__("bn", None),
+         "bn: patch size", decode=False)
     c1 = dec.up[1].block[-1].out_channels
     atts = [init_random(ldm.AttnBlock(c1)) for _ in dec.up[1].block]
     case("attention in an up level", lambda: dec.up[1].attn.extend(atts), lambda: [dec.up[1].attn.__delitem__(0) for _ in atts], "has attention")
@@ -366,7 +368,7 @@ def plan_tests(sd, lat4):
                                                          plan.live_peak / G, plan.prefix_bytes / G, plan.stripe_bytes / G, plan.pass_bytes / G,
                                                          plan.arena / G, plan.estimate / G, plan.recompute),
               len(plan.passes) == 19 and len(plan.saves) == {"A": 0, "D": 1, "B": 2, "C": 5}[scheme] and floor_ok and parts
-              and plan.estimate == plan.arena + plan.largest + eng.ESTIMATE_PAD)
+              and plan.out_segment == eng.out_segment(outb) and plan.estimate == plan.out_segment + plan.arena + plan.largest + eng.ESTIMATE_PAD)
     check("schemes: arena A < D < B < C; recompute A > D > B, A > D > C (C's saves share one pool, B's are separate: {} / {})".format(
           res["C"].save_layout, res["B"].save_layout),
           res["A"].recompute > res["D"].recompute > res["B"].recompute and res["D"].recompute > res["C"].recompute
@@ -492,8 +494,13 @@ def budget_tests(sd, lat4):
         bud = floor
         while bud < 8 * floor and pick is None:
             mvae.set_budget(bud)
-            d = mvae.choose_budget(sd, lat4, {}, bud, selftest=_stub_selftest)
-            mvae.set_budget(None)
+            try:
+                d = mvae.choose_budget(sd, lat4, {}, bud, selftest=_stub_selftest)
+            except MonoloadError:      # nothing fits yet (a scheme not self-tested yet counts its self-test, DESIGN §9.20)
+                bud = int(bud * 1.03) + 1
+                continue
+            finally:
+                mvae.set_budget(None)
             fit1 = [c for c in d["candidates"] if c["layer"] == 1 and c["fits"]]
             if d["layer"] == 1 and len(d["plan"].stripes) > 1 and len(fit1) >= 3 and len({c["gn_scheme"] for c in fit1}) >= 3:
                 pick = bud

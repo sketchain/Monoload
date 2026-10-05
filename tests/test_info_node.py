@@ -161,6 +161,52 @@ def vae_tests():
     return sd
 
 
+def error_record_tests(sd):
+    """A decode that fails gets a record of its own error (strategy "error", kind, message), never the fields of the
+    previous decode of another VAE (or of its own earlier success); the exception propagates unchanged."""
+    import comfy.model_management as mm
+    from monoload import vae_engine as eng
+    lat = torch.randn(1, 4, 12, 10, generator=torch.Generator().manual_seed(7))
+    cls_v = __import__("monoload.nodes", fromlist=["NODE_CLASS_MAPPINGS"]).NODE_CLASS_MAPPINGS["MonoloadVAESettings"]
+    stale = ("adapter", "stripes", "rows", "seconds", "estimate", "plan", "workspace", "retries")
+
+    def fail(v, label, patch, exc, kind, words):
+        comfy.sd.VAE.decode(sd, lat)                    # A succeeds right before: _LAST holds A's layer-1 fields
+        a_before = mvae.decode_record(sd)
+        obj, name, repl = patch
+        orig = getattr(obj, name)
+        setattr(obj, name, repl)
+        raised = None
+        try:
+            comfy.sd.VAE.decode(v, lat)
+        except Exception as e:
+            raised = e
+        finally:
+            setattr(obj, name, orig)
+        r = mvae.decode_record(v) or {}
+        line = info.describe_decode(r)
+        same_a = v is sd or mvae.decode_record(sd) == a_before
+        check("{}: {} raised and propagated; record: {} {} ({}), none of the previous decode's fields; Info: {}".format(
+            label, type(raised).__name__, r.get("strategy"), r.get("kind"), r.get("error"), line.split("): ", 1)[-1][:90]),
+            isinstance(raised, exc) and r.get("strategy") == "error" and r.get("kind") == kind and not any(k in r for k in stale)
+            and all(w in line for w in words) and same_a and a_before.get("strategy") == "layer1")
+
+    b = node_apply(cls_v, sd)
+    fail(b, "VAE B fails while loading", (mm, "load_models_gpu", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("load refused"))),
+         RuntimeError, "other", ["the decode failed", "RuntimeError: load refused"])
+    fail(b, "VAE B fails during the stripes", (eng, "run_stripes", lambda *a, **k: (_ for _ in ()).throw(ValueError("stripe broke"))),
+         ValueError, "other", ["the decode failed", "ValueError: stripe broke"])
+    oom = mm.OOM_EXCEPTION("simulated")
+    fail(b, "VAE B out of memory at every retry", (eng, "run_stripes", lambda *a, **k: (_ for _ in ()).throw(oom)),
+         mvae.MonoloadVAEOOMError, "oom", ["out of memory", "MonoloadVAEOOMError"])
+    fail(sd, "VAE A succeeds, then fails itself", (eng, "run_stripes", lambda *a, **k: (_ for _ in ()).throw(ValueError("second time"))),
+         ValueError, "other", ["the decode failed", "second time"])
+    comfy.sd.VAE.decode(sd, lat)
+    check("... and its next successful decode replaces the error record", (mvae.decode_record(sd) or {}).get("strategy") == "layer1")
+    from monoload import messages
+    check("the new Info lines have English and Chinese text", all(len(messages.M[k]) == 2 and all(messages.M[k]) for k in ("info.decode_oom", "info.decode_failed")))
+
+
 def probe_tests():
     """_MemProbe on a GPU (simulated here): the allocator's cache is emptied
     before the starting point is taken, so blocks cached by earlier work (the
@@ -253,6 +299,7 @@ def main():
     interface_tests()
     global_tests()
     sd = vae_tests()
+    error_record_tests(sd)
     probe_tests()
     m = model_tests(sd)
     combo_tests(sd, m)

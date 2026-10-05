@@ -31,7 +31,10 @@ The adapter interface (StripeAdapter):
   units                [Unit] the stripe part
   ckpt_channels        channels of the checkpoint
   hdim                 the row dimension of the tensors (5D Wan: 3, 4D: 2)
-  scale                output rows per latent row
+  scale                output rows per checkpoint row (per row of the decoder's input)
+  decoder_hw(samples)  rows / cols the decoder works at below the prefix (the plan's
+                       h8 x w8): the latent's, unless the first prefix step changes the
+                       resolution (Flux 2's 2x2 un-patchify of the latent)
   out_channels         channels of the decoder output
   output_shape(samples)            the native-layout shape of the decoded batch
   cost model           prefix_peak / prefix_largest / prefix_out_channels /
@@ -60,6 +63,9 @@ MIN_ROWS = 8                 # smallest automatic / OOM-retry stripe core height
 SELFTEST_LATENT = 24         # latent rows/cols of the self-test
 SELFTEST_ROWS = 40           # forced stripe core height in the self-test (192 output rows -> 5 stripes, the last one shorter)
 SELFTEST_WORKSPACE = 8 * MIB # small workspace: the big convs inside the stripes also run in layer-2 row blocks
+SELFTEST_REF_WORKSPACE = 32 * MIB  # the reference whole-image decode under layer-2 chunking too (other row blocks than the
+                             # stripes'): without it its fp32 im2col columns made the self-test peak ~0.74 GiB (DESIGN §9.19)
+SELFTEST_MARGIN = 32 * MIB   # allocator rounding / fragmentation on top of the self-test's tensors (selftest_memory)
 SELFTEST_TOL = 1e-4          # max|stripes - whole| / max(1, max|whole|), fp32
 
 
@@ -151,7 +157,10 @@ def conv_io(m):
 # single whole-image stripe up to live + 12 %); the estimate is the arena plus
 # the largest single allocation plus ESTIMATE_PAD for the small-block pool.
 # Allocations whose place in the arena is guaranteed (the GroupNorm saves, see
-# saves_fit) are not candidates for that largest allocation.
+# saves_fit) are not candidates for that largest allocation. The output buffer
+# is not in the arena (DESIGN §9.22): it is allocated first, in a segment of its
+# own (out_segment, also in the estimate), so that emptying the cache after the
+# decode returns the whole arena.
 
 ARENA_DIV = 32               # arena = live peak + live peak / ARENA_DIV + ARENA_PAD, rounded up to 2 MiB
 ARENA_DIV_SINGLE = 8         # ... with one stripe (whole-image planes of 1-2 GiB fragment more)
@@ -162,6 +171,9 @@ ARENA_PAD = 64 * MIB
 ESTIMATE_PAD = 16 * MIB      # small-block pool (<= 1 MiB requests come from their own 2 MiB segments; 2-6 MiB seen)
 CONTIGUOUS_INPUT = (UP,)     # units whose row slice is made contiguous before the call
 ARENA_ENABLED = True         # bench --no-arena: off, to measure the tensors' own peak (the arena block counts as allocated)
+CKPT_LOW = True              # a checkpoint that is not at the front of the arena moves into a free block below it if one fits
+OUTPUT_IN_ARENA = False      # True: the layout up to 6324592 (tests/alloc_sim.py replays the readings of those versions):
+                             # no cache emptied before / after, the output allocated after the first prefix, in the arena
 
 
 FRONT_DIV = 8                # room above the live saves: the phase's temporaries + 1/FRONT_DIV (Plan, see front_arena)
@@ -215,6 +227,20 @@ def place(arena, seq):
             below = [size for st, size in free if st < top]
             marks[op[1]] = (top, max(below + [0]), sum(below))
     return True, marks
+
+
+def out_segment(nbytes):
+    """What the caching allocator reserves for one request of nbytes made when
+    no cached block can take it: requests up to SMALL_ALLOC share a 2 MiB
+    segment, those below 10 MiB get a 20 MiB one, larger ones their size
+    rounded up to 2 MiB."""
+    if nbytes <= 0:
+        return 0
+    if nbytes <= SMALL_ALLOC:
+        return 2 * MIB
+    if nbytes < 10 * MIB:
+        return 20 * MIB
+    return -(-int(nbytes) // (2 * MIB)) * (2 * MIB)
 
 
 def saves_fit(arena, seq):
@@ -355,8 +381,11 @@ class Plan:
         self.final_units = units[sf:]
         self.final_heights = heights[sf:]
         self.stripes = split_rows(self.h_out, rows)
+        # the output buffer: in the arena (OUTPUT_IN_ARENA, the earlier layout) or a segment of its own before it
+        out_arena = out_bytes if OUTPUT_IN_ARENA else 0
+        self.out_segment = 0 if OUTPUT_IN_ARENA else out_segment(out_bytes)
         prefix_live = s = 0
-        largest = max(out_bytes, lat_bytes)
+        largest = max(out_arena, lat_bytes)
         for _, m in bound.prefix:
             prefix_live = max(prefix_live, bound.prefix_peak(m, h8, w8, elem, ws, s))
             largest = max(largest, bound.prefix_largest(m, h8, w8, elem, ws))
@@ -450,7 +479,7 @@ class Plan:
                 out.append(best)
             return final_bytes, max([0] + [a + b[1][1][2] for a, b in zip(alive, out)]), out
 
-        persistent = out_bytes + lat_bytes
+        persistent = out_arena + lat_bytes
         variants = [("separate", [self.save_bytes[ps.start] + sum(self.save_bytes[p] for p in ps.builds) for ps in self.passes],
                      self.save_bytes[sf] + strip_live, slack, max([0] + [self.save_bytes[p] for p in saves]))]
         if len(saves) > 1:
@@ -475,7 +504,7 @@ class Plan:
             # phase whose largest temporary is larger than every such hole cannot use them; when they are more than
             # the rule's slack, its temporaries need the room above the live saves (tests/alloc_sim.py: very tall
             # stripes, 4K B with 540 / 768 rows, stranded several requests outside the arena of the rule above)
-            seq = self.long_lived(out_bytes)
+            seq = self.long_lived(out_arena)
             _, marks = place(self.arena, seq)
             slack_rule = self.arena - self.live_peak
             phases = [(k, ps.live, ps.largest) for k, ps in enumerate(self.passes)] + [("final", strip_live, lg)]
@@ -485,16 +514,16 @@ class Plan:
                     self.front_arena = max(self.front_arena, top + temps + temps // FRONT_DIV + ARENA_PAD)
             if self.front_arena > self.arena:
                 self.arena = -(-self.front_arena // (2 * MIB)) * (2 * MIB)
-        self.saves_guaranteed = bool(saves) and saves_fit(self.arena, self.long_lived(out_bytes))
+        self.saves_guaranteed = bool(saves) and saves_fit(self.arena, self.long_lived(out_arena))
         if saves and not self.saves_guaranteed:
             largest = max(largest, save_alloc)
         if not self.passes:
             self.live_peak = int(self.persistent + max(self.prefix_bytes, self.stripe_bytes))
             self.arena = arena_bytes(self.live_peak, len(self.stripes))
         self.largest = int(largest)
-        # reserved = the arena, unless fragmentation strands one request outside it (then that request's own segment);
-        # the saves are not among the candidates when saves_fit guarantees their place
-        self.estimate = self.arena + self.largest + ESTIMATE_PAD
+        # reserved = the output's segment and the arena, unless fragmentation strands one request outside it (then
+        # that request's own segment); the saves are not among the candidates when saves_fit guarantees their place
+        self.estimate = self.out_segment + self.arena + self.largest + ESTIMATE_PAD
         work_prefix = sum(bound.prefix_macs(m) for _, m in bound.prefix) * h8 * w8
         work_whole = work_prefix + sum(heights[i + 1] * widths[i + 1] * u.macs_row for i, u in enumerate(units))
         work_stripes = _macs(final_levels)
@@ -515,10 +544,11 @@ class Plan:
     def long_lived(self, out_bytes):
         """The long-lived allocations of one sample of a decode with saves, in
         order (for saves_fit): the checkpoint buffer (before the prefix), the
-        output buffer (after it), each save (or the pool) at the start of the
-        pass that builds it, a save freed after the pass from which nothing
-        starts from it any more (the checkpoint too)."""
-        seq = [("alloc", 0, self.ckpt_bytes), ("alloc", "out", out_bytes)]
+        output buffer (after it; out_bytes 0: not in the arena), each save (or
+        the pool) at the start of the pass that builds it, a save freed after
+        the pass from which nothing starts from it any more (the checkpoint
+        too)."""
+        seq = [("alloc", 0, self.ckpt_bytes)] + ([("alloc", "out", out_bytes)] if out_bytes else [])
         alive = {0}
         pool = False
         for k, ps in enumerate(self.passes):
@@ -819,6 +849,37 @@ def reserve_arena(device, nbytes):
     del t
 
 
+def block_addr(t):
+    """Device address of t's storage (the caching allocator's block)."""
+    return t.untyped_storage().data_ptr()
+
+
+def device_reserved(device):
+    return torch.cuda.memory_reserved(device) if torch.device(device).type == "cuda" else 0
+
+
+def move_low(t, device):
+    """t, or a copy of it in a free block below it when the caching allocator
+    has one that fits (DESIGN §9.22). The prefix's last temporaries leave a
+    hole in front of its output, the checkpoint; only requests up to the
+    hole's size can use it (the output buffer did, when it was in the arena:
+    without it, a column block 1 MiB too large for it was stranded outside the
+    arena). Best fit takes the smallest free block that is large enough: if
+    that is the hole, the checkpoint moves into it and the rest of the arena
+    is one piece; if it is above t (the arena's tail) or a new segment, the
+    trial block is freed at once, merging back where it came from."""
+    before = device_reserved(device)
+    buf = torch.empty_like(t)
+    if device_reserved(device) == before and block_addr(buf) < block_addr(t):
+        buf.copy_(t)
+        return buf
+    grew = device_reserved(device) != before
+    del buf
+    if grew:
+        mm.soft_empty_cache()   # the new segment, free again
+    return t
+
+
 class StripeAdapter:
     """What every layer-1 adapter shares: planning and running a decode. A
     subclass binds to one decoder instance and provides the structure and the
@@ -834,7 +895,7 @@ class StripeAdapter:
         bound handed to load_models_gpu, or "arena", what is reserved) fits the
         budget (None if no height fits: MIN_ROWS, doubled up to the image height);
         else exactly `rows`."""
-        h8, w8 = int(samples.shape[-2]), int(samples.shape[-1])
+        h8, w8 = self.decoder_hw(samples)
         elem = mm.dtype_size(vae.vae_dtype)
         lat = samples[0:1].numel() * elem
         if rows is not None:
@@ -865,7 +926,7 @@ class StripeAdapter:
         """The plan with the lowest estimate among the heights plan() tries first
         (MIN_ROWS, doubled up to the image height): what the error names when
         nothing fits a budget."""
-        h_out = int(samples.shape[-2]) * self.scale
+        h_out = self.decoder_hw(samples)[0] * self.scale
         r, best = min(MIN_ROWS, h_out), None
         while True:
             p = self.plan(vae, samples, 0, ws, rows=r, out_bytes=out_bytes)
@@ -874,6 +935,10 @@ class StripeAdapter:
             if r >= h_out:
                 return best
             r = min(h_out, r * 2)
+
+    def decoder_hw(self, samples):
+        """(rows, cols) of the decoder below the prefix for this latent: the latent's own."""
+        return int(samples.shape[-2]), int(samples.shape[-1])
 
     def variants(self, scheme=None):
         """The layer-1 configurations of this decoder the budget policy chooses
@@ -908,13 +973,24 @@ class StripeAdapter:
 
     def run(self, vae, samples_in, plan, budget_ws, stats):
         """Decode every sample with the stripe plan; returns pixel_samples
-        (process_output applied) shaped like native's output."""
+        (process_output applied) shaped like native's output.
+
+        Memory (DESIGN §9.22): the allocator's cache is emptied first, so that
+        blocks other work left cached (the budget probe's) do not take the
+        decode's first requests in place of the arena; the output buffer is
+        allocated next, in a segment of its own (Plan.out_segment), then the
+        arena is reserved; after the decode the cache is emptied again, which
+        returns the whole arena and leaves only the output reserved."""
         n = samples_in.shape[0]
         hdim = self.hdim
-        if plan.arena and arena_supported(vae.device):
+        pixel_samples = None
+        if not OUTPUT_IN_ARENA:
+            mm.soft_empty_cache()
+            pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
+        arena = bool(plan.arena) and arena_supported(vae.device)
+        if arena:
             reserve_arena(vae.device, plan.arena)
             stats.arena = plan.arena
-        pixel_samples = None
         with OpChunking(self.module, budget_ws, stats):
             for i in range(n):
                 buf = None
@@ -922,6 +998,7 @@ class StripeAdapter:
                     # the checkpoint at the front of the arena (Plan.long_lived), allocated before the prefix
                     shape = list(samples_in.shape)
                     shape[0], shape[1] = 1, self.ckpt_channels
+                    shape[-2], shape[-1] = self.decoder_hw(samples_in)
                     buf = torch.empty(shape, device=vae.device, dtype=vae.vae_dtype)
                 z = samples_in[i:i + 1].to(device=vae.device, dtype=vae.vae_dtype)
                 ckpt = self.prefix_pass(z)
@@ -930,6 +1007,8 @@ class StripeAdapter:
                     buf.copy_(ckpt)
                     ckpt = buf
                     del buf
+                elif arena and CKPT_LOW and not OUTPUT_IN_ARENA:
+                    ckpt = move_low(ckpt, vae.device)
                 if pixel_samples is None:
                     pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
                 dst = pixel_samples[i:i + 1]
@@ -941,6 +1020,8 @@ class StripeAdapter:
                 self.stripe_pass(saves, plan, write)
                 del saves
                 vae.process_output(pixel_samples[i:i + 1])
+        if not OUTPUT_IN_ARENA:
+            mm.soft_empty_cache()
         return pixel_samples
 
     def output_bytes(self, vae, samples):
@@ -954,9 +1035,26 @@ class StripeAdapter:
         return n * mm.dtype_size(vae.vae_output_dtype())
 
     def selftest_memory(self):
-        """What the self-test needs on the device (load_models_gpu): the fp32
-        copy of the weights, the workspace, a margin."""
-        return int(self.selftest_params() * 4 + 2 * SELFTEST_WORKSPACE + 256 * MIB)
+        """Upper bound of what the self-test reserves on the device (load_models_gpu,
+        and the first decode's estimate / budget, DESIGN §9.20): the fp32 copy of
+        the weights, then the larger of the reference decode (whole image, layer-2
+        chunked at SELFTEST_REF_WORKSPACE: 4 x its largest activation + 2 x the
+        workspace, the layer-2 bound of vae.estimate) and the stripe pass (its
+        plan's estimate), the reference's output alive through both, a margin.
+        All fp32, at the self-test's geometry: the same for every image."""
+        key = ("selftest_memory", self.key)
+        hit = _PASS_COST.get(key)
+        if hit is not None:
+            return hit
+        n = SELFTEST_LATENT
+        plan = Plan(self, n, n, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0)
+        act = max(c * h * w for c, h, w in zip(plan.channels, plan.heights, plan.widths))
+        act = max(act, max(self.prefix_out_channels(m) for _, m in self.prefix) * n * n) * 4
+        out = self.out_channels * plan.h_out * plan.w_out * 4
+        ref = 4 * act + 2 * SELFTEST_REF_WORKSPACE + out
+        need = int(self.selftest_params() * 4 + max(ref, plan.estimate + out) + out + SELFTEST_MARGIN)
+        _PASS_COST[key] = need
+        return need
 
 
 # ---------------------------------------------------------------------------
@@ -969,8 +1067,10 @@ _SELFTEST = {}   # structure key -> (ok, detail)
 def self_test(bound, vae):
     """First use of a structure in this process: decode a small latent with
     forced small stripes (several inner boundaries, layer-2 conv blocks inside)
-    and with the decoder's own whole-image decode, both on an fp32 copy of the
-    decoder; pass if they agree to SELFTEST_TOL. Cached per structure; the RNG
+    and with the decoder's own whole-image decode (its convs in layer-2 row
+    blocks of another size, SELFTEST_REF_WORKSPACE, which bounds its memory),
+    both on an fp32 copy of the decoder; pass if they agree to SELFTEST_TOL.
+    What it reserves is bounded by bound.selftest_memory(). Cached per structure; the RNG
     state is preserved. Afterwards the fp32 copy and every tensor of the test
     are freed and the allocator's cache is emptied, so the decode that follows
     starts from the same memory state as any later one. Returns (ok, detail)."""
@@ -1004,7 +1104,8 @@ def _self_test_run(bound, vae):
             raise StripeError("fp32 copy has structure {} instead of {}".format(tb.key, bound.key))
         g = torch.Generator().manual_seed(0)
         z = torch.randn(bound.selftest_latent(SELFTEST_LATENT), generator=g).to(dev)
-        ref = tb.reference_decode(z)
+        with OpChunking(tb.module, SELFTEST_REF_WORKSPACE, OpStats()):
+            ref = tb.reference_decode(z)
         plan = Plan(tb, SELFTEST_LATENT, SELFTEST_LATENT, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0)
         out = torch.empty_like(ref)
         stats = OpStats()

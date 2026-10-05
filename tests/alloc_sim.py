@@ -288,8 +288,8 @@ WAN_QWEN = dict(dim=96, z_dim=16, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_
 # SD3 (z 16, AutoencodingEngine, no post_quant_conv)
 LDM_DDCONFIG = {'double_z': True, 'z_channels': 4, 'resolution': 256, 'in_channels': 3, 'out_ch': 3, 'ch': 128,
                 'ch_mult': [1, 2, 4, 4], 'num_res_blocks': 2, 'attn_resolutions': [], 'dropout': 0.0}
-# model name -> (latent channels, latent dims)
-LATENT = {"qwen": (16, 5), "sdxl": (4, 4), "flux": (16, 4)}
+# model name -> (latent channels, latent dims[, spatial ratio (default 8)])
+LATENT = {"qwen": (16, 5), "sdxl": (4, 4), "flux": (16, 4), "flux2": (128, 4, 16)}
 
 
 class _MetaVAE:
@@ -318,6 +318,9 @@ def _build(model):
     from comfy.ldm.models.autoencoder import AutoencoderKL, AutoencodingEngine
     if model == "sdxl":
         return AutoencoderKL(ddconfig=dict(LDM_DDCONFIG), embed_dim=4)
+    if model == "flux2":
+        # Flux 2: AutoencoderKL with a batch-norm latent (z 32, latent 128 channels at H/16), as comfy.sd.VAE builds it
+        return AutoencoderKL(ddconfig=dict(LDM_DDCONFIG, z_channels=32, batch_norm_latent=True), embed_dim=32)
     if model == "flux":
         dd = dict(LDM_DDCONFIG, z_channels=16)
         return AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
@@ -348,7 +351,8 @@ def _patched(obj, name, value):
 
 
 def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, order="largest", conv2d=True, arena=None, batch=1, out_first=True,
-                 layer1_ws=None, contiguous=True, model="qwen", scheme=None, arena_need=False, units=False):
+                 layer1_ws=None, contiguous=True, model="qwen", scheme=None, arena_need=False, units=False, output_in_arena=False,
+                 probe=False):
     """alloc / reserved deltas (bytes) of one decode of a w x h image, as bench_vae measures them
     (cache emptied and peaks reset right before the decode, the weights already loaded).
 
@@ -360,9 +364,16 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     out_first  a row-blocked conv allocates its output before the first block (False: after it, up to 725a010)
     layer1_ws  monoload.vae.LAYER1_WORKSPACE for this decode (384 MiB up to 5d668b6, 128 MiB since)
     contiguous the row slice into a Resample is made contiguous first (False: up to 725a010)
-    model   "qwen" (Wan 2.1, qwen_image_vae), "sdxl" (LDM AutoencoderKL, z 4), "flux" (LDM AutoencodingEngine, z 16)
+    model   "qwen" (Wan 2.1, qwen_image_vae), "sdxl" (LDM AutoencoderKL, z 4), "flux" (LDM AutoencodingEngine, z 16),
+            "flux2" (LDM AutoencoderKL with a batch-norm latent, z 32, latent 128 x H/16)
     scheme  GroupNorm scheme of an LDM layer-1 decode (None: the current setting)
     units   tag every allocation with the layer-1 unit / prefix module that made it (for --peak)
+    output_in_arena  the layer-1 layout up to 6324592 (vae_engine.OUTPUT_IN_ARENA): no cache emptied before / after the
+            decode, the output buffer allocated after the first prefix, in the arena (False: the current layout, DESIGN §9.22)
+    probe   run choose_budget's layer-2 shape probe (vae._probe, 8 x 8) right before a layer-1 decode, its blocks left
+            in the cache: the first decode with a budget (DESIGN §9.21)
+    info["stays"]  reserved after the decode with its output still alive and the cache emptied (check_selftest_mem's
+            "stays reserved after empty_cache")
     arena_need  run in an arena 4x the plan's live peak and report (info["arena_need"]) the highest offset any
             block reached in it: the smallest arena with the same placements (best fit keeps choosing the same
             blocks while the arena's tail is the largest free block), i.e. the arena this plan needs
@@ -383,8 +394,8 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     sim.empty_cache()
     sim.reset_peak()
     base_alloc, base_res = sim.allocated, sim.reserved
-    zc, nd = LATENT[model]
-    lat = torch.empty((batch, zc, 1, h // 8, w // 8) if nd == 5 else (batch, zc, h // 8, w // 8), device="meta")   # the bench's latent is on the CPU: not counted, its copy is
+    zc, nd, r = (LATENT[model] + (8,))[:3]
+    lat = torch.empty((batch, zc, 1, h // r, w // r) if nd == 5 else (batch, zc, h // r, w // r), device="meta")   # the bench's latent is on the CPU: not counted, its copy is
     tracer = make_tracer(sim)
     tracer.static.update(t.untyped_storage()._cdata for t in itertools.chain(fsm.parameters(), fsm.buffers(), [lat]))
     events = {"empty_cache": 0}
@@ -407,6 +418,11 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
         es.enter_context(_patched(vae_ops, "OUT_FIRST", out_first))
         es.enter_context(_patched(mm, "soft_empty_cache", soft_empty_cache))
         es.enter_context(_patched(eng, "arena_supported", lambda device: True))
+        es.enter_context(_patched(eng, "OUTPUT_IN_ARENA", output_in_arena))
+        es.enter_context(_patched(eng, "block_addr", lambda t: tracer.live[t.untyped_storage()._cdata][1].addr))
+        es.enter_context(_patched(eng, "device_reserved", lambda device: sim.reserved))
+        if probe:   # the probe's attention (not under OpChunking) asks for the free memory
+            es.enter_context(_patched(mm, "get_free_memory", lambda dev=None, torch_free_too=False: (48 << 30, 48 << 30) if torch_free_too else 48 << 30))
         if layer1_ws:
             es.enter_context(_patched(mvae, "LAYER1_WORKSPACE", layer1_ws))
         if not contiguous:
@@ -459,7 +475,14 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
                         arena=plan.arena, live_peak=plan.live_peak)
             stats = vae_ops.OpStats()
             with torch.inference_mode(), tracer:
+                if probe:
+                    mvae._PROBES.clear()
+                    mvae._probe(v, lat, {})
+                    tracer.poll()
                 out = bound.run(v, lat, plan, ws_, stats)
+                tracer.poll()
+                sim.empty_cache()
+                info["stays"] = sim.reserved - base_res
                 del out
                 tracer.poll()
             info["stats"] = stats
@@ -481,14 +504,91 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     return info
 
 
+def selftest_trace(model, dtype="bf16", tail=True, info=None):
+    """Reserved peak (bytes) of the first-use layer-1 self-test on the full-size decoder (meta device), the steps
+    of vae_engine._self_test_run: the fp32 copy, the reference whole-image decode under layer-2 chunking
+    (SELFTEST_REF_WORKSPACE), the forced small stripes (SELFTEST_ROWS, SELFTEST_WORKSPACE); the VAE's own weights
+    loaded before; tail=True: also the comparison at the end (max|ref|, max|out - ref|, isfinite; info, a dict:
+    what it allocates and adds to reserved, tail_alloc / tail_reserved, and reserved before it). Returns (peak
+    reserved, reserved left after the copy and every tensor are freed, the bound's selftest_memory())."""
+    import gc
+    import torch
+    import comfy.model_management as mm
+    from monoload import vae as mvae, vae_ops, vae_engine as eng
+
+    dt = {"bf16": torch.bfloat16, "fp32": torch.float32, "fp16": torch.float16}[dtype]
+    v = meta_vae(dt, model)
+    fsm = v.first_stage_model
+    zc, nd, r = (LATENT[model] + (8,))[:3]
+    lat = torch.empty((1, zc, 1, 64, 64) if nd == 5 else (1, zc, 64, 64), device="meta")
+    bound, why = mvae._select_layer1(v, lat, {})
+    assert bound is not None, why
+    sim = AllocatorSim()
+    sim.tag = "weights"
+    for p in itertools.chain(fsm.parameters(), fsm.buffers()):
+        sim.malloc(p.numel() * p.element_size())
+    sim.empty_cache()
+    sim.reset_peak()
+    base = sim.reserved
+    tracer = make_tracer(sim)
+    tracer.static.update(t.untyped_storage()._cdata for t in itertools.chain(fsm.parameters(), fsm.buffers()))
+
+    def soft_empty_cache(force=False):
+        tracer.poll()
+        sim.empty_cache()
+
+    free = 48 << 30
+    with contextlib.ExitStack() as es:
+        es.enter_context(_patched(vae_ops, "slow_dilated3d", lambda x: True))
+        es.enter_context(_patched(mm, "soft_empty_cache", soft_empty_cache))
+        es.enter_context(_patched(mm, "get_free_memory", lambda dev=None, torch_free_too=False: (free, free) if torch_free_too else free))
+        es.enter_context(torch.inference_mode())
+        es.enter_context(tracer)
+        dev = torch.device("meta")
+        tb = bound.fp32_copy(dev)
+        z = torch.empty(list(bound.selftest_latent(eng.SELFTEST_LATENT)), device=dev)
+        with vae_ops.OpChunking(tb.module, eng.SELFTEST_REF_WORKSPACE, vae_ops.OpStats()):
+            ref = tb.reference_decode(z)
+        n = eng.SELFTEST_LATENT
+        plan = eng.Plan(tb, n, n, eng.SELFTEST_ROWS, eng.SELFTEST_WORKSPACE, 4, 0, 0)
+        out = torch.empty_like(ref)
+
+        def write(o0, o1, rows):
+            out.narrow(tb.hdim, o0, o1 - o0).copy_(rows)
+        with vae_ops.OpChunking(tb.module, eng.SELFTEST_WORKSPACE, vae_ops.OpStats()):
+            tb.stripe_pass({0: tb.prefix_pass(z)}, plan, write)
+        if tail:
+            # the comparison (vae_engine._self_test_run): max|ref|, max|out - ref|, isfinite(out), each statement's
+            # temporaries freed before the next (float() / bool() of a meta tensor cannot be taken: the reductions only)
+            tracer.poll()
+            a0, r0, p_alloc, p_res = sim.allocated, sim.reserved, sim.peak_allocated, sim.peak_reserved
+            sim.peak_allocated, sim.peak_reserved = a0, r0
+            m = ref.abs().max()
+            del m
+            m = (out - ref).abs().max()
+            del m
+            m = torch.isfinite(out).all()
+            del m
+            tracer.poll()
+            if info is not None:
+                info.update(tail_alloc=sim.peak_allocated - a0, tail_reserved=sim.peak_reserved - r0, before_tail=r0 - base)
+            sim.peak_allocated, sim.peak_reserved = max(p_alloc, sim.peak_allocated), max(p_res, sim.peak_reserved)
+        del tb, z, ref, out, plan
+        gc.collect()
+        tracer.poll()
+    sim.empty_cache()
+    return sim.peak_reserved - base, sim.reserved - base, bound.selftest_memory()
+
+
 # ---------------------------------------------------------------------------
 # validation against CT 700
 # ---------------------------------------------------------------------------
 
 # (label, w, h, dtype, rows, layer, version, measured alloc GiB or None, measured reserved GiB)
 # version "v1" = 4e54d20 (SlowDilated3d, no cache emptied, top-to-bottom), "v2" = 725a010, "v3" = 85a5c6f
-# (arena, layer-1 workspace 384 MiB), "cur" = the current code (layer-1 workspace 128 MiB; GTT readings of
-# the -w128 runs of the workspace experiment). rows None = the default plan.
+# (arena, layer-1 workspace 384 MiB), "w128" = 5d668b6..6324592 (layer-1 workspace 128 MiB, the output in the
+# arena; GTT readings of the -w128 runs of the workspace experiment), "cur" = the current code (layer 2: unchanged
+# since 5d668b6). v1..w128 replay the layer-1 layout of their time (output_in_arena). rows None = the default plan.
 MEASURED = [
     ("4K r32 v2", 3840, 2160, "bf16", 32, 1, "v2", 0.94, 1.07),
     ("4K r64 v2", 3840, 2160, "bf16", 64, 1, "v2", 0.94, 1.14),
@@ -517,9 +617,22 @@ MEASURED = [
     ("4K r256 v3", 3840, 2160, "bf16", 256, 1, "v3", 1.35, 1.35),
     ("4K r512 v3", 3840, 2160, "bf16", 512, 1, "v3", 1.82, 1.82),
     ("fp32 4K default v3", 3840, 2160, "fp32", None, 1, "v3", 1.70, 1.70),
-    ("1344 default cur", 1344, 768, "bf16", None, 1, "cur", None, 0.36),
-    ("2688 default cur", 2688, 1536, "bf16", None, 1, "cur", None, 0.56),
-    ("4K default cur", 3840, 2160, "bf16", None, 1, "cur", None, 0.87),
+    ("1344 default w128", 1344, 768, "bf16", None, 1, "w128", None, 0.36),
+    ("2688 default w128", 2688, 1536, "bf16", None, 1, "w128", None, 0.56),
+    ("4K default w128", 3840, 2160, "bf16", None, 1, "w128", None, 0.87),
+    # Flux 2 layer 1 (README §10.5, 4fbaa22; GTT): X default (B), Y schemes at 4K, Z the budgets' choices
+    ("F2 1344 default w128", 1344, 768, "bf16", None, 1, "w128", None, 0.62, dict(model="flux2")),
+    ("F2 2688 default w128", 2688, 1536, "bf16", None, 1, "w128", None, 1.33, dict(model="flux2")),
+    ("F2 4K default w128", 3840, 2160, "bf16", None, 1, "w128", None, 2.18, dict(model="flux2")),
+    ("F2 4K A w128", 3840, 2160, "bf16", None, 1, "w128", None, 1.11, dict(model="flux2", scheme="A")),
+    ("F2 4K D w128", 3840, 2160, "bf16", None, 1, "w128", None, 1.53, dict(model="flux2", scheme="D")),
+    ("F2 4K C w128", 3840, 2160, "bf16", None, 1, "w128", None, 4.71, dict(model="flux2", scheme="C")),
+    ("F2 1344 b3 w128", 1344, 768, "bf16", 768, 1, "w128", None, 1.98, dict(model="flux2", scheme="B", ws=384 * MIB)),
+    ("F2 2688 b3 w128", 2688, 1536, "bf16", 384, 1, "w128", None, 2.74, dict(model="flux2", scheme="C", ws=128 * MIB)),
+    ("F2 4K b3 w128", 3840, 2160, "bf16", 180, 1, "w128", None, 2.44, dict(model="flux2", scheme="B", ws=128 * MIB)),
+    ("F2 1344 b1.5 w128", 1344, 768, "bf16", 384, 1, "w128", None, 1.05, dict(model="flux2", scheme="C", ws=192 * MIB)),
+    ("F2 2688 b1.5 w128", 2688, 1536, "bf16", 96, 1, "w128", None, 1.22, dict(model="flux2", scheme="B", ws=128 * MIB)),
+    ("F2 4K b1.5 w128", 3840, 2160, "bf16", 128, 1, "w128", None, 1.11, dict(model="flux2", scheme="A", ws=128 * MIB)),
     ("1344 layer 2", 1344, 768, "bf16", None, 2, "v1", 1.82, 2.12),
     ("2688 layer 2", 2688, 1536, "bf16", None, 2, "v1", 3.80, 5.07),
     ("4K layer 2", 3840, 2160, "bf16", None, 2, "v1", 6.45, 9.61),
@@ -548,11 +661,15 @@ MEASURED = [
 
 def _version(version):
     if version == "v1":
-        return dict(clear=False, order="natural", conv2d=False, arena=0, out_first=False, layer1_ws=384 * MIB, contiguous=False)
+        return dict(clear=False, order="natural", conv2d=False, arena=0, out_first=False, layer1_ws=384 * MIB, contiguous=False,
+                    output_in_arena=True)
     if version == "v2":
-        return dict(clear=True, order="largest", conv2d=True, arena=0, out_first=False, layer1_ws=384 * MIB, contiguous=False)
+        return dict(clear=True, order="largest", conv2d=True, arena=0, out_first=False, layer1_ws=384 * MIB, contiguous=False,
+                    output_in_arena=True)
     if version == "v3":
-        return dict(layer1_ws=384 * MIB)
+        return dict(layer1_ws=384 * MIB, output_in_arena=True)
+    if version == "w128":
+        return dict(output_in_arena=True)
     return {}
 
 
@@ -562,11 +679,12 @@ def main():
     ap.add_argument("--res", default=None)
     ap.add_argument("--rows", default=None)
     ap.add_argument("--dtype", default="bf16")
-    ap.add_argument("--version", default="current", help="current / v1 / v2 / v3")
-    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux")
+    ap.add_argument("--version", default="current", help="current / v1 / v2 / v3 / w128")
+    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux / flux2")
     ap.add_argument("--scheme", default=None, help="GroupNorm scheme of an LDM layer-1 decode: A / B / C / D")
     ap.add_argument("--layer", type=int, default=1)
     ap.add_argument("--ws", default=None, help="workspace MiB (layer 2: default 1024; layer 1: the layer-1 default)")
+    ap.add_argument("--probe", action="store_true", help="layer 1: the budget's shape probe right before the decode")
     ap.add_argument("--peak", action="store_true", help="list the live blocks at the allocation peak")
     ap.add_argument("--segments", action="store_true", help="the segments (>= 2 MiB) and their blocks when reserved peaked")
     a = ap.parse_args()
@@ -575,16 +693,19 @@ def main():
         w, h = (int(x) for x in a.res.lower().split("x"))
         for r in ([int(x) for x in a.rows.split(",")] if a.rows else [None]):
             kw = dict(_version(a.version), model=a.model, scheme=a.scheme, layer=a.layer, units=a.layer == 1)
+            if a.probe:
+                kw["probe"] = True
             if a.ws:
                 kw["ws"] = int(float(a.ws) * MIB)
             i = decode_trace(w, h, a.dtype, r, **kw)
             if a.layer == 1:
                 p = i["plan"]
                 print("{} {} {} rows {}: {} x {} rows{}, recompute {:.2f}x, live {:.2f} arena {:.2f} estimate {:.2f} | sim alloc {:.2f} reserved {:.2f} GiB, "
-                      "{} device mallocs, cache emptied {}x".format(
+                      "stays {:.2f} GiB, {} device mallocs, cache emptied {}x".format(
                           a.model, a.res, a.dtype, r or "default", i["stripes"], i["rows"],
                           ", {} statistics passes (scheme {})".format(len(p.passes), a.scheme or "default") if p.passes else "", p.recompute,
-                          p.live_peak / G, p.arena / G, i["estimate"] / G, i["alloc"] / G, i["reserved"] / G, i["mallocs"], i["empty_cache"]))
+                          p.live_peak / G, p.arena / G, i["estimate"] / G, i["alloc"] / G, i["reserved"] / G, i["stays"] / G, i["mallocs"],
+                          i["empty_cache"]))
             else:
                 print("{} {} {} layer 2: sim alloc {:.2f} reserved {:.2f} GiB, {} device mallocs".format(
                     a.model, a.res, a.dtype, i["alloc"] / G, i["reserved"] / G, i["mallocs"]))

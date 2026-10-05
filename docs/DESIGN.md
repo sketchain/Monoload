@@ -104,7 +104,9 @@ Hook LoRA（复刻 patch_hook_weight_to_device，在已合并基础 LoRA 的权�
 
 ### 3.2 Hook LoRA
 
-每个 patcher 有一份 `hook_patches`（key → 当前生效的 hook patch 列表），它的所有运行时 patch 共享这一份。`patch_hooks(hooks)` 用原生的 `get_combined_hook_patches(hooks)` 算出组合（包括 keyframe 强度），写进这份状态；只被 hook 改到、还没有运行时 patch 的层补挂一个，不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。** 采样时正/负条件可能挂着不同的 hook 组，每一步会来回切换；在这里只是换一个 dict。CLIP 的 `SetClipHooks`（`forced_hooks`）走同一条路。
+每个模型有一个**绑定**（`_Binding`，放在 `patcher.model` 上，所有 clone 共用；review 01）：当前生效的 patcher 的 `patches` 和合并方式（exact）、当前生效的 `hook_patches`（key → hook patch 列表）、LoRA 张量的设备副本。模型上所有运行时 patch 每次调用都读它。`load` / `partially_load` / 装运行时 patch 时绑定指向正在加载的 patcher：同一个 `patches_uuid` 的 clone 加载时原生 `partially_load` 不卸载、权重全部已加载时也不调用 `load()`（只重新应用它的 forced hooks 就返回），所以要在调用原函数**之前**把绑定指向它。hook 状态由最后一次 `patch_hooks` / `unpatch_hooks` 的那个 clone 写，与原生一致（原生的 clone 共用权重和 `hook_backup`）。以前每个 patcher 一份状态、运行时 patch 绑着装它的那个 patcher，同 uuid 的 clone 会用前一个 clone 的 hook 强度、patches 和合并方式（CLIP 路径用 ComfyUI 自带的节点就能遇到，差 0.02；`tests/test_lora_clone_binding.py`）。没有运行时 patch 时绑定清空，不留住已经不用的 clone 的东西。
+
+`patch_hooks(hooks)` 用原生的 `get_combined_hook_patches(hooks)` 算出组合（包括 keyframe 强度），写进绑定；只被 hook 改到、还没有运行时 patch 的层补挂一个，不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。** 采样时正/负条件可能挂着不同的 hook 组，每一步会来回切换；在这里只是换一个 dict。CLIP 的 `SetClipHooks`（`forced_hooks`）走同一条路。
 
 ### 3.3 量化参数：在反量化的临时权重上合并，不重新量化
 
@@ -131,6 +133,7 @@ Monoload 的做法：量化层挂上 weight function 后，`forward` 会走 `cas
 * **重复加载。** 原生 `load()` 会清空所有全量加载层的 `weight_function`，但跳过已标记 `comfy_patched_weights` 的层（原生里它们已经合并好了）。Monoload 的 patch 并没有合并进权重，所以 `load()` 之前先清掉被 patch 层的这个标记，保证这些层会重新走一遍 `patch_weight_to_device`。
 * **切换组合 / 卸载。** 原生 `unpatch_model()` 只在 lowvram 时清 `weight_function`；Monoload 在卸载权重时摘掉自己挂的所有运行时 patch。所以撤掉 LoRA 后，权重与加载时逐字节一致（本来也从未改过），也没有残留的 weight function。
 * **部分加载（非 `--gpu-only`、显存不够）。** 原生对被卸载的层本来就用 `LowVramPatch`，而且不备份。Monoload **不改这部分**，只接管原生会合并进权重的那些层，所以在部分加载下结果也和原生逐位一致。原生 `partially_unload()` 会给已经合并过的层追加 `LowVramPatch`（原生里是先写回备份）；这时同一层会同时挂着 Monoload 的 patch 和原生的 `LowVramPatch`，Monoload 摘掉自己那个，得到的结果和原生一样。
+* **部分加载 + hook（lora-lowvram-hook）。** 卸到 CPU 的层上，普通 LoRA 由原生的 `LowVramPatch` 在计算时加。这样的层同一个 key 上再有 hook 时，Monoload 的运行时 patch 排在 `LowVramPatch` 前面，以前它把普通 LoRA 也加了一遍（加了两次，差 0.025）。现在运行时 patch 看到同一个 key 后面有原生 `LowVramPatch`，就只加 hook；hook 撤掉之后什么都不加。顺序与原生相同：原生先把 hook 合并进存储的权重，计算时再由 `LowVramPatch` 加普通 LoRA。exact 下与原生逐位一致，fused 差 ≤ 1.4e-4（`tests/test_lora_lowvram_hook.py`）。
 * 每次 `load()` / `partially_unload()` 之后都断言 `backup` / `hook_backup` 为空。
 
 ## 5. 效率
@@ -498,6 +501,9 @@ loop:
 | 5D、T=1 给 3D VAE（Wan 2.1 / `qwen_image_vae` 等） | 第二层 |
 | 多帧视频（5D、T>1） | **暂时**交给原生，打日志。这是第一阶段暂时不做，不是永远不做：多帧需要按时空分别规划（时间 cache、首帧特例），留到第一层之后 |
 | 1D / 音频 latent、`comfy_has_chunked_io` 的 VAE（LTX、MiniMax：自己往预分配输出里写） | 原生，打日志 |
+| 2D latent 的音频 VAE（ACE-Step、LTX 2 音频、MiniMax H3 音频；`extra_1d_channel` 已设，或放大倍数大于 64，图像 VAE 是 1 / 4 / 8 / 16 / 32） | 原生，打日志（第四阶段 4b-0 起，§9.17） |
+| decoder 在 batch 的各帧之间混合（SVD 的 `VideoDecoder`：batch 就是时间轴，逐样本解码会改变结果） | 原生，打日志（4b-0 起；以后做视频第二层时改成整批一次） |
+| first-stage model 里没有卷积也没有 ComfyUI 的 VAE 注意力（像素空间「VAE」） | 原生，打日志（4b-0 起：第二层没有可做的） |
 | 用户显式用 `VAEDecodeTiled` 节点或 `VAE.decode_tiled` | 不经过 `VAE.decode`，保持原生（用户自己选择了 tiled 的语义） |
 | 直接调用 `first_stage_model.decode` 的第三方代码 | 不经过 `VAE.decode`，原生 |
 
@@ -772,7 +778,7 @@ peak 按 62b3c94 的 forward 逐个数同时存活的张量。S 是模块输入�
 
 #### 9.13.5 OOM
 
-条带高度和工作区一起减半，重新做计划、重跑整个解码（前缀在 H/8 上，重跑代价小）；高度到 8 行（或强制的更小值）且工作区到 64 MiB 仍 OOM，就抛 `MonoloadVAEOOMError`。不退回 tiled，也不退回第二层：第二层的峰值更高，退回去没有意义。arena 在 `run` 的开头分配，它 OOM 时和解码中途 OOM 一样处理（重试时 arena 随计划变小）。测试里替换 `run_stripes` 模拟 OOM，确认 `decode_tiled_` 和第二层的 `_run` 都没有被调用。
+条带高度和工作区一起减半，重新做计划、重跑整个解码（前缀在 H/8 上，重跑代价小）。新计划的估算高于第一次的计划时跳过这一档、继续减半（日志写明；设了预算时第一次的计划本来就在预算内，强制高度超预算照跑的除外），交给 `load_models_gpu` 的量因此不用重算（review 06：45 个真实的重试序列里没有出现过估算变大，这是保险，`tests/test_vae_retry.py` 注入 OOM 和估算来测）；高度到 8 行（或强制的更小值）且工作区到 64 MiB 仍 OOM，就抛 `MonoloadVAEOOMError`。不退回 tiled，也不退回第二层：第二层的峰值更高，退回去没有意义。arena 在 `run` 的开头分配，它 OOM 时和解码中途 OOM 一样处理（重试时 arena 随计划变小）。测试里替换 `run_stripes` 模拟 OOM，确认 `decode_tiled_` 和第二层的 `_run` 都没有被调用。
 
 #### 9.13.6 识别、自检、开关、日志
 
@@ -1034,7 +1040,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 * **候选**：第二层（工作区 `MONOLOAD_VAE_WORKSPACE`，估算同 §9.4）；第一层的每个变体（LDM：A / B / C / D 各一个；Wan：一个），各取**估算不超过预算的最高条带**（Wan 第一层仍是「预算内最高的条带」）。
 * **排序**：第二层能放下就选第二层——它每个卷积只算一次，实测总是最快（SDXL 4K 9.9 s，第一层最快的 C 35.5 s；Qwen 4K 6.9 s，第一层 8.4 s；1344 上第二层也不慢于单条带的第一层）。放不下时在放得下的第一层变体里选耗时模型预测最快的；预测相同（例如只有一条带）时取默认方案。没有用「各候选都用模型预测」的统一排序，因为第二层的耗时形态（整图大 GEMM、分块注意力）不在这个模型里，而第二层比第一层快的结论有真机数据直接支持。
 * **第一层的工作区**：依次试 `min(MONOLOAD_VAE_WORKSPACE, max(64 MiB, 预算/8))`（第二阶段的预算工作区）、128 MiB、64 MiB；每个变体取预测最快的那档（同样快时取大的，Wan 取第一档放得下的）。原因：工作区越大估算越高，预算/8 会把本来放得下的方案挤出去（SDXL 4K、预算 3 GiB：方案 B 在 384 MiB 工作区下最少要 3.26 GiB，64 MiB 下 3.01）。耗时模型不含工作区的影响（Qwen 上 384 → 128 MiB 慢 2–7%），这是已知的近似。
-* **强制设置优先**：`MONOLOAD_DISABLE_VAE_STRIPE=1` → 第二层（超出预算也跑，日志注明）；`MONOLOAD_VAE_STRIPE_ROWS` → 第一层、这个高度，方案仍按预算内最快选，一个都放不下时取估算最小的照跑（日志注明）；`MONOLOAD_VAE_GN_SCHEME` → LDM 第一层用这个方案，高度仍取预算内最高。强制了第一层的设置时不考虑第二层；强制的变体自检都失败时退回第二层（与不设预算时一样）。
+* **强制设置优先**：`MONOLOAD_DISABLE_VAE_STRIPE=1` → 第二层（超出预算也跑，日志注明）；`MONOLOAD_VAE_STRIPE_ROWS` → 第一层、这个高度，方案仍按预算内最快选，一个都放不下时取估算最小的照跑（日志注明）；`MONOLOAD_VAE_GN_SCHEME` → LDM 第一层用这个方案，高度仍取预算内最高。强制了第一层的设置时不考虑第二层。强制的第一层配置因为自检未通过不能用时（这次解码里刚失败，或者这个进程里早先失败、已缓存，两种情况决定相同；强制意图看实际生效的设置，不看过滤后的候选），改走第二层，但第二层也要放得下预算，放不下就报错，写明强制的设置、自检失败的变体和第二层需要多少（review 02，`tests/test_vae_selftest_budget.py`；以前首次失败时第二层不受预算限制、缓存后却又受限）。
 * **自检**：只对选中的变体做（按「结构 + 方案」缓存）；不通过就排除它，选下一个。
 * **都放不下**：抛 `MonoloadError`，列出第二层和每个方案最少需要多少（最少的高度不一定是 8 行，见下），以及第一层不可用时的原因。不认识的 decoder（只有第二层可选）在预算放不下第二层时也报错——预算是显式设置，严格执行。
 * **日志**：`[Monoload] VAE MONOLOAD_VAE_BUDGET 3.00 GiB -> layer 1 scheme D 309 rows (workspace 64 MiB) 2.94 GiB, ~53.6 s: the fastest predicted that fits; others: layer 2 17.91 GiB (over); layer 1 scheme B 32 rows (workspace 64 MiB) 3.01 GiB, ~58.1 s (over); ...`，之后照常是这一次解码的那一行。`last_decode()["candidates"]` 记录所有候选。
@@ -1119,6 +1125,278 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 **测试：** `tests/test_vae_node.py`（README §8）；ComfyUI 加载器的注册在 `tests/test_entry.py` 的 8 种开关组合里检查。真机验证：`tests/check_vae_node.py`（README §9.7 的 U）。
 
+### 9.16 第四阶段 4a：全部 VAE 的盘点（vae-inventory）
+
+目的：把 VAE 解码管理推广到全部 VAE 之前，先弄清楚锁定镜像（ComfyUI 0.31.0）的 `comfy/sd.py` 能构造哪些 VAE、各自的结构、现在 Monoload 怎么处理、原生和第二层的峰值，再由用户定先做哪几种。这一步不改插件行为。
+
+**方法（三个脚本，都不需要模型文件）：**
+
+* `tests/vae_inventory.py`：每种 VAE 按 sd.py 的配置在 meta 设备上建出全尺寸的 first-stage model，把它的 state dict（meta 张量）交给 `comfy.sd.VAE` 本身（bf16，`is_amd()` 为真），所以分支、`latent_dim`、比例、`memory_used_decode` 都是 ComfyUI 自己的。然后：结构统计（GroupNorm / RMS / Pixel / Layer / Batch norm、带 `optimized_attention` 的注意力、Conv2d / Conv3d / ConvTranspose、Linear）、Monoload 现在的路（`_native_reason`、各适配器的 `match`）、`tests/alloc_sim.py` 的追踪（CT 700 的后端：4D 卷积 Slow2d im2col、5D 卷积 SlowDilated3d vol2col、缓存分配器）：原生、第二层（1 GiB 工作区）、有适配器的第一层。追踪新加了**设备上限**：一次申请需要新段而超过 60 GiB（62.5 GiB GTT 减去权重和机器其余部分）时，先释放全部缓存的空闲段再试（CUDA / HIP 分配器 OOM 时就是这样做的），还超过就记一次真 OOM（原生这时会退回 tiled）。加上这条之后，SDXL 4K 原生的模拟值是 52.48 GiB，与 CT 700 实测（§9.12）完全一致；其余已测的读数（SDXL / Flux 1344 原生 8.36、第二层 3.71–3.72，Qwen 4K 原生 59.14、第二层 9.59，各第一层）也都在 0.02 GiB 以内。
+* `tests/probe_vae_gaps.py`：CPU 上随机权重的真实小解码，确认下面的「现有缺口」，以及第二层在多帧视频 decoder 上是否精确。
+* `tests/check_models.py`：给 CT 700 用，只读 safetensors 头（加上 64 KiB 以下的小张量），在 meta 上识别 `models/` 下每个文件：VAE 是哪一种、checkpoint 内置的 VAE、diffusion model 是什么模型、要哪种 latent（因此要哪个 VAE）、`models/vae` 里哪个文件对得上（README §9.11 的命令 W）。
+
+**用户实际在用的（CT 700 上的文件）：** `models/vae/ae.safetensors`（Flux `ae`，Z-Image / Lumina 2 也用它）、`models/vae/qwen_image_vae.safetensors`（Wan 2.1 结构；Krea 2、Anima、Qwen-Image 都用它，ComfyUI 的 `Krea2` / `Anima` 配置的 latent 格式都是 `Wan21`）、`waiIllustriousSDXL_v170` 内置的 SDXL VAE（`wai_v17_fp8_test` 是 SDXL UNet，也用它）。这三种**图像解码现在都已经走第一层**。`novaAnimeAM_v5029B`、`luciddreamerZ_*` 从文件名看不出模型类型，命令 W 会给出答案（按命名推测分别是 Anima → `qwen_image_vae`、Z-Image → `ae`）。
+
+**表一：结构与现在的路**（✔ = 有；「整图统计」= 需要整张图统计量的归一化）
+
+| VAE（用在哪些模型） | first-stage model / decoder，latent | 整图统计的归一化 | 时间维因果缓存 | 注意力 | 特殊输出 | 现在走 | 为什么 |
+|---|---|---|---|---|---|---|---|
+| SD1.x / SD2.x / SDXL（Pony、Illustrious…）**用户在用** | `AutoencoderKL` / LDM `Decoder`，4D `[B,4,H/8,W/8]` | ✔ GroupNorm ×52（整图） | — | H/8 全局（mid） | — | 第一层 LDM | 已支持 |
+| Flux.1 / Z-Image / Lumina 2 / Chroma / HiDream / SD3（`ae`）**用户在用** | `AutoencodingEngine` / LDM `Decoder`，4D z16 | ✔ 同上 | — | 同上 | — | 第一层 LDM | 已支持 |
+| Flux 2 / Ideogram 4 / Lens / Ernie-Image | `AutoencoderKL`（`batch_norm_latent`）/ LDM `Decoder`，4D `[B,128,H/16,W/16]` → 反归一化 + 2×2 还原成 z32 `[B,32,H/8,W/8]` | ✔ 同上 | — | 同上 | — | 第二层 | `ldm_structure` 拒绝 `bn` |
+| SD x4 upscaler | `AutoencoderKL` / LDM `Decoder`（ch_mult [1,2,4]，4x） | ✔ | — | H/4 全局 | — | 第一层 LDM | 已支持（3 级） |
+| SVD img2vid | `AutoencodingEngine` / `VideoDecoder`，4D，**batch 当时间轴** | ✔ GroupNorm ×80 | 时间混合（Conv3d 核 [3,1,1]、时间注意力）跨整个 batch | H/8 | — | 第二层 | **现有缺口 1** |
+| HunyuanImage 2.1 | `AutoencodingEngine` / `hunyuan_video.vae.Decoder`，4D z64，32x | ✔ GroupNorm ×72 | — | H/32 全局 | 上采样是先卷积再 2×2 depth-to-space（`PixelUnshuffle2D`）+ 重复通道的残差 | 第二层 | 不认识的结构 |
+| HunyuanImage 2.1 Refiner | `AutoencodingEngine` / `vae_refiner.Decoder`（`refiner_vae=False`），5D T=1，16x | ✔ GroupNorm 在 C×T×H×W 上（一张图内部解成 4 帧，取最后一帧） | 非因果 Conv3d（时间补零） | 3D 全局 | — | 第二层 | 不认识 |
+| HunyuanVideo 1.5 | `AutoencodingEngine` / `vae_refiner.Decoder`（RMS），5D z32，16x，时间 4x | — RMS（逐位置） | ✔ CarriedConv3d：每 2 个 latent 帧一段，带 2 帧 carry | 3D 全局（T×H/16×W/16 个 token） | 首帧特例（时间上采样） | T=1 第二层；多帧原生 | 多帧未放开 |
+| HunyuanVideo 1.0 / Kandinsky 5 视频 | `AutoencoderKL` / LDM `Decoder`（conv3d，`CarriedConv3d`），5D z16，8x | ✔ GroupNorm：mid 在全视频上，up 级每个时间段各自统计 | ✔ 每 2 帧一段带 carry | 3D 全局（T×H/8×W/8） | — | T=1 第二层；多帧原生 | `post_quant_conv` 是 Conv3d；多帧未放开 |
+| Wan 2.1 / Qwen-Image / Krea 2 / Anima / Cosmos Predict 2 / JoyImage（`qwen_image_vae`）**用户在用** | `WanVAE` / `Decoder3d`，5D z16，8x，时间 4x | — RMS | ✔ `feat_cache`（CACHE_T=2）；首帧单独，之后每段 2 个 latent 帧 | 每帧 2D（mid） | — | T=1 第一层 Wan；多帧原生 | 多帧未放开 |
+| Wan 2.2 5B | `vae2_2.WanVAE` / `Decoder3d`（dec_dim 256），5D z48，16x（patchify 2） | — RMS | ✔ `feat_cache`，每个 latent 帧一段；输出逐帧 `torch.cat` | 每帧 2D | up 级的 `DupUp3D` 捷径、`unpatchify` | T=1 第二层；多帧原生 | 不认识（类名同为 WanVAE，但不是 2.1 的类） |
+| Mochi | `VideoVAE` / genmo `Decoder`，5D z12，8x，时间 6x | ✔ GroupNorm **逐帧**（`GroupNormSpatial`） | 因果 Conv3d（`PConv3d`），**整段视频一次算** | 只有时间维 1D 注意力（ComfyUI 通用 `optimized_attention`，第二层不分块） | `DepthToSpaceTime` | 原生 | 多帧未放开 |
+| LTX-Video 0.9.0 / 0.9.5+ / LTX 2 | `VideoVAE` / lightricks `Decoder`，5D z128，32x，时间 8x | — PixelNorm | ✔ 因果 Conv3d，按时间块解码 | — | `comfy_has_chunked_io`：写进预分配输出 | 原生 | chunked io |
+| CogVideoX | `AutoencoderKLCogVideoX` / `Decoder3D`，5D z16，8x | ✔ GroupNorm（`SpatialNorm3D`，在每个时间块上统计） | ✔ `conv_cache`；低分辨率级整段算，高分辨率级按时间块滚动 | — | 解完的块先放到 CPU | 原生 | 多帧未放开 |
+| Cosmos 1.0（CV8x8x8） | `CausalContinuousVideoTokenizer` / `DecoderFactorized`，5D z16 | ✔ GroupNorm（num_groups=1，整段） | 因果 Conv3d（复制补边），整段一次算 | 空间注意力（已知函数）+ 时间注意力 | 小波 `unpatcher3d` | 原生 | 多帧未放开 |
+| SeedVR2 | `VideoAutoencoderKLWrapper` / `Decoder3D`，5D z16 | ✔ GroupNorm 逐帧 | ✔ 因果，自带 `memory_limit` 切片 | diffusers 式（第二层不分块） | `handles_tiling` | T=1 第二层 | 不认识 |
+| MiniMax H3 视频 | `MiniMaxH3VideoVAE` / `ViT3DDecoder`，5D z24，16x | GroupNorm / RMS（transformer） | 内部按 17 帧 / 256 px 分块 | 内部 | chunked io + 自己分块 | 原生 | chunked io |
+| Mage-VAE | `MageVAE`（一步扩散 codec），4D z128，16x | 少量 | — | 有 | — | 第二层 | 不认识 |
+| TAESD / TAEF1 / TAEF2 | `TAESD`，4D | TAEF2 低分辨率级有 4 组 GroupNorm | — | — | — | 第二层 | 不认识 |
+| TAEHV / TAEW2.2 / lighttae | `TAEHV`，5D | — | 帧间 memblock | — | 输出逐帧搬到 intermediate device | 多帧原生 | 多帧未放开 |
+| Stable Cascade Stage A / Stage C previewer | `StageA`（ConvTranspose、depthwise、LayerNorm 逐像素）/ `Previewer`（BatchNorm） | — | — | — | — | 第二层 | 不认识 |
+| 像素空间（Chroma Radiance、Z-Image pixel、PixelDiT、HiDream O1） | `PixelspaceConversionVAE`（恒等） | — | — | — | — | 第二层 | **现有缺口 3** |
+| ACE-Step 音频 / LTX 2 音频 / MiniMax H3 音频 | `MusicDCAE` / `AudioVAE` / `MiniMaxH3AudioVAE`，**2D latent**（`latent_dim` 2） | — | — | — | 输出是波形 | 第二层 | **现有缺口 2** |
+| Stable Audio 1 / 3、MMAudio、Hunyuan3D、TripoSplat | 1D latent | — | — | — | — | 原生 | `latent_dim` 1 |
+
+**表二：峰值（alloc_sim，CT 700，bf16，GiB，GTT / reserved 增量；图像为「1344×768 / 3840×2160」）与第一层的预期**
+
+| VAE | 原生 | 第二层 | 第一层 | ComfyUI 估算（AMD） | 难度 / 风险 |
+|---|---|---|---|---|---|
+| SDXL / Flux `ae` | 8.36 / 52.48（实测一致） | 3.71 / 14.97 | 0.62 / 2.17（已实现） | 11.4 / 91.9 | — |
+| Flux 2 | 8.36 / 52.50 | 3.72 / 15.05 | **预计 0.62 / 2.18**：decoder 与 Flux `ae` 相同，只多了 latent 级的反归一化和 2×2 还原（放进前缀，H/16 级，几 MiB） | 11.4 / 91.9 | **低**：`vae_ldm` 接受 `bn`，前缀加一步；自检、方案、耗时模型照用 |
+| SD x4 upscaler（输出 1344×768） | 16.25 | 3.30 | 已走第一层（未单独模拟） | 45.7 | — |
+| HunyuanImage 2.1（输出 3840×2176） | 4.66 / 38.11 | 2.34 / 11.10 | 粗估 4K 2–3 GiB（全分辨率 128 通道、GroupNorm，与 SDXL 相近；未模拟） | 1.35 / 10.9 | 中：新单元「先卷积再 depth-to-space」，区间倒推要新写；GroupNorm 统计照用 |
+| HunyuanImage 2.1 Refiner（1344×768） | **50.29** | 4.43 | 粗估 1–2 GiB（未模拟） | 5.38（低估约 10 倍，原生实际会 OOM → tiled） | 高：内部 4 帧、GroupNorm 跨帧、非因果时间补零 |
+| Wan 2.1 / `qwen_image_vae` 单帧 | 6.09 / 59.14（实测一致） | 2.10 / 9.59 | 0.36 / 0.87（已实现） | 4.2 / 34.0 | — |
+| Wan 2.2 单帧 | 5.21 / 34.23 | 4.01 / **19.78**（第二层不够：全分辨率级 256 通道，激活本身大） | 粗估 4K 0.5–1.5 GiB（未模拟） | 15.4 / **123.6**（`load_models_gpu` 会卸载一切） | 中：照 `vae_wan` 写，多 `DupUp3D` 捷径、patchify |
+| HunyuanVideo 1.5 单帧 / HunyuanVideo 1.0 单帧 | 12.94 / 23.50（1344） | 3.31 / 5.38 | 未估 | 27.7 / 5.4 | 中 |
+| SeedVR2 单帧（1920×1080） | 26.26 | 9.12 | 未估 | 0.31 | 高（自带切片机制） |
+| Mage-VAE / Stage A | 0.62 / 1.44 | 相同（没有可分块的大卷积） | 不需要 | — | 不做 |
+| TAESD（1344 / 4K） | 1.77 / 14.23 | **2.66** / 4.88（1344 时第二层反而高，**现有缺口 4**） | 不需要 | 11.4 / 91.9 | — |
+| Stage C previewer（1024²） | 3.27 | 2.02 | 不需要 | 11.6 | — |
+| SVD（1024×576，14 帧） | 25.71 | 2.75（**结果错**，缺口 1） | — | 6.5 | — |
+| 视频（多帧） | | | | | |
+| Wan 2.1，832×480×81 | 8.72 | 4.96 | 粗估 1–2 GiB（按时间段条带；未模拟） | 5.2 | 第二层：低；第一层：高 |
+| Wan 2.2，1280×704×121 | 39.38 | 10.39 | 同上 | 13.4 | 第二层：低 |
+| HunyuanVideo 1.0，848×480×73 | 62.2（**超上限 → 原生退回 tiled**） | 15.21 | 未估 | 17.0 | 第二层：低 |
+| HunyuanVideo 1.5，1280×720×121 | 113（**OOM → tiled**） | 21.64 | 未估 | 24.7 | 第二层：低 |
+| CogVideoX，720×480×49 | 35.02 | 11.66 | 未估 | **88.3** | 第二层：低（解完的块放 CPU，见注） |
+| Cosmos 1.0，1280×704×121 | 30.18 | 12.99 | 未估 | 10.7 | 第二层：低 |
+| Mochi，848×480×85 | 362（OOM → tiled） | **59.3（仍在上限，第二层不够）** | 要第一层（整段视频一次算，单个激活 8.5 GiB） | 68.2 | 高 |
+| LTX 0.9.0 / LTX 2，768×512×97 | 30.6 / 59.3（**模拟里碎片严重**：alloc 只有 5.5 / 6.1，待真机确认） | 6.70 / 4.97 | 未估 | 5.7 | 中：要支持 `output_buffer`（chunked io） |
+| TAEHV / TAEW2.2 / MiniMax H3 视频 | 1.31 / 3.04 / 0.99 | 相同 | 不需要 | — | 不做 |
+
+注：模拟值都是「权重已加载、解码前清空缓存」之后的增量，输出缓冲（fp32）按 `--gpu-only` 算在设备上；CogVideoX 放到 CPU 的块不计。第二层的数字假设逐样本解码、1 GiB 工作区，估算（`estimate` / `_probe`）还没有为多帧做，这是 4b 的工作。
+
+**第二层在多帧视频上可以直接用**（`probe_vae_gaps.py` 第 4 项）：小尺寸随机权重的 Wan 2.1（5 个 latent 帧）、Wan 2.2、HunyuanVideo 1.0、HunyuanVideo 1.5、CogVideoX（全尺寸），各自的 `decode`（带时间因果缓存）在 16 KiB 工作区下几乎所有卷积按行分块，与不分块相比相对误差 ≤ 2.3e-6。原因：分块只在 H 方向，时间维的缓存拼接发生在卷积调用之前，每次调用拿到的已经是拼好的输入。
+
+**现有缺口（4a 时的代码；1–3 已在 4b-0 修掉，§9.17；Flux 2 第一层见 §9.18）：**
+
+1. **SVD 的结果被改变**：`VideoDecoder` 的时间混合以整个 batch 为时间轴（`timesteps` 默认等于 batch 大小），第二层逐样本解码，等于每帧单独解码。4 帧的小解码：与原生 max|Δ| = 1、平均 0.13（像素值 [0,1]），与「原生逐帧单独解码」逐位相同。（原生自己也按空闲内存切 batch，`batch_number = free / memory_used_decode`，切了同样会变；但通常一次装得下。）
+2. **2D latent 的音频 VAE 被管理**：ACE-Step（`[B,8,16,T]`）、LTX 2 音频、MiniMax H3 音频的 `latent_dim` 是 2，`_native_reason` 只看 `latent_dim`，于是走第二层。输出与原生相同，但 ACE 的形状探测（8×8 latent）失败，退回静态上界时用的放大倍数是 4096，交给 `load_models_gpu` 的估算约 **1 PiB**——每次解码都会把其他模型全部卸载。设计上（§9.8）音频应该原生。
+3. **像素空间「VAE」被管理**：恒等变换，没有卷积，却报 2 GiB 估算（原生 24 KiB），可能白白腾出 2 GiB。
+4. **小 decoder 第二层反而更高**：TAESD 1344×768 原生 1.77、第二层 2.66 GiB（第二层的 1 GiB 工作区块和预分配输出比原生最大的 columns 1.1 GiB 还占地方）。4K 时第二层仍然好得多（14.2 → 4.9）。影响小（TAESD 一般用于预览，不经过 `VAE.decode`）。
+
+另外看到 ComfyUI 自己的估算对很多 VAE 偏差很大（Wan 2.2 4K 单帧 123.6 GiB、CogVideoX 88 GiB → 卸载一切；Refiner 5.4 GiB 而实际 50 GiB → 真 OOM 后退回 tiled），被 Monoload 管理之后用的是 Monoload 的估算，这本身也是推广的收益之一。
+
+**建议的实施顺序**（等用户定）：
+
+0. **修缺口 1–3**（一个分支，小，纯正确性）：SVD 这类跨 batch 耦合的 decoder 暂时走原生（或者第二层整批一次解码，峰值仍远低于原生，但估算要按 batch 算）；音频（`extra_1d_channel` 已设、或放大倍数是音频量级）走原生；没有卷积和注意力的 first-stage model 走原生。缺口 4 可选（例如原生最大的 columns 不超过工作区时直接原生）。
+1. **Flux 2 第一层**：几乎就是改 `ldm_structure` 和前缀；4K 15.05 → 约 2.2 GiB。Flux 2 系列（Flux 2、Ideogram 4、Lens、Ernie-Image 都用这个 VAE）是现在的主流新模型。
+2. **多帧视频第二层（通用）**：放开 `_native_reason` 的多帧限制（按 VAE 类型逐个放开，先 Wan 2.1 / 2.2、HunyuanVideo 1.0 / 1.5、CogVideoX、Cosmos），`_probe` / `estimate` 认识 5D 多帧（激活和 T 不成正比：Wan / HunyuanVideo / CogVideoX 都按时间段解码，探测要用能覆盖一段的帧数，输出缓冲按全长算）；LTX 需要走 `output_buffer`。HunyuanVideo 1.0 / 1.5 原生在 CT 700 上会 OOM 退回 tiled，这里变成整段精确解码。用户的 `qwen_image_vae` 就是 Wan 2.1 VAE，将来做 Wan 2.1 视频就用得上。
+3. **Wan 2.2 单帧第一层**（照 `vae_wan` 写）：4K 19.8 → 约 1 GiB（粗估）。
+4. **HunyuanImage 2.1 第一层**：4K 11.1 → 约 2–3 GiB（粗估）。
+5. **视频第一层**（按时间段的条带，GroupNorm 按时间段统计）：工作量大，等真有需要再说；Mochi 只有这条路能降下来。
+
+不建议做：TAE 系列、Stage A / C、Mage、MiniMax H3 视频（自己分块）、SeedVR2 的第一层（自带切片）、音频和 3D。
+
+**待真机确认：** LTX 原生的碎片（模拟 reserved 30–59 GiB 而 alloc 只有 5–6 GiB）；命令 W 的输出（用户两个看不出类型的模型用哪个 VAE）。
+
+### 9.17 第四阶段 4b-0：修盘点发现的缺口（vae-coverage-fixes）
+
+用户定的顺序：① 修缺口 1–3 → ② Flux 2 第一层 → ③ 视频以后再定。SVD 先走原生，以后做视频第二层时再做 SVD 整批第二层。
+
+**改动（`vae._native_reason`）：** 判断按真实结构和 VAE 对象的属性，结果按模型缓存（`_TRAITS`，弱引用）：
+
+* **2D latent 的音频 VAE → 原生**（`_audio_ratio`）：ComfyUI 给 ACE-Step、LTX 2 音频设了 `extra_1d_channel`；MiniMax H3 音频没设，但它的 `upscale_ratio` 是 800（latent 帧 → 采样点），图像 VAE 只有 1 / 4 / 8 / 16 / 32，所以阈值取 64（`AUDIO_MIN_RATIO`）。
+* **在 batch 的各帧之间混合的 decoder → 原生**（`_model_traits`）：模型里有 `comfy.ldm.modules.temporal_ae` 的 `VideoResBlock` / `AE3DConv` / `AttnVideoBlock`（SVD 的 `VideoDecoder` 用它们，`timesteps` 默认等于 batch 大小）。
+* **没有可分块的算子 → 原生**：模型里既没有 `torch.nn.Conv2d` / `Conv3d`，也没有 ComfyUI 三个 VAE 注意力函数之一（像素空间 VAE 是恒等变换，以前白报 2 GiB 估算）。
+* `_native_reason` 的所有理由都改走消息表（`vae.nr_*`，英文 / 中文）；以前是写死的英文。英文措辞不变（如 `multi-frame video latent (T=...)`）。
+
+缺口 4（TAESD 小图第二层反而高）不在用户定的范围里，没动。
+
+**验证：** `tests/test_vae.py` 第 5 部分：全尺寸随机权重的 SVD `VideoDecoder`，3 帧一个 batch：走原生、与原生逐位相同，而逐帧单独解码与原生差 0.82（像素）；ACE 式（`extra_1d_channel` + 4096）、MiniMax 式（800）走原生，比例 4 / 8 / 16 / 32 照常管理；真实的像素空间 VAE 走原生、结果相同、`load_models_gpu` 收到 ComfyUI 自己的估算；SDXL / Wan 单帧照常管理。`tests/probe_vae_gaps.py` 用真实的 ACE（MusicDCAE）和 MiniMax 音频重跑：都走原生，结果与原生相同，不再有 1 PiB 的估算。`tests/vae_inventory.py --no-trace`：图像 VAE 的路一个没变。
+
+### 9.18 第四阶段 4b-1：Flux 2 VAE 走第一层（vae-flux2-layer1）
+
+**结构核对（0.31.0）：** `comfy.sd.VAE` 看到 `bn.running_mean` 就给 ddconfig 加 `batch_norm_latent`，建 `AutoencoderKL`（z 32，embed 32，有 `post_quant_conv`），latent 128 通道、比例 16。`AutoencodingEngineLegacy.decode` 先 `z = z * sqrt(running_var + bn_eps) + running_mean`（BatchNorm 反归一化，`bn_eps` 1e-4，buffer 每次 `cast_to` 成 latent 的 dtype），再 `rearrange("... (c pi pj) i j -> ... c (i pi) (j pj)", pi=2, pj=2)`（128 × H/16 → 32 × H/8），然后是和 Flux `ae` 相同的 `post_quant_conv` + LDM `Decoder`（ch 128，ch_mult [1,2,4,4]）。真实文件 `flux2-vae.safetensors`（Comfy-Org/flux2-dev，sha256 d64f3a68…）用命令 W 核对过：`AutoencoderKL / Decoder | latent 128 ch, x16`。
+
+**做法（`vae_ldm.py`）：**
+
+* `ldm_structure` 接受这个 BatchNorm（`_check_bn_latent`）：`torch.nn.BatchNorm2d`、非 affine、有 running 统计量、`ps == [2, 2]`、有 `bn_eps`、特征数 = 4 × `post_quant_conv` 的输入通道；其他样子的 BatchNorm 仍走第二层并写明原因。
+* latent 这一步是前缀的第一个模块 `LatentUnpatch`：用模型自己的 buffer、同样的运算和顺序，所以与原生给 `post_quant_conv` 的输入逐位相同（测试核对）。这一步在原生里也不是模块调用，是 `decode` 里的几行运算，所以这里照抄运算；fp32 自检把整条路（含这一步）与模型类自己的 `decode` 对比兜底。
+* 引擎加一个钩子 `StripeAdapter.decoder_hw(samples)`：计划在 decoder 的分辨率（H/8）上做（`plan` / `smallest_plan` / 存档缓冲的形状），LDM 适配器在有 BatchNorm latent 时返回 latent 尺寸的 2 倍；其余适配器不变。`LatentUnpatch` 的内存模型：输出和一个临时量各一份 latent 大小（`prefix_peak`），没有卷积量。
+* 结构签名多了 `bn` 一项，第一次使用单独做 fp32 自检；fp32 副本带上 BatchNorm 的 buffer、`bn_eps`、`ps`，参照解码就是 `AutoencoderKL.decode` 本身。自检的 latent 是 decoder 24 × 24 对应的 12 × 12（几何与其他 LDM 相同）。
+* 名字 `LDM stripes (batch-norm latent), GroupNorm scheme B`；方案、条带、预算、耗时模型（decoder 相同，`TIME_COEF` 照用）、VAE 设置节点、Info 节点都不用改。启动日志、节点 tooltip（两份 nodeDefs.json）、README 的列表加上 Flux 2。
+
+**模拟（`tests/alloc_sim.py --model flux2`，bf16，GiB）：** 默认 B：1344×768 reserved 0.62 / 估算 0.76，2688×1536 1.33 / 1.61，4K 2.18 / 2.69；4K 的 A 1.11 / 1.49、D 1.53 / 2.04、C 4.71 / 5.22；预算 3G 选 4K B 12 × 180（2.44 / 2.97），1.5G 选 A。都与 Flux `ae` 相差 ≤ 0.01 GiB，计划（条带数、高度、方案、按预算的选择、预测耗时）完全相同。第二层 3.72 / 9.25 / 15.05，原生 8.36 / 42.8（实测 Flux）/ 52.50。
+
+**测试：** `tests/test_vae_flux2.py`（46 项）：识别（含 3 种不认的 BatchNorm → 第二层 == 原生）；`LatentUnpatch` 与原生逐位相同；四种方案 × 条带高度 7 / 40 / 默认、奇数和 1×1 latent、batch 2、16 KiB 工作区、bf16 对 fp32 真值（RMSE 0.00983，原生 0.00996），fp32 与原生差 ≤ 4.5e-6；自检通过并与 SDXL 式分开缓存，注入错误的 latent 步骤 / 条带内统计 → 自检失败、第二层、== 原生；模拟 OOM → 缩条带，到底 → `MonoloadVAEOOMError`，不走 tiled 也不走第二层；预算：等于第二层估算选第二层、稍低选第一层、1 KiB 报错列出各自需要；VAE 设置节点（副本强制方案 C、16 行；`layer 2 only`）和 Info 节点直接生效；alloc_sim 上 reserved ≤ 估算（6 种）。真实权重：下载的 `flux2-vae.safetensors` 在 CPU 上 768×512 解码，A / D / B / C 都走第一层，与原生 max|Δ| ≤ 1.6e-6（fp32）。`tests/make_synthetic_vaes.py` 多一个 `synthetic_flux2`，bench / 节点检查脚本 CPU 冒烟通过。真机命令与逐行预测：README §9.12（X / Y / Z）。
+
+### 9.19 第一次使用时的自检峰值不在估算里（分析；用户选了 B + A，实现见 §9.20）
+
+**现象（CT 700，Flux 2，4fbaa22）：** bench X 1344×768 第一次（含 B 的自检）reserved +0.78 / GTT +0.81，估算 0.76，第二次 0.62；`check_vae_node.py` 4K 节点预算 3G，副本第一次（含自检）reserved +2.68 / GTT +2.96，估算 2.97、预算 3.00，再次 2.44。
+
+**自检做了什么（`vae_engine._self_test_run`）：** ① `fp32_copy`：decoder（+ `post_quant_conv` / BatchNorm）的 fp32 副本；② `reference_decode`：模型类自己的 `decode` 在 24 × 24 latent（输出 192 × 192）上整图 fp32 解码，**不在第二层分块下**；③ 同一 latent 按 40 行强制条带走第一层（8 MiB 工作区）；④ 释放、`gc.collect()`、`soft_empty_cache(True)`。之前 `load_models_gpu` 收到的是 `selftest_memory()` = 参数 × 4 + 16 MiB + 256 MiB（LDM 约 461 MiB）。
+
+**alloc_sim 模拟（meta 设备，CT 700 后端）：**
+
+| 结构 | fp32 副本 | 参照解码后的 reserved 峰值 | 整个自检 | 自检后仍占 |
+|---|---|---|---|---|
+| SDXL / Flux / Flux 2（LDM） | 189 MiB | 736 MiB | **738 MiB** | 0 |
+| Wan 2.1（qwen_image_vae） | 280 MiB | 692 MiB | 692 MiB | 0 |
+| 参照解码也在 8 MiB 分块下：LDM / Wan | 同上 | 320 / 342 MiB | 320 / 342 MiB | 0 |
+| 再把自检 latent 降到 16：LDM / Wan | 同上 | 254 / 314 MiB | 254 / 314 MiB | 0 |
+
+峰值的大头是参照解码里全分辨率 3×3 卷积的 Slow2d im2col columns（fp32，256 通道 × 9 × 192²，约 340 MiB）加 fp32 激活，其次是 fp32 权重副本；自检和解码是先后执行的，自检结束时全部释放、缓存清空。
+
+**两个现象分别是什么：**
+
+1. **1344×768：自检本身的峰值高过了这次解码。** 自检约 0.74 GiB（模拟；实测 0.78 含碎片），解码只要 0.62，所以第一次的峰值是自检的。与图的大小无关：4K A 第一次（含 A 的自检，bench Y）reserved 1.11 = 第二次，因为解码 1.10 高过自检。凡是这次解码的峰值低于约 0.75 GiB（小图、紧预算）都会出现。
+2. **4K 节点副本：多出的 0.24 GiB reserved（GTT 多 0.52）不是自检的峰值**（0.74 < 2.44）。这个进程（`check_vae_node.py`）在副本解码之前没做过任何 GPU 计算，第一批 GPU 计算的一次性开销都落在这次测量里：BLAS 句柄和工作区（经 PyTorch 的缓存分配器分配、进程内一直活着，会钉住它所在的段，`empty_cache` 释放不了，arena 只好另开一段：0.24 + 2.44 = 2.68，「再次」从新起点量是 2.44）、第一次用到的 GPU 内核代码（只在 GTT 里，不在 reserved 里：GTT 比 reserved 多 0.28）。bench 里原生先跑过，所以没有这一项。ComfyUI 服务里采样早就付过这笔开销，VAE 解码时不会再有。这是推断，要在真机上区分（下面的命令 AA）。
+
+**可选的改法和代价：**
+
+| 改法 | 做法 | 好处 | 代价 |
+|---|---|---|---|
+| A 自检算进估算和预算 | 某结构第一次使用时，交给 `load_models_gpu` 和预算比较的都是 max(计划估算, 自检估算)；自检估算用 alloc_sim 校验过的公式（fp32 权重 + 参照解码上界） | 估算重新是上界；预算严格成立 | 不改自检时自检要 0.74 GiB：小于这个的预算第一次就放不下（换方案也没用），第二次又放得下，前后不一致；要多维护一个内存模型 |
+| B 自检变小 | 参照解码也在第二层分块下跑（工作区与条带不同，如 32 MiB，块边界不同）；可再把自检 latent 24 → 16 | 0.74 → 0.32 GiB（latent 16：0.25；Wan 0.34 / 0.31）；剩下主要是 fp32 权重副本，省不掉（1e-4 的判据要 fp32） | 参照和条带共用第二层的卷积分块代码，分块本身的错误自检查不出（第二层另有 `test_vae.py` 的 53 项单测）；latent 16 时条带边界少一些；耗时几乎不变 |
+| C1 自检放进 arena | 先按选好的计划预留 arena，再跑自检（自检的块从 arena 的空闲段里分），然后解码 | 自检 ≤ arena 时 reserved 不增加；与 B 合用时几乎所有解码（arena ≥ 0.35 GiB）都不会超出 | 执行顺序变复杂（预算选择、自检失败退回第二层都要在 arena 预留之后处理）；arena 小于自检时仍要 A 兜底 |
+| C2 加载 VAE 时就自检 | 包装 `VAE.__init__` / VAELoader，加载后立刻自检 | 解码时不再有自检 | 加载时就要把 VAE 搬上 GPU（违背 ComfyUI 的惰性加载）、每次加载多 1–2 s 和约 0.74 GiB 瞬时峰值（哪怕这个 VAE 从不走第一层）；峰值只是挪到了加载时 |
+| C3 自检结果缓存到磁盘 | 按结构 + torch / ComfyUI / Monoload 版本记住通过，下次进程不再自检 | 只有第一次运行付一次 | 违反「每个进程第一次使用前自检」的规矩（要你同意）；驱动或库升级后缓存可能过期，需要版本键 |
+| 不改 | 文档写明第一次解码多一次约 0.74 GiB 的自检峰值 | 零改动 | 紧预算下第一次可能超预算 |
+
+第 2 种现象（进程里第一批 GPU 计算）与改法无关：Monoload 不该为它预留，也测不准（每台机器、每个库版本不同）。
+
+**建议：** B + A。先把自检降到约 0.3 GiB（参照用不同工作区分块，latent 保持 24），再把这个（小而稳定、模拟可校验的）自检峰值算进第一次的估算和预算比较；C1 以后需要时再加。
+
+**真机区分（`tests/check_selftest_mem.py`，README §9.12 的 AA）：** 新进程里依次单独测「第一批 GPU 计算（`--warmup`）」「自检本身」「解码 1」「解码 2」，每一步之前清缓存，报告 reserved / GTT 峰值和清缓存后仍占的量。预测：自检 reserved 峰值约 0.74 GiB；不加 `--warmup` 时自检之后仍占一些 reserved 和 GTT（第一批 GPU 计算的一次性开销），加了以后这部分出现在 warm-up 一行、自检之后为 0；解码 1 = 解码 2 = 2.44（4K 预算 3G）。
+
+### 9.20 自检缩小、并算进第一次的估算和预算（vae-selftest-budget，用户选 B + A）
+
+**CT 700 的诊断（命令 AA，0a4e177）：** 自检 reserved 峰值不加 warm-up 0.85、加 warm-up 0.78 GiB（之后留下 0），报给 `load_models_gpu` 的是 0.45；进程里第一批 GPU 计算留下 0.07 GiB reserved（加 warm-up 后出现在 warm-up 一行），自检之后 GTT 仍剩 0.08（量小，先不管）。§9.19 的两点推断都成立。
+
+**B：自检变小。** 参照解码（模型类自己的整图 `decode`）也在第二层分块下跑，工作区 `SELFTEST_REF_WORKSPACE` = 32 MiB，与条带那遍的 8 MiB 不同（块边界不同，保留一部分独立性）。自检 latent 仍是 24。alloc_sim：LDM（SDXL / Flux / Flux 2）0.74 → **0.37 GiB**（378–380 MiB），Wan 0.69 → 0.38（390 MiB），结束后都不留东西。剩下的主要是 fp32 权重副本（LDM 189 MiB，Wan 280 MiB）。
+
+**新的自检上界 `StripeAdapter.selftest_memory()`：** fp32 权重副本 + max(参照解码的第二层上界 = 4 × 最大激活 + 2 × 32 MiB + 输出, 条带那遍的计划估算 + 输出) + 参照输出 + 32 MiB 余量；全部按自检的几何（24 × 24，fp32）算，与图的大小无关，按结构缓存。LDM / Flux 2 / Wan 都是 430 MiB，模拟峰值 378–390 MiB 在其内（以前给的 0.45 GiB 低于真实的 0.74）。
+
+**A：算进第一次的估算和预算比较。**
+
+* 预算（`choose_budget`）：某个第一层变体的结构还没自检过时，它的估算按 max(计划估算, 自检上界) 比较预算（自检和解码先后执行，第一次的峰值是两者较大的那个）。候选标签和「放不下」的报错里写明「首次使用：解码前的自检最多占 X；解码本身 Y」（`vae.cand_selftest`，中英文）。只有这次就要做的自检才算：自检过一次之后，同一个预算按计划估算比较。
+* 记录和日志：这次解码里跑了自检时，`last_decode()` / Info 的估算 `total` = max(计划, 自检)，另记 `plan` 和 `selftest`；解码日志的估算后面加「解码前的首次自检最多 X」（`vae.est_selftest`）。交给 `load_models_gpu` 的不变：自检之前用自检上界，解码之前用计划估算（自检已经释放）。
+* 默认策略（不设预算）不受影响：没有预算要比较，只是记录里的估算变成两者较大的那个。
+
+**影响：** 自检上界 0.42 GiB，只有比它小的预算会在第一次解码时把第一层排除（以前的 1344×768 第一次 0.78 > 估算 0.76 的情况：现在自检约 0.40 < 解码 0.62，第一次峰值就是解码的）。
+
+**测试：** `tests/test_vae_flux2.py`：参照解码确实在 32 MiB 的块下跑（还有条带的 8 MiB）；第一次解码的记录 `selftest` = 自检上界、`total` = max，第二次没有；把自检上界改成比预算大时第一次报错并写明自检，自检记录在案后同一预算走第一层、== 原生；alloc_sim 上 Flux 2 / SDXL 的自检峰值 ≤ 上界且 ≤ 0.45 GiB。`tests/test_vae_stripe.py`：Wan 的自检峰值 ≤ 上界。`alloc_sim.selftest_trace(model)` 按 `_self_test_run` 的步骤重放自检，含最后的比较（max|参照|、max|条带 − 参照|、isfinite；review 07 补上）：它分配 0.84 MiB（小块池），reserved 不增加，Wan / Flux 2 / SDXL 的峰值仍是 390 / 380 / 378 MiB ≤ 上界 430 MiB，上界不用改。
+
+### 9.21 第一次解码多 0.13 GiB、解码后 arena 被输出钉住（分析；用户选了 ① a、② a + 解码结束时清缓存，实现见 §9.22）
+
+**现象（命令 AA，Flux 2，4K，预算 3G）：** ① 解码 1 的 reserved 峰值 2.57、解码 2 是 2.44（两条命令都这样，自检和第一批 GPU 计算已经单独测过），多出的 0.13 解码完就释放了；② 两次解码之后、`empty_cache` 之后都还留着 2.44 GiB reserved 和 GTT。
+
+**① 的原因：第二层的形状探测留下的缓存块。** 设了预算时 `choose_budget` 要比较第二层，第二层的估算要 `_probe`：每个模型（和 latent 布局）第一次用 8 × 8 的 latent 跑一次小解码（带 forward hook，不在第二层分块下），按模型缓存。它在解码 1 的测量窗口里、arena 预留之前运行；用完的块留在分配器的缓存里没有清，arena（一整块 2.44 GiB）放不进这些小段，只能另开一段，峰值 = 探测留下的缓存 + arena。解码 2 时探测已缓存，不再运行。alloc_sim 复现：先跑探测再按同一计划解码，reserved 峰值 2.55（实测 2.57），不跑探测 2.44；探测之后、预留 arena 之前清一次缓存就回到 2.44。这些块是缓存、不是活着的张量，所以解码完 `empty_cache` 就释放了。对照：没有预算的默认策略不跑探测（bench X 1344 第一次没有这项）；bench Z 的 4K 第一次没有这项是因为 1344 时已经探测过（缓存键与分辨率无关）；在 `check_vae_node.py` 里探测之后紧接着是自检，自检结束时清缓存，所以那里的多出量另有来源（第一批 GPU 计算，持久的工作区钉住了它落脚的那一段）。
+
+**① 的可选改法：**
+
+| 改法 | 代价 |
+|---|---|
+| a 预留 arena 之前清一次缓存（`_decode_layer1`，每次解码一次 `soft_empty_cache`） | 一次 `empty_cache`（毫秒级）；之前缓存的块（采样留下的）这时还给系统，下一次采样要重新 `hipMalloc`（`_MemProbe` 进入时本来就清一次，影响相同） |
+| b 只在形状探测之后清缓存（每个模型一次） | 几乎没有；只针对这一个来源 |
+| c 把探测留下的缓存算进估算 | 不建议：大小取决于分配器状态，估算会变松 |
+
+建议 a（覆盖解码之前所有残留，和 `_MemProbe` 的做法一致）。
+
+**② 的原因：输出缓冲分配在 arena 的段里。** 已从代码确认：`StripeAdapter.run` 先 `reserve_arena`（申请一整块再释放，缓存成一个空闲段），然后才分配 `pixel_samples`（整个 batch 的输出，fp32，`--gpu-only` 时在设备上；4K 约 95 MiB）。这时唯一放得下它的空闲块在 arena 段里，按最佳匹配就切在那里——这本来是设计里的一部分（输出算在 arena 的 persistent 里，§9.13.4）。解码完其他块都释放了，但输出还活着，缓存分配器只释放完全空闲的段，于是整段 2.44 GiB 一直 reserved。alloc_sim 复现：输出活着时 `empty_cache` 后仍留 2.44（默认计划 2.18）。对照：第二层 / 原生的输出落在别的小段里，只留约 0.1 GiB。
+
+**② 的实际影响：** ComfyUI 开 `--gpu-only` 时 VAEDecode 的输出（IMAGE）留在 GPU 上，节点输出缓存一直保留到这个节点下次重新执行；`main.py` 在 prompt 之后（按 gc 间隔）调用 `soft_empty_cache()` 也释放不了这一段。PyTorch 进程内部这段的空闲部分可以复用（ComfyUI 的 `get_free_memory` 把 reserved − active 算作空闲，下一次采样的块可以放进去），损失的是进程外：在统一内存的 CT 700 上，这 2.4 GiB GTT 是被钉住的系统内存，CPU 那边（加载模型文件、页缓存）用不了。一个工作流里有两个 VAEDecode 时会钉住两段。
+
+**② 的可选改法：**
+
+| 改法 | 做法 | 代价 |
+|---|---|---|
+| a 输出在 arena 之外单独分配 | `run` 里先分配输出（独立的段，按 2 MiB 取整），再预留 arena（arena 里不再含输出） | alloc_sim：峰值不变（4K 预算计划 2.44，默认 2.18），输出活着时清缓存后只留 0.09 GiB；arena 的布局（persistent / long_lived、`saves_fit`）要改并重新验证 51 个读数和 reserved ≤ 估算；输出在 CPU 上时（不开 `--gpu-only`）不变 |
+| a + 解码结束时清缓存 | 在 a 的基础上，受管理的解码结束时 `soft_empty_cache()` | arena 立刻还给系统，不用等 ComfyUI 的 gc 间隔；下一次大分配要重新 `hipMalloc`（毫秒级） |
+| c 结束时把输出拷到 arena 外 | 解码完再拷一份 | 做不到：旧输出活着时 arena 段释放不了，新的一份按最佳匹配还会落进 arena 的空闲部分 |
+| d 用私有内存池（`torch.cuda.MemPool`）放解码的临时块 | 输出在默认池，临时块在私有池，用完整个池释放 | ROCm 上这个接口是否可靠未知；alloc_sim 不模拟内存池，验证手段没有了；改动大 |
+| 不改 | 文档写明 | 每次第一层解码之后，在输出被 ComfyUI 缓存期间多钉住一个 arena（2.2–2.4 GiB）的 GTT |
+
+建议 a + 解码结束时清缓存；① 的 a 可以和它一起做（同一个函数里）。
+
+### 9.22 解码前后清缓存、输出单独一段（vae-arena-output，§9.21 ① a、② a + 结束时清缓存）
+
+**CT 700 验收通过（4f140ea，README §10.6）：** decode 1 = decode 2 = 2.43 GiB，解码后只留输出 0.09；方案 A 4K 1.10（检查点下移生效）；预算选择不变；自检 0.37（加 warm-up）≤ 上界 0.42，不加 warm-up 的 0.45 含进程第一批 GPU 计算的约 0.07（不在上界里，§9.19）。
+
+**`StripeAdapter.run` 的顺序：** 清缓存（`soft_empty_cache`）→ 分配输出缓冲（整个 batch）→ 预留 arena → 逐个样本解码 → 清缓存。
+
+* 先清缓存：之前的工作（设了预算时的形状探测，§9.21 ①）留在缓存里的块还给系统，arena 和解码的第一批请求不会落进这些小段里。
+* 输出在 arena 之前分配：缓存刚清空，它只能单独开一段（`out_segment`：≥ 10 MiB 按 2 MiB 取整，1–10 MiB 一个 20 MiB 的段，≤ 1 MiB 在小块池的 2 MiB 段里）。arena 里不再有一直活着的块。
+* 结束时清缓存：解码完 arena 整段空闲，立刻还给系统，只留输出（4K 95 MiB），不用等 ComfyUI 的 gc 间隔（§9.21 ②）。
+* 输出在 CPU 上时（不开 `--gpu-only`）：输出不占设备，`out_segment` = 0，arena 同样在结束时还回去。
+* 代价：每次解码两次 `soft_empty_cache`（同步 + `empty_cache`，毫秒级）；之前缓存的块（采样留下的）这时还给系统，下一次采样要重新 `hipMalloc`。
+
+**计划（`Plan`）：** persistent 只剩 latent 的拷贝；存档的位置（`long_lived` / `saves_fit`）里不再有输出；largest 的候选去掉输出；估算 = `out_segment` + arena + largest + 16 MiB。`OUTPUT_IN_ARENA = True` 还原以前的布局（不清缓存、输出在第一个样本的前缀之后分配、在 arena 里），只给 alloc_sim 重放旧版本的读数用。
+
+**布局变了带出的一个问题，以及处理（`move_low`）：** 新布局在 alloc_sim 里扫了 37 个配置，只有一类变高：没有存档的方案 A，4K，工作区 128 MiB（Flux 2 / SDXL；bench Z 的 4K 1.5G 选的就是它，bench Y 的 A 行也是），1.105 → 1.229 GiB（仍 ≤ 估算 1.49）。原因：前缀的最后一步（mid 块的残差相加）的输出（检查点，127 MiB）落在它的一个输入后面，那个输入释放后，检查点前面留下一个 127 MiB 的洞。以前输出缓冲（95 MiB）正好放进这个洞；现在洞空着，统计 pass 的卷积 columns 块是 128 MiB，比洞大 1 MiB，放不进，只好在 arena 外另开一段。方案 B / C / D 有存档，检查点是前缀之前在 arena 最前面预先分配的，没有这个洞。
+
+处理：检查点不在 arena 最前面时（没有存档），前缀之后试着分配一块检查点大小的块。按最佳匹配，它落在能放下它的最小空闲块里：如果落在检查点下面（那个洞），就把检查点拷过去，原位置释放后与后面的空闲区连成一片；如果落在检查点上面（arena 的尾部）或者新开了一段，就立刻释放，块并回原处，布局不变（新开的段随即清掉）。代价：一次检查点大小的分配，移动时多一次拷贝（4K 127 MiB，毫秒级）。峰值不增加：拷贝时两份检查点同时活着，但新的一份放在已经空着的洞里。
+
+试过两种更简单的做法，都不行：
+
+* 无条件挪：洞比检查点小时，检查点反而往上挪，SDXL A 4K 64 MiB 工作区 1.02 → 1.14 GiB，Qwen fp32 4K 1.44 → 1.69。
+* 没有存档时也在前缀之前预先分配检查点：前缀的峰值多一个检查点，A 4K 32–96 行 1.06 → 1.18。
+
+**重新验证（alloc_sim）：**
+
+* **CT 700 读数：** 原有的 51 个读数（v1 / v2 / v3 / w128 = 5d668b6..6324592，旧布局重放）都在 0.02 GiB 以内，与改动前相同。另把 Flux 2 的 12 个读数（README §10.5 的 X / Y / Z）加进了 `MEASURED`，同样用旧布局重放，都在 0.01 GiB 以内。
+* **37 个配置的新布局（Qwen 9、Flux 2 19、SDXL 9；默认策略、各方案、bench Z 的六档）：**
+  * reserved 全部 ≤ 旧布局：相等，或低 2–12 MiB（arena 的余量按不含输出的 live 算）。
+  * reserved 全部 ≤ 估算；估算变化 ≤ 6 MiB。
+  * 输出活着时清缓存，只剩输出的段：1344 0–12 MiB、2688 48 MiB、4K 96 MiB、8K 380 MiB。旧布局是整个 arena。
+  * Qwen 4K 5 × 432 行和 8K 默认在两种布局下都有一块请求落在 arena 外（以前就有：need > arena），估算包住了它。
+
+| 配置（Flux 2，GiB） | 旧布局 | 新布局 | 估算（旧 → 新） | 解码后留下（旧 → 新） |
+|---|---|---|---|---|
+| 4K 预算 3G，B 12 × 180（AA / Z / 节点副本） | 2.439（先跑形状探测 2.547） | 2.434（先跑探测也是 2.434） | 2.968 → 2.962 | 2.438 → 0.094 |
+| 4K 默认 B 17 × 128 | 2.182 | 2.176 | 2.688 → 2.682 | 2.180 → 0.094 |
+| 4K A 17 × 128（1.5G） | 1.105 | 1.104（不挪检查点 1.229） | 1.490 → 1.488 | 1.104 → 0.094 |
+| 1344 默认 B 6 × 128 | 0.621 | 0.609 | 0.758 | 0 → 0 |
+
+**预算选择不变：** bench Z 的六档、`check_vae_node.py` 的节点副本，选中的方案、条带高度和工作区都与以前相同。候选的估算只变了几 MiB，例如 2688 1.5G 的 A 220 行 1.50 → 1.49。
+
+**测试：**
+
+* `tests/test_vae_stripe.py`：
+  * 解码的顺序：清缓存 → 输出 → arena → 清缓存（CPU 上没有 arena）。
+  * `move_low` 的三种情况：洞在下面就挪；块在上面不挪；新开了段不挪，并清缓存。
+  * 估算 = 输出段 + arena + largest + 16 MiB。
+  * Qwen 三个尺寸新旧布局对比：峰值不升、解码后只留输出、清缓存次数多 2、条带不变。
+  * 旧布局重放 w128 的两个读数。
+* `tests/test_vae_flux2.py`：
+  * AA 的两个现象：旧布局先跑探测 2.55、不跑 2.44，与实测 2.57 / 2.44 相差 ≤ 0.03，解码后留下整个 arena；新布局两者相等，只留输出。
+  * 方案 A 4K 128 MiB：新布局 ≤ 旧布局，旧布局与实测 1.11 相差 ≤ 0.03；不挪检查点时高 0.1 GiB 以上。
+* `alloc_sim.decode_trace` 新增：
+  * `output_in_arena`：旧布局；
+  * `probe`：先跑预算的形状探测；
+  * `info["stays"]`：输出活着时清缓存后留下的量。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
@@ -1162,7 +1440,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 **运行时合并按 ModelPatcher 决定（核对过 hotpatch）：** 以前「是否接管」和「合并路径」都是全局的：`_active()` 只看类，`MonoloadRuntimePatch.__call__` 读全局 `_MODE["exact"]`。现在：
 
 * `_enabled(patcher)` = `lora_overrides.enabled(patcher)`：patcher 的 `mode`，没有就看总开关。所有替换的方法都经过 `_active()`（它先看 `_enabled`），`patch_weight_to_device`、`ModelPatcherDynamic.load` 也看。没有节点时就是总开关，行为与以前相同。
-* 合并路径：`_install_runtime_patch` 建 `MonoloadRuntimePatch` 时传入 `exact = lora_overrides.merge_exact(patcher)`（节点选了就是 True / False，没选是 None = 每次调用时读全局 `settings.exact()`，`set_exact()` 照旧立刻生效）。运行时 patch 每次 `load()` 都重新装（`_load` 清掉 `comfy_patched_weights`），所以总是对应当前加载的 patcher。
+* 合并路径：模型的绑定（§3.2）记着当前生效的 patcher 的 `exact = lora_overrides.merge_exact(patcher)`（节点选了就是 True / False，没选是 None = 每次调用时读全局 `settings.exact()`，`set_exact()` 照旧立刻生效）。`load` / `partially_load` 时绑定指向正在加载的 patcher，所以同一个 `patches_uuid`、不重新 `load()` 的 clone 也用自己的合并方式（review 01；以前写的「每次 load() 都重新装，所以总是对应当前加载的 patcher」在原生提前返回的路径上不成立）。
 * 全局默认的 `exact` / `keep` 挪到 `settings.py`（`hotpatch.set_exact` / `is_exact`、`release.keep` / `set_keep` 转发过去），`lora_overrides` 不导入 torch / ComfyUI。
 
 **prompt 结束后按 patcher 释放：** `release_after_prompt` 对每个已加载模型看 `wants_release(patcher)`；输出缓存里的 MODEL / CLIP 也按各自的 patcher 判断；没有 patcher 的 Hook LoRA 组按全局默认；`LoraLoader` 等的文件缓存（`loaded_lora`）在全局默认是释放、或者这次释放了任何东西时清掉（保留的模型的 LoRA 张量被它的 patches 引用着，清掉文件缓存不影响它，只是加载器重新执行时要重读文件）。全局默认是保留、而且这个进程里没用过 LoRA 节点时直接返回（`MONOLOAD=0` 不加节点时零开销）。原生模型的 `release`：`unpatch_model` 走原生，按备份逐位还原，然后照常指回底模。

@@ -133,7 +133,10 @@ def describe_decode(r):
     if strat == "native":
         return head + msg("info.decode_native", reason=r.get("reason"), t=t)
     if strat == "error":
-        return head + msg("info.decode_error", budget=_gib(r.get("budget")))
+        kind = r.get("kind", "budget")
+        if kind == "budget":
+            return head + msg("info.decode_error", budget=_gib(r.get("budget")))
+        return head + msg("info.decode_oom" if kind == "oom" else "info.decode_failed", error=r.get("error") or "?")
     if strat == "layer1":
         what = msg("info.decode_l1", adapter=r.get("adapter"), n=r.get("stripes"), rows=r.get("rows"))
     elif strat == "layer2":
