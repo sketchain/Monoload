@@ -896,9 +896,11 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
                     fit; when no height fits: MonoloadError (it does not run
                     over the budget, and does not fall back to layer 2);
                   fixed height and scheme: that configuration, run anyway.
-                When every forced layer-1 variant that fits fails its self-test
-                in this decode: layer 2 (as without a budget). A failure cached
-                from an earlier decode is handled differently (review 02, open).
+                When the forced layer-1 configuration cannot run because its
+                self-test failed (in this decode or cached from an earlier one,
+                the same decision): layer 2 if it fits the budget, else
+                MonoloadError naming the forced setting, the variant(s) that
+                failed and what layer 2 needs.
     none fits   MonoloadError naming what each candidate needs.
 
     selftest(bound) -> (ok, detail): the layer-1 self-test (default: run it,
@@ -921,16 +923,19 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
     bound, l1_note = _select_layer1(vae, samples_in, vae_options)
     if not _SETTINGS["stripe"]:
         return layer2(msg("vae.l2_forced_policy", src=_from("mode")), msg("vae.l2_forced_why", src=_from("mode")), l1_note)[1]
-    variants = []
+    # a forced layer-1 configuration is read from the effective settings, not from the variants left after failed
+    # self-tests: the decision must not depend on whether a failure was cached by an earlier decode (review 02)
+    forced = []
+    if bound is not None and rows:
+        forced.append(msg("vae.forced_rows", rows=rows, src=_from("stripe_rows")))
+    if bound is not None and scheme and bound.schemes:
+        forced.append(msg("vae.forced_scheme", scheme=scheme, src=_from("gn_scheme")))
+    variants, failed = [], []
     if bound is not None:
-        variants = [v for v in bound.variants(scheme if bound.schemes else None) if not _selftest_failed(v)]
+        for v in bound.variants(scheme if bound.schemes else None):
+            (failed if _selftest_failed(v) else variants).append(v)
         if not variants:
             l1_note = msg("vae.selftest_failed_short")
-    forced = []
-    if variants and rows:
-        forced.append(msg("vae.forced_rows", rows=rows, src=_from("stripe_rows")))
-    if variants and scheme and bound.schemes:
-        forced.append(msg("vae.forced_scheme", scheme=scheme, src=_from("gn_scheme")))
     if not forced:
         c, d = layer2(msg("vae.l2_fits_policy"),
                       msg("vae.l2_fits_why", l1=msg("vae.l1_unavailable_note", why=l1_note) if l1_note else ""), l1_note)
@@ -973,6 +978,7 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
         ok, detail = selftest(v)
         if not ok:
             c["selftest_result"] = "failed"
+            failed.append(v)
             continue
         if over_budget:
             reason = pre + msg("vae.reason_over")
@@ -985,10 +991,16 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
         return {"layer": 1, "bound": v, "plan": p, "workspace": p.workspace, "selftest": detail, "candidates": considered,
                 "policy": msg("vae.policy_join", head=head, policy=msg("vae.policy_forced_over") if over_budget else msg("vae.policy_fastest"), over=""),
                 "why": msg("vae.why_layer1", head=head, cand=_candidate_label(c), reason=reason, others=others)}
-    if forced and pick:
-        # every forced layer-1 variant that fits failed its self-test: layer 2, as without a budget
-        failed = msg("vae.selftest_failed_short")
-        return layer2(msg("vae.l2_after_selftest"), failed, failed)[1]
+    if forced and (pick or not variants):
+        # the forced layer-1 configuration cannot run: its self-test failed, now or earlier in this process. Layer 2,
+        # but only within the budget (DESIGN §9.14.10, review 02); the same decision either way
+        note = msg("vae.selftest_failed_short")
+        c2, d2 = layer2(msg("vae.l2_after_selftest"), note, note)
+        if c2["fits"]:
+            return d2
+        raise MonoloadError(msg("vae.err_forced_selftest", budget=fmt_bytes(bud), src=_from("budget"), what=", ".join(forced),
+                                failed=", ".join(v.name for v in failed), l2=fmt_bytes(c2["estimate"]), shape=list(samples_in.shape),
+                                advice=_budget_advice()))
     needs = []
     for c in considered:
         if c["layer"] == 2:

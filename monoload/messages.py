@@ -252,6 +252,11 @@ M = {
     "vae.err_budget": (
         '[Monoload] VAE decode does not fit the peak budget {budget} (from {src}; latent {shape}): {needs}. {advice}',
         '[Monoload] VAE 解码在峰值预算 {budget}（来源：{src}）内放不下（latent {shape}）：{needs}。{advice}'),
+    "vae.err_forced_selftest": (
+        '[Monoload] VAE decode does not fit the peak budget {budget} (from {src}; latent {shape}): the forced layer-1 configuration '
+        '({what}) cannot run, its self-test failed ({failed}); layer 2 needs about {l2}, above the budget. {advice}',
+        '[Monoload] VAE 解码在峰值预算 {budget}（来源：{src}）内放不下（latent {shape}）：强制的第一层配置（{what}）不能用，'
+        '它的自检未通过（{failed}）；第二层需要约 {l2}，超出预算。{advice}'),
     "vae.src_node": ("the Monoload VAE Settings node", "Monoload VAE 设置节点"),
     "vae.src_env": ("environment variable {var}", "环境变量 {var}"),
     "vae.advice_node": (

@@ -38,6 +38,7 @@ step "VAE decode: layer 1, LDM stripes (SDXL / Flux ae) vs native (synthetic dec
 step "VAE decode: layer 1, Flux 2 VAE vs native (synthetic decoder, no model files)"; run $R python tests/test_vae_flux2.py
 step "VAE Settings node (synthetic decoders, no model files)"; run $R python tests/test_vae_node.py
 step "VAE layer-1 OOM retries (injected; synthetic decoder, no model files)"; run $R python tests/test_vae_retry.py
+step "forced layer-1 settings whose self-test fails, under a budget (synthetic decoder, no model files)"; run $R python tests/test_vae_selftest_budget.py
 step "check_selftest_mem.py chooses the variant the decodes use (synthetic decoder, no model files)"; run $R python tests/test_check_selftest_mem.py
 # every functional suite runs on both merge paths: bit-exact (MONOLOAD_EXACT=1)
 # and the default (fused / relaxed, checked against native within tolerance)
