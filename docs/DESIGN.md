@@ -104,7 +104,9 @@ Hook LoRA（复刻 patch_hook_weight_to_device，在已合并基础 LoRA 的权�
 
 ### 3.2 Hook LoRA
 
-每个 patcher 有一份 `hook_patches`（key → 当前生效的 hook patch 列表），它的所有运行时 patch 共享这一份。`patch_hooks(hooks)` 用原生的 `get_combined_hook_patches(hooks)` 算出组合（包括 keyframe 强度），写进这份状态；只被 hook 改到、还没有运行时 patch 的层补挂一个，不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。** 采样时正/负条件可能挂着不同的 hook 组，每一步会来回切换；在这里只是换一个 dict。CLIP 的 `SetClipHooks`（`forced_hooks`）走同一条路。
+每个模型有一个**绑定**（`_Binding`，放在 `patcher.model` 上，所有 clone 共用；review 01）：当前生效的 patcher 的 `patches` 和合并方式（exact）、当前生效的 `hook_patches`（key → hook patch 列表）、LoRA 张量的设备副本。模型上所有运行时 patch 每次调用都读它。`load` / `partially_load` / 装运行时 patch 时绑定指向正在加载的 patcher：同一个 `patches_uuid` 的 clone 加载时原生 `partially_load` 不卸载、权重全部已加载时也不调用 `load()`（只重新应用它的 forced hooks 就返回），所以要在调用原函数**之前**把绑定指向它。hook 状态由最后一次 `patch_hooks` / `unpatch_hooks` 的那个 clone 写，与原生一致（原生的 clone 共用权重和 `hook_backup`）。以前每个 patcher 一份状态、运行时 patch 绑着装它的那个 patcher，同 uuid 的 clone 会用前一个 clone 的 hook 强度、patches 和合并方式（CLIP 路径用 ComfyUI 自带的节点就能遇到，差 0.02；`tests/test_lora_clone_binding.py`）。没有运行时 patch 时绑定清空，不留住已经不用的 clone 的东西。
+
+`patch_hooks(hooks)` 用原生的 `get_combined_hook_patches(hooks)` 算出组合（包括 keyframe 强度），写进绑定；只被 hook 改到、还没有运行时 patch 的层补挂一个，不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。** 采样时正/负条件可能挂着不同的 hook 组，每一步会来回切换；在这里只是换一个 dict。CLIP 的 `SetClipHooks`（`forced_hooks`）走同一条路。
 
 ### 3.3 量化参数：在反量化的临时权重上合并，不重新量化
 
@@ -1438,7 +1440,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 **运行时合并按 ModelPatcher 决定（核对过 hotpatch）：** 以前「是否接管」和「合并路径」都是全局的：`_active()` 只看类，`MonoloadRuntimePatch.__call__` 读全局 `_MODE["exact"]`。现在：
 
 * `_enabled(patcher)` = `lora_overrides.enabled(patcher)`：patcher 的 `mode`，没有就看总开关。所有替换的方法都经过 `_active()`（它先看 `_enabled`），`patch_weight_to_device`、`ModelPatcherDynamic.load` 也看。没有节点时就是总开关，行为与以前相同。
-* 合并路径：`_install_runtime_patch` 建 `MonoloadRuntimePatch` 时传入 `exact = lora_overrides.merge_exact(patcher)`（节点选了就是 True / False，没选是 None = 每次调用时读全局 `settings.exact()`，`set_exact()` 照旧立刻生效）。运行时 patch 每次 `load()` 都重新装（`_load` 清掉 `comfy_patched_weights`），所以总是对应当前加载的 patcher。
+* 合并路径：模型的绑定（§3.2）记着当前生效的 patcher 的 `exact = lora_overrides.merge_exact(patcher)`（节点选了就是 True / False，没选是 None = 每次调用时读全局 `settings.exact()`，`set_exact()` 照旧立刻生效）。`load` / `partially_load` 时绑定指向正在加载的 patcher，所以同一个 `patches_uuid`、不重新 `load()` 的 clone 也用自己的合并方式（review 01；以前写的「每次 load() 都重新装，所以总是对应当前加载的 patcher」在原生提前返回的路径上不成立）。
 * 全局默认的 `exact` / `keep` 挪到 `settings.py`（`hotpatch.set_exact` / `is_exact`、`release.keep` / `set_keep` 转发过去），`lora_overrides` 不导入 torch / ComfyUI。
 
 **prompt 结束后按 patcher 释放：** `release_after_prompt` 对每个已加载模型看 `wants_release(patcher)`；输出缓存里的 MODEL / CLIP 也按各自的 patcher 判断；没有 patcher 的 Hook LoRA 组按全局默认；`LoraLoader` 等的文件缓存（`loaded_lora`）在全局默认是释放、或者这次释放了任何东西时清掉（保留的模型的 LoRA 张量被它的 patches 引用着，清掉文件缓存不影响它，只是加载器重新执行时要重读文件）。全局默认是保留、而且这个进程里没用过 LoRA 节点时直接返回（`MONOLOAD=0` 不加节点时零开销）。原生模型的 `release`：`unpatch_model` 走原生，按备份逐位还原，然后照常指回底模。

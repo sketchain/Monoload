@@ -30,6 +30,7 @@ step "release with a chain of patch-free clones (no model files)"; run $R python
 step "Info node (no model files)"; run $R python tests/test_info_node.py
 step "master switch: MONOLOAD=0 == native bit for bit, priorities (no model files)"; run $R python tests/test_master_switch.py
 step "hook + normal LoRA on a lowvram layer == native (no model files)"; run $R python tests/test_lora_lowvram_hook.py
+step "clones sharing a model: runtime LoRA patches follow the patcher loaded == native (no model files)"; run $R python tests/test_lora_clone_binding.py
 step "LoRA Settings node (synthetic SD1.5: python tests/make_synthetic_checkpoint.py \$MODELS)"
 if [ -f "$MODELS/checkpoints/synthetic_sd15.safetensors" ]; then run $R python tests/test_lora_node.py; else echo "skipped: no synthetic checkpoint"; fi
 step "VAE decode: op-level chunking vs native (synthetic decoders, no model files)"; run $R python tests/test_vae.py
