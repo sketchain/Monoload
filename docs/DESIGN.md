@@ -131,6 +131,7 @@ Monoload 的做法：量化层挂上 weight function 后，`forward` 会走 `cas
 * **重复加载。** 原生 `load()` 会清空所有全量加载层的 `weight_function`，但跳过已标记 `comfy_patched_weights` 的层（原生里它们已经合并好了）。Monoload 的 patch 并没有合并进权重，所以 `load()` 之前先清掉被 patch 层的这个标记，保证这些层会重新走一遍 `patch_weight_to_device`。
 * **切换组合 / 卸载。** 原生 `unpatch_model()` 只在 lowvram 时清 `weight_function`；Monoload 在卸载权重时摘掉自己挂的所有运行时 patch。所以撤掉 LoRA 后，权重与加载时逐字节一致（本来也从未改过），也没有残留的 weight function。
 * **部分加载（非 `--gpu-only`、显存不够）。** 原生对被卸载的层本来就用 `LowVramPatch`，而且不备份。Monoload **不改这部分**，只接管原生会合并进权重的那些层，所以在部分加载下结果也和原生逐位一致。原生 `partially_unload()` 会给已经合并过的层追加 `LowVramPatch`（原生里是先写回备份）；这时同一层会同时挂着 Monoload 的 patch 和原生的 `LowVramPatch`，Monoload 摘掉自己那个，得到的结果和原生一样。
+* **部分加载 + hook（lora-lowvram-hook）。** 卸到 CPU 的层上，普通 LoRA 由原生的 `LowVramPatch` 在计算时加。这样的层同一个 key 上再有 hook 时，Monoload 的运行时 patch 排在 `LowVramPatch` 前面，以前它把普通 LoRA 也加了一遍（加了两次，差 0.025）。现在运行时 patch 看到同一个 key 后面有原生 `LowVramPatch`，就只加 hook；hook 撤掉之后什么都不加。顺序与原生相同：原生先把 hook 合并进存储的权重，计算时再由 `LowVramPatch` 加普通 LoRA。exact 下与原生逐位一致，fused 差 ≤ 1.4e-4（`tests/test_lora_lowvram_hook.py`）。
 * 每次 `load()` / `partially_unload()` 之后都断言 `backup` / `hook_backup` 为空。
 
 ## 5. 效率
