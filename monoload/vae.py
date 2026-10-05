@@ -884,11 +884,21 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
                 4K: SDXL 9.9 s vs 35.5 s at best, Qwen 6.9 vs 8.4 s); then the
                 layer-1 variants by bound.predict_seconds (LDM: the time model,
                 vae_ldm.TIME_COEF).
-    forced      outrank the budget: MONOLOAD_DISABLE_VAE_STRIPE -> layer 2;
-                MONOLOAD_VAE_STRIPE_ROWS -> layer 1 at that height (the scheme is
-                still chosen); MONOLOAD_VAE_GN_SCHEME -> layer 1 with that scheme
-                for an LDM decoder (the height is still chosen). A forced
-                configuration that does not fit runs anyway (logged).
+    forced      each has its own relation to the budget (DESIGN §9.14.10):
+                  layer 2 only (MONOLOAD_DISABLE_VAE_STRIPE / node mode): layer
+                    2, also when its estimate is above the budget (logged);
+                  fixed height (MONOLOAD_VAE_STRIPE_ROWS): layer 1 at that
+                    height, layer 2 not considered; the scheme is the fastest
+                    that fits at that height, and when none fits the one with
+                    the lowest estimate runs anyway (logged);
+                  fixed scheme (MONOLOAD_VAE_GN_SCHEME, LDM): layer 1 with that
+                    scheme, layer 2 not considered, the tallest stripes that
+                    fit; when no height fits: MonoloadError (it does not run
+                    over the budget, and does not fall back to layer 2);
+                  fixed height and scheme: that configuration, run anyway.
+                When every forced layer-1 variant that fits fails its self-test
+                in this decode: layer 2 (as without a budget). A failure cached
+                from an earlier decode is handled differently (review 02, open).
     none fits   MonoloadError naming what each candidate needs.
 
     selftest(bound) -> (ok, detail): the layer-1 self-test (default: run it,

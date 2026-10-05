@@ -16,8 +16,11 @@ safe to run next to a working ComfyUI.
   models/diffusion_models, unet the model ComfyUI detects (the same steps as
                                 its UNETLoader: old quantization formats converted,
                                 a key prefix removed when present) and its latent
-                                format, i.e. the VAE family it needs, and the files in
-                                models/vae (or checkpoints' built-in VAEs) that fit it
+                                format, i.e. the VAE family it needs, and the VAE
+                                candidates: files in models/vae (or checkpoints'
+                                built-in VAEs) whose latent channels and dims match
+                                (a shape match only, not a check that it is the
+                                VAE the model was trained with)
 
 A file that is not a complete safetensors file (too small, header or data cut
 short) is reported as unreadable with the reason.
@@ -291,7 +294,7 @@ def main():
                 inst = lf() if lf else None
                 ch, dims = getattr(inst, "latent_channels", None), getattr(inst, "latent_dimensions", None)
                 fits = [n for n, (cls, c, d) in vaes.items() if c == ch and d == dims]
-                print("   model: {} | latent format {} ({} ch, {}D) | VAE files that fit: {} [{}]".format(
+                print("   model: {} | latent format {} ({} ch, {}D) | VAE candidates (same latent channels / dims): {} [{}]".format(
                     type(cfg).__name__, lf.__name__ if lf else "-", ch, dims, ", ".join(fits) or "none in models/vae or the checkpoints", how))
             except HeaderError as e:
                 print("   unreadable:", e)
