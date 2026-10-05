@@ -271,6 +271,9 @@ M = {
         "[Monoload] VAE 解码显存不足：第一层（条带解码）的条带已缩到 {rows} 行、工作区 {ws}（共重试 {retries} 次）仍然 OOM。"
         "Monoload 不会退回到 tiled 近似解码，也不会退回第二层（第二层峰值更高）。可以先释放其他模型（/free）、降低分辨率，"
         "或把这个 VAE 的模式设成原生（全部原生：MONOLOAD_DISABLE_VAE=1）。latent {shape}，估算需要 {est}。"),
+    "vae.retry_skip": (
+        "[Monoload] VAE OOM retry: {rows}-row stripes, workspace {ws} would need {est}, more than the first plan's {first}; skipped",
+        "[Monoload] VAE 显存不足重试：{rows} 行条带、工作区 {ws} 需要 {est}，比第一次的计划 {first} 还多，跳过这一档"),
     "vae.retry_l1": (
         "[Monoload] VAE decode ran out of memory; retrying layer 1 with {rows}-row stripes, workspace {ws} (retry {retries})",
         "[Monoload] VAE 解码显存不足；第一层改用 {rows} 行的条带、工作区 {ws} 重试（第 {retries} 次）"),
