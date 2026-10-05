@@ -212,15 +212,27 @@ class MonoloadRuntimePatch(LowVramPatch):
             return weight
         return None
 
+    def _native_base(self):
+        """A native LowVramPatch for this key follows on the module (a lowvram
+        layer): it applies the key's own patches, so this one must not."""
+        module = self._module()
+        funcs = getattr(module, self.attr + "_function", ()) if module is not None else ()
+        return any(type(f) is LowVramPatch and f.key == self.key for f in funcs)
+
     def __call__(self, weight):
         key = self.key
-        base = self.patches.get(key)
+        base_all = self.patches.get(key)
         hooks = self.state.hook_patches.get(key)
+        if not base_all and not hooks:
+            return weight
+        # on a lowvram layer native's LowVramPatch (after this one) adds the key's patches: only the hooks here, i.e.
+        # native's order (the hook merged into the stored weight, the LoRA added when the layer runs)
+        base = None if base_all and self._native_base() else base_all
         if not base and not hooks:
             return weight
         param = getattr(self._module(), self.attr)
         if not (settings.exact() if self.exact is None else self.exact):
-            return self._call_fast(weight, param, base, hooks)
+            return self._call_fast(weight, param, base, hooks, base_all)
         device = weight.device
         pdt = param.dtype  # for a QuantizedTensor: its dequantized dtype
         cdt = weight.dtype
@@ -245,7 +257,7 @@ class MonoloadRuntimePatch(LowVramPatch):
             else:
                 temp = comfy.model_management.cast_to_device(param, device, torch.float32, copy=True)
             orig_param = param.dequantize() if _is_quantized(param) else param
-            original = {key: [(orig_param, _identity)] + list(base or [])}
+            original = {key: [(orig_param, _identity)] + list(base_all or [])}
             moved_hooks = _to_device(hooks, device, self.state.device_cache, param.numel(), {"transient": False})
             out = comfy.lora.calculate_weight(moved_hooks, temp, key, original_weights=original)
             w = comfy.float.stochastic_rounding(out, pdt, seed=self.seed)
@@ -253,7 +265,7 @@ class MonoloadRuntimePatch(LowVramPatch):
 
         return w.to(dtype=cdt)
 
-    def _call_fast(self, weight, param, base, hooks):
+    def _call_fast(self, weight, param, base, hooks, base_all=None):
         """Default path. The temporary is the one cast_bias_weight made, in the
         compute dtype (the tensor native lowvram LowVramPatch merges into). For
         a quantized parameter whose dequantized dtype differs from the compute
@@ -271,7 +283,7 @@ class MonoloadRuntimePatch(LowVramPatch):
             w = _merge_fast(self._base_on(base, device, param.numel()), w, key)
         if hooks:
             orig_param = param.dequantize() if _is_quantized(param) else param
-            original = {key: [(orig_param, _identity)] + list(base or [])}
+            original = {key: [(orig_param, _identity)] + list((base if base_all is None else base_all) or [])}
             moved_hooks = _to_device(hooks, device, self.state.device_cache, param.numel(), {"transient": False})
             w = _merge_fast(moved_hooks, w, key, original_weights=original)
         return w.to(dtype=cdt)
