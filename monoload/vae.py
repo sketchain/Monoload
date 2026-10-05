@@ -1039,14 +1039,22 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
             break
         pixel_samples = None
         mm.soft_empty_cache(True)
+        # halve stripes and workspace; a step whose estimate is above the first plan's (with a budget the first plan
+        # is within it, unless forced rows run above it anyway) is skipped: shorter stripes are not monotone in
+        # every plan (statistics passes, save layouts), and the retry must not need more than was loaded for
         rows = max(b - a for a, b in plan.stripes)
-        if rows <= min_rows and ws <= floor_ws:
-            raise MonoloadVAEOOMError(msg("vae.err_oom_l1", rows=rows, ws=fmt_bytes(ws), retries=retries, shape=list(samples_in.shape),
-                                          est=fmt_bytes(plan.estimate)))
-        rows = max(min_rows, rows // 2)
-        ws = max(floor_ws, ws // 2)
+        while True:
+            if rows <= min_rows and ws <= floor_ws:
+                raise MonoloadVAEOOMError(msg("vae.err_oom_l1", rows=rows, ws=fmt_bytes(ws), retries=retries, shape=list(samples_in.shape),
+                                              est=fmt_bytes(plan.estimate)))
+            rows = max(min_rows, rows // 2)
+            ws = max(floor_ws, ws // 2)
+            cand = bound.plan(self, samples_in, bud, ws, rows=rows, out_bytes=outb)
+            if cand.estimate <= first_est:
+                break
+            logging.warning(msg("vae.retry_skip", rows=rows, ws=fmt_bytes(ws), est=fmt_bytes(cand.estimate), first=fmt_bytes(first_est)))
+        plan = cand
         retries += 1
-        plan = bound.plan(self, samples_in, bud, ws, rows=rows, out_bytes=outb)
         logging.warning(msg("vae.retry_l1", rows=rows, ws=fmt_bytes(ws), retries=retries))
 
     pixel_samples = pixel_samples.to(self.output_device).movedim(1, -1)
