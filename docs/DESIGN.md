@@ -1303,7 +1303,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 **影响：** 自检上界 0.42 GiB，只有比它小的预算会在第一次解码时把第一层排除（以前的 1344×768 第一次 0.78 > 估算 0.76 的情况：现在自检约 0.40 < 解码 0.62，第一次峰值就是解码的）。
 
-**测试：** `tests/test_vae_flux2.py`：参照解码确实在 32 MiB 的块下跑（还有条带的 8 MiB）；第一次解码的记录 `selftest` = 自检上界、`total` = max，第二次没有；把自检上界改成比预算大时第一次报错并写明自检，自检记录在案后同一预算走第一层、== 原生；alloc_sim 上 Flux 2 / SDXL 的自检峰值 ≤ 上界且 ≤ 0.45 GiB。`tests/test_vae_stripe.py`：Wan 的自检峰值 ≤ 上界。`alloc_sim.selftest_trace(model)` 按 `_self_test_run` 的步骤重放自检。
+**测试：** `tests/test_vae_flux2.py`：参照解码确实在 32 MiB 的块下跑（还有条带的 8 MiB）；第一次解码的记录 `selftest` = 自检上界、`total` = max，第二次没有；把自检上界改成比预算大时第一次报错并写明自检，自检记录在案后同一预算走第一层、== 原生；alloc_sim 上 Flux 2 / SDXL 的自检峰值 ≤ 上界且 ≤ 0.45 GiB。`tests/test_vae_stripe.py`：Wan 的自检峰值 ≤ 上界。`alloc_sim.selftest_trace(model)` 按 `_self_test_run` 的步骤重放自检，含最后的比较（max|参照|、max|条带 − 参照|、isfinite；review 07 补上）：它分配 0.84 MiB（小块池），reserved 不增加，Wan / Flux 2 / SDXL 的峰值仍是 390 / 380 / 378 MiB ≤ 上界 430 MiB，上界不用改。
 
 ### 9.21 第一次解码多 0.13 GiB、解码后 arena 被输出钉住（分析；用户选了 ① a、② a + 解码结束时清缓存，实现见 §9.22）
 

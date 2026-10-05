@@ -504,12 +504,13 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     return info
 
 
-def selftest_trace(model, dtype="bf16"):
+def selftest_trace(model, dtype="bf16", tail=True, info=None):
     """Reserved peak (bytes) of the first-use layer-1 self-test on the full-size decoder (meta device), the steps
     of vae_engine._self_test_run: the fp32 copy, the reference whole-image decode under layer-2 chunking
     (SELFTEST_REF_WORKSPACE), the forced small stripes (SELFTEST_ROWS, SELFTEST_WORKSPACE); the VAE's own weights
-    loaded before. Returns (peak reserved, reserved left after the copy and every tensor are freed, the bound's
-    selftest_memory())."""
+    loaded before; tail=True: also the comparison at the end (max|ref|, max|out - ref|, isfinite; info, a dict:
+    what it allocates and adds to reserved, tail_alloc / tail_reserved, and reserved before it). Returns (peak
+    reserved, reserved left after the copy and every tensor are freed, the bound's selftest_memory())."""
     import gc
     import torch
     import comfy.model_management as mm
@@ -556,6 +557,22 @@ def selftest_trace(model, dtype="bf16"):
             out.narrow(tb.hdim, o0, o1 - o0).copy_(rows)
         with vae_ops.OpChunking(tb.module, eng.SELFTEST_WORKSPACE, vae_ops.OpStats()):
             tb.stripe_pass({0: tb.prefix_pass(z)}, plan, write)
+        if tail:
+            # the comparison (vae_engine._self_test_run): max|ref|, max|out - ref|, isfinite(out), each statement's
+            # temporaries freed before the next (float() / bool() of a meta tensor cannot be taken: the reductions only)
+            tracer.poll()
+            a0, r0, p_alloc, p_res = sim.allocated, sim.reserved, sim.peak_allocated, sim.peak_reserved
+            sim.peak_allocated, sim.peak_reserved = a0, r0
+            m = ref.abs().max()
+            del m
+            m = (out - ref).abs().max()
+            del m
+            m = torch.isfinite(out).all()
+            del m
+            tracer.poll()
+            if info is not None:
+                info.update(tail_alloc=sim.peak_allocated - a0, tail_reserved=sim.peak_reserved - r0, before_tail=r0 - base)
+            sim.peak_allocated, sim.peak_reserved = max(p_alloc, sim.peak_allocated), max(p_res, sim.peak_reserved)
         del tb, z, ref, out, plan
         gc.collect()
         tracer.poll()

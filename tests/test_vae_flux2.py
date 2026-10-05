@@ -385,10 +385,15 @@ def allocator_tests():
     import alloc_sim
     G = float(1 << 30)
     for model in ("flux2", "sdxl"):
-        pk, left, bound = alloc_sim.selftest_trace(model)
+        tail = {}
+        pk, left, bound = alloc_sim.selftest_trace(model, info=tail)
+        pk0 = alloc_sim.selftest_trace(model, tail=False)[0]
         check("{} self-test (full size, meta): simulated reserved peak {:.0f} MiB <= selftest_memory {:.0f} MiB, nothing left ({:.0f} MiB); "
-              "was ~740 MiB with the reference unchunked".format(model, pk / 2 ** 20, bound / 2 ** 20, left / 2 ** 20),
-              pk <= bound and left == 0 and pk <= 0.45 * G)
+              "was ~740 MiB with the reference unchunked; the final comparison allocates {:.2f} MiB, adds {:.2f} MiB to reserved "
+              "({:.0f} MiB before it), peak {:.0f} MiB without it".format(
+                  model, pk / 2 ** 20, bound / 2 ** 20, left / 2 ** 20, tail["tail_alloc"] / 2 ** 20, tail["tail_reserved"] / 2 ** 20,
+                  tail["before_tail"] / 2 ** 20, pk0 / 2 ** 20),
+              pk <= bound and left == 0 and pk <= 0.45 * G and tail["tail_alloc"] > 0 and tail["before_tail"] + tail["tail_reserved"] <= bound)
     for w, h, scheme in ((1344, 768, None), (2688, 1536, None), (3840, 2160, None), (3840, 2160, "A"), (3840, 2160, "C"), (3840, 2160, "D")):
         i = alloc_sim.decode_trace(w, h, "bf16", None, model="flux2", scheme=scheme)
         f = alloc_sim.decode_trace(w, h, "bf16", None, model="flux", scheme=scheme)
