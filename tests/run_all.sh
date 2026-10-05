@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full CPU test suite in the locked image (tests/test_vae.py needs no model files). Needs, under $MODELS:
+# Full CPU test suite in the locked image (the VAE tests need no model files). Needs, under $MODELS:
 #   checkpoints/v1-5-pruned-emaonly-fp16.safetensors        (CheckpointLoaderSimple)
 #   diffusion_models/v1-5-pruned-emaonly-fp16.safetensors   (UNETLoader; same file, a hard link is fine)
 #   diffusion_models/sd15_unet_fp8_scaled.safetensors       (tests/make_fp8_unet.py)
@@ -10,7 +10,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 export MODELS="${MODELS:?set MODELS}"
 OUT="${OUT:-$(mktemp -d)}"; chmod 777 "$OUT"
-R=tests/docker_run.sh
+R="${R:-tests/docker_run.sh}"   # R=<stub> lists the steps without running them
 SD=v1-5-pruned-emaonly-fp16.safetensors
 ARGS="--cpu --fp16-unet"
 fails=0
@@ -33,6 +33,9 @@ step "LoRA Settings node (synthetic SD1.5: python tests/make_synthetic_checkpoin
 if [ -f "$MODELS/checkpoints/synthetic_sd15.safetensors" ]; then run $R python tests/test_lora_node.py; else echo "skipped: no synthetic checkpoint"; fi
 step "VAE decode: op-level chunking vs native (synthetic decoders, no model files)"; run $R python tests/test_vae.py
 step "VAE decode: layer 1, Wan 2.1 stripes vs native (synthetic decoder, no model files)"; run $R python tests/test_vae_stripe.py
+step "VAE decode: layer 1, LDM stripes (SDXL / Flux ae) vs native (synthetic decoders, no model files)"; run $R python tests/test_vae_ldm.py
+step "VAE decode: layer 1, Flux 2 VAE vs native (synthetic decoder, no model files)"; run $R python tests/test_vae_flux2.py
+step "VAE Settings node (synthetic decoders, no model files)"; run $R python tests/test_vae_node.py
 # every functional suite runs on both merge paths: bit-exact (MONOLOAD_EXACT=1)
 # and the default (fused / relaxed, checked against native within tolerance)
 for EXACT in 1 ""; do
