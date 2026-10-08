@@ -6,7 +6,9 @@ when the layer runs). Before the fix the runtime patch applied the normal
 LoRA too, so it was added twice. Compared with native ComfyUI (Monoload's
 methods uninstalled) on a two-layer comfy.ops model, CPU, no model files:
 lowvram and full load, keys with a normal LoRA only / a hook only / both,
-exact and fused; no weight backups, the weights never changed.
+exact and fused; no weight backups, the weights never changed. Also a native
+partial unload after the hooks were applied (review 2026-10 item 04): the
+hook must survive on the keys that also have a normal LoRA.
 
     MODELS=/tmp/nomodels tests/docker_run.sh python tests/test_lora_lowvram_hook.py
 """
@@ -50,15 +52,41 @@ def run(base_keys, hook_keys, lowvram):
     return y, y_off, info
 
 
+def run_unload(base_keys, hook_keys):
+    """Review 2026-10 item 04: full load, hooks applied, then a native partial unload of everything (free_memory under
+    memory pressure) and the sampler's next apply_hooks(same group), as ComfyUI does every step."""
+    net = make_net()
+    w0 = weights(net)
+    p = comfy.model_patcher.ModelPatcher(net, CPU, CPU)
+    p.add_patches({k: v for k, v in make_lora(5).items() if k in base_keys}, 0.8)
+    group = comfy.hooks.create_hook_lora(None, 0.6, 0.0)
+    p.add_hook_patches(group.hooks[0], {k: v for k, v in make_lora(6).items() if k in hook_keys}, 0.6)
+    p.hook_mode = comfy.hooks.EnumHookMode.MinVram
+    p.load(CPU, full_load=True)
+    p.apply_hooks(group)
+    p.partially_unload(CPU, memory_to_free=1 << 40)
+    p.apply_hooks(group)
+    y = net(X)
+    info = {"fns": sorted(type(f).__name__ for m in (net.a, net.b) for f in (m.__dict__.get("weight_function") or [])),
+            "backups": len(p.backup) + len(p.hook_backup)}
+    p.unpatch_hooks()
+    y_off = net(X)
+    p.unpatch_model(CPU)
+    info["restored"] = same(weights(net), w0)
+    return y, y_off, info
+
+
 def main():
     cases = []
     for lowvram in (True, False):
         for base_keys, hook_keys, label in ((("b.weight",), ("a.weight", "b.weight"), "LoRA on b, hook on a and b"),
                                             (("a.weight", "b.weight"), ("b.weight",), "LoRA on a and b, hook on b")):
             cases.append((lowvram, base_keys, hook_keys, label))
+    unload_cases = [(b, h, label) for lv, b, h, label in cases if lv]
     hotpatch.uninstall()
     try:
         ref = [run(b, h, lv) for lv, b, h, _ in cases]
+        ref_unload = [run_unload(b, h) for b, h, _ in unload_cases]
     finally:
         hotpatch.install()
     for exact in (True, False):
@@ -69,7 +97,17 @@ def main():
             tol = 0.0 if exact else 2e-4
             check("{} {}, {}: == native (max|Δ| {:.2g}; hooks off {:.2g}); weight functions {} (native {}); no backups, weights never changed".format(
                 "exact" if exact else "fused", "lowvram" if lv else "full load", label, d, d_off, info["fns"], rinfo["fns"]),
-                d <= tol and d_off <= tol and info["backups"] == 0 and info["weights untouched while patched"] and info["restored"])
+                d <= tol and d_off <= tol and info["backups"] == 0 and info["weights untouched while patched"] and info["restored"]
+                and (not lv or info["fns"].count("LowVramPatch") == rinfo["fns"].count("LowVramPatch") > 0))
+        for (b, h, label), (r, r_off, rinfo) in zip(unload_cases, ref_unload):
+            y, y_off, info = run_unload(b, h)
+            d, d_off = float((y - r).abs().max()), float((y_off - r_off).abs().max())
+            tol = 0.0 if exact else 2e-4
+            check("{} full load, hooks applied, partially_unload of everything, apply_hooks(same group), {}: == native (max|Δ| {:.2g}; "
+                  "hooks off {:.2g}); weight functions {} (native {}, the same LowVramPatches); no backups".format(
+                      "exact" if exact else "fused", label, d, d_off, info["fns"], rinfo["fns"]),
+                  d <= tol and d_off <= tol and info["backups"] == 0 and info["restored"]
+                  and info["fns"].count("LowVramPatch") == rinfo["fns"].count("LowVramPatch") > 0)
     hotpatch.set_exact(False)
     finish()
 
