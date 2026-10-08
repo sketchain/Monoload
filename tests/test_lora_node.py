@@ -24,7 +24,9 @@ LoraLoaderModelOnly nodes; CPU, one sampling step on an 8x8 latent.
      restored bit for bit afterwards;
   6. MONOLOAD=0: no node -> native; node enable -> Monoload's runtime merge;
   7. after the prompt: release / keep / default (global, native keeps) for
-     loaded models and cached outputs;
+     loaded models and cached outputs; through ComfyUI's PromptExecutor, a
+     native MODEL (node before LoraLoader) next to a released CLIP: the next
+     prompt without the LoRA runs on the base (review 2026-10 item 02);
   8. MONOLOAD_DISABLE=1: the node passes its inputs through.
 
     python tests/make_synthetic_checkpoint.py $MODELS   # once
@@ -274,6 +276,55 @@ def release_tests(model, clip):
     check("after the prompt, per model: " + "; ".join(rows), ok)
 
 
+def executor_native_model_test():
+    """Review 2026-10 item 02 through ComfyUI's PromptExecutor: Checkpoint -> Monoload LoRA Settings (MODEL only, mode
+    native) -> LoraLoader (MODEL + CLIP) -> KSampler, then the same without the LoraLoader (the Settings output, still
+    cached, straight into the sampler). The CLIP is Monoload's and released; the native MODEL clone dies with the
+    LoraLoader's cached output and the loaded entry falls back to the Settings clone, whose weights still carry the
+    LoRA (the shared backup). The second prompt must equal the same prompt run first in a fresh executor."""
+    import asyncio
+    import uuid
+    import execution
+    from monoload.nodes import NODE_CLASS_MAPPINGS
+    from test_release import Server
+    nodes.NODE_CLASS_MAPPINGS.update(NODE_CLASS_MAPPINGS)
+
+    def wf(with_lora):
+        w = {"1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": CKPT}},
+             "2": {"class_type": NODE, "inputs": {"model": ["1", 0], "mode": "native", "merge": "default", "after_prompt": "default"}},
+             "3": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["1", 1], "text": "a photo of a duck"}},
+             "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 64, "height": 64, "batch_size": 1}},
+             "6": {"class_type": "KSampler", "inputs": {"model": ["2", 0], "positive": ["3", 0], "negative": ["3", 0], "latent_image": ["5", 0],
+                                                        "seed": 7, "steps": 1, "cfg": 1.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0}},
+             "7": {"class_type": "SaveLatent", "inputs": {"samples": ["6", 0], "filename_prefix": "monoload_test"}}}
+        if with_lora:
+            w["8"] = {"class_type": "LoraLoader", "inputs": {"model": ["2", 0], "clip": ["1", 1], "lora_name": LORA,
+                                                             "strength_model": 0.8, "strength_clip": 0.8}}
+            w["6"]["inputs"]["model"] = ["8", 0]
+            w["3"]["inputs"]["clip"] = ["8", 1]
+        return w
+
+    def executor():
+        return execution.PromptExecutor(Server(), cache_type=execution.CacheType.CLASSIC, cache_args={"lru": 20, "ram": 2.0, "ram_inactive": 16.0})
+
+    def run_wf(e, w):
+        e.execute(w, str(uuid.uuid4()), {}, ["7"])
+        assert e.success, "prompt failed: {}".format(e.status_messages[-1:])
+        return asyncio.run(e.caches.outputs.get("6")).outputs[0][0]["samples"].clone()
+
+    free_all()
+    ref = run_wf(executor(), wf(False))
+    free_all()
+    e = executor()
+    with_lora = run_wf(e, wf(True))
+    after = run_wf(e, wf(False))
+    free_all()
+    check("PromptExecutor: Settings (MODEL only, native) -> LoraLoader, then the Settings output without the LoRA: == the same "
+          "prompt in a fresh executor (max|Δ| {:.3g}; the LoRA changes it by {:.3g})".format(
+              float((after - ref).abs().max()), float((with_lora - ref).abs().max())),
+          torch.equal(after, ref) and not torch.equal(with_lora, ref))
+
+
 def disable_tests(model, clip):
     from monoload.nodes import lora_settings as nl
     os.environ["MONOLOAD_DISABLE"] = "1"
@@ -303,6 +354,7 @@ def main():
     per_patcher_tests(model, clip, ref)
     master_off_tests(model, clip, ref)
     release_tests(model, clip)
+    executor_native_model_test()
     disable_tests(model, clip)
     finish()
 

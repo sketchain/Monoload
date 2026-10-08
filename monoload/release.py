@@ -240,12 +240,18 @@ def _sync_clean_loaded_models():
     the LoadedModel back at the parent but leaves the model's
     current_weight_patches_uuid as it was, so the next prompt would run a full
     load() again. Under Monoload weights are never modified, so a model with
-    no runtime patches is in exactly the state of any patcher without
-    patches: sync the uuid."""
+    no runtime patches and no native backup is in exactly the state of any
+    patcher without patches: sync the uuid. Native ComfyUI (MONOLOAD=0, a
+    Monoload LoRA Settings node with mode native) bakes the LoRA into the
+    weights and keeps the originals in the backup, which every clone shares:
+    there the weights still carry the dead clone's LoRA, so the uuid stays and
+    the next load restores the backup."""
     n = 0
     for lm in comfy.model_management.current_loaded_models:
         p = lm.model
         if p is None or patcher_has_weight_patches(p) or _model_has_runtime_patches(p.model):
+            continue
+        if len(p.backup) or len(p.hook_backup):
             continue
         if p.model.current_weight_patches_uuid != p.patches_uuid:
             p.model.current_weight_patches_uuid = p.patches_uuid
