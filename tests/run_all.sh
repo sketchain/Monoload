@@ -33,6 +33,8 @@ step "hook + normal LoRA on a lowvram layer == native (no model files)"; run $R 
 step "clones sharing a model: runtime LoRA patches follow the patcher loaded == native (no model files)"; run $R python tests/test_lora_clone_binding.py
 step "LoRA Settings node (synthetic SD1.5: python tests/make_synthetic_checkpoint.py \$MODELS)"
 if [ -f "$MODELS/checkpoints/synthetic_sd15.safetensors" ]; then run $R python tests/test_lora_node.py; else echo "skipped: no synthetic checkpoint"; fi
+step "saving a LoRA'd model: CheckpointSave / ModelSave / CLIPSave == native (synthetic SD1.5)"
+if [ -f "$MODELS/checkpoints/synthetic_sd15.safetensors" ]; then run $R python tests/test_lora_save.py; else echo "skipped: no synthetic checkpoint"; fi
 step "VAE decode: op-level chunking vs native (synthetic decoders, no model files)"; run $R python tests/test_vae.py
 step "VAE decode: layer 1, Wan 2.1 stripes vs native (synthetic decoder, no model files)"; run $R python tests/test_vae_stripe.py
 step "VAE decode: layer 1, LDM stripes (SDXL / Flux ae) vs native (synthetic decoders, no model files)"; run $R python tests/test_vae_ldm.py

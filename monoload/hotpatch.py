@@ -510,6 +510,8 @@ def _load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=Fals
     if not _active(self):
         return _ORIG["load"](self, device_to, lowvram_model_memory=lowvram_model_memory, force_patch_weights=force_patch_weights, full_load=full_load)
     _check_dynamic(self)
+    # No caller in ComfyUI 0.31 passes force_patch_weights=True (saving goes through model_state_dict_for_saving,
+    # below); a custom node that asks for the patches to be baked in gets an error instead of base weights.
     if force_patch_weights and len(self.patches) > 0:
         raise MonoloadUnsupportedError("force_patch_weights", msg("lora.force_patch"), key=_first_key(self))
     # Native load() wipes weight_function on every fully-loaded comfy.ops
@@ -624,6 +626,30 @@ def _patch_cached_hook_weights(self, cached_weights, key, memory_counter):
     raise MonoloadError(msg("lora.internal_hook_cache", key=key))
 
 
+def _model_state_dict_for_saving(self, model=None, prefix=""):
+    """Saving (CheckpointSave / ModelSave / CLIPSave, comfy.sd.save_checkpoint): native outputs the stored tensor of
+    every module flagged comfy_patched_weights (natively the patches are baked into it) and a LazyCastingParam
+    (patch_weight_to_device(return_weight=True): the merged weight, computed while saving) for the others. Under
+    Monoload the stored tensors of a patched module are the base, so for the call the modules of this patcher's
+    patched keys are not flagged: they go through LazyCastingParam, which native merges exactly."""
+    if not _active(self) or not self.patches:
+        return _ORIG["model_state_dict_for_saving"](self, model=model, prefix=prefix)
+    unflagged = []
+    try:
+        for key in self.patches:
+            try:
+                m, _attr = _module_for_key(self, key)
+            except (AttributeError, MonoloadUnsupportedError):
+                continue
+            if getattr(m, "comfy_patched_weights", False) is True:
+                m.comfy_patched_weights = False
+                unflagged.append(m)
+        return _ORIG["model_state_dict_for_saving"](self, model=model, prefix=prefix)
+    finally:
+        for m in unflagged:
+            m.comfy_patched_weights = True
+
+
 def _dynamic_load(self, *args, **kwargs):
     if _enabled(self):
         _check_dynamic(self)
@@ -640,6 +666,7 @@ _REPLACEMENTS = {
     "unpatch_hooks": _unpatch_hooks,
     "patch_hook_weight_to_device": _patch_hook_weight_to_device,
     "patch_cached_hook_weights": _patch_cached_hook_weights,
+    "model_state_dict_for_saving": _model_state_dict_for_saving,
 }
 
 

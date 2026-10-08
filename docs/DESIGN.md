@@ -30,13 +30,15 @@ v2 只做一件事：**在 ComfyUI 原生加载出来的模型上打 LoRA 时，
 
 ## 2. 挂载方式：替换 `ModelPatcher` 类上的方法
 
-`install()`（插件被 ComfyUI 导入时执行）直接在 `comfy.model_patcher.ModelPatcher` **这个类**上替换 8 个方法，原函数保存起来，由替换函数在需要时调用：
+`install()`（插件被 ComfyUI 导入时执行）直接在 `comfy.model_patcher.ModelPatcher` **这个类**上替换 10 个方法，原函数保存起来，由替换函数在需要时调用：
 
 | 方法 | Monoload 版本做什么 |
 |---|---|
 | `patch_weight_to_device` | 对有 patch 的 key：**不备份、不改权重**，把 `MonoloadRuntimePatch` 插到该层 `weight_function` / `bias_function` 的最前面。没有 patch 的 key，以及只取合并结果、不写回的 `return_weight=True`，交给原函数。 |
 | `load` | 检查 DynamicVRAM 和 `force_patch_weights`，清掉被 patch 层的 `comfy_patched_weights` 标记（见 §4），调用原 `load()`，最后断言没有产生备份。 |
 | `partially_unload` | 调用原函数后，去掉被原生 `LowVramPatch` 取代的那些运行时 patch（见 §4）。 |
+| `partially_load` | 和已加载的 `patches_uuid` 相同的 clone 加载时（原生不 unpatch、直接返回），先把绑定指向它（§3.2）。 |
+| `model_state_dict_for_saving` | 保存（`CheckpointSave` / `ModelSave` / `CLIPSave`）：原生对标了 `comfy_patched_weights` 的层直接输出存着的张量（原生里 patch 已烘焙进去），Monoload 下那是底模；调用期间把这个 patcher 被 patch 的层的标记暂时改成 False，这些层走原生的 `LazyCastingParam`（`patch_weight_to_device(return_weight=True)`，精确合并），返回后恢复。存出来的和原生逐位一致（`tests/test_lora_save.py`）。 |
 | `unpatch_model` | 调用原函数；卸载权重时摘掉所有运行时 patch，清空设备上的 LoRA 缓存。 |
 | `patch_hooks` / `unpatch_hooks` | 只切换「当前生效的 hook patch」这个状态，不写权重（§3.2）。 |
 | `patch_hook_weight_to_device` / `patch_cached_hook_weights` | 不应再被调用，被调用即报内部错误。 |
@@ -302,7 +304,7 @@ CPU 上计算 dtype 是 fp32，默认路径在 fp32 下合并、不舍入回 fp1
 | 情况 | kind | 何时 |
 |---|---|---|
 | DynamicVRAM（comfy-aimdo）开启且模型有 LoRA/hook patch | `dynamic_vram` | 加载该模型时 |
-| 要求把 patch 合并进权重（`force_patch_weights`，常见于 `ModelSave` / `CheckpointSave` / 模型合并后保存） | `force_patch_weights` | 加载时 |
+| 加载时要求把 patch 烘焙进权重（`force_patch_weights`；ComfyUI 0.31 里没有调用方传它，只可能来自自定义节点。保存节点走 `model_state_dict_for_saving`，见 §2，不报错） | `force_patch_weights` | 加载时 |
 | 被 patch 的参数不属于 `comfy.ops` 层（没有 `comfy_cast_weights`，没有运行时路径） | `lora_non_comfy_ops_param` | 挂 patch 时 |
 | patch 会改变权重形状 | `lora_shape_change` | 挂 patch 时 |
 

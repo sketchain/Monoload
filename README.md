@@ -165,7 +165,8 @@ Load Checkpoint ──> Load LoRA（可以串好几个）──MODEL/CLIP──>
 * **同一个底模的两个 clone 设置不同时**（比如一个分支 `native`、一个分支 `enable`），设置不同的 clone 会换一个 `patches_uuid`，ComfyUI 在两者之间切换时会把权重还原再按各自的方式加载（测试确认交替加载各得各的结果，最后底模权重逐位还原）。
 * 日志：节点执行时打一行 `[Monoload] Monoload LoRA Settings: LoRA settings: mode enable (node), merge exact (node), after prompt release (default)`（括号里是来源：`node` / `env MONOLOAD=0` 等 / `default`）。
 * `MONOLOAD_DISABLE=1` 时节点原样输出输入的 MODEL / CLIP，日志说明一次。
-* 不在范围内的照旧：bypass LoRA（`LoraLoaderBypass`）不经过运行时合并；`force_patch_weights`（保存合并后的模型）在走 Monoload 的模型上照旧报错——这时把那个模型的 `mode` 设成 `native` 即可，不用重启（§6）。
+* 保存：`CheckpointSave` / `ModelSave` / `CLIPSave` 存出来的是合并了 LoRA 的权重，和原生逐位一致（保存时被 patch 的层逐层交给原生的精确合并 `patch_weight_to_device(return_weight=True)`，不改权重、不备份；`tests/test_lora_save.py`）。
+* 不在范围内的照旧：bypass LoRA（`LoraLoaderBypass`）不经过运行时合并；`force_patch_weights`（加载时要求把 LoRA 烘焙进权重；ComfyUI 0.31 自己的节点都不传，只可能来自自定义节点）在走 Monoload 的模型上报错——这时把那个模型的 `mode` 设成 `native` 即可，不用重启（§6）。
 
 ### 4.3 节点用法：Monoload Info（看 Monoload 在做什么）
 
@@ -228,7 +229,7 @@ CT 700 实测（WAI v17 SDXL + Smooth Booster，788 层，4.77 GiB 被 patch 的
 | kind | 情况 | 怎么办 |
 |---|---|---|
 | `dynamic_vram` | 开了 DynamicVRAM（comfy-aimdo）的同时打 LoRA | 用 `--gpu-only`（目标配置），或 `MONOLOAD_DISABLE=1` |
-| `force_patch_weights` | 有节点要求把 LoRA 合并进权重：`ModelSave`、`CheckpointSave`、保存合并后的模型等 | 在这个模型前面加 Monoload LoRA Settings，`mode` 选 `native`（§4.2）；或设 `MONOLOAD=0` / `MONOLOAD_DISABLE=1` 重启 |
+| `force_patch_weights` | 有节点要求加载时把 LoRA 烘焙进权重（ComfyUI 0.31 自己的节点都不传，只可能来自自定义节点；`CheckpointSave` / `ModelSave` / `CLIPSave` 不经过这里，照常存出合并后的权重，§4.2） | 在这个模型前面加 Monoload LoRA Settings，`mode` 选 `native`（§4.2）；或设 `MONOLOAD=0` / `MONOLOAD_DISABLE=1` 重启 |
 | `lora_non_comfy_ops_param` | LoRA 改到的参数不属于 `comfy.ops` 层（没有运行时合并路径） | 设 `MONOLOAD_DISABLE=1` |
 | `lora_shape_change` | patch 会改变权重形状 | 同上 |
 
@@ -275,6 +276,7 @@ MODELS=/path/to/models tests/run_all.sh
 | `tests/test_vae_stripe.py` | VAE 第一层（§12.7），不需要模型文件：区间倒推对照暴力依赖展开；每个单元（残差块、上采样、head 卷积）在任意切片上「有效行」与整图逐行一致、紧邻的下一行不一致；用 ComfyUI 的 `WanVAE`（小通道、随机权重）在 fp32 下比较第一层与原生整图解码（条带 1 行、不整除、等于整图、按预算自动、默认策略、奇数尺寸、很小的 latent、batch 2、条带内再分块、bf16），块边界附近的误差不比其他区域大；识别（Dropout 训练态、forward hook、开关）；故意少算一行 halo 时自检能抓到并回退第二层；预算报错；OOM 缩小条带、到下限报错、不退回 tiled 也不退回第二层；默认策略（128 行条带的估算为目标）和开关的优先级；内存模型单调、最大的条带先跑；自检后和前缀 / 条带之间清空缓存；SDXL / Flux 结构不归 Wan 适配器（归 LDM 适配器）；单帧 Conv3d 改走 conv2d 与模块原样一致、只在该改的时候改 |
 | `tests/test_master_switch.py` | 总开关和全局默认（§4），不需要模型文件：`MONOLOAD` 的解析；`MONOLOAD=0` 且没有节点时，挂 LoRA 的模型（整体加载、lowvram 部分加载、Hook LoRA）和 VAE 解码与卸掉钩子的原版 ComfyUI 逐位一致，备份也和原生一样；释放不运行；包装每次调用的开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `mode auto` 打开管理、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 时节点原样透传 |
 | `tests/test_lora_node.py` | Monoload LoRA Settings 节点（§4.2），需要 `tests/make_synthetic_checkpoint.py $MODELS` 生成的随机权重 SD1.5 checkpoint 和 LoRA（约 2 GiB）：接口；逐项优先级和来源；clone 共享权重、输入不变、设置不同时换 uuid；节点放在 `LoraLoader` 前面设置也保留；串联；`LoraLoader` / `LoraLoaderModelOnly`（不接 CLIP）/ 两个串联的 `LoraLoader`：`exact` 和 `native` 与卸掉钩子的原版逐位一致（`native` 的备份数也一样），`fused` = 不加节点的默认路径；同一底模的不同设置交替加载各得各的结果、底模权重逐位还原；`MONOLOAD=0` 下 `enable`；prompt 结束后的释放 / 保留；`MONOLOAD_DISABLE` 透传 |
+| `tests/test_lora_save.py` | 保存挂了 LoRA 的模型（§4.2）：小模型（不需要模型文件）整体加载 / lowvram、逐位一致 / 默认路径下 `model_state_dict_for_saving` 与原生逐位一致；合成 SD1.5 + LoRA 经 `LoraLoader` 后用 ComfyUI 的 `CheckpointSave` / `ModelSave` / `CLIPSave` 存出的每个张量与原生逐位一致（带 LoRA 的张量和底模不同）；存完无备份、权重不变、输出不变；`mode native` 也一致 |
 | `tests/test_info_node.py` | Monoload Info 节点（§4.3），不需要模型文件：接口（输出节点、输入都可选、不缓存、界面文字 = STRING 输出）；不接输入时的版本 / 总开关 / 全局默认和来源；VAE 的设置来源、`not decoded yet`、解码记录归属（副本和原 VAE 不混）、原生解码也有记录、每次刷新；模型的 LoRA 名字和强度（串联、只接 MODEL、强度 0）、设置来源、加载后的状态；各种输入组合和 `MONOLOAD_DISABLE` 不报错 |
 | `tests/test_messages.py` | 消息和翻译，不需要模型文件：消息表每一项都有英文和中文、格式字段一致；`MONOLOAD_LANG` 的解析；`zh` 时预算报错、OOM 报错、不支持 LoRA 的报错、节点的报错和日志、Info 的文字都是中文；代码里（消息表以外）没有中文；`locales/en`、`locales/zh` 的 `nodeDefs.json` 覆盖每个节点、输入（名字、提示）、下拉选项（键 = 存储的英文值）、输出 |
 | `tests/test_vae_node.py` | Monoload VAE Settings 节点（§4.1），不需要模型文件：注册表和接口；按 ComfyUI 的方式调用节点；预算（下拉框 + `budget_gib`）/ 方案 / 条带高度 / 模式逐项判断「节点 > 环境变量 > 默认值」；副本共享权重和 patcher、输入的 VAE 不变、ComfyUI 的模型管理里只有一个已加载模型、串联、encode 一致；预算报错、强制方案和高度、只用第二层、原生；解码后（包括报错后）全局设置复原；多个副本交替解码互不干扰；日志写明来源；包装没装上时副本走原生；总开关和全局默认下的节点行为在 `test_master_switch.py`。ComfyUI 加载器注册节点的检查在 `test_entry.py`（各种开关组合） |
