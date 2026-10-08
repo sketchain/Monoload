@@ -80,7 +80,7 @@ def runtime_tests():
         expect_raises("MONOLOAD_LANG=zh: the budget error in Chinese, naming layer 2 and each scheme", MonoloadError,
                       lambda: managed_decode(tiny, lat), "峰值预算", "第二层需要约", "方案 B")
         oom = messages.msg("vae.err_oom_l2", ws="64 MiB", retries=4, shape=[1, 4, 270, 480], est="17.9 GiB")
-        oom1 = messages.msg("vae.err_oom_l1", rows=8, ws="64 MiB", retries=5, shape=[1, 4, 270, 480], est="2.9 GiB")
+        oom1 = messages.msg("vae.err_oom_l1", rows=8, ws="64 MiB", retries=5, shape=[1, 4, 270, 480], est="2.9 GiB", skipped="")
         check("MONOLOAD_LANG=zh: the OOM errors in Chinese ({}...)".format(oom[:40]), "显存不足" in oom and "tiled" in oom and "第二层" in oom1)
         e = MonoloadUnsupportedError("force_patch_weights", messages.msg("lora.force_patch"), key="a.weight")
         check("MONOLOAD_LANG=zh: unsupported-LoRA error in Chinese, kind and key kept ({}...)".format(str(e)[:50]),

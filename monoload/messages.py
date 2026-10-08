@@ -272,10 +272,14 @@ M = {
         "[Monoload] VAE decode out of memory: layer 1 (stripe decoding) still runs out of memory with {rows}-row stripes and workspace "
         "{ws} ({retries} retries). Monoload never falls back to the approximate tiled decode, nor to layer 2 (its peak is higher). Free "
         "other models (/free), lower the resolution, or set this VAE's mode to native (MONOLOAD_DISABLE_VAE=1 for all). Latent {shape}, "
-        "estimate {est}.",
+        "estimate {est}.{skipped}",
         "[Monoload] VAE 解码显存不足：第一层（条带解码）的条带已缩到 {rows} 行、工作区 {ws}（共重试 {retries} 次）仍然 OOM。"
         "Monoload 不会退回到 tiled 近似解码，也不会退回第二层（第二层峰值更高）。可以先释放其他模型（/free）、降低分辨率，"
-        "或把这个 VAE 的模式设成原生（全部原生：MONOLOAD_DISABLE_VAE=1）。latent {shape}，估算需要 {est}。"),
+        "或把这个 VAE 的模式设成原生（全部原生：MONOLOAD_DISABLE_VAE=1）。latent {shape}，估算需要 {est}。{skipped}"),
+    "vae.oom_skipped": (
+        " Not tried (their plans need more than the first plan's {first}): {steps}.",
+        "没有尝试的（计划需要的比第一次的 {first} 还多）：{steps}。"),
+    "vae.oom_skip_step": ("{rows}-row stripes, workspace {ws}: {est}", "{rows} 行条带、工作区 {ws}：{est}"),
     "vae.err_oom_selftest": (
         "[Monoload] VAE decode out of memory in the layer-1 self-test of {name} (it runs once per decoder structure and GroupNorm scheme in "
         "this process, before the first layer-1 decode, and needs about {need}). Not cached: the next decode runs it again. Monoload does "
