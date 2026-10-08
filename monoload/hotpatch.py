@@ -452,8 +452,10 @@ def _has_runtime_patch(patcher, key):
 
 
 def _remove_runtime_patches(patcher, keep=None):
+    # comfy_patched_weights stays: a runtime patch never changed the stored weight, so a fully loaded module is still
+    # exactly "loaded" (native partially_unload only offloads flagged modules); native unpatch_model drops the flags
+    # itself when the model is really unloaded.
     for m in patcher.model.modules():
-        touched = False
         for fn_attr in ("weight_function", "bias_function"):
             funcs = m.__dict__.get(fn_attr, None)
             if not funcs:
@@ -461,9 +463,6 @@ def _remove_runtime_patches(patcher, keep=None):
             kept = [f for f in funcs if not _is_runtime_patch(f) or (keep is not None and f.key in keep)]
             if len(kept) != len(funcs):
                 setattr(m, fn_attr, kept)
-                touched = True
-        if touched and hasattr(m, "comfy_patched_weights"):
-            del m.comfy_patched_weights
     if keep is None:
         patcher.model.__dict__.pop("_monoload_runtime", None)
         _release_binding(patcher)
