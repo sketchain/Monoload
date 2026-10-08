@@ -1018,6 +1018,8 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
 def _decode_budget(self, samples_in, vae_options, t0, bud):
     try:
         d = choose_budget(self, samples_in, vae_options, bud)
+    except MonoloadVAEOOMError:
+        raise   # the first-use self-test ran out of memory: an OOM, not "nothing fits the budget"
     except MonoloadError:
         _LAST.clear()
         _LAST.update({"strategy": "error", "kind": "budget", "budget": bud})

@@ -276,6 +276,14 @@ M = {
         "[Monoload] VAE 解码显存不足：第一层（条带解码）的条带已缩到 {rows} 行、工作区 {ws}（共重试 {retries} 次）仍然 OOM。"
         "Monoload 不会退回到 tiled 近似解码，也不会退回第二层（第二层峰值更高）。可以先释放其他模型（/free）、降低分辨率，"
         "或把这个 VAE 的模式设成原生（全部原生：MONOLOAD_DISABLE_VAE=1）。latent {shape}，估算需要 {est}。"),
+    "vae.err_oom_selftest": (
+        "[Monoload] VAE decode out of memory in the layer-1 self-test of {name} (it runs once per decoder structure and GroupNorm scheme in "
+        "this process, before the first layer-1 decode, and needs about {need}). Not cached: the next decode runs it again. Monoload does "
+        "not fall back to layer 2 or the approximate tiled decode here. Free other models (/free) and run again, or set this VAE's mode to "
+        "layer 2 only (MONOLOAD_DISABLE_VAE_STRIPE=1 for all) or native (MONOLOAD_DISABLE_VAE=1 for all).",
+        "[Monoload] VAE 解码显存不足：{name} 的第一层自检 OOM（自检在本进程里每种 decoder 结构和 GroupNorm 方案第一次走第一层之前做一次，"
+        "约需 {need}）。结果不缓存，下次解码会重新自检。Monoload 不会因此退回第二层或 tiled 近似解码。可以先释放其他模型（/free）再运行，"
+        "或把这个 VAE 的模式设成「只用第二层」（全部：MONOLOAD_DISABLE_VAE_STRIPE=1）或原生（全部：MONOLOAD_DISABLE_VAE=1）。"),
     "vae.retry_skip": (
         "[Monoload] VAE OOM retry: {rows}-row stripes, workspace {ws} would need {est}, more than the first plan's {first}; skipped",
         "[Monoload] VAE 显存不足重试：{rows} 行条带、工作区 {ws} 需要 {est}，比第一次的计划 {first} 还多，跳过这一档"),

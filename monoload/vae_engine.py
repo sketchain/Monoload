@@ -55,7 +55,7 @@ import torch
 import comfy.model_management as mm
 import comfy.ops
 
-from .errors import MonoloadError
+from .errors import MonoloadError, MonoloadVAEOOMError
 from .vae_ops import MIB, OpChunking, OpStats, fmt_bytes
 
 POINT, CONV, RES, UP = "point", "conv", "res", "up"
@@ -1088,8 +1088,9 @@ def self_test(bound, vae):
     # out of the except block: the traceback (and the tensors its frames hold) is gone
     gc.collect()
     mm.soft_empty_cache(True)
-    if oom:
-        raise mm.OOM_EXCEPTION("[Monoload] out of memory in the VAE layer-1 self-test")
+    if oom:   # not cached (a later decode may have the memory); not layer 2 either (a layer-1 OOM never falls back to it)
+        from .messages import msg
+        raise MonoloadVAEOOMError(msg("vae.err_oom_selftest", name=bound.name, need=fmt_bytes(bound.selftest_memory())))
     _SELFTEST[bound.key] = (ok, detail)
     return ok, detail
 

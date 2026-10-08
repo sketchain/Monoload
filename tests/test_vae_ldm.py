@@ -336,6 +336,36 @@ def selftest_tests(sd, lat4):
         note = last.get("layer1") or ""
         check("injected bug: {} -> self-test fails, layer 2, == native (max|Δ| {:.2g}): {}".format(label, float((out - ref).abs().max()), note[:150]),
               last.get("strategy") == "layer2" and "self-test failed" in note and float((out - ref).abs().max()) <= 1e-4)
+    # review 2026-10 item 06: an OOM inside the first-use self-test -> MonoloadVAEOOMError with the message of the table,
+    # recorded as an OOM, not cached (the next decode runs the self-test again), no layer-2 fallback; budget path too
+    orig_run = eng._self_test_run
+
+    def oom_run(bound, vae):
+        raise comfy.model_management.OOM_EXCEPTION("injected")
+    rows = []
+    for label, bud in (("default policy", None), ("budget 4 GiB", 4 << 30)):
+        eng._SELFTEST.clear()
+        mvae.set_budget(bud)
+        eng._self_test_run = oom_run
+        try:
+            try:
+                managed_decode(sd, lat4)
+                err = None
+            except Exception as e:
+                err = e
+            last = mvae.last_decode()
+        finally:
+            eng._self_test_run = orig_run
+            mvae.set_budget(None)
+        good = (isinstance(err, MonoloadVAEOOMError) and "self-test" in str(err) and bound.name in str(err)
+                and last.get("strategy") == "error" and last.get("kind") == "oom" and not eng._SELFTEST)
+        rows.append("{}: {} / record {} {}".format(label, type(err).__name__, last.get("strategy"), last.get("kind")))
+        check("OOM in the first-use self-test, {}: MonoloadVAEOOMError ({}), recorded as an OOM ({} / {}), not cached ({} entries)".format(
+              label, str(err).splitlines()[0][:110] if err else None, last.get("strategy"), last.get("kind"), len(eng._SELFTEST)), good)
+    out = managed_decode(sd, lat4)
+    check("... the next decode runs the self-test again and decodes on layer 1 ({}; cached {})".format(
+          mvae.last_decode().get("strategy"), len(eng._SELFTEST)), mvae.last_decode().get("strategy") == "layer1" and len(eng._SELFTEST) == 1
+          and out is not None)
     eng._SELFTEST.clear()
     for scheme in "AD":
         mvae.set_gn_scheme(scheme)
