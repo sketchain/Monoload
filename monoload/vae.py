@@ -1056,18 +1056,25 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
         # halve stripes and workspace; a step whose estimate is above the first plan's (with a budget the first plan
         # is within it, unless forced rows run above it anyway) is skipped: shorter stripes are not monotone in
         # every plan (statistics passes, save layouts), and the retry must not need more than was loaded for
-        rows = max(b - a for a, b in plan.stripes)
+        # the error names the plan that ran out of memory last (rows, workspace, estimate); the steps skipped after it
+        # are listed apart (review 2026-10 item 08)
+        rows = r = max(b - a for a, b in plan.stripes)
+        w = ws
+        skipped = []
         while True:
-            if rows <= min_rows and ws <= floor_ws:
+            if r <= min_rows and w <= floor_ws:
+                steps = msg("vae.need_sep").join(msg("vae.oom_skip_step", rows=sr, ws=fmt_bytes(sw), est=fmt_bytes(se)) for sr, sw, se in skipped)
                 raise MonoloadVAEOOMError(msg("vae.err_oom_l1", rows=rows, ws=fmt_bytes(ws), retries=retries, shape=list(samples_in.shape),
-                                              est=fmt_bytes(plan.estimate)))
-            rows = max(min_rows, rows // 2)
-            ws = max(floor_ws, ws // 2)
-            cand = bound.plan(self, samples_in, bud, ws, rows=rows, out_bytes=outb)
+                                              est=fmt_bytes(plan.estimate),
+                                              skipped=msg("vae.oom_skipped", first=fmt_bytes(first_est), steps=steps) if skipped else ""))
+            r = max(min_rows, r // 2)
+            w = max(floor_ws, w // 2)
+            cand = bound.plan(self, samples_in, bud, w, rows=r, out_bytes=outb)
             if cand.estimate <= first_est:
                 break
-            logging.warning(msg("vae.retry_skip", rows=rows, ws=fmt_bytes(ws), est=fmt_bytes(cand.estimate), first=fmt_bytes(first_est)))
-        plan = cand
+            skipped.append((r, w, cand.estimate))
+            logging.warning(msg("vae.retry_skip", rows=r, ws=fmt_bytes(w), est=fmt_bytes(cand.estimate), first=fmt_bytes(first_est)))
+        plan, rows, ws = cand, r, w
         retries += 1
         logging.warning(msg("vae.retry_l1", rows=rows, ws=fmt_bytes(ws), retries=retries))
 
