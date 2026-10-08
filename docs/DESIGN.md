@@ -108,7 +108,7 @@ Hook LoRA（复刻 patch_hook_weight_to_device，在已合并基础 LoRA 的权�
 
 每个模型有一个**绑定**（`_Binding`，放在 `patcher.model` 上，所有 clone 共用；review 01）：当前生效的 patcher 的 `patches` 和合并方式（exact）、当前生效的 `hook_patches`（key → hook patch 列表）、LoRA 张量的设备副本。模型上所有运行时 patch 每次调用都读它。`load` / `partially_load` / 装运行时 patch 时绑定指向正在加载的 patcher：同一个 `patches_uuid` 的 clone 加载时原生 `partially_load` 不卸载、权重全部已加载时也不调用 `load()`（只重新应用它的 forced hooks 就返回），所以要在调用原函数**之前**把绑定指向它。hook 状态由最后一次 `patch_hooks` / `unpatch_hooks` 的那个 clone 写，与原生一致（原生的 clone 共用权重和 `hook_backup`）。以前每个 patcher 一份状态、运行时 patch 绑着装它的那个 patcher，同 uuid 的 clone 会用前一个 clone 的 hook 强度、patches 和合并方式（CLIP 路径用 ComfyUI 自带的节点就能遇到，差 0.02；`tests/test_lora_clone_binding.py`）。没有运行时 patch 时绑定清空，不留住已经不用的 clone 的东西。
 
-`patch_hooks(hooks)` 用原生的 `get_combined_hook_patches(hooks)` 算出组合（包括 keyframe 强度），写进绑定；只被 hook 改到、还没有运行时 patch 的层补挂一个，不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。** 采样时正/负条件可能挂着不同的 hook 组，每一步会来回切换；在这里只是换一个 dict。CLIP 的 `SetClipHooks`（`forced_hooks`）走同一条路。
+`patch_hooks(hooks)` 用原生的 `get_combined_hook_patches(hooks)` 算出组合（包括 keyframe 强度），写进绑定；只被 hook 改到、还没有运行时 patch 的层补挂一个，不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。** 采样时正/负条件可能挂着不同的 hook 组，每一步会来回切换；在这里只是换一个 dict。CLIP 的 `SetClipHooks`（`forced_hooks`）走同一条路。摘运行时 patch 时不动层上的 `comfy_patched_weights`：权重从没改过，整层加载的层仍然就是「已加载」，原生 `partially_unload` 只卸标了这个标记的层；以前摘掉 hook-only patch（以及没有普通 LoRA 时每次采样结束摘掉全部）会顺手删标记，内存紧时这些层卸不掉、可能变成整模型卸载（审查 2026-10 第 05 项，`test_lora_lowvram_hook.py`）。真正卸载时原生 `unpatch_model` 自己删标记。
 
 ### 3.3 量化参数：在反量化的临时权重上合并，不重新量化
 
