@@ -260,7 +260,10 @@ CT 700 实测（WAI v17 SDXL + Smooth Booster，788 层，4.77 GiB 被 patch 的
 #   loras/synthetic_{lokr,loha,unet_only}_sd15.safetensors
 #       tests/make_synthetic_loras.py 生成（HF 上找不到 SD1.5 的 LoKr，按真实 LoRA 的层名和形状合成，UNet + TE；
 #       unet_only 是 Rubber Duck 去掉 TE key 的版本）
+#   checkpoints/synthetic_sd15.safetensors、loras/synthetic_sd15_lora.safetensors
+#       tests/make_synthetic_checkpoint.py $MODELS 生成（随机权重的 SD1.5 + LoRA，test_lora_node / test_lora_save 用）
 MODELS=/path/to/models tests/run_all.sh
+# 缺模型文件的测试组会被跳过并计数（「skipped (missing model files): N」），退出码 = 失败组数 + 跳过组数，跳过不算通过
 ```
 
 `run_all.sh` 先跑入口测试（8 种开关组合）、消息、释放链、Info 节点、总开关、LoRA 节点和全部 VAE 测试（`test_vae.py`、`test_vae_stripe.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_node.py`，不需要模型文件），然后把下面每个 LoRA 功能测试在两种合并路径下各跑一遍：先 `MONOLOAD_EXACT=1`（逐位一致），再默认路径。只想跑 VAE 部分时：`MODELS=/path/to/models tests/docker_run.sh python tests/test_vae.py`（不需要任何模型文件，`$MODELS` 可以是空目录）。
