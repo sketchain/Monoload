@@ -340,6 +340,7 @@ CPU 上计算 dtype 是 fp32，默认路径在 fp32 下合并、不舍入回 fp1
 1. **已加载的模型**（`model_management.current_loaded_models`）：对 patcher 带 LoRA、或模块上还挂着运行时 patch 的 `LoadedModel`：
    * 就地 `unpatch_hooks()` + `unpatch_model(device_to=None, unpatch_weights=True)`。Monoload 版本会摘掉所有运行时 patch，清空设备上的 LoRA 缓存；**权重一个字节都不搬**，因为本来就没被改过。
    * 原生 `unpatch_model` 即使不搬权重，也会把模型标成「未加载」（`model_loaded_weight_memory = 0`，删掉 `comfy_patched_weights`）。权重其实还在原位，所以卸之前先记下这些状态，卸完原样恢复。
+   * 节点明确选了 `after_prompt = release` 的原生 patcher（`MONOLOAD=0`，或 `mode native`）在这里从备份还原权重；备份建在 offload 设备上（`model_patcher.py:907`，非 `--gpu-only` 时是 CPU），`inplace_update` 为假时直接把备份设成参数。所以先记下被备份的参数原来所在的设备，还原后不在那里的移回去，模型仍然整个在计算设备上、「已加载」的记账才对（审查 2026-10 第 03 项，`test_master_switch.py` 用 meta 当计算设备模拟）。`--gpu-only` 时 offload 设备就是 GPU，什么都不用移。
    * 沿 `patcher.parent` 往上找到第一个没有权重 patch 的祖先，也就是底模的 patcher（`LoraLoader` 的输出是它的 clone）。把 `LoadedModel` 切到这个 patcher（ComfyUI 自己在 patcher 被回收时也用 `_set_model` 做同样的事），并把 `model.current_weight_patches_uuid` 设为底模的。这样在 ComfyUI 看来，现在「已加载的就是底模、而且没有 patch」：下一个不带 LoRA 的工作流会直接复用，不调用 `ModelPatcher.load()`；下一个带 LoRA 的工作流因为 uuid 不同，会照常重新挂 patch。
    * 找不到干净的祖先时，把 uuid 设成一个新的随机值，强制下次使用时重新评估。
    * 部分加载（`model_lowvram`，只在非 `--gpu-only` 时出现）时，就地卸会连被卸载层的原生 lowvram 状态一起清掉，所以改用原生的 `LoadedModel.model_unload()`，权重回到 offload 设备。

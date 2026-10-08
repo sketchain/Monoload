@@ -12,7 +12,9 @@ SDXL-like VAE with random weights (tests/test_vae_ldm.py), fp32 on the CPU.
      bit-exactly on unpatch); with the switch on the same model runs through
      Monoload (no backups) as a control;
   3. MONOLOAD=0: VAE.decode == native bit for bit, nothing logged at INFO;
-     the per-prompt LoRA release returns at once (no LoRA node used); the wrappers' own cost per
+     the per-prompt LoRA release returns at once (no LoRA node used); a native
+     patcher released by its node puts the parameters its backup restores back
+     on the load device (review 2026-10 item 03); the wrappers' own cost per
      call (measured against a stub) is microseconds;
   4. priority, item by item, node > global > built-in: under MONOLOAD=0, or
      with MONOLOAD_DISABLE_VAE / MONOLOAD_EXACT as the global default, a VAE
@@ -198,6 +200,44 @@ def vae_native_tests(sd, lat):
           and eff.get("mode_env") == "MONOLOAD=0" and not [line for line in cap.lines if "[Monoload]" in line])
 
 
+def native_release_device_tests():
+    """Review 2026-10 item 03: a native patcher (MONOLOAD=0, or mode native) whose node says after_prompt release, outside
+    --gpu-only: its backup lives on the offload device, so restoring it in place would leave those parameters there
+    while the model stays marked as loaded. Simulated with load device meta, offload device CPU (no second real device
+    here): after the release every parameter is on the load device, no backup, the loaded memory kept, the entry on the nearest patch-free ancestor (the node's clone)."""
+    from monoload import lora_overrides
+    meta = torch.device("meta")
+    rows, ok = [], True
+    for master, kw in ((False, {"after_prompt": "release"}), (True, {"mode": "native", "after_prompt": "release"})):
+        comfy.model_management.unload_all_models()
+        settings.set_master(master)
+        try:
+            base = comfy.model_patcher.ModelPatcher(make_net(), meta, CPU)
+            node_out = lora_overrides.with_settings(base, **kw)   # the node, then LoraLoader's clone
+            q = node_out.clone()
+            q.add_patches(make_lora(5), 0.8)
+            lm = comfy.model_management.LoadedModel(q)
+            lm.model_load()
+            comfy.model_management.current_loaded_models.insert(0, lm)
+            baked = len(q.backup) > 0 and all(v.device == meta for v in q.model.state_dict().values())
+            mem = q.model.model_loaded_weight_memory
+
+            class Ex:
+                caches = type("C", (), {"outputs": None, "objects": None})()
+            r = release.release_after_prompt(Ex())
+            devs = {str(v.device) for v in q.model.state_dict().values()}
+            good = (baked and r["models"] == 1 and devs == {"meta"} and len(q.backup) == 0 and lm.model is node_out
+                    and q.model.model_loaded_weight_memory == mem > 0 and q.model.current_weight_patches_uuid == node_out.patches_uuid)
+            ok = ok and good
+            rows.append("{}{}: parameters on {}, backups {}, loaded {}".format("" if master else "MONOLOAD=0 ", kw, sorted(devs),
+                        len(q.backup), q.model.model_loaded_weight_memory == mem))
+        finally:
+            settings.set_master(True)
+            comfy.model_management.unload_all_models()
+    check("release of a native patcher whose backup is on the offload device: every parameter back on the load device, still "
+          "loaded on the node's clone ({})".format("; ".join(rows)), ok)
+
+
 def release_tests():
     import execution
     calls = []
@@ -356,6 +396,7 @@ def main():
     lat = torch.randn(1, 4, 12, 10, generator=torch.Generator().manual_seed(7))
     vae_native_tests(sd, lat)
     release_tests()
+    native_release_device_tests()
     cost_tests(sd, lat)
     priority_tests(cls, sd, lat)
     disable_tests(cls, sd)

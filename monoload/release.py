@@ -44,6 +44,7 @@ import torch
 import comfy.hooks
 import comfy.model_management
 import comfy.model_patcher
+import comfy.utils
 from comfy.model_patcher import ModelPatcher
 
 from . import lora_overrides, settings
@@ -169,8 +170,15 @@ def _release_loaded_models():
         loaded_mem = model.model_loaded_weight_memory
         offload_mem = model.model_offload_buffer_memory
         flagged = [m for m in model.modules() if getattr(m, "comfy_patched_weights", False) is True]
+        # A native patcher (MONOLOAD=0, mode native) restores its backup, which ComfyUI keeps on the offload device
+        # (the CPU unless --gpu-only): put those parameters back where they were loaded.
+        backup_devices = {k: comfy.utils.get_attr(model, k).device for k in p.backup}
         p.unpatch_hooks()
         p.unpatch_model(device_to=None, unpatch_weights=True)  # in place: nothing is moved
+        for k, dev in backup_devices.items():
+            w = comfy.utils.get_attr(model, k)
+            if w.device != dev:
+                comfy.utils.set_attr_param(model, k, w.to(dev))
         model.model_loaded_weight_memory = loaded_mem
         model.model_offload_buffer_memory = offload_mem
         for m in flagged:
