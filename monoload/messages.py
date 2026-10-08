@@ -95,9 +95,9 @@ M = {
         "the patch would change the weight's shape from {old} to {new}; the runtime merge cannot do that",
         "patch 会把权重形状从 {old} 改成 {new}，运行时合并无法支持"),
     "lora.force_patch": (
-        "a node asks for the LoRA / patches to be baked into the weights (force_patch_weights, e.g. saving or merging a model). Monoload "
+        "a node asks for the LoRA / patches to be baked into the weights at load (force_patch_weights; ComfyUI's own nodes, saving included, never do). Monoload "
         "only merges at run time; set this model's Monoload LoRA Settings mode to native, or MONOLOAD=0 / MONOLOAD_DISABLE=1.",
-        "有节点要求把 LoRA/patch 直接烘焙进权重（force_patch_weights，常见于保存/合并模型）。Monoload 只做运行时临时合并，"
+        "有节点要求加载时把 LoRA/patch 直接烘焙进权重（force_patch_weights；ComfyUI 自己的节点包括保存都不会这样做）。Monoload 只做运行时临时合并，"
         "不改权重、不备份；请把这个模型的 Monoload LoRA 设置的模式设成「原生」，或设 MONOLOAD=0 / MONOLOAD_DISABLE=1。"),
     "lora.force_patch_unload": (
         "force_patch_weights is not supported for models Monoload drives",
