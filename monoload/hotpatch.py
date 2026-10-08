@@ -469,23 +469,6 @@ def _remove_runtime_patches(patcher, keep=None):
         _release_binding(patcher)
 
 
-def _drop_shadowed_runtime_patches(patcher):
-    """After a native partial unload a module may carry both our patch and a
-    native LowVramPatch for the same key (native would have restored the
-    backup and switched that layer to LowVramPatch). Keep only the native one
-    so the result is exactly what native ComfyUI computes."""
-    for m in patcher.model.modules():
-        for fn_attr in ("weight_function", "bias_function"):
-            funcs = m.__dict__.get(fn_attr, None)
-            if not funcs:
-                continue
-            native_keys = {f.key for f in funcs if type(f) is LowVramPatch}
-            if native_keys:
-                kept = [f for f in funcs if not (_is_runtime_patch(f) and f.key in native_keys)]
-                if len(kept) != len(funcs):
-                    setattr(m, fn_attr, kept)
-
-
 def _assert_no_backup(patcher):
     if len(patcher.backup) > 0 or len(patcher.hook_backup) > 0:
         raise MonoloadError(msg("lora.internal_backup", keys=list(patcher.backup)[:5] + list(patcher.hook_backup)[:5]))
@@ -538,8 +521,10 @@ def _partially_unload(self, device_to, memory_to_free=0, force_patch_weights=Fal
         return _ORIG["partially_unload"](self, device_to, memory_to_free=memory_to_free, force_patch_weights=force_patch_weights)
     if force_patch_weights and len(self.patches) > 0:
         raise MonoloadUnsupportedError("force_patch_weights", msg("lora.force_patch_unload"), key=_first_key(self))
+    # A layer unloaded here gets native's LowVramPatch after our runtime patch: the runtime patch then applies only the
+    # key's hooks (MonoloadRuntimePatch._native_base), native's order. It stays, so the hooks in effect (current_hooks
+    # unchanged: there is no backup, so native does not unpatch them) keep being applied.
     freed = _ORIG["partially_unload"](self, device_to, memory_to_free=memory_to_free, force_patch_weights=force_patch_weights)
-    _drop_shadowed_runtime_patches(self)
     _assert_no_backup(self)
     return freed
 

@@ -36,7 +36,7 @@ v2 只做一件事：**在 ComfyUI 原生加载出来的模型上打 LoRA 时，
 |---|---|
 | `patch_weight_to_device` | 对有 patch 的 key：**不备份、不改权重**，把 `MonoloadRuntimePatch` 插到该层 `weight_function` / `bias_function` 的最前面。没有 patch 的 key，以及只取合并结果、不写回的 `return_weight=True`，交给原函数。 |
 | `load` | 检查 DynamicVRAM 和 `force_patch_weights`，清掉被 patch 层的 `comfy_patched_weights` 标记（见 §4），调用原 `load()`，最后断言没有产生备份。 |
-| `partially_unload` | 调用原函数后，去掉被原生 `LowVramPatch` 取代的那些运行时 patch（见 §4）。 |
+| `partially_unload` | 调用原函数，断言没有备份。被卸到 CPU 的层上原生追加的 `LowVramPatch` 加普通 LoRA，运行时 patch 留着只加 hook（见 §4）。 |
 | `partially_load` | 和已加载的 `patches_uuid` 相同的 clone 加载时（原生不 unpatch、直接返回），先把绑定指向它（§3.2）。 |
 | `model_state_dict_for_saving` | 保存（`CheckpointSave` / `ModelSave` / `CLIPSave`）：原生对标了 `comfy_patched_weights` 的层直接输出存着的张量（原生里 patch 已烘焙进去），Monoload 下那是底模；调用期间把这个 patcher 被 patch 的层的标记暂时改成 False，这些层走原生的 `LazyCastingParam`（`patch_weight_to_device(return_weight=True)`，精确合并），返回后恢复。存出来的和原生逐位一致（`tests/test_lora_save.py`）。 |
 | `unpatch_model` | 调用原函数；卸载权重时摘掉所有运行时 patch，清空设备上的 LoRA 缓存。 |
@@ -134,7 +134,7 @@ Monoload 的做法：量化层挂上 weight function 后，`forward` 会走 `cas
 
 * **重复加载。** 原生 `load()` 会清空所有全量加载层的 `weight_function`，但跳过已标记 `comfy_patched_weights` 的层（原生里它们已经合并好了）。Monoload 的 patch 并没有合并进权重，所以 `load()` 之前先清掉被 patch 层的这个标记，保证这些层会重新走一遍 `patch_weight_to_device`。
 * **切换组合 / 卸载。** 原生 `unpatch_model()` 只在 lowvram 时清 `weight_function`；Monoload 在卸载权重时摘掉自己挂的所有运行时 patch。所以撤掉 LoRA 后，权重与加载时逐字节一致（本来也从未改过），也没有残留的 weight function。
-* **部分加载（非 `--gpu-only`、显存不够）。** 原生对被卸载的层本来就用 `LowVramPatch`，而且不备份。Monoload **不改这部分**，只接管原生会合并进权重的那些层，所以在部分加载下结果也和原生逐位一致。原生 `partially_unload()` 会给已经合并过的层追加 `LowVramPatch`（原生里是先写回备份）；这时同一层会同时挂着 Monoload 的 patch 和原生的 `LowVramPatch`，Monoload 摘掉自己那个，得到的结果和原生一样。
+* **部分加载（非 `--gpu-only`、显存不够）。** 原生对被卸载的层本来就用 `LowVramPatch`，而且不备份。Monoload **不改这部分**，只接管原生会合并进权重的那些层，所以在部分加载下结果也和原生逐位一致。原生 `partially_unload()` 会给已经合并过的层追加 `LowVramPatch`（原生里是先写回备份）；这时同一层会同时挂着 Monoload 的 patch 和原生的 `LowVramPatch`：Monoload 的 patch 留着，按下一条的规则只加这个 key 的 hook（没有 hook 时什么都不加），普通 LoRA 由 `LowVramPatch` 加，结果和原生一样。以前 Monoload 在这里摘掉自己那个 patch；同一个 key 上还有 hook 时 hook 就丢了：Monoload 没有备份，原生不会 `unpatch_hooks`，`current_hooks` 不变，之后 `apply_hooks(同一组)` 直接返回，不再装回来（审查 2026-10 第 04 项，`test_lora_lowvram_hook.py`：整层加载 + hook 后 `partially_unload` 全部，再 `apply_hooks`，与原生比较）。原生在这里先 `unpatch_hooks`、下一次 `apply_hooks` 重新合并 hook，计算结果相同。
 * **部分加载 + hook（lora-lowvram-hook）。** 卸到 CPU 的层上，普通 LoRA 由原生的 `LowVramPatch` 在计算时加。这样的层同一个 key 上再有 hook 时，Monoload 的运行时 patch 排在 `LowVramPatch` 前面，以前它把普通 LoRA 也加了一遍（加了两次，差 0.025）。现在运行时 patch 看到同一个 key 后面有原生 `LowVramPatch`，就只加 hook；hook 撤掉之后什么都不加。顺序与原生相同：原生先把 hook 合并进存储的权重，计算时再由 `LowVramPatch` 加普通 LoRA。exact 下与原生逐位一致，fused 差 ≤ 1.4e-4（`tests/test_lora_lowvram_hook.py`）。
 * 每次 `load()` / `partially_unload()` 之后都断言 `backup` / `hook_backup` 为空。
 
