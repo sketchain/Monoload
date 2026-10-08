@@ -1152,8 +1152,11 @@ def _decode_layer2(self, samples_in, vae_options, t0, l1_note, est=None, probe=N
     _sync()
     dt = time.perf_counter() - t0
     native_est = _native_estimate(self, samples_in.shape)
+    # a first-use layer-1 self-test that failed in this decode ran before it: the call's peak is the larger (as layer 1)
+    st = _SELFTEST_IN_DECODE[0]
+    rec_est = dict(est, total=max(est["total"], st), decode=est["total"], selftest=st)
     _LAST.clear()
-    _LAST.update({"strategy": "layer2", "estimate": est, "native_estimate": native_est, "workspace": budget,
+    _LAST.update({"strategy": "layer2", "estimate": rec_est, "native_estimate": native_est, "workspace": budget,
                   "retries": retries, "seconds": dt, "probe": probe is not None, "stats": stats.as_dict(), "layer1": l1_note,
                   "budget": _SETTINGS["budget"], "policy": policy, "candidates": considered})
     attn = ""
@@ -1163,7 +1166,8 @@ def _decode_layer2(self, samples_in, vae_options, t0, l1_note, est=None, probe=N
         attn += msg("vae.attn_native", what=", ".join(stats.attn_unmanaged[:4]))
     logging.info(msg("vae.log_layer2", shape="x".join(str(d) for d in samples_in.shape), ws=fmt_bytes(budget),
                      retries=msg("vae.retries", n=retries) if retries else "", chunked=stats.conv_chunked, calls=stats.conv_calls, attn=attn,
-                     policy=policy + "; " if policy else "", est=fmt_bytes(est["total"]), native=fmt_bytes(native_est), secs=dt, note=_NOTE[0]))
+                     policy=policy + "; " if policy else "", est=fmt_bytes(est["total"]) + (msg("vae.est_selftest", st=fmt_bytes(st)) if st else ""),
+                     native=fmt_bytes(native_est), secs=dt, note=_NOTE[0]))
     return pixel_samples
 
 

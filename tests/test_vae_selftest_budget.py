@@ -3,7 +3,8 @@
 failure happens in this decode or was cached by an earlier one -- layer 2 if
 it fits the budget, else MonoloadError naming the forced setting, the failed
 variant and layer 2's need. Layer 2 only and forced stripe rows keep their
-own semantics. Self-test failures and layer 2's estimate are injected; no
+own semantics. The layer-2 record counts a self-test that failed in that
+decode (review 2026-10 item 09). Self-test failures and layer 2's estimate are injected; no
 model files: the small SDXL-like VAE of tests/test_vae_ldm.py, fp32 on the CPU.
 
     MODELS=/tmp/nomodels tests/docker_run.sh python tests/test_vae_selftest_budget.py
@@ -82,6 +83,23 @@ def main():
              ("scheme C", "self-test failed", "LDM stripes", "GroupNorm scheme C", "layer 2 needs about 1024.00 GiB"))
         l2_total[0] = 1 << 20
         both("forced scheme C fails its self-test, layer 2 within the budget", {"C"}, "layer2")
+        # review 2026-10 item 09: the layer-2 record of such a decode counts the self-test that ran before it (fresh
+        # failure), as a layer-1 record does; none when the failure was cached; also on the default path (no budget)
+        need = next(b for b in variants if b.gn_scheme == "C").selftest_memory()
+        recs = {}
+        for label, bud, cached in (("budget, fresh", GIB, False), ("budget, cached", GIB, True), ("no budget, fresh", None, False)):
+            mvae.set_budget(bud)
+            state({"C"}, cached)
+            decode()
+            recs[label] = dict(mvae.last_decode().get("estimate") or {}, strategy=mvae.last_decode().get("strategy"))
+        mvae.set_budget(GIB)
+        check("layer-2 record after a failed self-test: estimate total = max(layer 2 {}, self-test {}), selftest field ({})".format(
+              recs["budget, fresh"].get("decode"), need, "; ".join("{}: total {} selftest {}".format(k, r.get("total"), r.get("selftest"))
+                                                                    for k, r in recs.items())),
+              all(r["strategy"] == "layer2" for r in recs.values())
+              and recs["budget, fresh"]["selftest"] == need and recs["budget, fresh"]["total"] == max(need, recs["budget, fresh"]["decode"])
+              and recs["budget, cached"]["selftest"] == 0 and recs["budget, cached"]["total"] == recs["budget, cached"]["decode"]
+              and recs["no budget, fresh"]["selftest"] == need and recs["no budget, fresh"]["total"] >= need)
         mvae.set_gn_scheme(None)
         mvae.set_stripe_rows(64)
         l2_total[0] = 1 << 40
