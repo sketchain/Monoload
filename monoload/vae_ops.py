@@ -29,7 +29,8 @@ floating-point differences (different GEMM shapes), with ~1x the arithmetic:
             (DESIGN §9.13.9).
   attention the `optimized_attention` instance attribute of attention blocks
             (comfy.ldm.modules.diffusionmodules.model.AttnBlock, Wan's
-            AttentionBlock) when it is one of ComfyUI's VAE attention functions
+            AttentionBlock; SeedVR2's `optimized_vae_attention`, ATTENTION_ATTRS)
+            when it is one of ComfyUI's VAE attention functions
             (split / pytorch / xformers): queries are processed in blocks, K/V
             stay whole, so every query still takes a softmax over the whole
             image. The arithmetic per block is that of the original function.
@@ -388,6 +389,11 @@ def _note_attn(stats, n, rows, batch, tokens, elem):
     stats.attn_score_max = max(stats.attn_score_max, 2 * batch * r * tokens * elem)
 
 
+# instance attributes holding a VAE attention function (q, k, v of shape (B, C, H, W) -> (B, C, H, W)): the LDM
+# AttnBlock's / Wan's optimized_attention, SeedVR2's optimized_vae_attention (comfy/ldm/seedvr/vae.py, heads == 1)
+ATTENTION_ATTRS = ("optimized_attention", "optimized_vae_attention")
+
+
 def known_attention():
     """ComfyUI's VAE attention functions -> chunked replacement."""
     return {
@@ -438,14 +444,16 @@ class OpChunking:
                     as2d = isinstance(m, torch.nn.Conv3d) and prev is _MISSING and type(m)._conv_forward in _CONV3D_FORWARDS
                     m.__dict__["_conv_forward"] = _ConvChunker(m, orig, self.budget, self.stats, as2d)
                     self.stats.conv_modules += 1
-                fn = m.__dict__.get("optimized_attention", None)
-                if fn is not None:
+                for attr in ATTENTION_ATTRS:
+                    fn = m.__dict__.get(attr, None)
+                    if fn is None:
+                        continue
                     impl = known.get(fn)
                     if impl is None:
                         self.stats.attn_unmanaged.append("{} ({})".format(name, getattr(fn, "__name__", type(fn).__name__)))
                         continue
-                    self._saved.append((m, "optimized_attention", fn))
-                    m.__dict__["optimized_attention"] = _AttnChunker(impl, self.budget, self.stats)
+                    self._saved.append((m, attr, fn))
+                    m.__dict__[attr] = _AttnChunker(impl, self.budget, self.stats)
                     self.stats.attn_modules += 1
         except BaseException:
             self._restore()
