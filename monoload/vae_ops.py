@@ -138,8 +138,10 @@ def slow_dilated3d(x):
     return x.is_cuda and not torch.backends.cudnn.enabled and not getattr(comfy.ops, "NVIDIA_MEMORY_CONV_BUG_WORKAROUND", False)
 
 
-# Conv3d classes whose _conv_forward is known: torch's, and comfy.ops' (causal_zero autopad = weight[:, :, -T:])
-_CONV3D_FORWARDS = (torch.nn.Conv3d._conv_forward, comfy.ops.disable_weight_init.Conv3d._conv_forward)
+# Conv3d classes whose _conv_forward is known: torch's, and comfy.ops' (causal_zero autopad = weight[:, :, -T:]); read
+# without failing the import when a ComfyUI update renames it (vae._check_api then refuses to install)
+_CONV3D_FORWARDS = tuple(f for f in (torch.nn.Conv3d._conv_forward,
+                                     getattr(getattr(comfy.ops.disable_weight_init, "Conv3d", None), "_conv_forward", None)) if f is not None)
 
 
 OUT_FIRST = True   # False: the output after the first block, as up to 725a010 (only for tests/alloc_sim.py to replay those versions)
