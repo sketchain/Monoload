@@ -174,6 +174,24 @@ def semantics_tests(cls, sd, lat):
                       lambda: managed_decode(sd, lat), "(from environment variable MONOLOAD_VAE_BUDGET", "Raise MONOLOAD_VAE_BUDGET")
     finally:
         mvae.set_budget(None)
+    # review 2026-10 item 10: an estimate just over the budget (2.1704 GiB against 2.17) must not read like the budget
+    near = node_apply(cls, sd, budget="custom", budget_gib=2.17)
+    orig_l2, orig_sel = mvae._layer2_estimate, mvae._select_layer1
+
+    def l2(*a, **kw):
+        est, probe = orig_l2(*a, **kw)
+        return dict(est, total=int(2.1704 * (1 << 30))), probe
+    mvae._layer2_estimate, mvae._select_layer1 = l2, lambda *a, **kw: (None, "not recognized (test)")
+    try:
+        try:
+            managed_decode(near, lat)
+            text = ""
+        except MonoloadError as e:
+            text = str(e)
+    finally:
+        mvae._layer2_estimate, mvae._select_layer1 = orig_l2, orig_sel
+    check("budget 2.17 GiB, layer 2 needs 2.1704 GiB: the error shows them apart ({})".format(text[:150]),
+          "budget 2.1700 GiB" in text and "layer 2 needs about 2.1704 GiB" in text)
     with LogCapture() as cap:
         managed_decode(node_apply(cls, sd, budget="custom", budget_gib=1024.0, stripe_rows=16), lat)
     line = next((x for x in cap.lines if "budget 1024.00 GiB (from" in x), "")
