@@ -161,6 +161,21 @@ def vae_tests():
     return sd
 
 
+def zh_source_tests(sd):
+    """Review 2026-10 item 17: in Chinese the VAE settings' source "env" is translated like the others."""
+    from monoload import messages
+    mvae.set_budget(3 << 30)
+    messages.set_lang("zh")
+    try:
+        t = text(vae=sd)
+    finally:
+        messages.set_lang("en")
+        mvae.set_budget(None)
+    line = next((l for l in t.splitlines() if "设置：模式" in l), "")
+    check("MONOLOAD_LANG=zh: the budget's source is shown as [环境变量], no bare [env] ({})".format(line.strip()[:120]),
+          "[环境变量]" in line and "[env]" not in t)
+
+
 def error_record_tests(sd):
     """A decode that fails gets a record of its own error (strategy "error", kind, message), never the fields of the
     previous decode of another VAE (or of its own earlier success); the exception propagates unchanged."""
@@ -299,6 +314,7 @@ def main():
     interface_tests()
     global_tests()
     sd = vae_tests()
+    zh_source_tests(sd)
     error_record_tests(sd)
     probe_tests()
     m = model_tests(sd)
