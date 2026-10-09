@@ -1191,8 +1191,8 @@ def _check_api():
         for name in ("raise_non_oom", "cuda_device_context", "soft_empty_cache", "dtype_size"):
             if not callable(getattr(mm, name, None)):
                 return "comfy.model_management.{} missing".format(name)
-    except (TypeError, ValueError) as e:
-        return str(e)
+    except (TypeError, ValueError, AttributeError) as e:
+        return "{}: {}".format(type(e).__name__, e)
     return None
 
 
