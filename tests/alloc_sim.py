@@ -395,7 +395,10 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     sim.reset_peak()
     base_alloc, base_res = sim.allocated, sim.reserved
     zc, nd, r = (LATENT[model] + (8,))[:3]
-    lat = torch.empty((batch, zc, 1, h // r, w // r) if nd == 5 else (batch, zc, h // r, w // r), device="meta")   # the bench's latent is on the CPU: not counted, its copy is
+    # the bench's latent is on the CPU: not counted, its copy is. float64, so that the decode's .to(device, dtype) is a
+    # real copy for every decode dtype (an fp32 latent on meta would be returned as is by .to(meta, fp32): review
+    # 2026-10 item 15, the fp32 configurations missed the latent's copy)
+    lat = torch.empty((batch, zc, 1, h // r, w // r) if nd == 5 else (batch, zc, h // r, w // r), device="meta", dtype=torch.float64)
     tracer = make_tracer(sim)
     tracer.static.update(t.untyped_storage()._cdata for t in itertools.chain(fsm.parameters(), fsm.buffers(), [lat]))
     events = {"empty_cache": 0}
