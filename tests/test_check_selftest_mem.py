@@ -68,7 +68,7 @@ def main():
             bud = int(bud * 1.03) + 1
         check("a budget at which the budget picks another scheme than the default {}: {}".format(vl.DEFAULT_SCHEME, pick), pick is not None)
         if pick is None:
-            return
+            finish()   # exits with the failure above (a bare return would skip finish() and exit 0)
         mvae.set_budget(pick)
         eng._SELFTEST.clear()
         mvae._PROBES.clear()
