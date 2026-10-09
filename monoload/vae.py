@@ -1118,12 +1118,22 @@ def _layer2_estimate(vae, samples_in, vae_options, ws):
         # the shape probe needs the weights where they compute
         mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, samples_in[0:1, ..., :PROBE_SIZE, :PROBE_SIZE], ws)["total"],
                            force_full_load=vae.disable_offload)
-        try:
-            probe = _probe(vae, samples_in, vae_options)
-        except Exception as e:
-            # a real problem with this decoder will surface again in the decode itself
-            logging.warning(msg("vae.probe_failed", err="{}: {}".format(type(e).__name__, e)))
+        probe = _shape_probe(vae, samples_in, vae_options)
     return estimate(vae, samples_in, ws, probe), probe
+
+
+def _shape_probe(vae, samples_in, vae_options):
+    """_probe (None if it fails: a real problem with this decoder will surface again in the decode itself), then the
+    allocator's cache emptied: with a budget the first-use layer-1 self-test can come right after, and its bound
+    (selftest_memory) does not count the probe's cached blocks (up to ~240 MiB, Flux 2 fp32; tests/alloc_sim.py
+    selftest_trace(probe=True), review 2026-10 item 21). The decode itself empties the cache before it starts anyway."""
+    probe = None
+    try:
+        probe = _probe(vae, samples_in, vae_options)
+    except Exception as e:
+        logging.warning(msg("vae.probe_failed", err="{}: {}".format(type(e).__name__, e)))
+    mm.soft_empty_cache(True)   # out of the except block: a failed probe's tensors are gone
+    return probe
 
 
 def _decode_layer2(self, samples_in, vae_options, t0, l1_note, est=None, probe=None, policy=None, considered=None):
