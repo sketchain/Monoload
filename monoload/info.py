@@ -119,7 +119,7 @@ def global_defaults():
 
 
 def _src(s):
-    return {"node": msg("info.src_node"), "env": "env", "default": msg("info.src_builtin")}[s]
+    return {"node": msg("info.src_node"), "env": msg("src.env"), "default": msg("info.src_builtin")}[s]
 
 
 def describe_decode(r):
