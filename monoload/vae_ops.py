@@ -463,9 +463,19 @@ class OpChunking:
         return False
 
 
-def fmt_bytes(n):
+def fmt_bytes(n, digits=2):
+    """digits: decimals of a GiB value (MiB / KiB values get digits - 2)."""
     if n is None:
         return "n/a"
     if n >= GIB:
-        return "{:.2f} GiB".format(n / GIB)
-    return "{:.0f} MiB".format(n / MIB) if n >= MIB else "{:.0f} KiB".format(n / 1024)
+        return "{:.{}f} GiB".format(n / GIB, digits)
+    return "{:.{}f} MiB".format(n / MIB, digits - 2) if n >= MIB else "{:.{}f} KiB".format(n / 1024, digits - 2)
+
+
+def budget_digits(budget, estimates):
+    """Decimals with which a budget and the estimates compared with it all read differently from the budget (an
+    estimate of 2.1704 GiB is over a 2.17 GiB budget: both "2.17 GiB" with two decimals). 2 .. 6."""
+    d = 2
+    while d < 6 and any(e is not None and e != budget and fmt_bytes(e, d) == fmt_bytes(budget, d) for e in estimates):
+        d += 1
+    return d

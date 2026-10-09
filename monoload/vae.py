@@ -837,8 +837,9 @@ def choose_plan(vae, samples_in, bound, out_bytes):
         plan = bound.plan(vae, samples_in, bud, ws, out_bytes=out_bytes)
         if plan is None:
             smallest = bound.smallest_plan(vae, samples_in, ws, out_bytes=out_bytes)
-            raise MonoloadError(msg("vae.err_l1_budget", budget=fmt_bytes(bud), src=_from("budget"), advice=_budget_advice(layer2=True),
-                                    shape=list(samples_in.shape), need=fmt_bytes(smallest.estimate),
+            d = vae_ops.budget_digits(bud, [smallest.estimate])
+            raise MonoloadError(msg("vae.err_l1_budget", budget=fmt_bytes(bud, d), src=_from("budget"), advice=_budget_advice(layer2=True),
+                                    shape=list(samples_in.shape), need=fmt_bytes(smallest.estimate, d),
                                     rows=max(b - a for a, b in smallest.stripes), prefix=fmt_bytes(smallest.prefix_bytes),
                                     stripes=fmt_bytes(smallest.stripe_bytes)))
         return plan, bud, ws, msg("vae.budget_head", budget=fmt_bytes(bud), src=_from("budget"))
@@ -998,20 +999,23 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
         c2, d2 = layer2(msg("vae.l2_after_selftest"), note, note)
         if c2["fits"]:
             return d2
-        raise MonoloadError(msg("vae.err_forced_selftest", budget=fmt_bytes(bud), src=_from("budget"), what=", ".join(forced),
-                                failed=", ".join(v.name for v in failed), l2=fmt_bytes(c2["estimate"]), shape=list(samples_in.shape),
+        dg = vae_ops.budget_digits(bud, [c2["estimate"]])
+        raise MonoloadError(msg("vae.err_forced_selftest", budget=fmt_bytes(bud, dg), src=_from("budget"), what=", ".join(forced),
+                                failed=", ".join(v.name for v in failed), l2=fmt_bytes(c2["estimate"], dg), shape=list(samples_in.shape),
                                 advice=_budget_advice()))
+    # enough decimals that no estimate over the budget reads like the budget itself (review 2026-10 item 10)
+    dg = vae_ops.budget_digits(bud, [c["estimate"] for c in considered])
     needs = []
     for c in considered:
         if c["layer"] == 2:
-            needs.append(msg("vae.need_layer2", est=fmt_bytes(c["estimate"])))
+            needs.append(msg("vae.need_layer2", est=fmt_bytes(c["estimate"], dg)))
         else:
             needs.append(msg("vae.need_layer1", scheme=msg("vae.need_scheme", scheme=c["gn_scheme"]) if c["gn_scheme"] else "", rows=c["rows"],
-                             est=fmt_bytes(c["estimate"]) + _selftest_note(c), prefix=fmt_bytes(c["prefix"]), stripes=fmt_bytes(c["stripes"]),
+                             est=fmt_bytes(c["estimate"], dg) + _selftest_note(c), prefix=fmt_bytes(c["prefix"]), stripes=fmt_bytes(c["stripes"]),
                              failed=msg("vae.need_failed") if c.get("selftest_result") else ""))
     if not variants:
         needs.append(msg("vae.need_l1_unavailable", why=l1_note))
-    raise MonoloadError(msg("vae.err_budget", budget=fmt_bytes(bud), src=_from("budget"), advice=_budget_advice(),
+    raise MonoloadError(msg("vae.err_budget", budget=fmt_bytes(bud, dg), src=_from("budget"), advice=_budget_advice(),
                             shape=list(samples_in.shape), needs=msg("vae.need_sep").join(needs)))
 
 
