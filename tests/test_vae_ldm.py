@@ -620,6 +620,28 @@ def budget_tests(sd, lat4):
         mvae.set_budget(None)
 
 
+def probe_request_tests(sd, lat4):
+    """Review 2026-10 item 23: what the 8 x 8 shape probe asks load_models_gpu for has no workspace in it."""
+    import comfy.model_management as mm
+    asked = []
+    orig = mm.load_models_gpu
+
+    def spy(models, memory_required=0, **kw):
+        asked.append(memory_required)
+        return orig(models, memory_required=memory_required, **kw)
+    mvae._PROBES.clear()
+    mm.load_models_gpu = spy
+    try:
+        est, probe = mvae._layer2_estimate(sd, lat4, {}, 1 << 30)
+    finally:
+        mm.load_models_gpu = orig
+    small = mvae.estimate(sd, lat4[0:1, ..., :mvae.PROBE_SIZE, :mvae.PROBE_SIZE], 0)["total"]
+    check("the shape probe asks load_models_gpu for {} (its own small estimate), not {} (with 2 x the 1 GiB workspace)".format(
+          vae_ops.fmt_bytes(asked[0]) if asked else None,
+          vae_ops.fmt_bytes(mvae.estimate(sd, lat4[0:1, ..., :mvae.PROBE_SIZE, :mvae.PROBE_SIZE], 1 << 30)["total"])),
+          probe is not None and asked == [small] and small < (64 << 20))
+
+
 def budget_plan_tests():
     """The README examples: full-size SDXL (meta device), budgets 20 / 3 / 1.5 GiB."""
     import alloc_sim
@@ -733,6 +755,7 @@ def main():
     selftest_tests(sd, lat4)
     plan_tests(sd, lat4)
     budget_tests(sd, lat4)
+    probe_request_tests(sd, lat4)
     budget_plan_tests()
     estimate_tests()
     allocator_tests()

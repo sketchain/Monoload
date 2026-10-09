@@ -1115,8 +1115,10 @@ def _layer2_estimate(vae, samples_in, vae_options, ws):
     shape probe (first decode of this model and latent layout) loads the weights."""
     probe = _PROBES.get(vae.first_stage_model, {}).get((int(samples_in.shape[1]), samples_in.ndim))
     if probe is None:
-        # the shape probe needs the weights where they compute
-        mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, samples_in[0:1, ..., :PROBE_SIZE, :PROBE_SIZE], ws)["total"],
+        # the shape probe needs the weights where they compute. It is one plain decode of a PROBE_SIZE x PROBE_SIZE
+        # latent, not under OpChunking: no workspace in what it asks for (with ws it asked ~2 GiB for tens of MiB;
+        # load_models_gpu adds its minimum_inference_memory on top anyway; review 2026-10 item 23)
+        mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, samples_in[0:1, ..., :PROBE_SIZE, :PROBE_SIZE], 0)["total"],
                            force_full_load=vae.disable_offload)
         probe = _shape_probe(vae, samples_in, vae_options)
     return estimate(vae, samples_in, ws, probe), probe
