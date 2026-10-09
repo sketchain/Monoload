@@ -394,6 +394,19 @@ def allocator_tests():
                   model, pk / 2 ** 20, bound / 2 ** 20, left / 2 ** 20, tail["tail_alloc"] / 2 ** 20, tail["tail_reserved"] / 2 ** 20,
                   tail["before_tail"] / 2 ** 20, pk0 / 2 ** 20),
               pk <= bound and left == 0 and pk <= 0.45 * G and tail["tail_alloc"] > 0 and tail["before_tail"] + tail["tail_reserved"] <= bound)
+    # review 2026-10 item 21: with a budget the first decode runs the layer-2 shape probe right before the first-use
+    # self-test; the cache is emptied in between, so the self-test's peak is what it is alone (before: Wan fp32 426 of
+    # its 430 MiB bound, the probe's cached blocks in the way)
+    rows = []
+    ok = True
+    for model in ("qwen", "flux2"):
+        info = {}
+        pk_p, left_p, bound = alloc_sim.selftest_trace(model, "fp32", info=info, probe=True)
+        pk = alloc_sim.selftest_trace(model, "fp32")[0]
+        ok = ok and info["after_probe"] == 0 and pk_p == pk <= bound and left_p == 0
+        rows.append("{} fp32 {:.0f} MiB after the probe ({:.0f} alone, bound {:.0f}, reserved when the self-test starts {:.0f})".format(
+            model, pk_p / 2 ** 20, pk / 2 ** 20, bound / 2 ** 20, info["after_probe"] / 2 ** 20))
+    check("self-test right after the budget's shape probe: the same peak as alone, nothing of the probe left: " + "; ".join(rows), ok)
     for w, h, scheme in ((1344, 768, None), (2688, 1536, None), (3840, 2160, None), (3840, 2160, "A"), (3840, 2160, "C"), (3840, 2160, "D")):
         i = alloc_sim.decode_trace(w, h, "bf16", None, model="flux2", scheme=scheme)
         f = alloc_sim.decode_trace(w, h, "bf16", None, model="flux", scheme=scheme)

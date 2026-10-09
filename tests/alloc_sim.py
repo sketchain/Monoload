@@ -370,8 +370,9 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     units   tag every allocation with the layer-1 unit / prefix module that made it (for --peak)
     output_in_arena  the layer-1 layout up to 6324592 (vae_engine.OUTPUT_IN_ARENA): no cache emptied before / after the
             decode, the output buffer allocated after the first prefix, in the arena (False: the current layout, DESIGN §9.22)
-    probe   run choose_budget's layer-2 shape probe (vae._probe, 8 x 8) right before a layer-1 decode, its blocks left
-            in the cache: the first decode with a budget (DESIGN §9.21)
+    probe   run choose_budget's layer-2 shape probe (8 x 8) right before a layer-1 decode: the first decode with a
+            budget (DESIGN §9.21). With output_in_arena (the code up to 6324592) its blocks stay cached (vae._probe);
+            otherwise vae._shape_probe empties the cache after it (review 2026-10 item 21)
     info["stays"]  reserved after the decode with its output still alive and the cache emptied (check_selftest_mem's
             "stays reserved after empty_cache")
     arena_need  run in an arena 4x the plan's live peak and report (info["arena_need"]) the highest offset any
@@ -480,7 +481,10 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
             with torch.inference_mode(), tracer:
                 if probe:
                     mvae._PROBES.clear()
-                    mvae._probe(v, lat, {})
+                    if output_in_arena:   # the code up to 6324592: the probe's blocks stayed cached
+                        mvae._probe(v, lat, {})
+                    else:                 # since review 2026-10 item 21: the cache is emptied after the probe
+                        mvae._shape_probe(v, lat, {})
                     tracer.poll()
                 out = bound.run(v, lat, plan, ws_, stats)
                 tracer.poll()
@@ -503,13 +507,14 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     return info
 
 
-def selftest_trace(model, dtype="bf16", tail=True, info=None):
+def selftest_trace(model, dtype="bf16", tail=True, info=None, probe=False):
     """Reserved peak (bytes) of the first-use layer-1 self-test on the full-size decoder (meta device), the steps
     of vae_engine._self_test_run: the fp32 copy, the reference whole-image decode under layer-2 chunking
     (SELFTEST_REF_WORKSPACE), the forced small stripes (SELFTEST_ROWS, SELFTEST_WORKSPACE); the VAE's own weights
     loaded before; tail=True: also the comparison at the end (max|ref|, max|out - ref|, isfinite; info, a dict:
-    what it allocates and adds to reserved, tail_alloc / tail_reserved, and reserved before it). Returns (peak
-    reserved, reserved left after the copy and every tensor are freed, the bound's selftest_memory())."""
+    what it allocates and adds to reserved, tail_alloc / tail_reserved, and reserved before it); probe=True: the
+    budget's layer-2 shape probe (vae._shape_probe) right before it, as the first decode with a budget runs them
+    (info["after_probe"]: what is reserved when the self-test starts). Returns (peak reserved, reserved left after the copy and every tensor are freed, the bound's selftest_memory())."""
     import gc
     import torch
     import comfy.model_management as mm
@@ -543,6 +548,12 @@ def selftest_trace(model, dtype="bf16", tail=True, info=None):
         es.enter_context(_patched(mm, "get_free_memory", lambda dev=None, torch_free_too=False: (free, free) if torch_free_too else free))
         es.enter_context(torch.inference_mode())
         es.enter_context(tracer)
+        if probe:
+            mvae._PROBES.clear()
+            mvae._shape_probe(v, lat, {})
+            tracer.poll()
+            if info is not None:
+                info["after_probe"] = sim.reserved - base
         dev = torch.device("meta")
         tb = bound.fp32_copy(dev)
         z = torch.empty(list(bound.selftest_latent(eng.SELFTEST_LATENT)), device=dev)
