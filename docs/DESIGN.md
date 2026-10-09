@@ -391,7 +391,7 @@ CPU 上计算 dtype 是 fp32，默认路径在 fp32 下合并、不舍入回 fp1
 
 | 层 | 适用 | 做法 | 状态 |
 |---|---|---|---|
-| 第一层：条带解码 | 认得的结构（LDM `Decoder`、Wan `Decoder3d` 单帧） | 低分辨率前缀（含 mid 全局注意力）整图算；只在每个分辨率阶段末尾存档；按输出条带倒推每层所需的输入行区间并重算；GroupNorm 的全局统计逐层空跑求得（条带内 fp32 Welford，跨条带 Chan 合并）；按峰值预算自动选条带高度和存档方案，满足不了就报错 | **第二阶段已实现 Wan `Decoder3d` 单帧（§9.13）**；第三阶段已实现 LDM（§9.14，待真机） |
+| 第一层：条带解码 | 认得的结构（LDM `Decoder`、Wan `Decoder3d` 单帧） | 低分辨率前缀（含 mid 全局注意力）整图算；存档按方案（A 不存，D / B 存各分辨率阶段的输出，C 再存全分辨率每个块的输出，§9.14）；按输出条带倒推每层所需的输入行区间并重算；GroupNorm 的全局统计逐层空跑求得（块内 fp32 `torch.var_mean`，跨块 / 跨条带 Chan 合并，§9.14）；按峰值预算自动选条带高度和存档方案，满足不了就报错 | **第二阶段已实现 Wan `Decoder3d` 单帧（§9.13）**；第三阶段已实现 LDM（§9.14，待真机） |
 | 第二层：逐算子分块 | 不认识结构也能用 | 原 forward 原样运行，只在受管理的解码过程中替换重算子：卷积按输出行分块，限制 im2col 工作区；注意力按 query 分块，K/V 完整，每个 query 仍对全图做 softmax。整图语义不变，算量约 1 倍 | 第一阶段实现（真机验收通过，§9.12） |
 | 兜底 | 前两层都处理不了 | 原生整图解码（结果本身正确），打一条日志 | 第一阶段实现 |
 
@@ -699,6 +699,8 @@ arena    = live + live/32 + 64 MiB（只有一条条带时 live/8），向上取
 estimate = arena + largest + 16 MiB            交给 load_models_gpu，reserved 的上界
   largest = 这次解码里最大的单个分配（im2col columns 块 ≤ 工作区、最大的激活平面、上采样结果、qkv、输出缓冲）
 ```
+
+（这是第二阶段的公式。§9.22 之后输出缓冲单独一段、不在 arena 和常驻里，也不在 largest 的候选里：estimate = 输出段 + arena + largest + 16 MiB，见 §9.22；有存档的计划 arena 的余量见 §9.14.11。）
 
 peak 按 62b3c94 的 forward 逐个数同时存活的张量。S 是模块输入的存储（调用期间由调用方持有；条带里是上一个单元的整份输出，模块拿到的是它的行切片），A / B 是模块所处理的那些行上一张输入 / 输出通道的平面，e 是元素字节数：
 
@@ -1149,7 +1151,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 |---|---|---|---|---|---|---|---|
 | SD1.x / SD2.x / SDXL（Pony、Illustrious…）**用户在用** | `AutoencoderKL` / LDM `Decoder`，4D `[B,4,H/8,W/8]` | ✔ GroupNorm ×52（整图） | — | H/8 全局（mid） | — | 第一层 LDM | 已支持 |
 | Flux.1 / Z-Image / Lumina 2 / Chroma / HiDream / SD3（`ae`）**用户在用** | `AutoencodingEngine` / LDM `Decoder`，4D z16 | ✔ 同上 | — | 同上 | — | 第一层 LDM | 已支持 |
-| Flux 2 / Ideogram 4 / Lens / Ernie-Image | `AutoencoderKL`（`batch_norm_latent`）/ LDM `Decoder`，4D `[B,128,H/16,W/16]` → 反归一化 + 2×2 还原成 z32 `[B,32,H/8,W/8]` | ✔ 同上 | — | 同上 | — | 第二层 | `ldm_structure` 拒绝 `bn` |
+| Flux 2 / Ideogram 4 / Lens / Ernie-Image | `AutoencoderKL`（`batch_norm_latent`）/ LDM `Decoder`，4D `[B,128,H/16,W/16]` → 反归一化 + 2×2 还原成 z32 `[B,32,H/8,W/8]` | ✔ 同上 | — | 同上 | — | 第二层（4a 盘点时；4b-1 之后第一层 LDM，§9.18） | `ldm_structure` 拒绝 `bn`（4b-1 之后支持） |
 | SD x4 upscaler | `AutoencoderKL` / LDM `Decoder`（ch_mult [1,2,4]，4x） | ✔ | — | H/4 全局 | — | 第一层 LDM | 已支持（3 级） |
 | SVD img2vid | `AutoencodingEngine` / `VideoDecoder`，4D，**batch 当时间轴** | ✔ GroupNorm ×80 | 时间混合（Conv3d 核 [3,1,1]、时间注意力）跨整个 batch | H/8 | — | 第二层 | **现有缺口 1** |
 | HunyuanImage 2.1 | `AutoencodingEngine` / `hunyuan_video.vae.Decoder`，4D z64，32x | ✔ GroupNorm ×72 | — | H/32 全局 | 上采样是先卷积再 2×2 depth-to-space（`PixelUnshuffle2D`）+ 重复通道的残差 | 第二层 | 不认识的结构 |
@@ -1481,7 +1483,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 * **`budget_gib` 的精度**：前端 1.48.7 的 FLOAT 控件按 `step` 推保存精度（`precision = max(0, -floor(log10(step)))`，`onFloatValueChange` 用 `toFixed(precision)`）：step 0.25 → 1 位小数，0.25 存成 0.3。改成 `step` / `round` 0.01（2 位小数）；浏览器里核对过 0.25、1.37 原样保存。控件顺序改成 `budget` 紧挨 `budget_gib` 前面；dev 不做旧工作流兼容（用户定）。
 * **Info**：总是在最后列全局默认值表；当前模式下不生效的设置标出来（VAE `native`：预算 / 方案 / 条带高度；`layer 2 only`：方案 / 条带高度；LoRA `native`：merge）；所用的 GroupNorm 方案附一句说明。
-* **方案说明**（`vae_ldm.scheme_positions`）：A 不存（每遍统计都从 H/8 存档重算），D 存 H/4 级输出，B 存 H/4 和 H/2 级输出，C 再存全分辨率每个块的输入；写进 tooltip（en / zh）、下拉标签、Info、README §4.1。
+* **方案说明**（`vae_ldm.scheme_positions`）：A 不存（每遍统计都从 H/8 存档重算），D 存 H/4 级输出，B 存 H/4 和 H/2 级输出，C 再存全分辨率每个块的输出（块 1、块 2 和 `norm_out` 的输入；审查 2026-10 第 20 项把各处的「输入」改正）；写进 tooltip（en / zh）、下拉标签、Info、README §4.1。
 * **预算等设置的来源**：`_Applied` 把逐项来源放进 `_SETTINGS["src"]`，`vae._from(item)` 给出「Monoload VAE 设置节点」或「环境变量 X」；预算行、预算报错、强制的条带高度 / 方案、只用第二层都写来源，预算放不下的建议按来源给（节点：改节点上的预算或改成跟随全局 / 不限；环境变量：改 `MONOLOAD_VAE_BUDGET`）。
 * **「memory leak with model SDXLClipModel」警告**：在锁定镜像里用 `/prompt` API 复现（合成 SD1.5 + 只改 UNet 的 LoRA）。条件：LoRA 没有 text-encoder key（`LoraLoader` 的 CLIP clone 不带 patch）+ Monoload LoRA Settings 接了 CLIP（又一层不带 patch 的 clone）+ 解码报错。已加载的 CLIP 是第二层 clone；release 丢掉两个节点的缓存输出后，这两层 clone 被报错留下的引用环（执行器里的 traceback / 列表）留到 release 的 `gc.collect()` 才一起回收；ComfyUI 的 `LoadedModel._switch_parent` 只往上切一层，切的时候父节点也已经死了，于是 LoadedModel 没有 patcher、但模型（底模的 `cond_stage_model`）还活着，`cleanup_models_gc` 每次加载都报「memory leak」。不是 Monoload 持有引用（追查过 CLIP clone 的引用者：只有 ComfyUI 的输出缓存和执行器的列表；解码记录、LoRA 名字元数据、Info、报错对象都不引用 CLIP）。对照：正常运行、带 TE key 的 LoRA（clone 带 patch，release 直接指回底模）、不加 LoRA 设置节点（只有一层）都不出现。修复：release 前记下每个已加载 clone 的祖先链（弱引用），`gc.collect()` 之后把没有 patcher 的条目指回活着的最近祖先（同一个模型），再同步 uuid。`tests/test_release_chain.py` 构造同样的两层 clone + 引用环：去掉修复时出现两条警告、LoadedModel 没有 patcher，加上修复后指回底模、没有警告；服务端复现也确认消失。
 * **第一次解码的实测峰值偏低**：一条带的解码 reserved 峰值不可能低于它自己的 arena，第一次只有 +1.25 GiB（arena 1.97）说明起点的 reserved 里有之前（采样）缓存下来的空闲块，被解码复用了；自检在测量窗口内只会让峰值变高。`_MemProbe` 改成先 `soft_empty_cache()` 再取起点；记录这次解码里有没有跑首次自检（`vae_engine._SELFTEST` 有没有变多），Info 注明「含首次自检」。
