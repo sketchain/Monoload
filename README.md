@@ -974,6 +974,35 @@ done
 
 预期：`13 / 8 / 5 / 9 checks, 0 failed`。
 
+### 9.15 第二轮代码审查修正（基准 main 5d9ac63）：真机检查
+
+**状态：待 CT 700 上跑。** 改动和 CPU 小测试见 HANDOFF §4.0（第二轮审查）。拉新代码后重启容器（插件改了：`hotpatch` 多接管了 `model_state_dict_for_saving`，`release`、`vae*` 都有改动）。先让服务把模型卸掉（`/free`，同 9.1）。
+
+```bash
+curl -X POST http://127.0.0.1:8188/free -H 'Content-Type: application/json' -d '{"unload_models":true,"free_memory":true}'
+# AC. 第 01 项：挂 LoRA 存 checkpoint，和原生逐个张量比（同一进程里：默认 Monoload / 节点 mode native / 卸掉钩子的原生 / 不带 LoRA 的底模）
+#     临时文件放 /tmp（容器里，SDXL 每个约 6.5 GiB，算完摘要就删，同时只有一个）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_lora_save.py \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --lora Smooth_Booster_v5.safetensors --all 2>&1 | tee check_lora_save.txt
+# AD. 同上，但和一个整进程 MONOLOAD=0 的原生比（只存 CheckpointSave）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_lora_save.py \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --lora Smooth_Booster_v5.safetensors --only-default --digests /tmp/save_monoload.json
+docker exec -w /opt/ComfyUI/custom_nodes/monoload -e MONOLOAD=0 comfyui python tests/check_lora_save.py \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --lora Smooth_Booster_v5.safetensors --only-default --compare /tmp/save_monoload.json 2>&1 | tee check_lora_save_m0.txt
+# AE. 第 07 项（arena 取整）不改行为：SDXL 4K 默认解码一次
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --res 3840x2160 --modes monoload --warm 1 2>&1 | tee bench_vae_review2.txt
+```
+
+**预期：**
+
+* **AC：** 开头一行 `N UNet / 0 text-encoder keys patched`（Smooth Booster 没有 text-encoder key，DESIGN §7.3）。`CheckpointSave` 和 `ModelSave` 两段：`the LoRA changes K tensors`，K > 0（UNet 里被 LoRA 改到的张量数）；`default (Monoload) vs native: ... 0 differ, 0 keys missing / extra -> IDENTICAL`；`node mode native vs native: ... IDENTICAL`；`after the Monoload save: backups 0, runtime patches > 0, weights unchanged True`。`CLIPSave` 一段：`the LoRA changes 0 tensors`（没有 TE key，存出来就是底模的 CLIP），两行仍是 IDENTICAL，runtime patches 可以是 0。最后 `RESULT: OK`。CPU 上用合成 SD1.5（UNet + TE 都有 LoRA）跑过：三种保存 1130 / 686 / 198 个张量全部相同，LoRA 改到 256 / 184 / 72 个。修之前 `default (Monoload)` 一行是 DIFFERENT，差的正好是那 K 个张量（存成了底模）。
+* **AD：** 第二条命令 `this process vs /tmp/save_monoload.json: ... IDENTICAL`，`RESULT: OK`。
+* **AE：** 和 §10.4 一样：第一层方案 B 17 条 128 行，GTT 峰值增量约 2.17 GiB，日志的估算 2.68 GiB（取整只多了不到 2 MiB，两位小数看不出来）。
+* 第 03 项只在非 `--gpu-only`（offload 设备是 CPU）时出现，CT 700 上测不到；CPU 测试用 meta 当计算设备模拟（`test_master_switch.py`）。
+
+**可选：** `run_all.sh`（测试素材同 §10.7，`/models/monoload-test`）：现在 41 组（多了 `test_lora_save` 和「ComfyUI 的 VAE 接口变了」的入口测试），最后一行 `suites failed: 0, skipped (missing model files): 0`；缺合成 checkpoint 时跳过的组会计数、退出码非零。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
@@ -1267,7 +1296,7 @@ web/monoload_info.js        前端扩展：把 Monoload Info 的文字显示在�
 web/monoload_i18n.js        前端扩展：下拉选项的显示文字按语言翻译（只改显示，存储值不变）
 monoload/vae_overrides.py   单个 VAE 的设置（节点做的副本带的设置；不导入 torch / ComfyUI）
 monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），lora_settings.py = Monoload LoRA Settings，vae_settings.py = Monoload VAE Settings，info.py = Monoload Info
-tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
+tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；保存挂 LoRA 的模型：test_lora_save.py、check_lora_save.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
                             bench_vae.py、check_vae_node.py、make_synthetic_vaes.py、alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10；
                             第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16；Flux 2：test_vae_flux2.py；
                             自检峰值诊断：check_selftest_mem.py，DESIGN.md §9.19）
