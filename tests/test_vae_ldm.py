@@ -398,7 +398,8 @@ def plan_tests(sd, lat4):
                                                          plan.live_peak / G, plan.prefix_bytes / G, plan.stripe_bytes / G, plan.pass_bytes / G,
                                                          plan.arena / G, plan.estimate / G, plan.recompute),
               len(plan.passes) == 19 and len(plan.saves) == {"A": 0, "D": 1, "B": 2, "C": 5}[scheme] and floor_ok and parts
-              and plan.out_segment == eng.out_segment(outb) and plan.estimate == plan.out_segment + plan.arena + plan.largest + eng.ESTIMATE_PAD)
+              and plan.out_segment == eng.out_segment(outb) and plan.estimate == plan.out_segment + plan.arena + plan.largest + eng.ESTIMATE_PAD
+              and plan.arena % (2 * eng.MIB) == 0)   # what the allocator reserves for it (review 2026-10 item 07: B's layout slack)
     check("schemes: arena A < D < B < C; recompute A > D > B, A > D > C (C's saves share one pool, B's are separate: {} / {})".format(
           res["C"].save_layout, res["B"].save_layout),
           res["A"].recompute > res["D"].recompute > res["B"].recompute and res["D"].recompute > res["C"].recompute

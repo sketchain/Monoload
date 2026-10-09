@@ -489,7 +489,9 @@ class Plan:
         for name, alive, final_bytes, extra, save_alloc in variants:
             fb, pb, rows = layout(alive, final_bytes)
             live = int(persistent + max(self.prefix_bytes, fb, pb))
-            arena = arena_bytes(live, len(self.stripes), bool(saves), ws) + extra
+            # extra (the separate layout's slack for dead saves) is any number of bytes; the allocator reserves the
+            # arena rounded up to 2 MiB, so the estimate takes it rounded too
+            arena = -(-(arena_bytes(live, len(self.stripes), bool(saves), ws) + extra) // (2 * MIB)) * (2 * MIB)
             if best_v is None or arena < best_v[0]:
                 best_v = (arena, name, alive, fb, pb, rows, live, save_alloc, extra)
         self.arena, self.save_layout, alive, self.stripe_bytes, self.pass_bytes, rows, self.live_peak, save_alloc, self.save_slack = best_v
