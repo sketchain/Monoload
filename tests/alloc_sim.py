@@ -490,11 +490,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
             ws_ = ws or mvae.workspace()
             stats = vae_ops.OpStats()
             with torch.inference_mode(), tracer:
-                with vae_ops.OpChunking(fsm, ws_, stats):
-                    z = lat.to(dt)
-                    out = fsm.decode(z)
-                    del z
-                out = out.to(torch.float32)
+                out = mvae._run(v, lat, {}, ws_, stats)   # the managed layer-2 decode itself (review 2026-10 item 16)
                 del out
                 tracer.poll()
     info["peak_blocks"] = [x for x in sim.peak_blocks if x[1] != "weights"]
