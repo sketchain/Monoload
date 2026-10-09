@@ -944,7 +944,12 @@ def main():
             if other == "native" or other not in captured:
                 continue
             if ref is None:
-                accuracy.append({"res": label, "pair": other + " vs native", "note": "native failed (OOM): no reference"})
+                if "native" not in modes:
+                    note = "native not run (not in --modes): no reference"
+                else:
+                    st = next((r["status"] for r in results if r.get("res") == label and r.get("mode") == "native"), "?")
+                    note = "native failed ({}): no reference".format(st)   # OOM, OOM(tiled), ...
+                accuracy.append({"res": label, "pair": other + " vs native", "note": note})
                 continue
             c = compare((ref[0], ref[1]), (captured[other][0], captured[other][1]), captured[other][2], a.boundary_rows)
             c.update({"res": label, "pair": other + " vs native"})
