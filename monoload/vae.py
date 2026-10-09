@@ -14,9 +14,12 @@ around first_stage_model.decode:
   * operators: layer 2 of the design -- op-level chunking (monoload/vae_ops.py):
     convs in blocks of output rows bounded by the workspace budget, attention
     in blocks of queries over the whole K/V;
-  * OOM: retried with half the workspace, down to MIN_WORKSPACE; then
-    MonoloadVAEOOMError. decode_tiled_ (tile-local GroupNorm, an
-    approximation) is never called;
+  * OOM: layer 2 is retried with half the workspace, down to MIN_WORKSPACE;
+    layer 1 with half the stripe height and half the workspace together,
+    skipping a step whose estimate is above the first plan's, down to
+    vae_engine.MIN_ROWS / MIN_WORKSPACE (never falling back to layer 2); then
+    MonoloadVAEOOMError, as is an OOM in the first-use layer-1 self-test.
+    decode_tiled_ (tile-local GroupNorm, an approximation) is never called;
   * output: device, dtype, process_output (to [0, 1], clamped) and the
     channels-last layout exactly as native.
 

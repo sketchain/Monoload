@@ -168,7 +168,9 @@ ARENA_DIV_SAVES = 16         # ... with GroupNorm saves (the pool splits the are
 ARENA_FEW_STRIPES = 3        # ... with saves and at most this many stripes: live / ARENA_DIV_SINGLE
 ARENA_WS_FREE = 128 * MIB    # ... with saves and a larger workspace: at least the workspace
 ARENA_PAD = 64 * MIB
-ESTIMATE_PAD = 16 * MIB      # small-block pool (<= 1 MiB requests come from their own 2 MiB segments; 2-6 MiB seen)
+ESTIMATE_PAD = 16 * MIB      # small-block pool (<= 1 MiB requests come from their own 2 MiB segments; 2-6 MiB seen), and
+                             # what the model leaves out: place() always splits a free block (the allocator keeps a
+                             # remainder <= 1 MiB attached), a bf16 latent's CPU -> GPU copy may stage an fp32 temporary
 CONTIGUOUS_INPUT = (UP,)     # units whose row slice is made contiguous before the call
 ARENA_ENABLED = True         # bench --no-arena: off, to measure the tensors' own peak (the arena block counts as allocated)
 CKPT_LOW = True              # a checkpoint that is not at the front of the arena moves into a free block below it if one fits
