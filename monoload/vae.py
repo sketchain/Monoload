@@ -521,7 +521,7 @@ def _model_traits(fsm):
     for m in modules:
         if batch_time and isinstance(m, batch_time):
             mixes = True
-        if isinstance(m, (torch.nn.Conv2d, torch.nn.Conv3d)) or m.__dict__.get("optimized_attention") in known:
+        if isinstance(m, (torch.nn.Conv2d, torch.nn.Conv3d)) or any(m.__dict__.get(a) in known for a in vae_ops.ATTENTION_ATTRS):
             ops = True
     hit = (mixes, ops)
     try:
