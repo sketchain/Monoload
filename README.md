@@ -976,7 +976,7 @@ done
 
 ### 9.15 第二轮代码审查修正（基准 main 5d9ac63）：真机检查
 
-**状态：待 CT 700 上跑。** 改动和 CPU 小测试见 HANDOFF §4.0（第二轮审查）。拉新代码后重启容器（插件改了：`hotpatch` 多接管了 `model_state_dict_for_saving`，`release`、`vae*` 都有改动）。先让服务把模型卸掉（`/free`，同 9.1）。
+**状态：已在 CT 700 上验收（8c5cb37，结果见 §10.8）。** 改动和 CPU 小测试见 HANDOFF §4.0（第二轮审查）。拉新代码后重启容器（插件改了：`hotpatch` 多接管了 `model_state_dict_for_saving`，`release`、`vae*` 都有改动）。先让服务把模型卸掉（`/free`，同 9.1）。
 
 ```bash
 curl -X POST http://127.0.0.1:8188/free -H 'Content-Type: application/json' -d '{"unload_models":true,"free_memory":true}'
@@ -1271,6 +1271,26 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
   * 原生备份 788 / 986 / 1052（同 9.1），Monoload 两种模式都是 0；切换组合（patch）原生 0.43–0.67 s，Monoload 0.09–0.11 s。
   * GTT：Monoload 8.2–8.7 GiB，原生 13.9 GiB。
   * layer probe 与 9.1 第三轮完全一致：788 层、4.77 GiB；每次模型调用临时拷贝 0.038 s、逐位一致 0.222 s、默认路径 0.052 s；默认路径与逐位一致的权重差异 2.54e-3，在容差 0.0308 以内。
+
+### 10.8 第二轮审查修正：真机检查（`check_lora_save`、`bench_vae_review2`、`run_all`，2026-10，8c5cb37）
+
+§9.15 的命令和 `run_all.sh`，**全部通过**。
+
+* **AC（WAI v17 SDXL + `Smooth_Booster_v5`，强度 1.0：788 个 UNet key、0 个 text-encoder key）：** 默认（Monoload）和节点 `mode native` 存出来的文件与卸掉钩子的原生**逐张量相同**（dtype、形状、字节）：
+
+| 节点 | 张量 | LoRA 改到的（与底模比） | Monoload / 节点 native 对原生 |
+|---|---|---|---|
+| `CheckpointSave` | 2515 | 722 | IDENTICAL / IDENTICAL |
+| `ModelSave` | 1680 | 722 | IDENTICAL / IDENTICAL |
+| `CLIPSave` | 716 | 0（没有 TE key，存的就是底模的 CLIP） | IDENTICAL / IDENTICAL |
+
+  * 存完：`backups 0`，运行时 patch 仍在（UNet 788；CLIPSave 时 CLIP 没有 patch，为 0），权重逐字节不变。`RESULT: OK`。
+* **AD：** 与一个整进程 `MONOLOAD=0` 的原生 `CheckpointSave` 比，2515 个张量 IDENTICAL。
+* **AE（SDXL 4K 默认）：** 第一层方案 B 17 条 128 行，arena 2.07 GiB，估算 2.68 GiB；热启动 GTT 峰值增量 2.17、reserved 2.17 GiB、42.0 s（耗时模型 42.7 s），与 §10.4 相同；冷启动 reserved 2.24、GTT 2.38、43.5 s（含进程第一批 GPU 计算和第一次自检，自检 1.01 s，上界 430 MiB）。（这次只跑了 `--modes monoload`，精度汇总里写的「native failed (OOM)」是 bench 的提示错了，实际是没跑原生，已改成「native not run」。）
+* **`run_all.sh`：** 41 组、1494 项检查，`suites failed: 0, skipped (missing model files): 0`。
+  * 新加 / 改过的测试：`test_lora_save` 8、`test_lora_node` 20、`test_info_node` 32、`test_lora_lowvram_hook` 14、`test_release_chain` 2、`test_master_switch` 19、`test_vae` 136、`test_vae_ldm` 103、`test_vae_flux2` 54、`test_vae_node` 26、`test_vae_retry` 6、`test_vae_selftest_budget` 10、`test_check_selftest_mem` 5。
+  * LoRA 功能测试：`MONOLOAD_EXACT=1` 时 dtype 108、LoRA 80、fp8 8、释放 2 + 42 × 3 + `MONOLOAD_KEEP_LORA` 22；默认路径 dtype 198、LoRA 106、fp8 8、释放 2 + 42 × 3 + 22。
+  * **例外：**「ComfyUI 的 VAE 接口变了」那一组在 CT 700 上实际跑的是普通入口测试（17 项，不是这个模式的 11 项）：`docker_run.sh` 只把 `MONOLOAD*` 变量传进容器，`TEST_BROKEN_VAE_API` 没传进去。之后已修（eee564c：`run_all` 在容器里设这个变量，`docker_run.sh` 也传它）。这个场景目前只在 CPU 上验证过（11 项）。修好后 `run_all` 应为 41 组、1488 项。
 
 ## 11. 仓库结构
 
