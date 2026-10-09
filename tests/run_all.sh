@@ -35,7 +35,7 @@ step "plugin entry (MONOLOAD_KEEP_LORA=1)"; run env MONOLOAD_KEEP_LORA=1 $R pyth
 step "plugin entry (MONOLOAD_EXACT=1)";     run env MONOLOAD_EXACT=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_DISABLE_VAE=1)"; run env MONOLOAD_DISABLE_VAE=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_DISABLE_VAE_STRIPE=1)"; run env MONOLOAD_DISABLE_VAE_STRIPE=1 $R python tests/test_entry.py
-step "plugin entry (a ComfyUI whose VAE API changed: LoRA and nodes still installed)"; run env TEST_BROKEN_VAE_API=1 $R python tests/test_entry.py
+step "plugin entry (a ComfyUI whose VAE API changed: LoRA and nodes still installed)"; run $R env TEST_BROKEN_VAE_API=1 python tests/test_entry.py
 step "messages and translations (no model files)"; run $R python tests/test_messages.py
 step "release with a chain of patch-free clones (no model files)"; run $R python tests/test_release_chain.py
 step "Info node (no model files)"; run $R python tests/test_info_node.py
