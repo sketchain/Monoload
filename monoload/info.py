@@ -158,8 +158,9 @@ def describe_decode(r):
 
 def vae_section(v):
     from . import vae, vae_overrides
-    own = vae_overrides.overrides(v)
-    lines = [msg("info.vae_head", model=type(getattr(v, "first_stage_model", None)).__name__, copy=msg("info.vae_copy") if own else "")]
+    # a copy made by the node carries the attribute even with every item left at default ({}): still its own object
+    copy_ = hasattr(v, vae_overrides.ATTR)
+    lines = [msg("info.vae_head", model=type(getattr(v, "first_stage_model", None)).__name__, copy=msg("info.vae_copy") if copy_ else "")]
     if not vae.is_installed():
         lines.append(msg("info.vae_not_installed"))
     eff, src = vae.resolve_settings(v)

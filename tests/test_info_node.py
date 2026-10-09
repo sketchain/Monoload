@@ -140,6 +140,11 @@ def vae_tests():
           and "layer 1 (LDM stripes" in t_orig2 and re.search(r"workspace .*, estimate .*, measured peak .*, [0-9.]+ s, OOM retries 0", last))
     check("the scheme the decode used is explained in one line: {}".format(next((l for l in t_orig2.splitlines() if "GroupNorm scheme B:" in l), "").strip()),
           "GroupNorm scheme B: keeps the H/4 and H/2 level outputs" in t_orig2)
+    plain_copy = node_apply(cls_v, sd)   # every item left at default: still a copy of its own (review 2026-10 item 18)
+    check("a node copy with every item at default is marked as a copy, the original is not ({})".format(
+          next(l for l in text(vae=plain_copy).splitlines() if l.startswith("VAE (")).strip()),
+          plain_copy is not sd and "a Monoload VAE Settings copy" in text(vae=plain_copy)
+          and "a Monoload VAE Settings copy" not in text(vae=sd))
     nat = node_apply(cls_v, sd, mode="native")
     native_decode(nat, lat)   # the original method: no record
     comfy.sd.VAE.decode(nat, lat)
