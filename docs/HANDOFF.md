@@ -22,11 +22,11 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | SDXL / Flux `ae` | 52.5 GiB / 11.9 s | 15.0 GiB / 9.9 s | 默认 B 2.17 GiB / 42 s（A 1.10 / 75，D 1.52 / 58，C 4.70 / 36） |
 | `qwen_image_vae` | 59.2 GiB / 7.9 s | 9.6 GiB / 6.9 s | 0.87 GiB / 8.5 s |
 
-验收情况：VAE 三个阶段、预算策略、VAE 节点、总开关、LoRA 节点、Info 节点、多语言都已在 CT 700 上通过（最近一次 8c5cb37：第二轮审查修正后的 `run_all.sh` 和命令 AC / AD / AE，README §10.8）。polish-after-ui-test（05ded8d）修了 UI 实测发现的六处问题，待 CT 700 复测（README §9.10）。
+验收情况：VAE 三个阶段、预算策略、VAE 节点、总开关、LoRA 节点、Info 节点、多语言都已在 CT 700 上通过（最近一次 e924a77：第二轮审查修正后的 `run_all.sh` 和命令 AC / AD / AE / Z，README §10.8）。polish-after-ui-test（05ded8d）修了 UI 实测发现的六处问题，待 CT 700 复测（README §9.10）。
 
 **第四阶段 4a（vae-inventory，575fc46；命令 W 的识别修正 87e6262）**：只加了盘点脚本和文档，插件行为没变。结论：用户实际在用的三个 VAE（SDXL、Flux `ae`、`qwen_image_vae`）的图像解码**已经全部走第一层**；其余 VAE 的结构、现在的路、模拟峰值和建议顺序见 §4 和 DESIGN §9.16；发现现有代码的 4 处缺口（SVD 结果被改变、2D latent 的音频 VAE 被管理且 ACE 的估算约 1 PiB、像素空间被管理、TAESD 小图第二层反而更高）。用户已定顺序（§4.0）。
 
-**第二轮代码审查（基准 main 5d9ac63，ComfyUI 62b3c94，2026-10）：已完成并在 CT 700 上验收**（8c5cb37，README §10.8）。清单 01–20 全部改完；21、23 按用户的决定做了，22 不做（§4.0）。最要紧的是 01：默认设置下 `CheckpointSave` / `ModelSave` / `CLIPSave` 以前会把 LoRA 悄悄丢掉、存成底模；CT 700 上 SDXL + Smooth Booster 存出的 checkpoint 与原生 2515 个张量逐个相同（也与整进程 `MONOLOAD=0` 相同）。验收后的小修正（没上真机）：`run_all` 的「VAE 接口变了」那组在容器里没拿到 `TEST_BROKEN_VAE_API`、实际跑的是普通入口测试，已修（eee564c）；`bench_vae` 没跑原生时写「native not run」（17880b8）；21 / 23 见 §4.0。
+**第二轮代码审查（基准 main 5d9ac63，ComfyUI 62b3c94，2026-10）：已完成并在 CT 700 上验收**（8c5cb37，README §10.8）。清单 01–20 全部改完；21、23 按用户的决定做了，22 不做（§4.0）。最要紧的是 01：默认设置下 `CheckpointSave` / `ModelSave` / `CLIPSave` 以前会把 LoRA 悄悄丢掉、存成底模；CT 700 上 SDXL + Smooth Booster 存出的 checkpoint 与原生 2515 个张量逐个相同（也与整进程 `MONOLOAD=0` 相同）。验收之后又改了：`run_all` 的「VAE 接口变了」那组在容器里没拿到 `TEST_BROKEN_VAE_API`、实际跑的是普通入口测试，已修（eee564c）；`bench_vae` 没跑原生时写「native not run」（17880b8）；21 / 23 见 §4.0。**这些也已在 CT 700 上复查通过**（e924a77，README §10.8 复查）：`run_all.sh` 41 组 1490 项 0 失败 0 跳过，「VAE 接口变了」那组 11 项、有 NOT managed 警告；命令 AE 不变；命令 Z（Flux 2 预算 3G / 1.5G）六档选择与 §10.5 相同，每档第一次（探测 + 自检 + 解码）都 ≤ 估算。
 
 **4b-1（vae-flux2-layer1，4fbaa22，CT 700 验收通过）**：Flux 2 VAE（`AutoencoderKL` + batch-norm latent）走第一层，复用 LDM 适配器：latent 的反归一化和 2×2 还原是前缀第一个模块（`vae_ldm.LatentUnpatch`），引擎加 `decoder_hw` 钩子在 decoder 的分辨率上做计划。模拟与 Flux `ae` 相同（4K 默认 B 2.18 GiB）。DESIGN §9.18，测试 `tests/test_vae_flux2.py`，真机命令 README §9.12。
 
@@ -92,8 +92,8 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
   * **LoRA / 释放**：01 保存时 LoRA 被丢掉（`lora-save-state-dict`；接管 `model_state_dict_for_saving`，调用期间把这个 patcher 被 patch 的层的 `comfy_patched_weights` 暂设 False，这些层走原生 `LazyCastingParam` 精确合并；`tests/test_lora_save.py`，真机脚本 `tests/check_lora_save.py`）；02 有原生备份的 patcher 不同步 uuid（`release-sync-backup`；先用 `PromptExecutor` 证实 clone 在那次释放里被回收、下个 prompt 带着 LoRA，max|Δ| 26.8）；03 原生 patcher 被节点释放时，从 offload 设备还原的参数移回原设备（`release-native-offload`，选了「移回」而不是 `model_unload`：底模仍常驻，`--gpu-only` 时什么都不做）；04 删掉 `_drop_shadowed_runtime_patches`（`lora-drop-shadowed-hooks`）；05 摘运行时 patch 时不删 `comfy_patched_weights`（`lora-hook-keep-flag`；比清单多一步：清单只保留 `keep is None` 时删，但只有 hook、没有普通 LoRA 的模型每次采样结束也走 `keep=None`，那样仍会删光，所以整个去掉）。
   * **VAE**：06 自检 OOM 包成 `MonoloadVAEOOMError`（用户选 (a)，不缓存、不退第二层；预算路径不再把它记成「预算不够」）；07 arena 加完余量再按 2 MiB 取整（alloc_sim 21 个受影响的计划 reserved 不变、≤ 估算）；08 第一层 OOM 报错写最后真跑过的计划，跳过的档另列；09 自检失败转第二层时记录含自检；10 预算报错的小数位数加到估算和预算看得出差别为止（2–6 位），节点预算按字节四舍五入；11 ComfyUI 升级使 VAE 部分导入失败时节点和 LoRA 部分照常（`TEST_BROKEN_VAE_API=1` 的入口测试，进了 `run_all.sh`）；12 第二层也分块 SeedVR2 的 `optimized_vae_attention`。
   * **测试 / Info / 文档**：13 `test_check_selftest_mem` 前置条件不满足时退出码 1；14 `run_all.sh` 缺模型文件跳过的组计数、退出码 = 失败 + 跳过；15 alloc_sim 的 fp32 配置也拷贝 latent（两条上界断言的配置不变；fp32 重放 v2 4K 2.07 → 2.09、v1 4K 3.21 → 3.23）；16 alloc_sim 第二层直接跑 `vae._run`（21 个第二层读数不变）；17 Info 中文下来源「环境变量」；18 全选 default 的节点副本也标「副本」；19 `gn_scheme` tooltip 加 Flux 2（`test_messages` 多查英文 locale 与节点自己的 tooltip 一致）；20 文档（另外把方案 C「全分辨率每个块的输入」改成「输出」，tooltip、两份 locale、消息表、README、DESIGN、HANDOFF 都有这个错）。
-  * **21–23（先分析，用户定了之后）**：21 **做了**（`vae-probe-cache`，56b9e93）：预算模式第一次解码时 8×8 形状探测的块留在缓存里紧接自检，alloc_sim 上 Wan（`qwen_image_vae`）fp32 自检到 426 / 430 MiB；现在 `vae._shape_probe` 探测完清一次缓存，所有结构 bf16 / fp32 的自检峰值都与单独自检相同（Wan fp32 410，余量 4 → 20 MiB），`alloc_sim.selftest_trace(probe=True)` 和 `test_vae_flux2` 检查。22 **不做**（用户定）：`place()` 补「剩余 ≤ 1 MiB 不切分」后 3780 个计划完全相同，DESIGN §9.14.11 记了一句（a0ce191）。23 **做了**（`vae-probe-memreq`，c9e6bcf）：8×8 探测交给 `load_models_gpu` 的 `memory_required` 不再带 2 × 工作区（以前 2.02–2.13 GiB，探测实际只占 18–238 MiB；现在是探测自己的小估算，`load_models_gpu` 另有约 0.8 GiB 的 `minimum_inference_memory` 兜底），`test_vae_ldm` 检查。
-  * **已在 CT 700 上验收**（8c5cb37，README §10.8）：AC / AD 三种保存与原生逐张量相同；AE SDXL 4K 默认 2.17 GiB / 估算 2.68，与以前相同；`run_all.sh` 41 组 1494 项 0 失败 0 跳过（其中「VAE 接口变了」那组实际没进入该模式，eee564c 修好后应为 1488 项）。21 / 23 和这两处测试工具的修正在验收之后，没上真机。
+  * **21–23（先分析，用户定了之后）**：21 **做了**（`vae-probe-cache`，56b9e93）：预算模式第一次解码时 8×8 形状探测的块留在缓存里紧接自检，alloc_sim 上 Wan（`qwen_image_vae`）fp32 自检到 426 / 430 MiB；现在 `vae._shape_probe` 探测完清一次缓存，所有结构 bf16 / fp32 的自检峰值都与单独自检相同（Wan fp32 410，余量 4 → 20 MiB），`alloc_sim.selftest_trace(probe=True)` 和 `test_vae_flux2` 检查；CT 700 命令 Z 复查：每档第一次都 ≤ 估算（README §10.8）。22 **不做**（用户定）：`place()` 补「剩余 ≤ 1 MiB 不切分」后 3780 个计划完全相同，DESIGN §9.14.11 记了一句（a0ce191）。23 **做了**（`vae-probe-memreq`，c9e6bcf）：8×8 探测交给 `load_models_gpu` 的 `memory_required` 不再带 2 × 工作区（以前 2.02–2.13 GiB，探测实际只占 18–238 MiB；现在是探测自己的小估算，`load_models_gpu` 另有约 0.8 GiB 的 `minimum_inference_memory` 兜底），`test_vae_ldm` 检查；CT 700 复查通过（命令 Z，选择和数字不变）。
+  * **已在 CT 700 上验收**（8c5cb37，README §10.8）：AC / AD 三种保存与原生逐张量相同；AE SDXL 4K 默认 2.17 GiB / 估算 2.68，与以前相同；`run_all.sh` 41 组 1494 项 0 失败 0 跳过（其中「VAE 接口变了」那组实际没进入该模式）。**复查**（e924a77，含 21 / 23 和两处测试工具的修正）：`run_all.sh` 41 组 1490 项（那一组 17 → 11，21 / 23 在 `test_vae_flux2` / `test_vae_ldm` 各加 1 项）0 失败 0 跳过；AE 不变；命令 Z 不变，每档第一次 ≤ 估算。
 * **已在 CT 700 上验收**（4f140ea，B + A 和这次的改动一起，命令 AA / X / Y / Z，README §10.6）：自检峰值 0.37（加 warm-up，≤ 上界 0.42）/ 0.45（不加，含进程第一批 GPU 计算约 0.07，不在上界里）；decode 1 = decode 2 = 2.43，解码后只留 0.09；X / Y / Z / check_vae_node 的选择和数字都与预测一致。
 
 ### 4.1 入口和做法（4a 之前写的，仍然适用）
@@ -176,6 +176,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | 第二轮审查 10 / 20 / 16 / 01 的真机脚本 / 15 | 5e6be4a / c9e4ea0 / 349e641 / e5003cc / 84627fb |
 | 第二轮审查的文档和真机清单 | 8c5cb37 |
 | 验收后：`TEST_BROKEN_VAE_API` 传进容器 / bench_vae「native not run」/ 21 / 22 / 23 | eee564c / 17880b8 / 56b9e93 / a0ce191 / c9e6bcf |
-| 第二轮审查的真机结果 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
+| 第二轮审查的真机结果 | e924a77 |
+| 复查结果（21 / 23 / 测试工具修正后） | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。
