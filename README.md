@@ -976,7 +976,7 @@ done
 
 ### 9.15 第二轮代码审查修正（基准 main 5d9ac63）：真机检查
 
-**状态：已在 CT 700 上验收（8c5cb37，结果见 §10.8）。** 改动和 CPU 小测试见 HANDOFF §4.0（第二轮审查）。拉新代码后重启容器（插件改了：`hotpatch` 多接管了 `model_state_dict_for_saving`，`release`、`vae*` 都有改动）。先让服务把模型卸掉（`/free`，同 9.1）。
+**状态：已在 CT 700 上验收（8c5cb37；之后的修正在 e924a77 复查通过，结果见 §10.8）。** 改动和 CPU 小测试见 HANDOFF §4.0（第二轮审查）。拉新代码后重启容器（插件改了：`hotpatch` 多接管了 `model_state_dict_for_saving`，`release`、`vae*` 都有改动）。先让服务把模型卸掉（`/free`，同 9.1）。
 
 ```bash
 curl -X POST http://127.0.0.1:8188/free -H 'Content-Type: application/json' -d '{"unload_models":true,"free_memory":true}'
@@ -1272,7 +1272,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
   * GTT：Monoload 8.2–8.7 GiB，原生 13.9 GiB。
   * layer probe 与 9.1 第三轮完全一致：788 层、4.77 GiB；每次模型调用临时拷贝 0.038 s、逐位一致 0.222 s、默认路径 0.052 s；默认路径与逐位一致的权重差异 2.54e-3，在容差 0.0308 以内。
 
-### 10.8 第二轮审查修正：真机检查（`check_lora_save`、`bench_vae_review2`、`run_all`，2026-10，8c5cb37）
+### 10.8 第二轮审查修正：真机检查（`check_lora_save`、`bench_vae_review2` / `review3`、`bench_vae_flux2_budget3`、`run_all`，2026-10，8c5cb37 / e924a77）
 
 §9.15 的命令和 `run_all.sh`，**全部通过**。
 
@@ -1290,7 +1290,20 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 * **`run_all.sh`：** 41 组、1494 项检查，`suites failed: 0, skipped (missing model files): 0`。
   * 新加 / 改过的测试：`test_lora_save` 8、`test_lora_node` 20、`test_info_node` 32、`test_lora_lowvram_hook` 14、`test_release_chain` 2、`test_master_switch` 19、`test_vae` 136、`test_vae_ldm` 103、`test_vae_flux2` 54、`test_vae_node` 26、`test_vae_retry` 6、`test_vae_selftest_budget` 10、`test_check_selftest_mem` 5。
   * LoRA 功能测试：`MONOLOAD_EXACT=1` 时 dtype 108、LoRA 80、fp8 8、释放 2 + 42 × 3 + `MONOLOAD_KEEP_LORA` 22；默认路径 dtype 198、LoRA 106、fp8 8、释放 2 + 42 × 3 + 22。
-  * **例外：**「ComfyUI 的 VAE 接口变了」那一组在 CT 700 上实际跑的是普通入口测试（17 项，不是这个模式的 11 项）：`docker_run.sh` 只把 `MONOLOAD*` 变量传进容器，`TEST_BROKEN_VAE_API` 没传进去。之后已修（eee564c：`run_all` 在容器里设这个变量，`docker_run.sh` 也传它）。这个场景目前只在 CPU 上验证过（11 项）。修好后 `run_all` 应为 41 组、1488 项。
+  * **例外：**「ComfyUI 的 VAE 接口变了」那一组在这次（8c5cb37）实际跑的是普通入口测试（17 项，不是这个模式的 11 项）：`docker_run.sh` 只把 `MONOLOAD*` 变量传进容器，`TEST_BROKEN_VAE_API` 没传进去。之后修好（eee564c），下面的复查里这一组已真正进入该模式。
+
+**复查（e924a77：上面的例外修好、`bench_vae` 的提示修正、审查 21（探测后清缓存）/ 23（探测的 `memory_required` 不带工作区）之后）：全部通过。**
+
+* **`run_all.sh`：** 41 组、1490 项检查，`suites failed: 0, skipped (missing model files): 0`。「VAE 接口变了」那一组 11 项，日志有 `VAE decode NOT managed`（`AttributeError: type object 'Conv3d' has no attribute '_conv_forward'`），LoRA 和释放照常安装、节点照常注册。比 8c5cb37 的 1494 少 4：这一组 17 → 11，21 和 23 各在 `test_vae_flux2`（54 → 55）、`test_vae_ldm`（103 → 104）加了 1 项。
+* **AE（SDXL 4K 默认，`bench_vae_review3`）：** 与上面相同：B 17 × 128，热启动 GTT 2.17 / 估算 2.68，冷启动 reserved 2.24 / GTT 2.38；精度汇总写 `native not run (not in --modes): no reference`。
+* **命令 Z（Flux 2 按预算选，`bench_vae_flux2_budget3`，GTT / 估算 / 热启动 s）：** 六档的选择与 §10.5 相同，数字差 ≤ 0.01 GiB。每档第一次（预算模式下：形状探测 + 需要时的第一次自检 + 解码）都 ≤ 估算。
+
+| | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| 预算 3G | 整图 1 条 768 行，1.98 / 2.48 / 1.0；第一次 reserved 1.98、GTT 2.02（含 B 的自检） | C 4 × 384，2.73 / 3.00 / 12.7；第一次 2.73 | B 12 × 180，2.43 / 2.96 / 41.3；第一次 2.43 |
+| 预算 1.5G | C 2 × 384，1.05 / 1.25 / 2.9；第一次 1.05（含 C 的自检） | B 16 × 96，1.22 / 1.48 / 20.3；第一次 1.22 | A 17 × 128，1.10 / 1.49 / 75.5；第一次 GTT 1.12（含 A 的自检） |
+
+  原生对照：1344 8.37、2688 42.88、4K 52.52 GiB（4K 原生内部 OOM 后退回较小的分配，日志有 HIP 的 OOM 警告，结果正常）。预算模式与原生的差异 PSNR 64.4–64.9 dB，像素 max ≤ 0.034，与 §10.5 同一水平。
 
 ## 11. 仓库结构
 
