@@ -336,6 +336,36 @@ def selftest_tests(sd, lat4):
         note = last.get("layer1") or ""
         check("injected bug: {} -> self-test fails, layer 2, == native (max|Δ| {:.2g}): {}".format(label, float((out - ref).abs().max()), note[:150]),
               last.get("strategy") == "layer2" and "self-test failed" in note and float((out - ref).abs().max()) <= 1e-4)
+    # review 2026-10 item 06: an OOM inside the first-use self-test -> MonoloadVAEOOMError with the message of the table,
+    # recorded as an OOM, not cached (the next decode runs the self-test again), no layer-2 fallback; budget path too
+    orig_run = eng._self_test_run
+
+    def oom_run(bound, vae):
+        raise comfy.model_management.OOM_EXCEPTION("injected")
+    rows = []
+    for label, bud in (("default policy", None), ("budget 4 GiB", 4 << 30)):
+        eng._SELFTEST.clear()
+        mvae.set_budget(bud)
+        eng._self_test_run = oom_run
+        try:
+            try:
+                managed_decode(sd, lat4)
+                err = None
+            except Exception as e:
+                err = e
+            last = mvae.last_decode()
+        finally:
+            eng._self_test_run = orig_run
+            mvae.set_budget(None)
+        good = (isinstance(err, MonoloadVAEOOMError) and "self-test" in str(err) and bound.name in str(err)
+                and last.get("strategy") == "error" and last.get("kind") == "oom" and not eng._SELFTEST)
+        rows.append("{}: {} / record {} {}".format(label, type(err).__name__, last.get("strategy"), last.get("kind")))
+        check("OOM in the first-use self-test, {}: MonoloadVAEOOMError ({}), recorded as an OOM ({} / {}), not cached ({} entries)".format(
+              label, str(err).splitlines()[0][:110] if err else None, last.get("strategy"), last.get("kind"), len(eng._SELFTEST)), good)
+    out = managed_decode(sd, lat4)
+    check("... the next decode runs the self-test again and decodes on layer 1 ({}; cached {})".format(
+          mvae.last_decode().get("strategy"), len(eng._SELFTEST)), mvae.last_decode().get("strategy") == "layer1" and len(eng._SELFTEST) == 1
+          and out is not None)
     eng._SELFTEST.clear()
     for scheme in "AD":
         mvae.set_gn_scheme(scheme)
@@ -368,7 +398,8 @@ def plan_tests(sd, lat4):
                                                          plan.live_peak / G, plan.prefix_bytes / G, plan.stripe_bytes / G, plan.pass_bytes / G,
                                                          plan.arena / G, plan.estimate / G, plan.recompute),
               len(plan.passes) == 19 and len(plan.saves) == {"A": 0, "D": 1, "B": 2, "C": 5}[scheme] and floor_ok and parts
-              and plan.out_segment == eng.out_segment(outb) and plan.estimate == plan.out_segment + plan.arena + plan.largest + eng.ESTIMATE_PAD)
+              and plan.out_segment == eng.out_segment(outb) and plan.estimate == plan.out_segment + plan.arena + plan.largest + eng.ESTIMATE_PAD
+              and plan.arena % (2 * eng.MIB) == 0)   # what the allocator reserves for it (review 2026-10 item 07: B's layout slack)
     check("schemes: arena A < D < B < C; recompute A > D > B, A > D > C (C's saves share one pool, B's are separate: {} / {})".format(
           res["C"].save_layout, res["B"].save_layout),
           res["A"].recompute > res["D"].recompute > res["B"].recompute and res["D"].recompute > res["C"].recompute
@@ -589,6 +620,28 @@ def budget_tests(sd, lat4):
         mvae.set_budget(None)
 
 
+def probe_request_tests(sd, lat4):
+    """Review 2026-10 item 23: what the 8 x 8 shape probe asks load_models_gpu for has no workspace in it."""
+    import comfy.model_management as mm
+    asked = []
+    orig = mm.load_models_gpu
+
+    def spy(models, memory_required=0, **kw):
+        asked.append(memory_required)
+        return orig(models, memory_required=memory_required, **kw)
+    mvae._PROBES.clear()
+    mm.load_models_gpu = spy
+    try:
+        est, probe = mvae._layer2_estimate(sd, lat4, {}, 1 << 30)
+    finally:
+        mm.load_models_gpu = orig
+    small = mvae.estimate(sd, lat4[0:1, ..., :mvae.PROBE_SIZE, :mvae.PROBE_SIZE], 0)["total"]
+    check("the shape probe asks load_models_gpu for {} (its own small estimate), not {} (with 2 x the 1 GiB workspace)".format(
+          vae_ops.fmt_bytes(asked[0]) if asked else None,
+          vae_ops.fmt_bytes(mvae.estimate(sd, lat4[0:1, ..., :mvae.PROBE_SIZE, :mvae.PROBE_SIZE], 1 << 30)["total"])),
+          probe is not None and asked == [small] and small < (64 << 20))
+
+
 def budget_plan_tests():
     """The README examples: full-size SDXL (meta device), budgets 20 / 3 / 1.5 GiB."""
     import alloc_sim
@@ -702,6 +755,7 @@ def main():
     selftest_tests(sd, lat4)
     plan_tests(sd, lat4)
     budget_tests(sd, lat4)
+    probe_request_tests(sd, lat4)
     budget_plan_tests()
     estimate_tests()
     allocator_tests()

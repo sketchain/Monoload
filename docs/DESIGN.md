@@ -30,13 +30,15 @@ v2 只做一件事：**在 ComfyUI 原生加载出来的模型上打 LoRA 时，
 
 ## 2. 挂载方式：替换 `ModelPatcher` 类上的方法
 
-`install()`（插件被 ComfyUI 导入时执行）直接在 `comfy.model_patcher.ModelPatcher` **这个类**上替换 8 个方法，原函数保存起来，由替换函数在需要时调用：
+`install()`（插件被 ComfyUI 导入时执行）直接在 `comfy.model_patcher.ModelPatcher` **这个类**上替换 10 个方法，原函数保存起来，由替换函数在需要时调用：
 
 | 方法 | Monoload 版本做什么 |
 |---|---|
 | `patch_weight_to_device` | 对有 patch 的 key：**不备份、不改权重**，把 `MonoloadRuntimePatch` 插到该层 `weight_function` / `bias_function` 的最前面。没有 patch 的 key，以及只取合并结果、不写回的 `return_weight=True`，交给原函数。 |
 | `load` | 检查 DynamicVRAM 和 `force_patch_weights`，清掉被 patch 层的 `comfy_patched_weights` 标记（见 §4），调用原 `load()`，最后断言没有产生备份。 |
-| `partially_unload` | 调用原函数后，去掉被原生 `LowVramPatch` 取代的那些运行时 patch（见 §4）。 |
+| `partially_unload` | 调用原函数，断言没有备份。被卸到 CPU 的层上原生追加的 `LowVramPatch` 加普通 LoRA，运行时 patch 留着只加 hook（见 §4）。 |
+| `partially_load` | 和已加载的 `patches_uuid` 相同的 clone 加载时（原生不 unpatch、直接返回），先把绑定指向它（§3.2）。 |
+| `model_state_dict_for_saving` | 保存（`CheckpointSave` / `ModelSave` / `CLIPSave`）：原生对标了 `comfy_patched_weights` 的层直接输出存着的张量（原生里 patch 已烘焙进去），Monoload 下那是底模；调用期间把这个 patcher 被 patch 的层的标记暂时改成 False，这些层走原生的 `LazyCastingParam`（`patch_weight_to_device(return_weight=True)`，精确合并），返回后恢复。存出来的和原生逐位一致（`tests/test_lora_save.py`）。 |
 | `unpatch_model` | 调用原函数；卸载权重时摘掉所有运行时 patch，清空设备上的 LoRA 缓存。 |
 | `patch_hooks` / `unpatch_hooks` | 只切换「当前生效的 hook patch」这个状态，不写权重（§3.2）。 |
 | `patch_hook_weight_to_device` / `patch_cached_hook_weights` | 不应再被调用，被调用即报内部错误。 |
@@ -106,7 +108,7 @@ Hook LoRA（复刻 patch_hook_weight_to_device，在已合并基础 LoRA 的权�
 
 每个模型有一个**绑定**（`_Binding`，放在 `patcher.model` 上，所有 clone 共用；review 01）：当前生效的 patcher 的 `patches` 和合并方式（exact）、当前生效的 `hook_patches`（key → hook patch 列表）、LoRA 张量的设备副本。模型上所有运行时 patch 每次调用都读它。`load` / `partially_load` / 装运行时 patch 时绑定指向正在加载的 patcher：同一个 `patches_uuid` 的 clone 加载时原生 `partially_load` 不卸载、权重全部已加载时也不调用 `load()`（只重新应用它的 forced hooks 就返回），所以要在调用原函数**之前**把绑定指向它。hook 状态由最后一次 `patch_hooks` / `unpatch_hooks` 的那个 clone 写，与原生一致（原生的 clone 共用权重和 `hook_backup`）。以前每个 patcher 一份状态、运行时 patch 绑着装它的那个 patcher，同 uuid 的 clone 会用前一个 clone 的 hook 强度、patches 和合并方式（CLIP 路径用 ComfyUI 自带的节点就能遇到，差 0.02；`tests/test_lora_clone_binding.py`）。没有运行时 patch 时绑定清空，不留住已经不用的 clone 的东西。
 
-`patch_hooks(hooks)` 用原生的 `get_combined_hook_patches(hooks)` 算出组合（包括 keyframe 强度），写进绑定；只被 hook 改到、还没有运行时 patch 的层补挂一个，不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。** 采样时正/负条件可能挂着不同的 hook 组，每一步会来回切换；在这里只是换一个 dict。CLIP 的 `SetClipHooks`（`forced_hooks`）走同一条路。
+`patch_hooks(hooks)` 用原生的 `get_combined_hook_patches(hooks)` 算出组合（包括 keyframe 强度），写进绑定；只被 hook 改到、还没有运行时 patch 的层补挂一个，不再生效的 hook-only patch 摘掉。**不写权重、不备份、不缓存。** 采样时正/负条件可能挂着不同的 hook 组，每一步会来回切换；在这里只是换一个 dict。CLIP 的 `SetClipHooks`（`forced_hooks`）走同一条路。摘运行时 patch 时不动层上的 `comfy_patched_weights`：权重从没改过，整层加载的层仍然就是「已加载」，原生 `partially_unload` 只卸标了这个标记的层；以前摘掉 hook-only patch（以及没有普通 LoRA 时每次采样结束摘掉全部）会顺手删标记，内存紧时这些层卸不掉、可能变成整模型卸载（审查 2026-10 第 05 项，`test_lora_lowvram_hook.py`）。真正卸载时原生 `unpatch_model` 自己删标记。
 
 ### 3.3 量化参数：在反量化的临时权重上合并，不重新量化
 
@@ -132,7 +134,7 @@ Monoload 的做法：量化层挂上 weight function 后，`forward` 会走 `cas
 
 * **重复加载。** 原生 `load()` 会清空所有全量加载层的 `weight_function`，但跳过已标记 `comfy_patched_weights` 的层（原生里它们已经合并好了）。Monoload 的 patch 并没有合并进权重，所以 `load()` 之前先清掉被 patch 层的这个标记，保证这些层会重新走一遍 `patch_weight_to_device`。
 * **切换组合 / 卸载。** 原生 `unpatch_model()` 只在 lowvram 时清 `weight_function`；Monoload 在卸载权重时摘掉自己挂的所有运行时 patch。所以撤掉 LoRA 后，权重与加载时逐字节一致（本来也从未改过），也没有残留的 weight function。
-* **部分加载（非 `--gpu-only`、显存不够）。** 原生对被卸载的层本来就用 `LowVramPatch`，而且不备份。Monoload **不改这部分**，只接管原生会合并进权重的那些层，所以在部分加载下结果也和原生逐位一致。原生 `partially_unload()` 会给已经合并过的层追加 `LowVramPatch`（原生里是先写回备份）；这时同一层会同时挂着 Monoload 的 patch 和原生的 `LowVramPatch`，Monoload 摘掉自己那个，得到的结果和原生一样。
+* **部分加载（非 `--gpu-only`、显存不够）。** 原生对被卸载的层本来就用 `LowVramPatch`，而且不备份。Monoload **不改这部分**，只接管原生会合并进权重的那些层，所以在部分加载下结果也和原生逐位一致。原生 `partially_unload()` 会给已经合并过的层追加 `LowVramPatch`（原生里是先写回备份）；这时同一层会同时挂着 Monoload 的 patch 和原生的 `LowVramPatch`：Monoload 的 patch 留着，按下一条的规则只加这个 key 的 hook（没有 hook 时什么都不加），普通 LoRA 由 `LowVramPatch` 加，结果和原生一样。以前 Monoload 在这里摘掉自己那个 patch；同一个 key 上还有 hook 时 hook 就丢了：Monoload 没有备份，原生不会 `unpatch_hooks`，`current_hooks` 不变，之后 `apply_hooks(同一组)` 直接返回，不再装回来（审查 2026-10 第 04 项，`test_lora_lowvram_hook.py`：整层加载 + hook 后 `partially_unload` 全部，再 `apply_hooks`，与原生比较）。原生在这里先 `unpatch_hooks`、下一次 `apply_hooks` 重新合并 hook，计算结果相同。
 * **部分加载 + hook（lora-lowvram-hook）。** 卸到 CPU 的层上，普通 LoRA 由原生的 `LowVramPatch` 在计算时加。这样的层同一个 key 上再有 hook 时，Monoload 的运行时 patch 排在 `LowVramPatch` 前面，以前它把普通 LoRA 也加了一遍（加了两次，差 0.025）。现在运行时 patch 看到同一个 key 后面有原生 `LowVramPatch`，就只加 hook；hook 撤掉之后什么都不加。顺序与原生相同：原生先把 hook 合并进存储的权重，计算时再由 `LowVramPatch` 加普通 LoRA。exact 下与原生逐位一致，fused 差 ≤ 1.4e-4（`tests/test_lora_lowvram_hook.py`）。
 * 每次 `load()` / `partially_unload()` 之后都断言 `backup` / `hook_backup` 为空。
 
@@ -302,7 +304,7 @@ CPU 上计算 dtype 是 fp32，默认路径在 fp32 下合并、不舍入回 fp1
 | 情况 | kind | 何时 |
 |---|---|---|
 | DynamicVRAM（comfy-aimdo）开启且模型有 LoRA/hook patch | `dynamic_vram` | 加载该模型时 |
-| 要求把 patch 合并进权重（`force_patch_weights`，常见于 `ModelSave` / `CheckpointSave` / 模型合并后保存） | `force_patch_weights` | 加载时 |
+| 加载时要求把 patch 烘焙进权重（`force_patch_weights`；ComfyUI 0.31 里没有调用方传它，只可能来自自定义节点。保存节点走 `model_state_dict_for_saving`，见 §2，不报错） | `force_patch_weights` | 加载时 |
 | 被 patch 的参数不属于 `comfy.ops` 层（没有 `comfy_cast_weights`，没有运行时路径） | `lora_non_comfy_ops_param` | 挂 patch 时 |
 | patch 会改变权重形状 | `lora_shape_change` | 挂 patch 时 |
 
@@ -338,13 +340,14 @@ CPU 上计算 dtype 是 fp32，默认路径在 fp32 下合并、不舍入回 fp1
 1. **已加载的模型**（`model_management.current_loaded_models`）：对 patcher 带 LoRA、或模块上还挂着运行时 patch 的 `LoadedModel`：
    * 就地 `unpatch_hooks()` + `unpatch_model(device_to=None, unpatch_weights=True)`。Monoload 版本会摘掉所有运行时 patch，清空设备上的 LoRA 缓存；**权重一个字节都不搬**，因为本来就没被改过。
    * 原生 `unpatch_model` 即使不搬权重，也会把模型标成「未加载」（`model_loaded_weight_memory = 0`，删掉 `comfy_patched_weights`）。权重其实还在原位，所以卸之前先记下这些状态，卸完原样恢复。
+   * 节点明确选了 `after_prompt = release` 的原生 patcher（`MONOLOAD=0`，或 `mode native`）在这里从备份还原权重；备份建在 offload 设备上（`model_patcher.py:907`，非 `--gpu-only` 时是 CPU），`inplace_update` 为假时直接把备份设成参数。所以先记下被备份的参数原来所在的设备，还原后不在那里的移回去，模型仍然整个在计算设备上、「已加载」的记账才对（审查 2026-10 第 03 项，`test_master_switch.py` 用 meta 当计算设备模拟）。`--gpu-only` 时 offload 设备就是 GPU，什么都不用移。
    * 沿 `patcher.parent` 往上找到第一个没有权重 patch 的祖先，也就是底模的 patcher（`LoraLoader` 的输出是它的 clone）。把 `LoadedModel` 切到这个 patcher（ComfyUI 自己在 patcher 被回收时也用 `_set_model` 做同样的事），并把 `model.current_weight_patches_uuid` 设为底模的。这样在 ComfyUI 看来，现在「已加载的就是底模、而且没有 patch」：下一个不带 LoRA 的工作流会直接复用，不调用 `ModelPatcher.load()`；下一个带 LoRA 的工作流因为 uuid 不同，会照常重新挂 patch。
    * 找不到干净的祖先时，把 uuid 设成一个新的随机值，强制下次使用时重新评估。
    * 部分加载（`model_lowvram`，只在非 `--gpu-only` 时出现）时，就地卸会连被卸载层的原生 lowvram 状态一起清掉，所以改用原生的 `LoadedModel.model_unload()`，权重回到 offload 设备。
 2. **输出缓存**（`caches.outputs`，包括子图的 subcache；CLASSIC / LRU / RAM_PRESSURE 三种都支持）：删掉值带 LoRA 的条目，同时清理 LRU / RAM_PRESSURE 的附属字典（`used_generation`、`children`、`timestamps`）。下游节点的输出（latent、图片、普通 conditioning）不含 LoRA，照常保留。下次跑同一个工作流时，如果下游已经命中缓存，LoRA 节点就根本不会被执行。
 3. **节点实例缓存**（`caches.objects`）：清掉节点实例上的 `loaded_lora`。`LoraLoader`、`LoraLoaderModelOnly`、`CreateHookLora`、`LoraLoaderBypass` 都用这个属性缓存读进来的 LoRA 文件。
 4. `gc.collect()`：被丢掉的 LoRA clone 在这里被回收。
-5. **同步不带 patch 的 clone 的 uuid**（真机验收时发现的问题）。`LoraLoader` 总会克隆 CLIP；而 `add_patches()` 不管有没有匹配到 key，都会换一个新的 `patches_uuid`。所以对 Smooth Booster 这种没有 TE key 的 LoRA，会得到一个「没有任何 patch、但 uuid 不同」的 CLIP clone，它被当作已加载模型。第 1 步只处理带 patch 的 patcher，没有处理它。缓存清掉之后它被回收，ComfyUI 的 finalizer 把 `LoadedModel` 切回父 patcher（底模的 CLIP），但模型上的 `current_weight_patches_uuid` 还是那个 clone 的，于是下一个工作流的 CLIP 又完整 `load()` 了一次（日志里只有 `loaded completely`，没有 `Requested to load`）。修法：gc 之后再检查一遍已加载模型，凡是 patcher 不带任何 patch 或 bypass 注入、模型上也没有运行时 patch 的，就把模型的 uuid 同步成这个 patcher 的。Monoload 下权重从不被修改，所以「没有 patch 的模型」与任何一个没有 patch 的 patcher 状态等价。
+5. **同步不带 patch 的 clone 的 uuid**（真机验收时发现的问题）。`LoraLoader` 总会克隆 CLIP；而 `add_patches()` 不管有没有匹配到 key，都会换一个新的 `patches_uuid`。所以对 Smooth Booster 这种没有 TE key 的 LoRA，会得到一个「没有任何 patch、但 uuid 不同」的 CLIP clone，它被当作已加载模型。第 1 步只处理带 patch 的 patcher，没有处理它。缓存清掉之后它被回收，ComfyUI 的 finalizer 把 `LoadedModel` 切回父 patcher（底模的 CLIP），但模型上的 `current_weight_patches_uuid` 还是那个 clone 的，于是下一个工作流的 CLIP 又完整 `load()` 了一次（日志里只有 `loaded completely`，没有 `Requested to load`）。修法：gc 之后再检查一遍已加载模型，凡是 patcher 不带任何 patch 或 bypass 注入、模型上也没有运行时 patch 的，就把模型的 uuid 同步成这个 patcher 的。Monoload 下权重从不被修改，所以「没有 patch 的模型」与任何一个没有 patch 的 patcher 状态等价。**有原生备份（`backup` / `hook_backup` 非空）的不同步**（审查 2026-10 第 02 项）：原生模式（`MONOLOAD=0`，或节点 `mode native`）的模型把 LoRA 烘焙进了权重，备份由所有 clone 共享；例如 Checkpoint → LoRA Settings（只接 MODEL，native）→ LoraLoader，CLIP 被释放时 LoraLoader 的缓存项整条被删，原生 MODEL clone 随之回收，`LoadedModel` 切到 Settings 的 clone，它没有 patch，但权重里还是那个 LoRA；同步了 uuid，下一个直接用 Settings 输出的 prompt 就不会 unpatch，带着残留的 LoRA 出图。不同步时 uuid 不同，下次加载按原生 unpatch、从备份还原（`test_release_chain.py`、`test_lora_node.py` 用 `PromptExecutor` 复现）。
 6. `soft_empty_cache()`，日志里打一行 `[Monoload] released LoRA after prompt: ...`（含 `N clean clone(s) re-synced`）。
 
 到这一步，LoRA 张量已经没有任何引用：LoRA 文件读出的 dict、clone 上的 patch、运行时 patch 和它在计算设备上的副本、hook 组都已被回收。测试里用弱引用逐个确认（§7.4）。
@@ -388,7 +391,7 @@ CPU 上计算 dtype 是 fp32，默认路径在 fp32 下合并、不舍入回 fp1
 
 | 层 | 适用 | 做法 | 状态 |
 |---|---|---|---|
-| 第一层：条带解码 | 认得的结构（LDM `Decoder`、Wan `Decoder3d` 单帧） | 低分辨率前缀（含 mid 全局注意力）整图算；只在每个分辨率阶段末尾存档；按输出条带倒推每层所需的输入行区间并重算；GroupNorm 的全局统计逐层空跑求得（条带内 fp32 Welford，跨条带 Chan 合并）；按峰值预算自动选条带高度和存档方案，满足不了就报错 | **第二阶段已实现 Wan `Decoder3d` 单帧（§9.13）**；第三阶段已实现 LDM（§9.14，待真机） |
+| 第一层：条带解码 | 认得的结构（LDM `Decoder`、Wan `Decoder3d` 单帧） | 低分辨率前缀（含 mid 全局注意力）整图算；存档按方案（A 不存，D / B 存各分辨率阶段的输出，C 再存全分辨率每个块的输出，§9.14）；按输出条带倒推每层所需的输入行区间并重算；GroupNorm 的全局统计逐层空跑求得（块内 fp32 `torch.var_mean`，跨块 / 跨条带 Chan 合并，§9.14）；按峰值预算自动选条带高度和存档方案，满足不了就报错 | **第二阶段已实现 Wan `Decoder3d` 单帧（§9.13）**；第三阶段已实现 LDM（§9.14，待真机） |
 | 第二层：逐算子分块 | 不认识结构也能用 | 原 forward 原样运行，只在受管理的解码过程中替换重算子：卷积按输出行分块，限制 im2col 工作区；注意力按 query 分块，K/V 完整，每个 query 仍对全图做 softmax。整图语义不变，算量约 1 倍 | 第一阶段实现（真机验收通过，§9.12） |
 | 兜底 | 前两层都处理不了 | 原生整图解码（结果本身正确），打一条日志 | 第一阶段实现 |
 
@@ -489,6 +492,8 @@ loop:
     workspace 已到下限 min(64 MiB, 设置值) → 抛 MonoloadVAEOOMError（写明下限、重试次数、latent 形状、估算值）
     否则 workspace 减半，打警告，重试
 ```
+
+第一层第一次使用前的自检（§9.13）OOM 时同样抛 `MonoloadVAEOOMError`（消息表 `vae.err_oom_selftest`：哪个结构、自检约需多少、怎么办），记录里是 OOM；不缓存（下次解码重新自检），也不退第二层（第一层 OOM 不退第二层）。以前抛的是原始的 OOM 异常，英文句子不在消息表里，预算路径还会把它记成「预算不够」（审查 2026-10 第 06 项，`test_vae_ldm.py` 注入）。
 
 `decode_tiled_` 等 tiled 路径**从不调用**（测试里替换成计数器确认）。所有实例属性在 `OpChunking.__exit__` 里还原，异常时也一样；与 prompt 结束后的 LoRA 释放没有共享状态。
 
@@ -694,6 +699,8 @@ arena    = live + live/32 + 64 MiB（只有一条条带时 live/8），向上取
 estimate = arena + largest + 16 MiB            交给 load_models_gpu，reserved 的上界
   largest = 这次解码里最大的单个分配（im2col columns 块 ≤ 工作区、最大的激活平面、上采样结果、qkv、输出缓冲）
 ```
+
+（这是第二阶段的公式。§9.22 之后输出缓冲单独一段、不在 arena 和常驻里，也不在 largest 的候选里：estimate = 输出段 + arena + largest + 16 MiB，见 §9.22；有存档的计划 arena 的余量见 §9.14.11。）
 
 peak 按 62b3c94 的 forward 逐个数同时存活的张量。S 是模块输入的存储（调用期间由调用方持有；条带里是上一个单元的整份输出，模块拿到的是它的行切片），A / B 是模块所处理的那些行上一张输入 / 输出通道的平面，e 是元素字节数：
 
@@ -1074,6 +1081,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 * **检查点前置。** 有存档的计划，检查点不再是前缀输出的那个张量（它落在 arena 的哪里取决于前缀的分配历史），而是前缀之前就分配好的缓冲区（arena 刚分出来，只有它一块，所以在最前面），前缀的输出拷进去。代价：前缀期间多占一个检查点（4K 127 MiB，模型里前缀的存活量加上它；B / C / D 的峰值不在前缀，arena 不变）。
 * **之后的长寿命分配是确定的序列：** 检查点 → 输出缓冲（前缀之后分配）→ 每个存档（或整个池）在建它的那一遍开始时分配、在不再有遍从它出发后释放（检查点也是）。统计遍在下一遍开始前释放了它的所有临时量，所以这些时刻 arena 里只有这几块。
 * **`vae_engine.saves_fit`** 按缓存分配器的规则（best fit：够大的空闲块里最小的、同样大取地址低的、从块头切；释放后与相邻空闲块合并）在 arena 里重放这个序列。每个存档都找得到空闲块，就说明它不会被挤出 arena（它若被放进 arena 外已有的空闲块，arena 只会更空）。这时估算的 largest 只在其余分配里取；放不下时照旧把最大的存档算进去。
+  * 与真实分配器的一处差别：`place()` 总是切分空闲块，分配器在剩余 ≤ 1 MiB 时不切分（整块给出去）。审查 2026-10 第 22 项按真实规则重放比较过：3780 个计划（SDXL / Flux / Flux 2 × bf16 / fp32 × 512² … 8K 共 10 种分辨率 × 方案 B / C / D × 条带 32 … 512 行和默认 × 工作区 64 / 128 / 192 / 384 MiB）的 `saves_fit`、arena、`front_arena`、largest、估算完全相同，这些长寿命序列里剩余 ≤ 1 MiB 的情况一次都没出现（存档都是整平面的大小），所以不改（用户定）。新的几何（新结构、新存档位置）要重新比较。
 * SDXL 4K 默认计划：B 3.17 → **2.68 GiB**（largest 0.99 → 0.49，现在是统计遍里一条整高的 H/4 条带，不是存档）、C 8.67 → 5.21、D 2.03 不变（它的 largest 本来就是同样大小的统计遍条带）。arena（实际 reserved）不变。
 * 检查点在 arena 最前面，与之后的存档之间就是输出缓冲和检查点死后留下的洞；`saves_fit` 不成立的计划（实际没有遇到）照旧把最大的存档算进 largest。
 
@@ -1081,6 +1089,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 * **死掉的存档留下的洞**（`Plan.front_arena`）：用同一个长寿命序列算出每一遍开始时「最高的存活块的位置」和它下面的洞；某一遍最大的临时量比每个洞都大、而洞的总量又超过规则给的余量时，这一遍的临时量只能放在存活块上面：arena ≥ 存活块的顶 + 临时量 × 9/8 + 64 MiB。
 * **余量**（`arena_bytes`）：条带不超过 3 条时用存活量 / 8（与整图一条带相同，几块极大的平面），工作区大于 128 MiB 时余量至少是一个工作区（384 MiB 的 columns 块像一块同样大的平面一样切碎 arena）。
+* **arena 按 2 MiB 取整**（审查 2026-10 第 07 项）：`arena_bytes` 取整到 2 MiB，但存档分开放（separate 布局）时再加的余量（死掉的较小存档的大小之和）是任意字节数，以前加完没再取整；分配器预留 arena 时按 2 MiB 取整，估算最多少算不到 2 MiB（SDXL / Flux / Flux 2 4K 默认 B 余 0.56 MiB，1344×768 B 余 1.75 MiB），被 `ESTIMATE_PAD` 盖住。现在加完余量再取整，arena 和估算多 0.25–1.4 MiB；alloc_sim 上这些计划（三种结构 × 4K / 1344×768 × B 默认 / 64 / 256 行、C 256 行，21 个）reserved 不变、都 ≤ 估算。
 
 默认计划（128 行左右的条带、128 MiB 工作区）的 arena 不变（`arena_need` 都在原来的 arena 以内）；变大的是很高的条带、只有 2–3 条带的计划（例如 1344 方案 C 两条 384 行：0.90 → 1.05 GiB）和 384 MiB 工作区的计划。
 
@@ -1143,7 +1152,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 |---|---|---|---|---|---|---|---|
 | SD1.x / SD2.x / SDXL（Pony、Illustrious…）**用户在用** | `AutoencoderKL` / LDM `Decoder`，4D `[B,4,H/8,W/8]` | ✔ GroupNorm ×52（整图） | — | H/8 全局（mid） | — | 第一层 LDM | 已支持 |
 | Flux.1 / Z-Image / Lumina 2 / Chroma / HiDream / SD3（`ae`）**用户在用** | `AutoencodingEngine` / LDM `Decoder`，4D z16 | ✔ 同上 | — | 同上 | — | 第一层 LDM | 已支持 |
-| Flux 2 / Ideogram 4 / Lens / Ernie-Image | `AutoencoderKL`（`batch_norm_latent`）/ LDM `Decoder`，4D `[B,128,H/16,W/16]` → 反归一化 + 2×2 还原成 z32 `[B,32,H/8,W/8]` | ✔ 同上 | — | 同上 | — | 第二层 | `ldm_structure` 拒绝 `bn` |
+| Flux 2 / Ideogram 4 / Lens / Ernie-Image | `AutoencoderKL`（`batch_norm_latent`）/ LDM `Decoder`，4D `[B,128,H/16,W/16]` → 反归一化 + 2×2 还原成 z32 `[B,32,H/8,W/8]` | ✔ 同上 | — | 同上 | — | 第二层（4a 盘点时；4b-1 之后第一层 LDM，§9.18） | `ldm_structure` 拒绝 `bn`（4b-1 之后支持） |
 | SD x4 upscaler | `AutoencoderKL` / LDM `Decoder`（ch_mult [1,2,4]，4x） | ✔ | — | H/4 全局 | — | 第一层 LDM | 已支持（3 级） |
 | SVD img2vid | `AutoencodingEngine` / `VideoDecoder`，4D，**batch 当时间轴** | ✔ GroupNorm ×80 | 时间混合（Conv3d 核 [3,1,1]、时间注意力）跨整个 batch | H/8 | — | 第二层 | **现有缺口 1** |
 | HunyuanImage 2.1 | `AutoencodingEngine` / `hunyuan_video.vae.Decoder`，4D z64，32x | ✔ GroupNorm ×72 | — | H/32 全局 | 上采样是先卷积再 2×2 depth-to-space（`PixelUnshuffle2D`）+ 重复通道的残差 | 第二层 | 不认识的结构 |
@@ -1475,7 +1484,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 * **`budget_gib` 的精度**：前端 1.48.7 的 FLOAT 控件按 `step` 推保存精度（`precision = max(0, -floor(log10(step)))`，`onFloatValueChange` 用 `toFixed(precision)`）：step 0.25 → 1 位小数，0.25 存成 0.3。改成 `step` / `round` 0.01（2 位小数）；浏览器里核对过 0.25、1.37 原样保存。控件顺序改成 `budget` 紧挨 `budget_gib` 前面；dev 不做旧工作流兼容（用户定）。
 * **Info**：总是在最后列全局默认值表；当前模式下不生效的设置标出来（VAE `native`：预算 / 方案 / 条带高度；`layer 2 only`：方案 / 条带高度；LoRA `native`：merge）；所用的 GroupNorm 方案附一句说明。
-* **方案说明**（`vae_ldm.scheme_positions`）：A 不存（每遍统计都从 H/8 存档重算），D 存 H/4 级输出，B 存 H/4 和 H/2 级输出，C 再存全分辨率每个块的输入；写进 tooltip（en / zh）、下拉标签、Info、README §4.1。
+* **方案说明**（`vae_ldm.scheme_positions`）：A 不存（每遍统计都从 H/8 存档重算），D 存 H/4 级输出，B 存 H/4 和 H/2 级输出，C 再存全分辨率每个块的输出（块 1、块 2 和 `norm_out` 的输入；审查 2026-10 第 20 项把各处的「输入」改正）；写进 tooltip（en / zh）、下拉标签、Info、README §4.1。
 * **预算等设置的来源**：`_Applied` 把逐项来源放进 `_SETTINGS["src"]`，`vae._from(item)` 给出「Monoload VAE 设置节点」或「环境变量 X」；预算行、预算报错、强制的条带高度 / 方案、只用第二层都写来源，预算放不下的建议按来源给（节点：改节点上的预算或改成跟随全局 / 不限；环境变量：改 `MONOLOAD_VAE_BUDGET`）。
 * **「memory leak with model SDXLClipModel」警告**：在锁定镜像里用 `/prompt` API 复现（合成 SD1.5 + 只改 UNet 的 LoRA）。条件：LoRA 没有 text-encoder key（`LoraLoader` 的 CLIP clone 不带 patch）+ Monoload LoRA Settings 接了 CLIP（又一层不带 patch 的 clone）+ 解码报错。已加载的 CLIP 是第二层 clone；release 丢掉两个节点的缓存输出后，这两层 clone 被报错留下的引用环（执行器里的 traceback / 列表）留到 release 的 `gc.collect()` 才一起回收；ComfyUI 的 `LoadedModel._switch_parent` 只往上切一层，切的时候父节点也已经死了，于是 LoadedModel 没有 patcher、但模型（底模的 `cond_stage_model`）还活着，`cleanup_models_gc` 每次加载都报「memory leak」。不是 Monoload 持有引用（追查过 CLIP clone 的引用者：只有 ComfyUI 的输出缓存和执行器的列表；解码记录、LoRA 名字元数据、Info、报错对象都不引用 CLIP）。对照：正常运行、带 TE key 的 LoRA（clone 带 patch，release 直接指回底模）、不加 LoRA 设置节点（只有一层）都不出现。修复：release 前记下每个已加载 clone 的祖先链（弱引用），`gc.collect()` 之后把没有 patcher 的条目指回活着的最近祖先（同一个模型），再同步 uuid。`tests/test_release_chain.py` 构造同样的两层 clone + 引用环：去掉修复时出现两条警告、LoadedModel 没有 patcher，加上修复后指回底模、没有警告；服务端复现也确认消失。
 * **第一次解码的实测峰值偏低**：一条带的解码 reserved 峰值不可能低于它自己的 arena，第一次只有 +1.25 GiB（arena 1.97）说明起点的 reserved 里有之前（采样）缓存下来的空闲块，被解码复用了；自检在测量窗口内只会让峰值变高。`_MemProbe` 改成先 `soft_empty_cache()` 再取起点；记录这次解码里有没有跑首次自检（`vae_engine._SELFTEST` 有没有变多），Info 注明「含首次自检」。

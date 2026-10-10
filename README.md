@@ -121,7 +121,7 @@ docker logs comfyui 2>&1 | grep -i monoload
 | A | 什么都不存（只有 H/8 存档） | 内存最低，重算最多，最慢 | 约 1.1 GiB / 75 s |
 | D | H/4 级的输出 | 介于 A 和 B 之间 | 约 1.5 GiB / 58 s |
 | B | H/4 和 H/2 级的输出 | **内置默认** | 约 2.2 GiB / 42 s |
-| C | B 再加上全分辨率每个块的输入 | 内存最高，最快 | 约 4.7 GiB / 36 s |
+| C | B 再加上全分辨率每个块的输出 | 内存最高，最快 | 约 4.7 GiB / 36 s |
 
 `default` = 跟随全局：看 `MONOLOAD_VAE_GN_SCHEME`；没设时用 B；设了预算（节点或环境变量）时，在放得下预算的方案里选预计最快的。选了具体方案就强制用它（预算只决定条带高度）。界面上的提示和 Monoload Info 里都有同样的一句说明。
 
@@ -165,7 +165,8 @@ Load Checkpoint ──> Load LoRA（可以串好几个）──MODEL/CLIP──>
 * **同一个底模的两个 clone 设置不同时**（比如一个分支 `native`、一个分支 `enable`），设置不同的 clone 会换一个 `patches_uuid`，ComfyUI 在两者之间切换时会把权重还原再按各自的方式加载（测试确认交替加载各得各的结果，最后底模权重逐位还原）。
 * 日志：节点执行时打一行 `[Monoload] Monoload LoRA Settings: LoRA settings: mode enable (node), merge exact (node), after prompt release (default)`（括号里是来源：`node` / `env MONOLOAD=0` 等 / `default`）。
 * `MONOLOAD_DISABLE=1` 时节点原样输出输入的 MODEL / CLIP，日志说明一次。
-* 不在范围内的照旧：bypass LoRA（`LoraLoaderBypass`）不经过运行时合并；`force_patch_weights`（保存合并后的模型）在走 Monoload 的模型上照旧报错——这时把那个模型的 `mode` 设成 `native` 即可，不用重启（§6）。
+* 保存：`CheckpointSave` / `ModelSave` / `CLIPSave` 存出来的是合并了 LoRA 的权重，和原生逐位一致（保存时被 patch 的层逐层交给原生的精确合并 `patch_weight_to_device(return_weight=True)`，不改权重、不备份；`tests/test_lora_save.py`）。
+* 不在范围内的照旧：bypass LoRA（`LoraLoaderBypass`）不经过运行时合并；`force_patch_weights`（加载时要求把 LoRA 烘焙进权重；ComfyUI 0.31 自己的节点都不传，只可能来自自定义节点）在走 Monoload 的模型上报错——这时把那个模型的 `mode` 设成 `native` 即可，不用重启（§6）。
 
 ### 4.3 节点用法：Monoload Info（看 Monoload 在做什么）
 
@@ -228,7 +229,7 @@ CT 700 实测（WAI v17 SDXL + Smooth Booster，788 层，4.77 GiB 被 patch 的
 | kind | 情况 | 怎么办 |
 |---|---|---|
 | `dynamic_vram` | 开了 DynamicVRAM（comfy-aimdo）的同时打 LoRA | 用 `--gpu-only`（目标配置），或 `MONOLOAD_DISABLE=1` |
-| `force_patch_weights` | 有节点要求把 LoRA 合并进权重：`ModelSave`、`CheckpointSave`、保存合并后的模型等 | 在这个模型前面加 Monoload LoRA Settings，`mode` 选 `native`（§4.2）；或设 `MONOLOAD=0` / `MONOLOAD_DISABLE=1` 重启 |
+| `force_patch_weights` | 有节点要求加载时把 LoRA 烘焙进权重（ComfyUI 0.31 自己的节点都不传，只可能来自自定义节点；`CheckpointSave` / `ModelSave` / `CLIPSave` 不经过这里，照常存出合并后的权重，§4.2） | 在这个模型前面加 Monoload LoRA Settings，`mode` 选 `native`（§4.2）；或设 `MONOLOAD=0` / `MONOLOAD_DISABLE=1` 重启 |
 | `lora_non_comfy_ops_param` | LoRA 改到的参数不属于 `comfy.ops` 层（没有运行时合并路径） | 设 `MONOLOAD_DISABLE=1` |
 | `lora_shape_change` | patch 会改变权重形状 | 同上 |
 
@@ -259,7 +260,10 @@ CT 700 实测（WAI v17 SDXL + Smooth Booster，788 层，4.77 GiB 被 patch 的
 #   loras/synthetic_{lokr,loha,unet_only}_sd15.safetensors
 #       tests/make_synthetic_loras.py 生成（HF 上找不到 SD1.5 的 LoKr，按真实 LoRA 的层名和形状合成，UNet + TE；
 #       unet_only 是 Rubber Duck 去掉 TE key 的版本）
+#   checkpoints/synthetic_sd15.safetensors、loras/synthetic_sd15_lora.safetensors
+#       tests/make_synthetic_checkpoint.py $MODELS 生成（随机权重的 SD1.5 + LoRA，test_lora_node / test_lora_save 用）
 MODELS=/path/to/models tests/run_all.sh
+# 缺模型文件的测试组会被跳过并计数（「skipped (missing model files): N」），退出码 = 失败组数 + 跳过组数，跳过不算通过
 ```
 
 `run_all.sh` 先跑入口测试（8 种开关组合）、消息、释放链、Info 节点、总开关、LoRA 节点和全部 VAE 测试（`test_vae.py`、`test_vae_stripe.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_node.py`，不需要模型文件），然后把下面每个 LoRA 功能测试在两种合并路径下各跑一遍：先 `MONOLOAD_EXACT=1`（逐位一致），再默认路径。只想跑 VAE 部分时：`MODELS=/path/to/models tests/docker_run.sh python tests/test_vae.py`（不需要任何模型文件，`$MODELS` 可以是空目录）。
@@ -275,6 +279,7 @@ MODELS=/path/to/models tests/run_all.sh
 | `tests/test_vae_stripe.py` | VAE 第一层（§12.7），不需要模型文件：区间倒推对照暴力依赖展开；每个单元（残差块、上采样、head 卷积）在任意切片上「有效行」与整图逐行一致、紧邻的下一行不一致；用 ComfyUI 的 `WanVAE`（小通道、随机权重）在 fp32 下比较第一层与原生整图解码（条带 1 行、不整除、等于整图、按预算自动、默认策略、奇数尺寸、很小的 latent、batch 2、条带内再分块、bf16），块边界附近的误差不比其他区域大；识别（Dropout 训练态、forward hook、开关）；故意少算一行 halo 时自检能抓到并回退第二层；预算报错；OOM 缩小条带、到下限报错、不退回 tiled 也不退回第二层；默认策略（128 行条带的估算为目标）和开关的优先级；内存模型单调、最大的条带先跑；自检后和前缀 / 条带之间清空缓存；SDXL / Flux 结构不归 Wan 适配器（归 LDM 适配器）；单帧 Conv3d 改走 conv2d 与模块原样一致、只在该改的时候改 |
 | `tests/test_master_switch.py` | 总开关和全局默认（§4），不需要模型文件：`MONOLOAD` 的解析；`MONOLOAD=0` 且没有节点时，挂 LoRA 的模型（整体加载、lowvram 部分加载、Hook LoRA）和 VAE 解码与卸掉钩子的原版 ComfyUI 逐位一致，备份也和原生一样；释放不运行；包装每次调用的开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `mode auto` 打开管理、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 时节点原样透传 |
 | `tests/test_lora_node.py` | Monoload LoRA Settings 节点（§4.2），需要 `tests/make_synthetic_checkpoint.py $MODELS` 生成的随机权重 SD1.5 checkpoint 和 LoRA（约 2 GiB）：接口；逐项优先级和来源；clone 共享权重、输入不变、设置不同时换 uuid；节点放在 `LoraLoader` 前面设置也保留；串联；`LoraLoader` / `LoraLoaderModelOnly`（不接 CLIP）/ 两个串联的 `LoraLoader`：`exact` 和 `native` 与卸掉钩子的原版逐位一致（`native` 的备份数也一样），`fused` = 不加节点的默认路径；同一底模的不同设置交替加载各得各的结果、底模权重逐位还原；`MONOLOAD=0` 下 `enable`；prompt 结束后的释放 / 保留；`MONOLOAD_DISABLE` 透传 |
+| `tests/test_lora_save.py` | 保存挂了 LoRA 的模型（§4.2）：小模型（不需要模型文件）整体加载 / lowvram、逐位一致 / 默认路径下 `model_state_dict_for_saving` 与原生逐位一致；合成 SD1.5 + LoRA 经 `LoraLoader` 后用 ComfyUI 的 `CheckpointSave` / `ModelSave` / `CLIPSave` 存出的每个张量与原生逐位一致（带 LoRA 的张量和底模不同）；存完无备份、权重不变、输出不变；`mode native` 也一致 |
 | `tests/test_info_node.py` | Monoload Info 节点（§4.3），不需要模型文件：接口（输出节点、输入都可选、不缓存、界面文字 = STRING 输出）；不接输入时的版本 / 总开关 / 全局默认和来源；VAE 的设置来源、`not decoded yet`、解码记录归属（副本和原 VAE 不混）、原生解码也有记录、每次刷新；模型的 LoRA 名字和强度（串联、只接 MODEL、强度 0）、设置来源、加载后的状态；各种输入组合和 `MONOLOAD_DISABLE` 不报错 |
 | `tests/test_messages.py` | 消息和翻译，不需要模型文件：消息表每一项都有英文和中文、格式字段一致；`MONOLOAD_LANG` 的解析；`zh` 时预算报错、OOM 报错、不支持 LoRA 的报错、节点的报错和日志、Info 的文字都是中文；代码里（消息表以外）没有中文；`locales/en`、`locales/zh` 的 `nodeDefs.json` 覆盖每个节点、输入（名字、提示）、下拉选项（键 = 存储的英文值）、输出 |
 | `tests/test_vae_node.py` | Monoload VAE Settings 节点（§4.1），不需要模型文件：注册表和接口；按 ComfyUI 的方式调用节点；预算（下拉框 + `budget_gib`）/ 方案 / 条带高度 / 模式逐项判断「节点 > 环境变量 > 默认值」；副本共享权重和 patcher、输入的 VAE 不变、ComfyUI 的模型管理里只有一个已加载模型、串联、encode 一致；预算报错、强制方案和高度、只用第二层、原生；解码后（包括报错后）全局设置复原；多个副本交替解码互不干扰；日志写明来源；包装没装上时副本走原生；总开关和全局默认下的节点行为在 `test_master_switch.py`。ComfyUI 加载器注册节点的检查在 `test_entry.py`（各种开关组合） |
@@ -969,6 +974,35 @@ done
 
 预期：`13 / 8 / 5 / 9 checks, 0 failed`。
 
+### 9.15 第二轮代码审查修正（基准 main 5d9ac63）：真机检查
+
+**状态：已在 CT 700 上验收（8c5cb37；之后的修正在 e924a77 复查通过，结果见 §10.8）。** 改动和 CPU 小测试见 HANDOFF §4.0（第二轮审查）。拉新代码后重启容器（插件改了：`hotpatch` 多接管了 `model_state_dict_for_saving`，`release`、`vae*` 都有改动）。先让服务把模型卸掉（`/free`，同 9.1）。
+
+```bash
+curl -X POST http://127.0.0.1:8188/free -H 'Content-Type: application/json' -d '{"unload_models":true,"free_memory":true}'
+# AC. 第 01 项：挂 LoRA 存 checkpoint，和原生逐个张量比（同一进程里：默认 Monoload / 节点 mode native / 卸掉钩子的原生 / 不带 LoRA 的底模）
+#     临时文件放 /tmp（容器里，SDXL 每个约 6.5 GiB，算完摘要就删，同时只有一个）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_lora_save.py \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --lora Smooth_Booster_v5.safetensors --all 2>&1 | tee check_lora_save.txt
+# AD. 同上，但和一个整进程 MONOLOAD=0 的原生比（只存 CheckpointSave）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_lora_save.py \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --lora Smooth_Booster_v5.safetensors --only-default --digests /tmp/save_monoload.json
+docker exec -w /opt/ComfyUI/custom_nodes/monoload -e MONOLOAD=0 comfyui python tests/check_lora_save.py \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --lora Smooth_Booster_v5.safetensors --only-default --compare /tmp/save_monoload.json 2>&1 | tee check_lora_save_m0.txt
+# AE. 第 07 项（arena 取整）不改行为：SDXL 4K 默认解码一次
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --res 3840x2160 --modes monoload --warm 1 2>&1 | tee bench_vae_review2.txt
+```
+
+**预期：**
+
+* **AC：** 开头一行 `N UNet / 0 text-encoder keys patched`（Smooth Booster 没有 text-encoder key，DESIGN §7.3）。`CheckpointSave` 和 `ModelSave` 两段：`the LoRA changes K tensors`，K > 0（UNet 里被 LoRA 改到的张量数）；`default (Monoload) vs native: ... 0 differ, 0 keys missing / extra -> IDENTICAL`；`node mode native vs native: ... IDENTICAL`；`after the Monoload save: backups 0, runtime patches > 0, weights unchanged True`。`CLIPSave` 一段：`the LoRA changes 0 tensors`（没有 TE key，存出来就是底模的 CLIP），两行仍是 IDENTICAL，runtime patches 可以是 0。最后 `RESULT: OK`。CPU 上用合成 SD1.5（UNet + TE 都有 LoRA）跑过：三种保存 1130 / 686 / 198 个张量全部相同，LoRA 改到 256 / 184 / 72 个。修之前 `default (Monoload)` 一行是 DIFFERENT，差的正好是那 K 个张量（存成了底模）。
+* **AD：** 第二条命令 `this process vs /tmp/save_monoload.json: ... IDENTICAL`，`RESULT: OK`。
+* **AE：** 和 §10.4 一样：第一层方案 B 17 条 128 行，GTT 峰值增量约 2.17 GiB，日志的估算 2.68 GiB（取整只多了不到 2 MiB，两位小数看不出来）。
+* 第 03 项只在非 `--gpu-only`（offload 设备是 CPU）时出现，CT 700 上测不到；CPU 测试用 meta 当计算设备模拟（`test_master_switch.py`）。
+
+**可选：** `run_all.sh`（测试素材同 §10.7，`/models/monoload-test`）：现在 41 组（多了 `test_lora_save` 和「ComfyUI 的 VAE 接口变了」的入口测试），最后一行 `suites failed: 0, skipped (missing model files): 0`；缺合成 checkpoint 时跳过的组会计数、退出码非零。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
@@ -1238,6 +1272,39 @@ done
   * GTT：Monoload 8.2–8.7 GiB，原生 13.9 GiB。
   * layer probe 与 9.1 第三轮完全一致：788 层、4.77 GiB；每次模型调用临时拷贝 0.038 s、逐位一致 0.222 s、默认路径 0.052 s；默认路径与逐位一致的权重差异 2.54e-3，在容差 0.0308 以内。
 
+### 10.8 第二轮审查修正：真机检查（`check_lora_save`、`bench_vae_review2` / `review3`、`bench_vae_flux2_budget3`、`run_all`，2026-10，8c5cb37 / e924a77）
+
+§9.15 的命令和 `run_all.sh`，**全部通过**。
+
+* **AC（WAI v17 SDXL + `Smooth_Booster_v5`，强度 1.0：788 个 UNet key、0 个 text-encoder key）：** 默认（Monoload）和节点 `mode native` 存出来的文件与卸掉钩子的原生**逐张量相同**（dtype、形状、字节）：
+
+| 节点 | 张量 | LoRA 改到的（与底模比） | Monoload / 节点 native 对原生 |
+|---|---|---|---|
+| `CheckpointSave` | 2515 | 722 | IDENTICAL / IDENTICAL |
+| `ModelSave` | 1680 | 722 | IDENTICAL / IDENTICAL |
+| `CLIPSave` | 716 | 0（没有 TE key，存的就是底模的 CLIP） | IDENTICAL / IDENTICAL |
+
+  * 存完：`backups 0`，运行时 patch 仍在（UNet 788；CLIPSave 时 CLIP 没有 patch，为 0），权重逐字节不变。`RESULT: OK`。
+* **AD：** 与一个整进程 `MONOLOAD=0` 的原生 `CheckpointSave` 比，2515 个张量 IDENTICAL。
+* **AE（SDXL 4K 默认）：** 第一层方案 B 17 条 128 行，arena 2.07 GiB，估算 2.68 GiB；热启动 GTT 峰值增量 2.17、reserved 2.17 GiB、42.0 s（耗时模型 42.7 s），与 §10.4 相同；冷启动 reserved 2.24、GTT 2.38、43.5 s（含进程第一批 GPU 计算和第一次自检，自检 1.01 s，上界 430 MiB）。（这次只跑了 `--modes monoload`，精度汇总里写的「native failed (OOM)」是 bench 的提示错了，实际是没跑原生，已改成「native not run」。）
+* **`run_all.sh`：** 41 组、1494 项检查，`suites failed: 0, skipped (missing model files): 0`。
+  * 新加 / 改过的测试：`test_lora_save` 8、`test_lora_node` 20、`test_info_node` 32、`test_lora_lowvram_hook` 14、`test_release_chain` 2、`test_master_switch` 19、`test_vae` 136、`test_vae_ldm` 103、`test_vae_flux2` 54、`test_vae_node` 26、`test_vae_retry` 6、`test_vae_selftest_budget` 10、`test_check_selftest_mem` 5。
+  * LoRA 功能测试：`MONOLOAD_EXACT=1` 时 dtype 108、LoRA 80、fp8 8、释放 2 + 42 × 3 + `MONOLOAD_KEEP_LORA` 22；默认路径 dtype 198、LoRA 106、fp8 8、释放 2 + 42 × 3 + 22。
+  * **例外：**「ComfyUI 的 VAE 接口变了」那一组在这次（8c5cb37）实际跑的是普通入口测试（17 项，不是这个模式的 11 项）：`docker_run.sh` 只把 `MONOLOAD*` 变量传进容器，`TEST_BROKEN_VAE_API` 没传进去。之后修好（eee564c），下面的复查里这一组已真正进入该模式。
+
+**复查（e924a77：上面的例外修好、`bench_vae` 的提示修正、审查 21（探测后清缓存）/ 23（探测的 `memory_required` 不带工作区）之后）：全部通过。**
+
+* **`run_all.sh`：** 41 组、1490 项检查，`suites failed: 0, skipped (missing model files): 0`。「VAE 接口变了」那一组 11 项，日志有 `VAE decode NOT managed`（`AttributeError: type object 'Conv3d' has no attribute '_conv_forward'`），LoRA 和释放照常安装、节点照常注册。比 8c5cb37 的 1494 少 4：这一组 17 → 11，21 和 23 各在 `test_vae_flux2`（54 → 55）、`test_vae_ldm`（103 → 104）加了 1 项。
+* **AE（SDXL 4K 默认，`bench_vae_review3`）：** 与上面相同：B 17 × 128，热启动 GTT 2.17 / 估算 2.68，冷启动 reserved 2.24 / GTT 2.38；精度汇总写 `native not run (not in --modes): no reference`。
+* **命令 Z（Flux 2 按预算选，`bench_vae_flux2_budget3`，GTT / 估算 / 热启动 s）：** 六档的选择与 §10.5 相同，数字差 ≤ 0.01 GiB。每档第一次（预算模式下：形状探测 + 需要时的第一次自检 + 解码）都 ≤ 估算。
+
+| | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| 预算 3G | 整图 1 条 768 行，1.98 / 2.48 / 1.0；第一次 reserved 1.98、GTT 2.02（含 B 的自检） | C 4 × 384，2.73 / 3.00 / 12.7；第一次 2.73 | B 12 × 180，2.43 / 2.96 / 41.3；第一次 2.43 |
+| 预算 1.5G | C 2 × 384，1.05 / 1.25 / 2.9；第一次 1.05（含 C 的自检） | B 16 × 96，1.22 / 1.48 / 20.3；第一次 1.22 | A 17 × 128，1.10 / 1.49 / 75.5；第一次 GTT 1.12（含 A 的自检） |
+
+  原生对照：1344 8.37、2688 42.88、4K 52.52 GiB（4K 原生内部 OOM 后退回较小的分配，日志有 HIP 的 OOM 警告，结果正常）。预算模式与原生的差异 PSNR 64.4–64.9 dB，像素 max ≤ 0.034，与 §10.5 同一水平。
+
 ## 11. 仓库结构
 
 ```
@@ -1262,7 +1329,7 @@ web/monoload_info.js        前端扩展：把 Monoload Info 的文字显示在�
 web/monoload_i18n.js        前端扩展：下拉选项的显示文字按语言翻译（只改显示，存储值不变）
 monoload/vae_overrides.py   单个 VAE 的设置（节点做的副本带的设置；不导入 torch / ComfyUI）
 monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），lora_settings.py = Monoload LoRA Settings，vae_settings.py = Monoload VAE Settings，info.py = Monoload Info
-tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
+tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；保存挂 LoRA 的模型：test_lora_save.py、check_lora_save.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
                             bench_vae.py、check_vae_node.py、make_synthetic_vaes.py、alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10；
                             第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16；Flux 2：test_vae_flux2.py；
                             自检峰值诊断：check_selftest_mem.py，DESIGN.md §9.19）

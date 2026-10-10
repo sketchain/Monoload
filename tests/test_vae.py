@@ -199,6 +199,23 @@ def attention_tests():
     with vae_ops.OpChunking(blk, 1, st):
         y = blk(x)
     check("unknown attention implementation: left native and reported", st.attn_modules == 0 and len(st.attn_unmanaged) == 1 and rel_err(y, ref) <= 1e-5)
+    # SeedVR2's VAE attention keeps its function in optimized_vae_attention (comfy/ldm/seedvr/vae.py; heads == 1 in the
+    # VAE): chunked the same way (review 2026-10 item 12)
+    from comfy.ldm.seedvr import vae as seedvr_vae
+    torch.manual_seed(4)
+    sa = seedvr_vae.Attention(32, heads=1, dim_head=32, norm_num_groups=8, residual_connection=True)
+    with torch.no_grad():
+        for p_ in sa.parameters():
+            p_.copy_(torch.randn(p_.shape) * 0.2)
+    orig_fn = sa.optimized_vae_attention
+    ref = sa(x)
+    st = vae_ops.OpStats()
+    with vae_ops.OpChunking(sa, 2 * 3 * 63 * 4, st):
+        y = sa(x)
+    check("SeedVR2 Attention (optimized_vae_attention) under OpChunking: == native (rel {:.2g}), query block {}, attention restored".format(
+          rel_err(y, ref), st.attn_rows_min),
+          rel_err(y, ref) <= 1e-5 and st.attn_rows_min == 3 and st.attn_modules == 1 and not st.attn_unmanaged
+          and sa.__dict__.get("optimized_vae_attention") is orig_fn)
 
 
 # ---------------------------------------------------------------------------

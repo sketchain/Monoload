@@ -14,10 +14,14 @@ runtime.
     MONOLOAD_VAE_BUDGET=2G MONOLOAD_VAE_STRIPE_ROWS=64 python tests/test_entry.py
     MONOLOAD_VAE_GN_SCHEME=D python tests/test_entry.py   # LDM layer-1 GroupNorm scheme
     MONOLOAD_LANG=zh python tests/test_entry.py           # log and error messages in Chinese
+    TEST_BROKEN_VAE_API=1 python tests/test_entry.py      # a ComfyUI whose comfy.ops Conv3d lacks _conv_forward (an
+                                                          # update renamed it): nodes, LoRA and release still installed,
+                                                          # the VAE decode native with a warning (review 2026-10 item 11)
 The Monoload nodes (LoRA Settings, VAE Settings, Info) and the web directory are registered in every combination.
 """
 
 import asyncio
+import logging
 import os
 
 from common import check, finish
@@ -30,6 +34,20 @@ native = {n: comfy.model_patcher.ModelPatcher.__dict__[n] for n in ("load", "pat
 native_exec = execution.PromptExecutor.execute_async
 native_vae_decode = comfy.sd.VAE.decode
 native_vae_tiled = (comfy.sd.VAE.decode_tiled, comfy.sd.VAE.decode_tiled_)
+broken = os.environ.get("TEST_BROKEN_VAE_API", "") == "1"
+if broken:
+    import comfy.ops
+    comfy.ops.disable_weight_init.Conv3d = type("Conv3d", (), {})   # no _conv_forward at all
+warnings = []
+
+
+class _Warnings(logging.Handler):
+    def emit(self, record):
+        if record.levelno >= logging.WARNING:
+            warnings.append(record.getMessage())
+
+
+logging.getLogger().addHandler(_Warnings())
 ok = asyncio.run(nodes.load_custom_node("/opt/ComfyUI/custom_nodes/monoload"))
 check("custom node imported by ComfyUI's loader", ok)
 disabled = os.environ.get("MONOLOAD_DISABLE", "") == "1"
@@ -64,6 +82,11 @@ else:
     check("merge path: {}".format("bit-exact (MONOLOAD_EXACT=1)" if exact else "fused/relaxed default"), hotpatch.is_exact() == exact)
     check("per-prompt LoRA release installed on PromptExecutor.execute_async; global default {}".format(
           "keep (MONOLOAD_KEEP_LORA=1)" if keep else "release"), release_hooked and release.keep() == keep and release.enabled() == (master and not keep))
+    if broken:
+        said = [w for w in warnings if "VAE decode NOT managed" in w or "VAE 解码没有接管" in w]
+        check("ComfyUI API changed under the VAE part: VAE.decode left native, said once ({}); LoRA and release installed (above)".format(
+              said[0][:140] if said else None), not vae_hooked and len(said) == 1)
+        finish()
     check("VAE.decode wrapped by Monoload (workspace {} bytes)".format(vae.workspace()),
           vae_hooked and comfy.sd.VAE.decode.__module__.endswith("monoload.vae") and comfy.sd.VAE.decode.__wrapped__ is native_vae_decode)
     want_mode = ("native", "MONOLOAD=0") if not master else ("native", "MONOLOAD_DISABLE_VAE=1") if flag("MONOLOAD_DISABLE_VAE") else \

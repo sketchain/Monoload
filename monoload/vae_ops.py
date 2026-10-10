@@ -29,7 +29,8 @@ floating-point differences (different GEMM shapes), with ~1x the arithmetic:
             (DESIGN §9.13.9).
   attention the `optimized_attention` instance attribute of attention blocks
             (comfy.ldm.modules.diffusionmodules.model.AttnBlock, Wan's
-            AttentionBlock) when it is one of ComfyUI's VAE attention functions
+            AttentionBlock; SeedVR2's `optimized_vae_attention`, ATTENTION_ATTRS)
+            when it is one of ComfyUI's VAE attention functions
             (split / pytorch / xformers): queries are processed in blocks, K/V
             stay whole, so every query still takes a softmax over the whole
             image. The arithmetic per block is that of the original function.
@@ -138,8 +139,10 @@ def slow_dilated3d(x):
     return x.is_cuda and not torch.backends.cudnn.enabled and not getattr(comfy.ops, "NVIDIA_MEMORY_CONV_BUG_WORKAROUND", False)
 
 
-# Conv3d classes whose _conv_forward is known: torch's, and comfy.ops' (causal_zero autopad = weight[:, :, -T:])
-_CONV3D_FORWARDS = (torch.nn.Conv3d._conv_forward, comfy.ops.disable_weight_init.Conv3d._conv_forward)
+# Conv3d classes whose _conv_forward is known: torch's, and comfy.ops' (causal_zero autopad = weight[:, :, -T:]); read
+# without failing the import when a ComfyUI update renames it (vae._check_api then refuses to install)
+_CONV3D_FORWARDS = tuple(f for f in (torch.nn.Conv3d._conv_forward,
+                                     getattr(getattr(comfy.ops.disable_weight_init, "Conv3d", None), "_conv_forward", None)) if f is not None)
 
 
 OUT_FIRST = True   # False: the output after the first block, as up to 725a010 (only for tests/alloc_sim.py to replay those versions)
@@ -386,6 +389,11 @@ def _note_attn(stats, n, rows, batch, tokens, elem):
     stats.attn_score_max = max(stats.attn_score_max, 2 * batch * r * tokens * elem)
 
 
+# instance attributes holding a VAE attention function (q, k, v of shape (B, C, H, W) -> (B, C, H, W)): the LDM
+# AttnBlock's / Wan's optimized_attention, SeedVR2's optimized_vae_attention (comfy/ldm/seedvr/vae.py, heads == 1)
+ATTENTION_ATTRS = ("optimized_attention", "optimized_vae_attention")
+
+
 def known_attention():
     """ComfyUI's VAE attention functions -> chunked replacement."""
     return {
@@ -436,14 +444,16 @@ class OpChunking:
                     as2d = isinstance(m, torch.nn.Conv3d) and prev is _MISSING and type(m)._conv_forward in _CONV3D_FORWARDS
                     m.__dict__["_conv_forward"] = _ConvChunker(m, orig, self.budget, self.stats, as2d)
                     self.stats.conv_modules += 1
-                fn = m.__dict__.get("optimized_attention", None)
-                if fn is not None:
+                for attr in ATTENTION_ATTRS:
+                    fn = m.__dict__.get(attr, None)
+                    if fn is None:
+                        continue
                     impl = known.get(fn)
                     if impl is None:
                         self.stats.attn_unmanaged.append("{} ({})".format(name, getattr(fn, "__name__", type(fn).__name__)))
                         continue
-                    self._saved.append((m, "optimized_attention", fn))
-                    m.__dict__["optimized_attention"] = _AttnChunker(impl, self.budget, self.stats)
+                    self._saved.append((m, attr, fn))
+                    m.__dict__[attr] = _AttnChunker(impl, self.budget, self.stats)
                     self.stats.attn_modules += 1
         except BaseException:
             self._restore()
@@ -463,9 +473,19 @@ class OpChunking:
         return False
 
 
-def fmt_bytes(n):
+def fmt_bytes(n, digits=2):
+    """digits: decimals of a GiB value (MiB / KiB values get digits - 2)."""
     if n is None:
         return "n/a"
     if n >= GIB:
-        return "{:.2f} GiB".format(n / GIB)
-    return "{:.0f} MiB".format(n / MIB) if n >= MIB else "{:.0f} KiB".format(n / 1024)
+        return "{:.{}f} GiB".format(n / GIB, digits)
+    return "{:.{}f} MiB".format(n / MIB, digits - 2) if n >= MIB else "{:.{}f} KiB".format(n / 1024, digits - 2)
+
+
+def budget_digits(budget, estimates):
+    """Decimals with which a budget and the estimates compared with it all read differently from the budget (an
+    estimate of 2.1704 GiB is over a 2.17 GiB budget: both "2.17 GiB" with two decimals). 2 .. 6."""
+    d = 2
+    while d < 6 and any(e is not None and e != budget and fmt_bytes(e, d) == fmt_bytes(budget, d) for e in estimates):
+        d += 1
+    return d

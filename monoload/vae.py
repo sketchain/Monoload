@@ -14,9 +14,12 @@ around first_stage_model.decode:
   * operators: layer 2 of the design -- op-level chunking (monoload/vae_ops.py):
     convs in blocks of output rows bounded by the workspace budget, attention
     in blocks of queries over the whole K/V;
-  * OOM: retried with half the workspace, down to MIN_WORKSPACE; then
-    MonoloadVAEOOMError. decode_tiled_ (tile-local GroupNorm, an
-    approximation) is never called;
+  * OOM: layer 2 is retried with half the workspace, down to MIN_WORKSPACE;
+    layer 1 with half the stripe height and half the workspace together,
+    skipping a step whose estimate is above the first plan's, down to
+    vae_engine.MIN_ROWS / MIN_WORKSPACE (never falling back to layer 2); then
+    MonoloadVAEOOMError, as is an OOM in the first-use layer-1 self-test.
+    decode_tiled_ (tile-local GroupNorm, an approximation) is never called;
   * output: device, dtype, process_output (to [0, 1], clamped) and the
     channels-last layout exactly as native.
 
@@ -521,7 +524,7 @@ def _model_traits(fsm):
     for m in modules:
         if batch_time and isinstance(m, batch_time):
             mixes = True
-        if isinstance(m, (torch.nn.Conv2d, torch.nn.Conv3d)) or m.__dict__.get("optimized_attention") in known:
+        if isinstance(m, (torch.nn.Conv2d, torch.nn.Conv3d)) or any(m.__dict__.get(a) in known for a in vae_ops.ATTENTION_ATTRS):
             ops = True
     hit = (mixes, ops)
     try:
@@ -837,8 +840,9 @@ def choose_plan(vae, samples_in, bound, out_bytes):
         plan = bound.plan(vae, samples_in, bud, ws, out_bytes=out_bytes)
         if plan is None:
             smallest = bound.smallest_plan(vae, samples_in, ws, out_bytes=out_bytes)
-            raise MonoloadError(msg("vae.err_l1_budget", budget=fmt_bytes(bud), src=_from("budget"), advice=_budget_advice(layer2=True),
-                                    shape=list(samples_in.shape), need=fmt_bytes(smallest.estimate),
+            d = vae_ops.budget_digits(bud, [smallest.estimate])
+            raise MonoloadError(msg("vae.err_l1_budget", budget=fmt_bytes(bud, d), src=_from("budget"), advice=_budget_advice(layer2=True),
+                                    shape=list(samples_in.shape), need=fmt_bytes(smallest.estimate, d),
                                     rows=max(b - a for a, b in smallest.stripes), prefix=fmt_bytes(smallest.prefix_bytes),
                                     stripes=fmt_bytes(smallest.stripe_bytes)))
         return plan, bud, ws, msg("vae.budget_head", budget=fmt_bytes(bud), src=_from("budget"))
@@ -998,26 +1002,31 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
         c2, d2 = layer2(msg("vae.l2_after_selftest"), note, note)
         if c2["fits"]:
             return d2
-        raise MonoloadError(msg("vae.err_forced_selftest", budget=fmt_bytes(bud), src=_from("budget"), what=", ".join(forced),
-                                failed=", ".join(v.name for v in failed), l2=fmt_bytes(c2["estimate"]), shape=list(samples_in.shape),
+        dg = vae_ops.budget_digits(bud, [c2["estimate"]])
+        raise MonoloadError(msg("vae.err_forced_selftest", budget=fmt_bytes(bud, dg), src=_from("budget"), what=", ".join(forced),
+                                failed=", ".join(v.name for v in failed), l2=fmt_bytes(c2["estimate"], dg), shape=list(samples_in.shape),
                                 advice=_budget_advice()))
+    # enough decimals that no estimate over the budget reads like the budget itself (review 2026-10 item 10)
+    dg = vae_ops.budget_digits(bud, [c["estimate"] for c in considered])
     needs = []
     for c in considered:
         if c["layer"] == 2:
-            needs.append(msg("vae.need_layer2", est=fmt_bytes(c["estimate"])))
+            needs.append(msg("vae.need_layer2", est=fmt_bytes(c["estimate"], dg)))
         else:
             needs.append(msg("vae.need_layer1", scheme=msg("vae.need_scheme", scheme=c["gn_scheme"]) if c["gn_scheme"] else "", rows=c["rows"],
-                             est=fmt_bytes(c["estimate"]) + _selftest_note(c), prefix=fmt_bytes(c["prefix"]), stripes=fmt_bytes(c["stripes"]),
+                             est=fmt_bytes(c["estimate"], dg) + _selftest_note(c), prefix=fmt_bytes(c["prefix"]), stripes=fmt_bytes(c["stripes"]),
                              failed=msg("vae.need_failed") if c.get("selftest_result") else ""))
     if not variants:
         needs.append(msg("vae.need_l1_unavailable", why=l1_note))
-    raise MonoloadError(msg("vae.err_budget", budget=fmt_bytes(bud), src=_from("budget"), advice=_budget_advice(),
+    raise MonoloadError(msg("vae.err_budget", budget=fmt_bytes(bud, dg), src=_from("budget"), advice=_budget_advice(),
                             shape=list(samples_in.shape), needs=msg("vae.need_sep").join(needs)))
 
 
 def _decode_budget(self, samples_in, vae_options, t0, bud):
     try:
         d = choose_budget(self, samples_in, vae_options, bud)
+    except MonoloadVAEOOMError:
+        raise   # the first-use self-test ran out of memory: an OOM, not "nothing fits the budget"
     except MonoloadError:
         _LAST.clear()
         _LAST.update({"strategy": "error", "kind": "budget", "budget": bud})
@@ -1054,18 +1063,25 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
         # halve stripes and workspace; a step whose estimate is above the first plan's (with a budget the first plan
         # is within it, unless forced rows run above it anyway) is skipped: shorter stripes are not monotone in
         # every plan (statistics passes, save layouts), and the retry must not need more than was loaded for
-        rows = max(b - a for a, b in plan.stripes)
+        # the error names the plan that ran out of memory last (rows, workspace, estimate); the steps skipped after it
+        # are listed apart (review 2026-10 item 08)
+        rows = r = max(b - a for a, b in plan.stripes)
+        w = ws
+        skipped = []
         while True:
-            if rows <= min_rows and ws <= floor_ws:
+            if r <= min_rows and w <= floor_ws:
+                steps = msg("vae.need_sep").join(msg("vae.oom_skip_step", rows=sr, ws=fmt_bytes(sw), est=fmt_bytes(se)) for sr, sw, se in skipped)
                 raise MonoloadVAEOOMError(msg("vae.err_oom_l1", rows=rows, ws=fmt_bytes(ws), retries=retries, shape=list(samples_in.shape),
-                                              est=fmt_bytes(plan.estimate)))
-            rows = max(min_rows, rows // 2)
-            ws = max(floor_ws, ws // 2)
-            cand = bound.plan(self, samples_in, bud, ws, rows=rows, out_bytes=outb)
+                                              est=fmt_bytes(plan.estimate),
+                                              skipped=msg("vae.oom_skipped", first=fmt_bytes(first_est), steps=steps) if skipped else ""))
+            r = max(min_rows, r // 2)
+            w = max(floor_ws, w // 2)
+            cand = bound.plan(self, samples_in, bud, w, rows=r, out_bytes=outb)
             if cand.estimate <= first_est:
                 break
-            logging.warning(msg("vae.retry_skip", rows=rows, ws=fmt_bytes(ws), est=fmt_bytes(cand.estimate), first=fmt_bytes(first_est)))
-        plan = cand
+            skipped.append((r, w, cand.estimate))
+            logging.warning(msg("vae.retry_skip", rows=r, ws=fmt_bytes(w), est=fmt_bytes(cand.estimate), first=fmt_bytes(first_est)))
+        plan, rows, ws = cand, r, w
         retries += 1
         logging.warning(msg("vae.retry_l1", rows=rows, ws=fmt_bytes(ws), retries=retries))
 
@@ -1099,15 +1115,27 @@ def _layer2_estimate(vae, samples_in, vae_options, ws):
     shape probe (first decode of this model and latent layout) loads the weights."""
     probe = _PROBES.get(vae.first_stage_model, {}).get((int(samples_in.shape[1]), samples_in.ndim))
     if probe is None:
-        # the shape probe needs the weights where they compute
-        mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, samples_in[0:1, ..., :PROBE_SIZE, :PROBE_SIZE], ws)["total"],
+        # the shape probe needs the weights where they compute. It is one plain decode of a PROBE_SIZE x PROBE_SIZE
+        # latent, not under OpChunking: no workspace in what it asks for (with ws it asked ~2 GiB for tens of MiB;
+        # load_models_gpu adds its minimum_inference_memory on top anyway; review 2026-10 item 23)
+        mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, samples_in[0:1, ..., :PROBE_SIZE, :PROBE_SIZE], 0)["total"],
                            force_full_load=vae.disable_offload)
-        try:
-            probe = _probe(vae, samples_in, vae_options)
-        except Exception as e:
-            # a real problem with this decoder will surface again in the decode itself
-            logging.warning(msg("vae.probe_failed", err="{}: {}".format(type(e).__name__, e)))
+        probe = _shape_probe(vae, samples_in, vae_options)
     return estimate(vae, samples_in, ws, probe), probe
+
+
+def _shape_probe(vae, samples_in, vae_options):
+    """_probe (None if it fails: a real problem with this decoder will surface again in the decode itself), then the
+    allocator's cache emptied: with a budget the first-use layer-1 self-test can come right after, and its bound
+    (selftest_memory) does not count the probe's cached blocks (up to ~240 MiB, Flux 2 fp32; tests/alloc_sim.py
+    selftest_trace(probe=True), review 2026-10 item 21). The decode itself empties the cache before it starts anyway."""
+    probe = None
+    try:
+        probe = _probe(vae, samples_in, vae_options)
+    except Exception as e:
+        logging.warning(msg("vae.probe_failed", err="{}: {}".format(type(e).__name__, e)))
+    mm.soft_empty_cache(True)   # out of the except block: a failed probe's tensors are gone
+    return probe
 
 
 def _decode_layer2(self, samples_in, vae_options, t0, l1_note, est=None, probe=None, policy=None, considered=None):
@@ -1143,8 +1171,11 @@ def _decode_layer2(self, samples_in, vae_options, t0, l1_note, est=None, probe=N
     _sync()
     dt = time.perf_counter() - t0
     native_est = _native_estimate(self, samples_in.shape)
+    # a first-use layer-1 self-test that failed in this decode ran before it: the call's peak is the larger (as layer 1)
+    st = _SELFTEST_IN_DECODE[0]
+    rec_est = dict(est, total=max(est["total"], st), decode=est["total"], selftest=st)
     _LAST.clear()
-    _LAST.update({"strategy": "layer2", "estimate": est, "native_estimate": native_est, "workspace": budget,
+    _LAST.update({"strategy": "layer2", "estimate": rec_est, "native_estimate": native_est, "workspace": budget,
                   "retries": retries, "seconds": dt, "probe": probe is not None, "stats": stats.as_dict(), "layer1": l1_note,
                   "budget": _SETTINGS["budget"], "policy": policy, "candidates": considered})
     attn = ""
@@ -1154,7 +1185,8 @@ def _decode_layer2(self, samples_in, vae_options, t0, l1_note, est=None, probe=N
         attn += msg("vae.attn_native", what=", ".join(stats.attn_unmanaged[:4]))
     logging.info(msg("vae.log_layer2", shape="x".join(str(d) for d in samples_in.shape), ws=fmt_bytes(budget),
                      retries=msg("vae.retries", n=retries) if retries else "", chunked=stats.conv_chunked, calls=stats.conv_calls, attn=attn,
-                     policy=policy + "; " if policy else "", est=fmt_bytes(est["total"]), native=fmt_bytes(native_est), secs=dt, note=_NOTE[0]))
+                     policy=policy + "; " if policy else "", est=fmt_bytes(est["total"]) + (msg("vae.est_selftest", st=fmt_bytes(st)) if st else ""),
+                     native=fmt_bytes(native_est), secs=dt, note=_NOTE[0]))
     return pixel_samples
 
 
@@ -1189,8 +1221,8 @@ def _check_api():
         for name in ("raise_non_oom", "cuda_device_context", "soft_empty_cache", "dtype_size"):
             if not callable(getattr(mm, name, None)):
                 return "comfy.model_management.{} missing".format(name)
-    except (TypeError, ValueError) as e:
-        return str(e)
+    except (TypeError, ValueError, AttributeError) as e:
+        return "{}: {}".format(type(e).__name__, e)
     return None
 
 

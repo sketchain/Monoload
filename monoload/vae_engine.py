@@ -55,7 +55,7 @@ import torch
 import comfy.model_management as mm
 import comfy.ops
 
-from .errors import MonoloadError
+from .errors import MonoloadError, MonoloadVAEOOMError
 from .vae_ops import MIB, OpChunking, OpStats, fmt_bytes
 
 POINT, CONV, RES, UP = "point", "conv", "res", "up"
@@ -168,7 +168,9 @@ ARENA_DIV_SAVES = 16         # ... with GroupNorm saves (the pool splits the are
 ARENA_FEW_STRIPES = 3        # ... with saves and at most this many stripes: live / ARENA_DIV_SINGLE
 ARENA_WS_FREE = 128 * MIB    # ... with saves and a larger workspace: at least the workspace
 ARENA_PAD = 64 * MIB
-ESTIMATE_PAD = 16 * MIB      # small-block pool (<= 1 MiB requests come from their own 2 MiB segments; 2-6 MiB seen)
+ESTIMATE_PAD = 16 * MIB      # small-block pool (<= 1 MiB requests come from their own 2 MiB segments; 2-6 MiB seen), and
+                             # what the model leaves out: place() always splits a free block (the allocator keeps a
+                             # remainder <= 1 MiB attached), a bf16 latent's CPU -> GPU copy may stage an fp32 temporary
 CONTIGUOUS_INPUT = (UP,)     # units whose row slice is made contiguous before the call
 ARENA_ENABLED = True         # bench --no-arena: off, to measure the tensors' own peak (the arena block counts as allocated)
 CKPT_LOW = True              # a checkpoint that is not at the front of the arena moves into a free block below it if one fits
@@ -489,7 +491,9 @@ class Plan:
         for name, alive, final_bytes, extra, save_alloc in variants:
             fb, pb, rows = layout(alive, final_bytes)
             live = int(persistent + max(self.prefix_bytes, fb, pb))
-            arena = arena_bytes(live, len(self.stripes), bool(saves), ws) + extra
+            # extra (the separate layout's slack for dead saves) is any number of bytes; the allocator reserves the
+            # arena rounded up to 2 MiB, so the estimate takes it rounded too
+            arena = -(-(arena_bytes(live, len(self.stripes), bool(saves), ws) + extra) // (2 * MIB)) * (2 * MIB)
             if best_v is None or arena < best_v[0]:
                 best_v = (arena, name, alive, fb, pb, rows, live, save_alloc, extra)
         self.arena, self.save_layout, alive, self.stripe_bytes, self.pass_bytes, rows, self.live_peak, save_alloc, self.save_slack = best_v
@@ -1088,8 +1092,9 @@ def self_test(bound, vae):
     # out of the except block: the traceback (and the tensors its frames hold) is gone
     gc.collect()
     mm.soft_empty_cache(True)
-    if oom:
-        raise mm.OOM_EXCEPTION("[Monoload] out of memory in the VAE layer-1 self-test")
+    if oom:   # not cached (a later decode may have the memory); not layer 2 either (a layer-1 OOM never falls back to it)
+        from .messages import msg
+        raise MonoloadVAEOOMError(msg("vae.err_oom_selftest", name=bound.name, need=fmt_bytes(bound.selftest_memory())))
     _SELFTEST[bound.key] = (ok, detail)
     return ok, detail
 

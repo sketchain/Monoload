@@ -46,7 +46,7 @@ def with_settings(vae, budget=0.0, gn_scheme="default", stripe_rows=0, mode="def
     elif budget is not None and float(budget) < 0:
         raise ValueError(msg("node.negative", item="budget", value=budget))
     elif budget:
-        new["budget"] = int(float(budget) * GIB)
+        new["budget"] = int(round(float(budget) * GIB))   # 2.17 -> 2.17 GiB exactly as far as bytes go, not 1 byte under
     s = str(gn_scheme or "default").strip()
     if s.lower() != "default":
         if s.upper() not in SCHEME_CHOICES[1:]:

@@ -11,7 +11,7 @@ No model files needed.
   3. no user-facing Chinese left in the code outside the table;
   4. locales/en and locales/zh nodeDefs.json: valid, every node, every input
      (name, tooltip), every dropdown option, every output; the English input
-     names are the real ones; the option keys are the stored (English) values;
+     names are the real ones, the English tooltips the nodes' own; the option keys are the stored (English) values;
      the web extensions are there.
 
     python tests/test_messages.py
@@ -80,7 +80,7 @@ def runtime_tests():
         expect_raises("MONOLOAD_LANG=zh: the budget error in Chinese, naming layer 2 and each scheme", MonoloadError,
                       lambda: managed_decode(tiny, lat), "峰值预算", "第二层需要约", "方案 B")
         oom = messages.msg("vae.err_oom_l2", ws="64 MiB", retries=4, shape=[1, 4, 270, 480], est="17.9 GiB")
-        oom1 = messages.msg("vae.err_oom_l1", rows=8, ws="64 MiB", retries=5, shape=[1, 4, 270, 480], est="2.9 GiB")
+        oom1 = messages.msg("vae.err_oom_l1", rows=8, ws="64 MiB", retries=5, shape=[1, 4, 270, 480], est="2.9 GiB", skipped="")
         check("MONOLOAD_LANG=zh: the OOM errors in Chinese ({}...)".format(oom[:40]), "显存不足" in oom and "tiled" in oom and "第二层" in oom1)
         e = MonoloadUnsupportedError("force_patch_weights", messages.msg("lora.force_patch"), key="a.weight")
         check("MONOLOAD_LANG=zh: unsupported-LoRA error in Chinese, kind and key kept ({}...)".format(str(e)[:50]),
@@ -140,6 +140,9 @@ def locale_tests():
                     problems.append("en {}.{} name {}".format(cls.__name__, name, e["name"]))
                 if len(spec) > 1 and spec[1].get("tooltip") and not e.get("tooltip"):
                     problems.append("{} {}.{} tooltip".format(lang, cls.__name__, name))
+                # the English locale is what the UI shows; the node's own tooltip is /object_info's original: the same text
+                if lang == "en" and len(spec) > 1 and spec[1].get("tooltip") and e.get("tooltip") and e["tooltip"] != spec[1]["tooltip"]:
+                    problems.append("en {}.{} tooltip differs from INPUT_TYPES".format(cls.__name__, name))
                 if isinstance(spec[0], list) and set(e.get("options", {})) != set(spec[0]):
                     problems.append("{} {}.{} options {}".format(lang, cls.__name__, name, sorted(e.get("options", {}))))
             for i in range(len(cls.RETURN_TYPES)):

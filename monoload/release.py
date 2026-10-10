@@ -44,6 +44,7 @@ import torch
 import comfy.hooks
 import comfy.model_management
 import comfy.model_patcher
+import comfy.utils
 from comfy.model_patcher import ModelPatcher
 
 from . import lora_overrides, settings
@@ -169,8 +170,15 @@ def _release_loaded_models():
         loaded_mem = model.model_loaded_weight_memory
         offload_mem = model.model_offload_buffer_memory
         flagged = [m for m in model.modules() if getattr(m, "comfy_patched_weights", False) is True]
+        # A native patcher (MONOLOAD=0, mode native) restores its backup, which ComfyUI keeps on the offload device
+        # (the CPU unless --gpu-only): put those parameters back where they were loaded.
+        backup_devices = {k: comfy.utils.get_attr(model, k).device for k in p.backup}
         p.unpatch_hooks()
         p.unpatch_model(device_to=None, unpatch_weights=True)  # in place: nothing is moved
+        for k, dev in backup_devices.items():
+            w = comfy.utils.get_attr(model, k)
+            if w.device != dev:
+                comfy.utils.set_attr_param(model, k, w.to(dev))
         model.model_loaded_weight_memory = loaded_mem
         model.model_offload_buffer_memory = offload_mem
         for m in flagged:
@@ -240,12 +248,18 @@ def _sync_clean_loaded_models():
     the LoadedModel back at the parent but leaves the model's
     current_weight_patches_uuid as it was, so the next prompt would run a full
     load() again. Under Monoload weights are never modified, so a model with
-    no runtime patches is in exactly the state of any patcher without
-    patches: sync the uuid."""
+    no runtime patches and no native backup is in exactly the state of any
+    patcher without patches: sync the uuid. Native ComfyUI (MONOLOAD=0, a
+    Monoload LoRA Settings node with mode native) bakes the LoRA into the
+    weights and keeps the originals in the backup, which every clone shares:
+    there the weights still carry the dead clone's LoRA, so the uuid stays and
+    the next load restores the backup."""
     n = 0
     for lm in comfy.model_management.current_loaded_models:
         p = lm.model
         if p is None or patcher_has_weight_patches(p) or _model_has_runtime_patches(p.model):
+            continue
+        if len(p.backup) or len(p.hook_backup):
             continue
         if p.model.current_weight_patches_uuid != p.patches_uuid:
             p.model.current_weight_patches_uuid = p.patches_uuid

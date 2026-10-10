@@ -38,12 +38,19 @@ warn_bad_lang()
 if settings.disabled():
     logging.info(msg("entry.disabled"))
 else:
-    from .monoload import hotpatch, release, vae
-    from .monoload.vae_ops import fmt_bytes
+    from .monoload import hotpatch, release
 
     hotpatch.install()
     release.install()
-    installed_vae = vae.install()
+    # the VAE part depends on more of ComfyUI's internals: if a ComfyUI update breaks its import or its API check,
+    # the LoRA part and the nodes still work (the VAE decode stays native)
+    try:
+        from .monoload import vae
+        from .monoload.vae_ops import fmt_bytes
+        installed_vae = vae.install()
+    except Exception as e:
+        logging.warning(msg("vae.api_differs", bad="{}: {}".format(type(e).__name__, e)))
+        installed_vae = False
     try:
         import nodes as _comfy_nodes
         from .monoload import lora_overrides

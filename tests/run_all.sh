@@ -5,7 +5,9 @@
 #   diffusion_models/sd15_unet_fp8_scaled.safetensors       (tests/make_fp8_unet.py)
 #   text_encoders/clip_l.safetensors                        (CLIPLoader)
 #   loras/{rubber_duck,lycoris_annalise,synthetic_lokr_sd15,synthetic_loha_sd15,synthetic_unet_only_sd15}.safetensors
+#   checkpoints/synthetic_sd15.safetensors, loras/synthetic_sd15_lora.safetensors   (tests/make_synthetic_checkpoint.py $MODELS)
 # (see README "测试" for download links; the synthetic ones come from tests/make_synthetic_loras.py)
+# A suite whose model files are missing is skipped and counted: the exit status is failed + skipped suites.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export MODELS="${MODELS:?set MODELS}"
@@ -14,7 +16,15 @@ R="${R:-tests/docker_run.sh}"   # R=<stub> lists the steps without running them
 SD=v1-5-pruned-emaonly-fp16.safetensors
 ARGS="--cpu --fp16-unet"
 fails=0
+skipped=0
 step() { echo; echo "######## $*"; }
+need() {   # the model files a suite needs; missing -> skipped (counted, the run does not pass)
+  local miss=() f
+  for f in "$@"; do [ -f "$MODELS/$f" ] || miss+=("$f"); done
+  [ ${#miss[@]} = 0 ] && return 0
+  echo "!!! skipped: missing ${miss[*]} under \$MODELS (python tests/make_synthetic_checkpoint.py \$MODELS)"; skipped=$((skipped+1)); return 1
+}
+SYNTH="checkpoints/synthetic_sd15.safetensors loras/synthetic_sd15_lora.safetensors"
 run() { "$@" 2>&1 | grep -vE "agent.cpp|sysfs nodes|comfy_kitchen backend|it/s\]|s/it\]|nodes_replacements" ; local rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || { echo "!!! exit $rc"; fails=$((fails+1)); }; }
 
 step "plugin entry (installed)";            run $R python tests/test_entry.py
@@ -25,6 +35,7 @@ step "plugin entry (MONOLOAD_KEEP_LORA=1)"; run env MONOLOAD_KEEP_LORA=1 $R pyth
 step "plugin entry (MONOLOAD_EXACT=1)";     run env MONOLOAD_EXACT=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_DISABLE_VAE=1)"; run env MONOLOAD_DISABLE_VAE=1 $R python tests/test_entry.py
 step "plugin entry (MONOLOAD_DISABLE_VAE_STRIPE=1)"; run env MONOLOAD_DISABLE_VAE_STRIPE=1 $R python tests/test_entry.py
+step "plugin entry (a ComfyUI whose VAE API changed: LoRA and nodes still installed)"; run $R env TEST_BROKEN_VAE_API=1 python tests/test_entry.py
 step "messages and translations (no model files)"; run $R python tests/test_messages.py
 step "release with a chain of patch-free clones (no model files)"; run $R python tests/test_release_chain.py
 step "Info node (no model files)"; run $R python tests/test_info_node.py
@@ -32,7 +43,9 @@ step "master switch: MONOLOAD=0 == native bit for bit, priorities (no model file
 step "hook + normal LoRA on a lowvram layer == native (no model files)"; run $R python tests/test_lora_lowvram_hook.py
 step "clones sharing a model: runtime LoRA patches follow the patcher loaded == native (no model files)"; run $R python tests/test_lora_clone_binding.py
 step "LoRA Settings node (synthetic SD1.5: python tests/make_synthetic_checkpoint.py \$MODELS)"
-if [ -f "$MODELS/checkpoints/synthetic_sd15.safetensors" ]; then run $R python tests/test_lora_node.py; else echo "skipped: no synthetic checkpoint"; fi
+if need $SYNTH; then run $R python tests/test_lora_node.py; fi
+step "saving a LoRA'd model: CheckpointSave / ModelSave / CLIPSave == native (synthetic SD1.5)"
+if need $SYNTH; then run $R python tests/test_lora_save.py; fi
 step "VAE decode: op-level chunking vs native (synthetic decoders, no model files)"; run $R python tests/test_vae.py
 step "VAE decode: layer 1, Wan 2.1 stripes vs native (synthetic decoder, no model files)"; run $R python tests/test_vae_stripe.py
 step "VAE decode: layer 1, LDM stripes (SDXL / Flux ae) vs native (synthetic decoders, no model files)"; run $R python tests/test_vae_ldm.py
@@ -61,5 +74,5 @@ for EXACT in 1 ""; do
   step "[$M] MONOLOAD_KEEP_LORA=1"
   run $E MONOLOAD_KEEP_LORA=1 DOCKER_EXTRA="-v $OUT:/out" $R env COMFY_ARGS="$ARGS" python tests/test_release.py --reference $REF
 done
-echo; echo "######## suites failed: $fails"
-exit $fails
+echo; echo "######## suites failed: $fails, skipped (missing model files): $skipped"
+exit $((fails + skipped))

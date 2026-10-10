@@ -140,6 +140,11 @@ def vae_tests():
           and "layer 1 (LDM stripes" in t_orig2 and re.search(r"workspace .*, estimate .*, measured peak .*, [0-9.]+ s, OOM retries 0", last))
     check("the scheme the decode used is explained in one line: {}".format(next((l for l in t_orig2.splitlines() if "GroupNorm scheme B:" in l), "").strip()),
           "GroupNorm scheme B: keeps the H/4 and H/2 level outputs" in t_orig2)
+    plain_copy = node_apply(cls_v, sd)   # every item left at default: still a copy of its own (review 2026-10 item 18)
+    check("a node copy with every item at default is marked as a copy, the original is not ({})".format(
+          next(l for l in text(vae=plain_copy).splitlines() if l.startswith("VAE (")).strip()),
+          plain_copy is not sd and "a Monoload VAE Settings copy" in text(vae=plain_copy)
+          and "a Monoload VAE Settings copy" not in text(vae=sd))
     nat = node_apply(cls_v, sd, mode="native")
     native_decode(nat, lat)   # the original method: no record
     comfy.sd.VAE.decode(nat, lat)
@@ -159,6 +164,21 @@ def vae_tests():
     t2 = text(vae=nat)
     check("refreshed on every run (the age of the record moves)", t2 != t)
     return sd
+
+
+def zh_source_tests(sd):
+    """Review 2026-10 item 17: in Chinese the VAE settings' source "env" is translated like the others."""
+    from monoload import messages
+    mvae.set_budget(3 << 30)
+    messages.set_lang("zh")
+    try:
+        t = text(vae=sd)
+    finally:
+        messages.set_lang("en")
+        mvae.set_budget(None)
+    line = next((l for l in t.splitlines() if "设置：模式" in l), "")
+    check("MONOLOAD_LANG=zh: the budget's source is shown as [环境变量], no bare [env] ({})".format(line.strip()[:120]),
+          "[环境变量]" in line and "[env]" not in t)
 
 
 def error_record_tests(sd):
@@ -299,6 +319,7 @@ def main():
     interface_tests()
     global_tests()
     sd = vae_tests()
+    zh_source_tests(sd)
     error_record_tests(sd)
     probe_tests()
     m = model_tests(sd)

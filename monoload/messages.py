@@ -95,9 +95,9 @@ M = {
         "the patch would change the weight's shape from {old} to {new}; the runtime merge cannot do that",
         "patch 会把权重形状从 {old} 改成 {new}，运行时合并无法支持"),
     "lora.force_patch": (
-        "a node asks for the LoRA / patches to be baked into the weights (force_patch_weights, e.g. saving or merging a model). Monoload "
+        "a node asks for the LoRA / patches to be baked into the weights at load (force_patch_weights; ComfyUI's own nodes, saving included, never do). Monoload "
         "only merges at run time; set this model's Monoload LoRA Settings mode to native, or MONOLOAD=0 / MONOLOAD_DISABLE=1.",
-        "有节点要求把 LoRA/patch 直接烘焙进权重（force_patch_weights，常见于保存/合并模型）。Monoload 只做运行时临时合并，"
+        "有节点要求加载时把 LoRA/patch 直接烘焙进权重（force_patch_weights；ComfyUI 自己的节点包括保存都不会这样做）。Monoload 只做运行时临时合并，"
         "不改权重、不备份；请把这个模型的 Monoload LoRA 设置的模式设成「原生」，或设 MONOLOAD=0 / MONOLOAD_DISABLE=1。"),
     "lora.force_patch_unload": (
         "force_patch_weights is not supported for models Monoload drives",
@@ -272,10 +272,22 @@ M = {
         "[Monoload] VAE decode out of memory: layer 1 (stripe decoding) still runs out of memory with {rows}-row stripes and workspace "
         "{ws} ({retries} retries). Monoload never falls back to the approximate tiled decode, nor to layer 2 (its peak is higher). Free "
         "other models (/free), lower the resolution, or set this VAE's mode to native (MONOLOAD_DISABLE_VAE=1 for all). Latent {shape}, "
-        "estimate {est}.",
+        "estimate {est}.{skipped}",
         "[Monoload] VAE 解码显存不足：第一层（条带解码）的条带已缩到 {rows} 行、工作区 {ws}（共重试 {retries} 次）仍然 OOM。"
         "Monoload 不会退回到 tiled 近似解码，也不会退回第二层（第二层峰值更高）。可以先释放其他模型（/free）、降低分辨率，"
-        "或把这个 VAE 的模式设成原生（全部原生：MONOLOAD_DISABLE_VAE=1）。latent {shape}，估算需要 {est}。"),
+        "或把这个 VAE 的模式设成原生（全部原生：MONOLOAD_DISABLE_VAE=1）。latent {shape}，估算需要 {est}。{skipped}"),
+    "vae.oom_skipped": (
+        " Not tried (their plans need more than the first plan's {first}): {steps}.",
+        "没有尝试的（计划需要的比第一次的 {first} 还多）：{steps}。"),
+    "vae.oom_skip_step": ("{rows}-row stripes, workspace {ws}: {est}", "{rows} 行条带、工作区 {ws}：{est}"),
+    "vae.err_oom_selftest": (
+        "[Monoload] VAE decode out of memory in the layer-1 self-test of {name} (it runs once per decoder structure and GroupNorm scheme in "
+        "this process, before the first layer-1 decode, and needs about {need}). Not cached: the next decode runs it again. Monoload does "
+        "not fall back to layer 2 or the approximate tiled decode here. Free other models (/free) and run again, or set this VAE's mode to "
+        "layer 2 only (MONOLOAD_DISABLE_VAE_STRIPE=1 for all) or native (MONOLOAD_DISABLE_VAE=1 for all).",
+        "[Monoload] VAE 解码显存不足：{name} 的第一层自检 OOM（自检在本进程里每种 decoder 结构和 GroupNorm 方案第一次走第一层之前做一次，"
+        "约需 {need}）。结果不缓存，下次解码会重新自检。Monoload 不会因此退回第二层或 tiled 近似解码。可以先释放其他模型（/free）再运行，"
+        "或把这个 VAE 的模式设成「只用第二层」（全部：MONOLOAD_DISABLE_VAE_STRIPE=1）或原生（全部：MONOLOAD_DISABLE_VAE=1）。"),
     "vae.retry_skip": (
         "[Monoload] VAE OOM retry: {rows}-row stripes, workspace {ws} would need {est}, more than the first plan's {first}; skipped",
         "[Monoload] VAE 显存不足重试：{rows} 行条带、工作区 {ws} 需要 {est}，比第一次的计划 {first} 还多，跳过这一档"),
@@ -377,8 +389,8 @@ M = {
                  "存 H/4 级的输出——介于 A 和 B 之间（SDXL 4K 约 1.5 GiB / 58 s）"),
     "scheme.B": ("keeps the H/4 and H/2 level outputs - the built-in default (SDXL 4K ~2.2 GiB / 42 s)",
                  "存 H/4 和 H/2 级的输出——内置默认（SDXL 4K 约 2.2 GiB / 42 s）"),
-    "scheme.C": ("also keeps every full-resolution block's input - most memory, fastest (SDXL 4K ~4.7 GiB / 36 s)",
-                 "再存全分辨率每个块的输入——内存最高、最快（SDXL 4K 约 4.7 GiB / 36 s）"),
+    "scheme.C": ("also keeps every full-resolution block's output - most memory, fastest (SDXL 4K ~4.7 GiB / 36 s)",
+                 "再存全分辨率每个块的输出——内存最高、最快（SDXL 4K 约 4.7 GiB / 36 s）"),
     "info.unused_native": (" (not used in native mode)", "（原生模式下不使用）"),
     "info.unused_layer2": (" (not used: layer 2 only)", "（只用第二层时不使用）"),
     "info.model_head": ("MODEL ({model}):", "MODEL（{model}）："),

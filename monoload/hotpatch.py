@@ -452,8 +452,10 @@ def _has_runtime_patch(patcher, key):
 
 
 def _remove_runtime_patches(patcher, keep=None):
+    # comfy_patched_weights stays: a runtime patch never changed the stored weight, so a fully loaded module is still
+    # exactly "loaded" (native partially_unload only offloads flagged modules); native unpatch_model drops the flags
+    # itself when the model is really unloaded.
     for m in patcher.model.modules():
-        touched = False
         for fn_attr in ("weight_function", "bias_function"):
             funcs = m.__dict__.get(fn_attr, None)
             if not funcs:
@@ -461,29 +463,9 @@ def _remove_runtime_patches(patcher, keep=None):
             kept = [f for f in funcs if not _is_runtime_patch(f) or (keep is not None and f.key in keep)]
             if len(kept) != len(funcs):
                 setattr(m, fn_attr, kept)
-                touched = True
-        if touched and hasattr(m, "comfy_patched_weights"):
-            del m.comfy_patched_weights
     if keep is None:
         patcher.model.__dict__.pop("_monoload_runtime", None)
         _release_binding(patcher)
-
-
-def _drop_shadowed_runtime_patches(patcher):
-    """After a native partial unload a module may carry both our patch and a
-    native LowVramPatch for the same key (native would have restored the
-    backup and switched that layer to LowVramPatch). Keep only the native one
-    so the result is exactly what native ComfyUI computes."""
-    for m in patcher.model.modules():
-        for fn_attr in ("weight_function", "bias_function"):
-            funcs = m.__dict__.get(fn_attr, None)
-            if not funcs:
-                continue
-            native_keys = {f.key for f in funcs if type(f) is LowVramPatch}
-            if native_keys:
-                kept = [f for f in funcs if not (_is_runtime_patch(f) and f.key in native_keys)]
-                if len(kept) != len(funcs):
-                    setattr(m, fn_attr, kept)
 
 
 def _assert_no_backup(patcher):
@@ -510,6 +492,8 @@ def _load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=Fals
     if not _active(self):
         return _ORIG["load"](self, device_to, lowvram_model_memory=lowvram_model_memory, force_patch_weights=force_patch_weights, full_load=full_load)
     _check_dynamic(self)
+    # No caller in ComfyUI 0.31 passes force_patch_weights=True (saving goes through model_state_dict_for_saving,
+    # below); a custom node that asks for the patches to be baked in gets an error instead of base weights.
     if force_patch_weights and len(self.patches) > 0:
         raise MonoloadUnsupportedError("force_patch_weights", msg("lora.force_patch"), key=_first_key(self))
     # Native load() wipes weight_function on every fully-loaded comfy.ops
@@ -536,8 +520,10 @@ def _partially_unload(self, device_to, memory_to_free=0, force_patch_weights=Fal
         return _ORIG["partially_unload"](self, device_to, memory_to_free=memory_to_free, force_patch_weights=force_patch_weights)
     if force_patch_weights and len(self.patches) > 0:
         raise MonoloadUnsupportedError("force_patch_weights", msg("lora.force_patch_unload"), key=_first_key(self))
+    # A layer unloaded here gets native's LowVramPatch after our runtime patch: the runtime patch then applies only the
+    # key's hooks (MonoloadRuntimePatch._native_base), native's order. It stays, so the hooks in effect (current_hooks
+    # unchanged: there is no backup, so native does not unpatch them) keep being applied.
     freed = _ORIG["partially_unload"](self, device_to, memory_to_free=memory_to_free, force_patch_weights=force_patch_weights)
-    _drop_shadowed_runtime_patches(self)
     _assert_no_backup(self)
     return freed
 
@@ -624,6 +610,30 @@ def _patch_cached_hook_weights(self, cached_weights, key, memory_counter):
     raise MonoloadError(msg("lora.internal_hook_cache", key=key))
 
 
+def _model_state_dict_for_saving(self, model=None, prefix=""):
+    """Saving (CheckpointSave / ModelSave / CLIPSave, comfy.sd.save_checkpoint): native outputs the stored tensor of
+    every module flagged comfy_patched_weights (natively the patches are baked into it) and a LazyCastingParam
+    (patch_weight_to_device(return_weight=True): the merged weight, computed while saving) for the others. Under
+    Monoload the stored tensors of a patched module are the base, so for the call the modules of this patcher's
+    patched keys are not flagged: they go through LazyCastingParam, which native merges exactly."""
+    if not _active(self) or not self.patches:
+        return _ORIG["model_state_dict_for_saving"](self, model=model, prefix=prefix)
+    unflagged = []
+    try:
+        for key in self.patches:
+            try:
+                m, _attr = _module_for_key(self, key)
+            except (AttributeError, MonoloadUnsupportedError):
+                continue
+            if getattr(m, "comfy_patched_weights", False) is True:
+                m.comfy_patched_weights = False
+                unflagged.append(m)
+        return _ORIG["model_state_dict_for_saving"](self, model=model, prefix=prefix)
+    finally:
+        for m in unflagged:
+            m.comfy_patched_weights = True
+
+
 def _dynamic_load(self, *args, **kwargs):
     if _enabled(self):
         _check_dynamic(self)
@@ -640,6 +650,7 @@ _REPLACEMENTS = {
     "unpatch_hooks": _unpatch_hooks,
     "patch_hook_weight_to_device": _patch_hook_weight_to_device,
     "patch_cached_hook_weights": _patch_cached_hook_weights,
+    "model_state_dict_for_saving": _model_state_dict_for_saving,
 }
 
 

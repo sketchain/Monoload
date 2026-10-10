@@ -1,10 +1,10 @@
-# Monoload 交接说明（第四阶段：VAE 解码管理推广到全部 VAE；4a 盘点、4b-0 修缺口、4b-1 Flux 2 第一层已完成并验收，2026-10）
+# Monoload 交接说明（第四阶段：VAE 解码管理推广到全部 VAE；4a 盘点、4b-0 修缺口、4b-1 Flux 2 第一层已完成并验收；第二轮代码审查的修正已完成并在 CT 700 上验收，2026-10）
 
 给下一个对话用。到这里为止的功能都已在 CT 700 上验收；这份文档讲：现在是什么状态（§1）、节点和设置体系（§2）、必须遵守的规矩（§3）、第四阶段的盘点结果和下一步（§4）、环境和工具（§5）、代码地图（§6）、提交记录（§7）。细节在 README.md（使用、真机结果、bench 命令）和 docs/DESIGN.md（§9 VAE 设计，§10–§13 总开关 / LoRA 节点 / Info 节点 / 多语言）。
 
 ## 1. 当前状态
 
-仓库 github.com/sketchain/Monoload，开发分支 `dev`（不碰 `main`，`main` 停在 5bfbc8e）。ComfyUI 插件，两部分功能互相独立：
+仓库 github.com/sketchain/Monoload，开发分支 `dev`（不碰 `main`，`main` 停在 5d9ac63，即 PR #2 合并的 dev）。ComfyUI 插件，两部分功能互相独立：
 
 * **LoRA 运行时合并**（`monoload/hotpatch.py`、`release.py`）：所有 `ModelPatcher` 的 LoRA 不写进权重、不留备份，每一层计算时在临时权重上合并；默认融合 fp16 `addmm_`，可选逐位一致；每个 prompt 结束后释放 LoRA，底模常驻。CT 700：SDXL 比原生少用约 4.7 GiB（8.2 对 12.9 GiB），每步 fused 0.73 s、exact 0.90 s、原生 0.654 s（19d7694，命令 V）。
 * **VAE 解码降峰值**（`monoload/vae*.py`）：包装 `comfy.sd.VAE.decode`。
@@ -22,9 +22,11 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | SDXL / Flux `ae` | 52.5 GiB / 11.9 s | 15.0 GiB / 9.9 s | 默认 B 2.17 GiB / 42 s（A 1.10 / 75，D 1.52 / 58，C 4.70 / 36） |
 | `qwen_image_vae` | 59.2 GiB / 7.9 s | 9.6 GiB / 6.9 s | 0.87 GiB / 8.5 s |
 
-验收情况：VAE 三个阶段、预算策略、VAE 节点、总开关、LoRA 节点、Info 节点、多语言都已在 CT 700 上通过（最近一次 b4c33d5：审查修正后的 `run_all.sh` 和命令 AB，README §10.7）。polish-after-ui-test（05ded8d）修了 UI 实测发现的六处问题，待 CT 700 复测（README §9.10）。
+验收情况：VAE 三个阶段、预算策略、VAE 节点、总开关、LoRA 节点、Info 节点、多语言都已在 CT 700 上通过（最近一次 e924a77：第二轮审查修正后的 `run_all.sh` 和命令 AC / AD / AE / Z，README §10.8）。polish-after-ui-test（05ded8d）修了 UI 实测发现的六处问题，待 CT 700 复测（README §9.10）。
 
 **第四阶段 4a（vae-inventory，575fc46；命令 W 的识别修正 87e6262）**：只加了盘点脚本和文档，插件行为没变。结论：用户实际在用的三个 VAE（SDXL、Flux `ae`、`qwen_image_vae`）的图像解码**已经全部走第一层**；其余 VAE 的结构、现在的路、模拟峰值和建议顺序见 §4 和 DESIGN §9.16；发现现有代码的 4 处缺口（SVD 结果被改变、2D latent 的音频 VAE 被管理且 ACE 的估算约 1 PiB、像素空间被管理、TAESD 小图第二层反而更高）。用户已定顺序（§4.0）。
+
+**第二轮代码审查（基准 main 5d9ac63，ComfyUI 62b3c94，2026-10）：已完成并在 CT 700 上验收**（8c5cb37，README §10.8）。清单 01–20 全部改完；21、23 按用户的决定做了，22 不做（§4.0）。最要紧的是 01：默认设置下 `CheckpointSave` / `ModelSave` / `CLIPSave` 以前会把 LoRA 悄悄丢掉、存成底模；CT 700 上 SDXL + Smooth Booster 存出的 checkpoint 与原生 2515 个张量逐个相同（也与整进程 `MONOLOAD=0` 相同）。验收之后又改了：`run_all` 的「VAE 接口变了」那组在容器里没拿到 `TEST_BROKEN_VAE_API`、实际跑的是普通入口测试，已修（eee564c）；`bench_vae` 没跑原生时写「native not run」（17880b8）；21 / 23 见 §4.0。**这些也已在 CT 700 上复查通过**（e924a77，README §10.8 复查）：`run_all.sh` 41 组 1490 项 0 失败 0 跳过，「VAE 接口变了」那组 11 项、有 NOT managed 警告；命令 AE 不变；命令 Z（Flux 2 预算 3G / 1.5G）六档选择与 §10.5 相同，每档第一次（探测 + 自检 + 解码）都 ≤ 估算。
 
 **4b-1（vae-flux2-layer1，4fbaa22，CT 700 验收通过）**：Flux 2 VAE（`AutoencoderKL` + batch-norm latent）走第一层，复用 LDM 适配器：latent 的反归一化和 2×2 还原是前缀第一个模块（`vae_ldm.LatentUnpatch`），引擎加 `decoder_hw` 钩子在 decoder 的分辨率上做计划。模拟与 Flux `ae` 相同（4K 默认 B 2.18 GiB）。DESIGN §9.18，测试 `tests/test_vae_flux2.py`，真机命令 README §9.12。
 
@@ -38,7 +40,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * **高级环境变量**（README §13）：`MONOLOAD_EXACT`、`MONOLOAD_KEEP_LORA`、`MONOLOAD_DISABLE_VAE`、`MONOLOAD_DISABLE_VAE_STRIPE`、`MONOLOAD_VAE_BUDGET`、`MONOLOAD_VAE_GN_SCHEME`、`MONOLOAD_VAE_STRIPE_ROWS`、`MONOLOAD_VAE_WORKSPACE`、`MONOLOAD_LANG`。bench 和测试仍用它们配置。
 * **Monoload LoRA Settings**（`lora_overrides.py`、`nodes/lora_settings.py`）：MODEL（必接）+ CLIP（可选）→ clone；`mode`（default / enable / native）、`merge`（default / fused / exact）、`after_prompt`（default / release / keep）。设置在 `model_options["monoload_lora"]`，每次 clone 都复制，所以放在 LoRA 加载器前后都行；设置和上游不同的 clone 换 `patches_uuid`。hotpatch 按 patcher 决定接管和合并路径（`_enabled`、`MonoloadRuntimePatch.exact`），release 按 patcher 决定释放。原生模型默认保留。
 * **Monoload VAE Settings**（`vae_overrides.py`、`nodes/vae_settings.py`）：VAE → 共享权重的副本（`copy.copy`，属性 `_monoload_vae_settings`）；控件顺序 `budget`（default / unlimited / custom）、`budget_gib`（精度 0.01，只在 custom 时用）、`gn_scheme`、`stripe_rows`、`mode`（default / auto / layer 2 only / native）。`vae.resolve_settings` 逐项取值和来源，`_Applied` 在解码期间换进全局设置（含来源 `_SETTINGS["src"]`，日志和报错据此写「来源：节点 / 环境变量」并按来源给建议）。dev 不做旧工作流兼容（用户定）。
-* **Monoload Info**（`info.py`、`nodes/info.py`、`web/monoload_info.js`）：输入 vae / model / images 都可选，文字显示在节点框里并从 STRING 输出；每次运行都刷新。内容：版本 / commit / 总开关；VAE 的设置和来源（当前模式下不生效的项会标出来）、这个 VAE 对象上一次解码的记录（`vae.decode_record`：层、方案及一句说明、条带、工作区、估算、实测 reserved / GTT 峰值增量，第一次含自检时注明）；模型的 LoRA 名字和强度（`LoraLoader` 包装记在 `model_options`）、设置和来源、内存里的状态；最后总是全局默认值表。
+* **Monoload Info**（`info.py`、`nodes/info.py`、`web/monoload_info.js`）：输入 vae / model / images 都可选，文字显示在节点框里并从 STRING 输出；每次运行都刷新。内容：版本 / commit / 总开关；VAE 的设置和来源（当前模式下不生效的项会标出来）、这个 VAE 对象上一次经 `VAE.decode` 的解码记录（不含 `VAEDecodeTiled`：`decode_tiled` 不经过 `VAE.decode`；`vae.decode_record`：层、方案及一句说明、条带、工作区、估算、实测 reserved / GTT 峰值增量，第一次含自检时注明）；模型的 LoRA 名字和强度（`LoraLoader` 包装记在 `model_options`）、设置和来源、内存里的状态；最后总是全局默认值表。
 * **界面翻译**：`locales/{en,zh}/nodeDefs.json`（官方机制）；下拉的显示文字由 `web/monoload_i18n.js` 用 combo 的 `getOptionLabel` 补（前端 1.48.7 不做），存储值始终英文。**加节点或输入时两份 nodeDefs.json 都要加**（`test_messages.py` 检查）。
 * **后端消息**：所有用户可见的日志、报错、Info 文字都在 `monoload/messages.py`（`msg(key, **字段)`，英文 / 中文两列，字段一致）。**加消息时两种语言都要写。** 内部诊断（internal error）保持英文。
 
@@ -81,11 +83,17 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * **用户定的（4a 之后）**：顺序 ① 修缺口 1–3 → ② Flux 2 第一层（一定会用）→ ③ 视频等用户定了再说（不是不做，往后放）。SVD 先走原生（并进 ①），以后做视频第二层时把 SVD 整批第二层一起做。每项一个分支，分开提交，合进 dev。
 * **进度**：① 完成（4b-0，DESIGN §9.17）；② 完成并在 CT 700 上**验收通过**（4b-1，DESIGN §9.18，实测 README §10.5：W / X / Y / Z / check_vae_node 都与预测一致）；③ 视频等用户定。
 * **自检峰值（DESIGN §9.19 → §9.20）**：用户选 B + A，已实现（vae-selftest-budget）：参照解码在第二层分块下跑（自检 0.74 → 约 0.38 GiB），自检上界（430 MiB）算进第一次解码的估算和预算比较。
-* **第一次解码多 0.13 GiB / arena 被输出钉住（DESIGN §9.21 → §9.22）**：用户选 ① a、② a + 结束时清缓存，已实现（vae-arena-output）：`StripeAdapter.run` 先清缓存、再分配输出（单独一段）、再预留 arena，解码完清缓存；估算 = 输出段 + arena + largest + 16 MiB。布局变了使方案 A（无存档）4K 128 MiB 工作区高了 0.12 GiB（前缀在检查点前留下的洞以前被输出填上），加了 `move_low`（检查点挪进下面的洞，只在洞放得下时）。alloc_sim：37 个配置峰值都不升、≤ 估算，解码后只留输出；63 个 CT 700 读数（含新加的 Flux 2 的 12 个）按旧布局重放都对得上；预算选择不变。
+* **第一次解码多 0.13 GiB / arena 被输出钉住（DESIGN §9.21 → §9.22）**：用户选 ① a、② a + 结束时清缓存，已实现（vae-arena-output）：`StripeAdapter.run` 先清缓存、再分配输出（单独一段）、再预留 arena，解码完清缓存；估算 = 输出段 + arena + largest + 16 MiB。布局变了使方案 A（无存档）4K 128 MiB 工作区高了 0.12 GiB（前缀在检查点前留下的洞以前被输出填上），加了 `move_low`（检查点挪进下面的洞，只在洞放得下时）。alloc_sim：37 个配置峰值都不升、≤ 估算（手工跑的结果；自动测试只断言其中一部分），解码后只留输出；63 个 CT 700 读数（含新加的 Flux 2 的 12 个）按旧布局重放都对得上；预算选择不变。
 * **代码审查（基准 4f140ea，ComfyUI 62b3c94）**，每项一个分支：
   * 已改：03 解码失败的记录（`vae-record-errors`）；04 `check_selftest_mem` 自检预算选中的方案（`check-selftest-scheme`）；05 `run_all.sh` 加上 `test_vae_ldm` / `test_vae_flux2` / `test_vae_node`（`run-all-vae`）；07 自检模拟补上最后的比较，上界不变（`selftest-trace-tail`）；08 文档（`review08-docs`）。
   * 用户定了之后改的：01 每个模型一个绑定对象，所有运行时 patch 读它，`partially_load` 调原函数之前绑定指向当前 patcher（`lora-runtime-binding`，`tests/test_lora_clone_binding.py`）；02 选 B，强制的第一层配置自检失败时（首次或已缓存，决定相同）第二层也要放得下预算，否则报错（`vae-selftest-fail-budget`）；06 加保险，重试计划的估算超过第一次就跳过这一档（`vae-retry-guard`）；分析 01 时发现的 lowvram + hook 普通 LoRA 加两次，单独修（`lora-lowvram-hook`）。
   * **审查修正全部完成，已在 CT 700 上验收**（b4c33d5，README §10.7）：`run_all.sh` 39 组 1451 项 0 失败；LoRA 每步耗时与 9.1 第三轮相同（默认 1.13 / 1.10 / 1.19×，逐位一致 1.39 / 1.33 / 1.66×，逐位一致 max|Δ| 0，备份 0）。
+* **第二轮代码审查（基准 main 5d9ac63，ComfyUI 62b3c94；报告的修复清单 01–23）**，每项一个分支，从 dev 开、`--no-ff` 合回 dev：
+  * **LoRA / 释放**：01 保存时 LoRA 被丢掉（`lora-save-state-dict`；接管 `model_state_dict_for_saving`，调用期间把这个 patcher 被 patch 的层的 `comfy_patched_weights` 暂设 False，这些层走原生 `LazyCastingParam` 精确合并；`tests/test_lora_save.py`，真机脚本 `tests/check_lora_save.py`）；02 有原生备份的 patcher 不同步 uuid（`release-sync-backup`；先用 `PromptExecutor` 证实 clone 在那次释放里被回收、下个 prompt 带着 LoRA，max|Δ| 26.8）；03 原生 patcher 被节点释放时，从 offload 设备还原的参数移回原设备（`release-native-offload`，选了「移回」而不是 `model_unload`：底模仍常驻，`--gpu-only` 时什么都不做）；04 删掉 `_drop_shadowed_runtime_patches`（`lora-drop-shadowed-hooks`）；05 摘运行时 patch 时不删 `comfy_patched_weights`（`lora-hook-keep-flag`；比清单多一步：清单只保留 `keep is None` 时删，但只有 hook、没有普通 LoRA 的模型每次采样结束也走 `keep=None`，那样仍会删光，所以整个去掉）。
+  * **VAE**：06 自检 OOM 包成 `MonoloadVAEOOMError`（用户选 (a)，不缓存、不退第二层；预算路径不再把它记成「预算不够」）；07 arena 加完余量再按 2 MiB 取整（alloc_sim 21 个受影响的计划 reserved 不变、≤ 估算）；08 第一层 OOM 报错写最后真跑过的计划，跳过的档另列；09 自检失败转第二层时记录含自检；10 预算报错的小数位数加到估算和预算看得出差别为止（2–6 位），节点预算按字节四舍五入；11 ComfyUI 升级使 VAE 部分导入失败时节点和 LoRA 部分照常（`TEST_BROKEN_VAE_API=1` 的入口测试，进了 `run_all.sh`）；12 第二层也分块 SeedVR2 的 `optimized_vae_attention`。
+  * **测试 / Info / 文档**：13 `test_check_selftest_mem` 前置条件不满足时退出码 1；14 `run_all.sh` 缺模型文件跳过的组计数、退出码 = 失败 + 跳过；15 alloc_sim 的 fp32 配置也拷贝 latent（两条上界断言的配置不变；fp32 重放 v2 4K 2.07 → 2.09、v1 4K 3.21 → 3.23）；16 alloc_sim 第二层直接跑 `vae._run`（21 个第二层读数不变）；17 Info 中文下来源「环境变量」；18 全选 default 的节点副本也标「副本」；19 `gn_scheme` tooltip 加 Flux 2（`test_messages` 多查英文 locale 与节点自己的 tooltip 一致）；20 文档（另外把方案 C「全分辨率每个块的输入」改成「输出」，tooltip、两份 locale、消息表、README、DESIGN、HANDOFF 都有这个错）。
+  * **21–23（先分析，用户定了之后）**：21 **做了**（`vae-probe-cache`，56b9e93）：预算模式第一次解码时 8×8 形状探测的块留在缓存里紧接自检，alloc_sim 上 Wan（`qwen_image_vae`）fp32 自检到 426 / 430 MiB；现在 `vae._shape_probe` 探测完清一次缓存，所有结构 bf16 / fp32 的自检峰值都与单独自检相同（Wan fp32 410，余量 4 → 20 MiB），`alloc_sim.selftest_trace(probe=True)` 和 `test_vae_flux2` 检查；CT 700 命令 Z 复查：每档第一次都 ≤ 估算（README §10.8）。22 **不做**（用户定）：`place()` 补「剩余 ≤ 1 MiB 不切分」后 3780 个计划完全相同，DESIGN §9.14.11 记了一句（a0ce191）。23 **做了**（`vae-probe-memreq`，c9e6bcf）：8×8 探测交给 `load_models_gpu` 的 `memory_required` 不再带 2 × 工作区（以前 2.02–2.13 GiB，探测实际只占 18–238 MiB；现在是探测自己的小估算，`load_models_gpu` 另有约 0.8 GiB 的 `minimum_inference_memory` 兜底），`test_vae_ldm` 检查；CT 700 复查通过（命令 Z，选择和数字不变）。
+  * **已在 CT 700 上验收**（8c5cb37，README §10.8）：AC / AD 三种保存与原生逐张量相同；AE SDXL 4K 默认 2.17 GiB / 估算 2.68，与以前相同；`run_all.sh` 41 组 1494 项 0 失败 0 跳过（其中「VAE 接口变了」那组实际没进入该模式）。**复查**（e924a77，含 21 / 23 和两处测试工具的修正）：`run_all.sh` 41 组 1490 项（那一组 17 → 11，21 / 23 在 `test_vae_flux2` / `test_vae_ldm` 各加 1 项）0 失败 0 跳过；AE 不变；命令 Z 不变，每档第一次 ≤ 估算。
 * **已在 CT 700 上验收**（4f140ea，B + A 和这次的改动一起，命令 AA / X / Y / Z，README §10.6）：自检峰值 0.37（加 warm-up，≤ 上界 0.42）/ 0.45（不加，含进程第一批 GPU 计算约 0.07，不在上界里）；decode 1 = decode 2 = 2.43，解码后只留 0.09；X / Y / Z / check_vae_node 的选择和数字都与预测一致。
 
 ### 4.1 入口和做法（4a 之前写的，仍然适用）
@@ -96,8 +104,9 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 |---|---|
 | SD1.5 / SDXL / SD3 / Flux `ae` / Flux 2（LDM `Decoder`，`AutoencoderKL` / `AutoencodingEngine`；Flux 2 带 `batch_norm_latent`，4b-1） | 第一层（`vae_ldm`） |
 | Wan 2.1 / `qwen_image_vae` 单帧（5D，T=1） | 第一层（`vae_wan`） |
-| 其他 2D 图像 VAE（带注意力的 up 级、TAESD、Stable Cascade Stage A / C、Mage-VAE、SeedVR2 等） | 第二层（逐算子分块），或第一层识别不通过时第二层 |
-| 多帧视频 latent：Wan 2.1 / 2.2、Hunyuan 系（3D 卷积 `AutoencoderKL` / `AutoencodingEngine`）、Mochi、Cosmos、CogVideoX、MiniMax H3、TAEHV 等 | **原生**（`_native_reason`：multi-frame video latent，第一阶段暂不做） |
+| 其他 2D 图像 VAE（带注意力的 up 级、TAESD、Stable Cascade Stage A / C、Mage-VAE 等） | 第二层（逐算子分块），或第一层识别不通过时第二层 |
+| 3D VAE 的单帧 latent（5D，T=1）：Wan 2.2、Hunyuan 系（含 HunyuanImage 2.1 Refiner）、Mochi、Cosmos、CogVideoX、TAEHV、SeedVR2（`latent_dim` 3）等，Wan 2.1 / `qwen_image_vae` 以外 | 第二层（SeedVR2 的注意力在 `optimized_vae_attention`，审查 2026-10 第 12 项起也分块） |
+| 多帧视频 latent（T>1）：Wan 2.1 / 2.2、Hunyuan 系（3D 卷积 `AutoencoderKL` / `AutoencodingEngine`）、Mochi、Cosmos、CogVideoX、MiniMax H3、TAEHV 等 | **原生**（`_native_reason`：multi-frame video latent，第一阶段暂不做） |
 | 自己往预分配输出写的（`comfy_has_chunked_io`，如 LTX） | 原生 |
 | 1D / 音频（Stable Audio、ACE、MMAudio、LTX Audio 等） | 原生 |
 
@@ -113,12 +122,12 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 ## 5. 环境与工具
 
 * **锁定镜像**：`docker.io/kyuz0/amd-strix-halo-comfyui@sha256:384aa1fecef6a841832e0d5552949977330308d8c25e212a94f5e8dfcc061cae`，ComfyUI 0.31.0 / 62b3c94，前端 1.48.7，torch 2.14.0a0 + ROCm 7.15。云端容器里 docker daemon 可能没起来：`sudo dockerd > /tmp/dockerd.log 2>&1 &`。
-* **跑测试**：`MODELS=<目录> tests/docker_run.sh python tests/<test>.py`（仓库只读挂进镜像的 custom_nodes；`docker_run.sh` 传 `MONOLOAD*` 环境变量）。
+* **跑测试**：`MODELS=<目录> tests/docker_run.sh python tests/<test>.py`（仓库只读挂进镜像的 custom_nodes；`docker_run.sh` 传 `MONOLOAD*` 环境变量）。镜像拉不下来时（第二轮审查就是这样做的）：venv 里装 CPU 版 torch（2.14.1+cpu）+ ComfyUI 62b3c94 的 requirements（另加 torchsde，torchvision / torchaudio 用 CPU 源），`COMFYUI_PATH=<ComfyUI 目录> python tests/<test>.py`；`test_entry.py` / `test_release.py` 要求 `/opt/ComfyUI/custom_nodes/monoload` 指向仓库（软链接即可）；`test_release.py` 的 LoRA 要是 `models/loras` 里的真文件（硬链接，不能是指到别处的软链接，否则弱引用统计是 0）。不要同时跑两个 torch 测试（4 核时互相拖慢十倍以上）。
 * **合成模型**：`tests/make_synthetic_vaes.py OUT [--full]`（SDXL / Flux / Wan 结构的随机权重 VAE）；`tests/make_synthetic_checkpoint.py MODELS`（随机权重 SD1.5 checkpoint + UNet / TE LoRA，约 2 GiB，`test_lora_node.py` 用）。真实 SD1.5 不在云端：`test_release.py` 可以用合成 checkpoint 冒充（硬链接成 `v1-5-pruned-emaonly-fp16.safetensors` / `rubber_duck.safetensors`）。
 * **网页实测**：在锁定镜像里起服务（`docker run -p 127.0.0.1:8188:8188 ... python main.py --cpu --listen 0.0.0.0`），Playwright（`/opt/node-tools/node_modules/playwright`，Chromium `/opt/pw-browsers/chromium-1194`）打开真实前端，或用 `/prompt` API 跑工作流看日志（第 5 项的泄漏就是这样复现的）。
 * **CT 700 的事实**：`--gpu-only --bf16-vae`；AMD 上 `cudnn.enabled = False`，4D 卷积走 Slow2d（im2col + GEMM），5D 走 SlowDilated3d；VAE 注意力是 split；统一内存，看 GTT。用户终端是 `LANG=C`，中文日志显示成下划线（字节是正确的 UTF-8，不用改）。
 * **`tests/bench_vae.py`**（README §9.7）：`--checkpoint` / `--vae`；`--res`；`--modes native,monoload,monoload-l2,monoload-r<N>,native2`，模式名后缀 `-g<S>`（方案）、`-b<GiB>`（预算）、`-w<MiB>`（工作区）；`--stripe-rows`；`--budgets`；`--gn-schemes`；`--fp32-ref`；`--profile-only`；`--json`。
-* **`tests/alloc_sim.py`**（DESIGN §9.13.10、§9.14.6）：meta 设备上跑全尺寸 decoder，按缓存分配器的规则重放，复现了 63 个 CT 700 读数（≤ 0.02 GiB；第一层的旧布局用 `output_in_arena` 重放，DESIGN §9.22）。改内存相关代码先用它看。
+* **`tests/alloc_sim.py`**（DESIGN §9.13.10、§9.14.6）：meta 设备上跑全尺寸 decoder，按缓存分配器的规则重放，复现了 63 个 CT 700 读数（手工跑全表时 ≤ 0.02 GiB；自动测试只抽查其中一部分，阈值 0.03 GiB（`test_vae_stripe` / `test_vae_flux2`）/ 0.05 GiB（`test_vae_ldm`）；第一层的旧布局用 `output_in_arena` 重放，DESIGN §9.22）。改内存相关代码先用它看。
 * **盘点脚本**（DESIGN §9.16）：`tests/vae_inventory.py`（`--only` / `--no-trace` / `--json`；每种 VAE 的结构、路径、原生 / 第二层 / 第一层模拟峰值，带 60 GiB 设备上限；新适配器的 meta 构造可以从这里的 `KINDS` 抄）、`tests/probe_vae_gaps.py`（缺口和多帧第二层精度的小解码）、`tests/check_models.py`（CT 700 的命令 W）。
 * **检查脚本**：`tests/check_vae_node.py`（命令 U）、`tests/check_lora_node.py`（命令 V，不带 `--lora` 时列文件）。
 
@@ -127,17 +136,17 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * `__init__.py`：插件入口；导出三张表（节点、显示名、`WEB_DIRECTORY`）；`MONOLOAD_DISABLE` 以外装 hotpatch / release / VAE 包装和 `LoraLoader` 名字包装；启动日志。
 * `monoload/settings.py`：总开关、全局默认 `exact()` / `keep()`、`disabled()`。不导入 torch / ComfyUI。
 * `monoload/messages.py`：消息表、`msg()` / `label()`、`MONOLOAD_LANG`。
-* `monoload/hotpatch.py`：`ModelPatcher` 方法替换、`MonoloadRuntimePatch`（融合 / 逐位一致）、按 patcher 的 `_enabled` / `_active`、`_monoload_runtime` 模型标记。
+* `monoload/hotpatch.py`：`ModelPatcher` 方法替换（含保存用的 `model_state_dict_for_saving`）、`MonoloadRuntimePatch`（融合 / 逐位一致）、按 patcher 的 `_enabled` / `_active`、`_monoload_runtime` 模型标记。
 * `monoload/release.py`：每个 prompt 结束后按 patcher 释放；`_ancestor_chains` / `_repoint_orphans`（两层不带 patch 的 clone 一起被回收时，把已加载模型指回活着的祖先，修 CT 700 的「memory leak」警告）。
 * `monoload/lora_overrides.py`：LoRA 节点的设置、`resolve()`、`enabled()` / `merge_exact()` / `wants_release()`、`install_names()`。
 * `monoload/vae.py`：VAE 入口和策略（`_decode` → `_managed_decode` → 预算 `choose_budget` / 默认 `choose_plan` → `_decode_layer1` / `_decode_layer2`）；`resolve_settings` / `settings_note` / `_Applied` / `_from`（来源）；`global_mode()`；`decode_record()` / `_MemProbe`（测量前先清分配器缓存）；`STRIPE_ADAPTERS`。
 * `monoload/vae_ops.py`：第二层引擎（`OpChunking`、`_ConvChunker`、注意力 query 分块、`OpStats`）。
 * `monoload/vae_engine.py`：第一层引擎（区间、`Plan`、统计遍、arena、`StripeAdapter` 基类、自检 `_SELFTEST`）。
-* `monoload/vae_wan.py`、`monoload/vae_ldm.py`：两个适配器（LDM 的含 Flux 2 batch-norm latent，`LatentUnpatch`；`vae_ldm.scheme_positions`：A 不存，D 存 H/4 级输出，B 存 H/4 和 H/2，C 再加全分辨率各块的输入；耗时模型 `TIME_COEF`）。
+* `monoload/vae_wan.py`、`monoload/vae_ldm.py`：两个适配器（LDM 的含 Flux 2 batch-norm latent，`LatentUnpatch`；`vae_ldm.scheme_positions`：A 不存，D 存 H/4 级输出，B 存 H/4 和 H/2，C 再加全分辨率各块的输出（块 1、块 2 和 norm_out 的输入；块 0 的输入不存）；耗时模型 `TIME_COEF`）。
 * `monoload/vae_overrides.py`：VAE 节点的设置（不导入 torch / ComfyUI）。
 * `monoload/info.py`：Info 节点的文字。
 * `monoload/nodes/`：注册表 + 三个节点。`web/`：`monoload_info.js`、`monoload_i18n.js`。`locales/`：界面翻译。
-* **小测试**（都不需要真实模型）：`test_entry.py`（开关组合，见文件头）、`test_master_switch.py`、`test_messages.py`、`test_info_node.py`、`test_release_chain.py`、`test_vae_node.py`、`test_vae.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_stripe.py`、`test_dtype_paths.py`（默认和 `MONOLOAD_EXACT=1`）、`test_lora_node.py`（要合成 checkpoint）。需要真实 SD1.5 的：`test_lora_hot.py`、`test_quant.py`、`test_release.py`。
+* **小测试**（都不需要真实模型）：`test_entry.py`（开关组合，见文件头；其中 `MONOLOAD_VAE_BUDGET` + `MONOLOAD_VAE_STRIPE_ROWS`、`MONOLOAD_VAE_GN_SCHEME` 两种不在 `run_all.sh` 里，要手动跑）、`test_master_switch.py`、`test_messages.py`、`test_info_node.py`、`test_release_chain.py`、`test_vae_node.py`、`test_vae.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_stripe.py`、`test_dtype_paths.py`（默认和 `MONOLOAD_EXACT=1`）、`test_lora_node.py` 和 `test_lora_save.py`（要合成 checkpoint）。CT 700 检查脚本另有 `check_lora_save.py`（README §9.15）。需要真实 SD1.5 的：`test_lora_hot.py`、`test_quant.py`、`test_release.py`。
 
 ## 7. 提交记录（`dev` 上的合并）
 
@@ -160,6 +169,14 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | 审查进度记录 | 01f3943 |
 | 审查 06 / lowvram + hook / 02 / 01 | 0b5311c / 75f5b6e / 2c28532 / c49960c |
 | 审查修正的文档和真机清单 | b4c33d5 |
-| 审查修正的真机结果 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
+| 审查修正的真机结果 | f70e485 |
+| 第二轮审查 01 / 02 / 03 / 04 / 05 | 0e110a1 / 4cb4ce8 / 275f400 / c0b6c7b / f327c9d |
+| 第二轮审查 06 / 14 / 08 / 09 / 07 | 07c1787 / a74a6a3 / d044df1 / d42689c / d03f72f |
+| 第二轮审查 13 / 19 / 17 / 18 / 11 / 12 | 5c1d8c2 / d88a0cb / 1d71488 / 9cadb98 / 2960272 / c99fb53 |
+| 第二轮审查 10 / 20 / 16 / 01 的真机脚本 / 15 | 5e6be4a / c9e4ea0 / 349e641 / e5003cc / 84627fb |
+| 第二轮审查的文档和真机清单 | 8c5cb37 |
+| 验收后：`TEST_BROKEN_VAE_API` 传进容器 / bench_vae「native not run」/ 21 / 22 / 23 | eee564c / 17880b8 / 56b9e93 / a0ce191 / c9e6bcf |
+| 第二轮审查的真机结果 | e924a77 |
+| 复查结果（21 / 23 / 测试工具修正后） | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。
