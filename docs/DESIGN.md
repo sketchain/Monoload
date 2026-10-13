@@ -1489,6 +1489,45 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 **要用户定的：** 自检峰值约 1.4 GiB（fp32 副本 0.99 GiB 占大头）高于 1344 和 2688 的解码本身，低于 1.49 GiB 的预算永远报错——与 Wan 2.2 是同一个问题，一起定。
 
+### 9.25 HunyuanImage 2.1 Refiner 的第一层：分析（先分析，等用户定）
+
+**结构（62b3c94，`comfy/ldm/hunyuan_video/vae_refiner.py`、`comfy/sd.py`，meta 上建出来核对）：** `comfy.sd.VAE` 看到 5D 的 `decoder.conv_in.weight`、输入 32 通道，建 `AutoencodingEngine` + `vae_refiner.Decoder(refiner_vae=False)`，`latent_dim` 3、`not_video` True、空间 16 倍、`ffactor_temporal` 4。`refiner_vae=False` 时卷积是普通的 `ops.Conv3d`（3×3×3，padding 1：**时间上两边补零，非因果**），归一化是 `Normalize` = GroupNorm 32 组（5D 上统计 C/32 × T × H × W：**跨帧**），中间的注意力是 `AttnBlock`（3D）。decoder 872 M 参数（encoder 390 M）。单张图（latent T=1）的解码：
+
+    x = conv_in(z) + z.repeat_interleave(32, 1)                    H/16, 1024 ch, T=1
+    mid (ResnetBlock, AttnBlock, ResnetBlock)                       T=1
+    up[0].block x3 (1024)                     -> UpSmpl(tus) -> H/8,  1024 ch, T=2
+    up[1].block x3 (1024)                     -> UpSmpl(tus) -> H/4,  512 ch,  T=4
+    up[2].block x3 (512)                      -> UpSmpl      -> H/2,  256 ch,  T=4
+    up[3].block x3 (256)                      -> UpSmpl      -> H,    128 ch,  T=4
+    up[4].block x3 (128) -> norm_out -> silu -> conv_out (3 ch, T=4) -> out[:, :, -1:]
+
+`UpSmpl`：3×3×3 卷积到 (时间 r1 × 2 × 2) × C_out 通道，再 depth-to-space（时间上采样的级 r1 = 2），加上输入按通道重复后同样重排；`refiner_vae=False` 时没有首帧特例。所以一张图在内部被解成 4 帧，最后只取第 4 帧；时间卷积让 4 帧互相影响，GroupNorm 的统计量跨 4 帧。
+
+**能不能做：能，引擎的条带机制本身不需要为时间维做特殊处理。**
+
+* 条带只切 H。每条带带着全部 T 帧，时间卷积、时间补零都在模块内部、整段完成，和不切一样；空间上的 halo 与 HunyuanImage 2.1 相同（ResnetBlock 每个卷积 1 行，`UpSmpl` 在输出那一级 2 行）。
+* 跨帧的 GroupNorm：引擎的 `Moments` 按通道分组、把一个条带核心行里的所有元素（包括所有帧）算进去，`group_norm_frozen` 对 5D 广播，与 GroupNorm 在 5D 上的定义一致；统计遍 / 存档 / 方案照用。
+* 最后一步「取第 4 帧」是一个逐行的单元（`x[:, :, -1:]`）。
+* 要改 / 新写的：① 引擎：单元的行数和每行元素数现在一起按 `scale` 放大，时间上采样的单元每行元素多一倍（宽 ×2、帧 ×2），要加一个「每行平面数」的因子（只影响内存 / 工作量的计算，不影响区间倒推）；② 适配器 `vae_refiner.py`：结构识别（`refiner_vae=False`、`ops.Conv3d` padding (1,1,1)、`UpSmpl` 的 tus / rp 与通道）、前缀（`conv_in` 一步、mid、`up[0]` 的块）、`UpSmpl` 单元、取帧单元、Conv3d 的内存模型（vol2col 每个输出 27 × cin，T 帧）、fp32 副本（T=1 的几级只留时间核中间一片）；③ alloc_sim 的 meta 构造；④ 测试照 `test_vae_hunyuan.py`。工作量与 HunyuanImage 2.1 相当，多一个引擎改动。
+
+**预期能降到多少（估计，没有实现）：** 每输出行的激活，refiner 每一级都正好是 SDXL 的 4 倍（帧数 × 通道：全分辨率 4 × 128 = 512，H/2 4 × 256，H/4 4 × 512，H/8 2 × 1024），所以用「ch = 512（SDXL 的 4 倍）的 LDM decoder」在 alloc_sim 上模拟当代理（它的前缀在 H/8、比 refiner 的 H/16 前缀重，卷积 columns 也略多，偏保守；没有算 `UpSmpl` 时间上采样里 8 倍通道的卷积输出，可能偏低）：
+
+| 输出 | 原生 | 第二层（现有估算） | 第一层 A（默认 128 行 / 32 行） | 第一层 B（128 / 32） | C |
+|---|---|---|---|---|---|
+| 1344×768 | 50.3 | 4.43（5.95） | 1.23 / 0.61 | 2.07 / 1.25 | 2.52 |
+| 2048×2048 | 169（OOM → tiled） | 23.4（**18.05，不是上界**） | 1.95 / 1.79 | 4.11 / 3.92 | 9.21 |
+
+（GiB，reserved；代理的估算都 ≥ reserved。）结论：1344 时第一层比第二层只好 2–7 倍（4.4 → 0.6–2.1），2K 时好 6–13 倍（23.4 → 1.8–4.1）。HunyuanImage 2.1 的 refiner 一般用在 2K 输出上，那里的收益是主要的。
+
+**代价和风险：**
+
+1. **耗时。** Conv3d 每个输出 27 × cin 次乘加、4 帧，同样输出尺寸下整图的卷积约是 SDXL 的 12 倍（2048² 约 240 万亿次乘加，按 CT 700 上 SDXL 的速度第二层约 1 分钟量级）；第一层重算 5×（B）到 12×（A），2048² 要几分钟到十几分钟。峰值优先的规矩下可以接受，但要你知道。
+2. **自检很大。** fp32 副本：872 M 参数，T=1 的几级（289 M）可以只留时间核中间一片（T=1 时零补的两片不起作用），T ≥ 2 的几级要整核：约 680 M 参数、2.5 GiB；再加参照解码，自检约 3 GiB——比 1344 的任何第一层解码都大，比 2048² 的 A / B 也大；低于约 3 GiB 的预算永远报错。和 Wan 2.2 / HunyuanImage 2.1 是同一个问题，但更严重。
+3. **第二层估算对它也不是上界**（2048² 23.4 对 18.05），与 HunyuanImage 2.1 同类（深度到空间的上采样留下的缓存段）；做第一层时一起修（`activation_copies`），不做第一层也应该单独修。
+4. 默认条带策略（以 128 行的峰值为目标）对这个 4 倍宽的 decoder 偏重：1344 B 128 行 2.07，32 行 1.25。也许默认目标要按结构换（或默认 A）。
+
+**要用户定的：** ① 做不做（建议做，收益在 2K）；② 自检怎么处理（与 Wan 2.2 / HunyuanImage 2.1 一起定：不改 / 缩小自检几何 / 自检放 CPU / 其他）；③ 默认方案和条带目标（B + 128 行，还是对它用 A 或更矮的目标）；④ 不论做不做，先修第二层估算吗。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
