@@ -43,7 +43,12 @@ The adapter interface (StripeAdapter):
   fp32_copy(device)    an adapter bound to an fp32 copy of the decoder (self-test)
   reference_decode(z)  the decoder's own whole-image decode (on such a copy)
   selftest_latent(n)   the latent shape of the self-test
+  selftest_size        rows / cols of the decoder's input in the self-test (SELFTEST_LATENT; a
+                       decoder with a larger scale may take fewer, HunyuanImage 2.1: 12)
   selftest_params()    parameter count of what fp32_copy copies
+  activation_copies    the layer-2 bound's activation copies for this decoder (vae.ACTIVATION_COPIES,
+                       4; HunyuanImage 2.1: 6): part of the self-test's bound and of the
+                       layer-2 estimate
   decode_retained(h, w, e)  bytes the model's own whole-image decode of an h x w (decoder
                        resolution) sample keeps alive beyond its live activations, e.g. Wan
                        2.2's feat_cache clones (0 by default): part of the self-test's bound
@@ -913,6 +918,8 @@ class StripeAdapter:
     hdim = 2
     scale = 8
     schemes = ()     # GroupNorm schemes the variants differ by (LDM); empty: one variant
+    selftest_size = SELFTEST_LATENT   # the self-test's decoder input rows / cols
+    activation_copies = 4             # = vae.ACTIVATION_COPIES (the layer-2 bound's live full-size activations)
 
     def plan(self, vae, samples, budget, ws, rows=None, out_bytes=0, measure="estimate"):
         """rows=None: the largest stripe height whose `measure` ("estimate", the
@@ -1066,8 +1073,8 @@ class StripeAdapter:
         """Upper bound of what the self-test reserves on the device (load_models_gpu,
         and the first decode's estimate / budget, DESIGN §9.20): the fp32 copy of
         the weights, then the larger of the reference decode (whole image, layer-2
-        chunked at SELFTEST_REF_WORKSPACE: 4 x its largest activation + 2 x the
-        workspace, the layer-2 bound of vae.estimate, plus what that decode keeps
+        chunked at SELFTEST_REF_WORKSPACE: activation_copies x its largest activation
+        + 2 x the workspace, the layer-2 bound of vae.estimate, plus what that decode keeps
         alive, decode_retained) and the stripe pass (its plan's estimate), the
         reference's output alive through both, a margin.
         All fp32, at the self-test's geometry: the same for every image."""
@@ -1075,12 +1082,12 @@ class StripeAdapter:
         hit = _PASS_COST.get(key)
         if hit is not None:
             return hit
-        n = SELFTEST_LATENT
+        n = self.selftest_size
         plan = Plan(self, n, n, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0)
         act = max(c * h * w for c, h, w in zip(plan.channels, plan.heights, plan.widths))
         act = max(act, max(self.prefix_out_channels(m) for _, m in self.prefix) * n * n) * 4
         out = self.out_channels * plan.h_out * plan.w_out * 4
-        ref = 4 * act + 2 * SELFTEST_REF_WORKSPACE + out + self.decode_retained(n, n, 4)
+        ref = self.activation_copies * act + 2 * SELFTEST_REF_WORKSPACE + out + self.decode_retained(n, n, 4)
         need = int(self.selftest_params() * 4 + max(ref, plan.estimate + out) + out + SELFTEST_MARGIN)
         _PASS_COST[key] = need
         return need
@@ -1133,10 +1140,11 @@ def _self_test_run(bound, vae):
         if tb.key != bound.key:
             raise StripeError("fp32 copy has structure {} instead of {}".format(tb.key, bound.key))
         g = torch.Generator().manual_seed(0)
-        z = torch.randn(bound.selftest_latent(SELFTEST_LATENT), generator=g).to(dev)
+        n = tb.selftest_size
+        z = torch.randn(bound.selftest_latent(n), generator=g).to(dev)
         with OpChunking(tb.module, SELFTEST_REF_WORKSPACE, OpStats()):
             ref = tb.reference_decode(z)
-        plan = Plan(tb, SELFTEST_LATENT, SELFTEST_LATENT, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0)
+        plan = Plan(tb, n, n, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0)
         out = torch.empty_like(ref)
         stats = OpStats()
         hdim = tb.hdim

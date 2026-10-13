@@ -464,7 +464,7 @@ def trace(v, shape, layer, ws=GIB):
             "attn_unmanaged": list(stats.attn_unmanaged)}
 
 
-L1_SIM = {"ldm_sdxl": "sdxl", "ldm_sd": "sdxl", "ldm_flux": "flux", "ldm_flux2": "flux2", "wan21": "qwen", "wan22": "wan22"}
+L1_SIM = {"ldm_sdxl": "sdxl", "ldm_sd": "sdxl", "ldm_flux": "flux", "ldm_flux2": "flux2", "wan21": "qwen", "wan22": "wan22", "hy_image21": "hy21"}
 
 
 def layer1_trace(name, w, h):
