@@ -35,7 +35,8 @@ STRIPE_ADAPTERS: the engine (monoload/vae_engine.py) plus one adapter per
 decoder structure (monoload/vae_wan.py: the Wan 2.1 VAE single frame;
 monoload/vae_wan22.py: the Wan 2.2 VAE single frame; monoload/vae_ldm.py:
 the LDM Decoder of SD1.5 / SDXL / SD3 / Flux ae / Flux 2, with GroupNorm
-statistics gathered across stripes). A recognized, self-tested decoder is
+statistics gathered across stripes; monoload/vae_hunyuan.py: the HunyuanImage
+2.1 decoder, the same with depth-to-space upsampling). A recognized, self-tested decoder is
 decoded in stripes of output rows from a low-resolution checkpoint instead of the
 whole-image activations; everything else keeps layer 2. Default stripe height:
 the lowest peak that does not cost speed (DEFAULT_POLICY_ROWS, DESIGN
@@ -71,7 +72,7 @@ import comfy.ops
 import comfy.sd
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
-from . import settings, vae_engine, vae_ldm, vae_ops, vae_overrides, vae_wan, vae_wan22
+from . import settings, vae_engine, vae_hunyuan, vae_ldm, vae_ops, vae_overrides, vae_wan, vae_wan22
 from .errors import MonoloadError, MonoloadVAEOOMError
 from .messages import label, msg
 from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
@@ -445,7 +446,7 @@ class _MemProbe:
 #   bound.plan(vae, samples, budget, workspace, rows=None, out_bytes=0) -> plan (estimate, stripes, recompute,
 #                                       ckpt_bytes, describe()) or None when the budget cannot be met
 #   bound.run(vae, samples, plan, workspace, stats) -> pixel_samples (process_output applied), native layout
-STRIPE_ADAPTERS = [vae_wan, vae_wan22, vae_ldm]
+STRIPE_ADAPTERS = [vae_wan, vae_wan22, vae_ldm, vae_hunyuan]
 
 _L1_NOTED = weakref.WeakKeyDictionary()   # first_stage_model -> last logged layer-1 reason
 
@@ -659,15 +660,16 @@ def _same_device(a, b):
     return a.type == b.type and (a.index or 0) == (b.index or 0)
 
 
-def estimate(vae, samples, budget, probe=None, retained=0):
+def estimate(vae, samples, budget, probe=None, retained=0, copies=ACTIVATION_COPIES):
     """Upper bound (bytes) of what one managed decode of `samples` adds on the
     VAE's device (docs/DESIGN.md §9.4):
-        ACTIVATION_COPIES x largest activation of one sample
+        copies x largest activation of one sample (ACTIVATION_COPIES; a decoder whose
+                                own decode needs more says so: _decoder_terms)
       + 2 x workspace         (conv columns or attention scores, plus the block copies around them)
       + output buffer         (the whole batch, intermediate dtype, if it lives on the same device)
       + one latent sample
       + retained              (what the decoder's own decode keeps alive besides its activations, one sample:
-                               _decode_retained; Wan 2.2's feat_cache clones, DESIGN §9.23)"""
+                               _decoder_terms; Wan 2.2's feat_cache clones, DESIGN §9.23)"""
     px = _latent_px(samples)
     if probe is not None:
         act = probe.act_bytes_per_px * px
@@ -680,21 +682,23 @@ def estimate(vae, samples, budget, probe=None, retained=0):
     if _same_device(vae.output_device, vae.device):
         out_bytes = out_numel * samples.shape[0] * mm.dtype_size(vae.vae_output_dtype())
     lat = (samples[0:1].numel()) * mm.dtype_size(vae.vae_dtype)
-    total = ACTIVATION_COPIES * act + 2 * budget + out_bytes + lat + retained
+    total = copies * act + 2 * budget + out_bytes + lat + retained
     return {"total": int(total), "activation": int(act), "workspace": int(budget), "output": int(out_bytes), "latent": int(lat),
             "retained": int(retained)}
 
 
-def _decode_retained(vae, samples, vae_options):
-    """What the decoder's own decode of one sample of `samples` keeps alive besides the activations the shape probe
-    sees, from the layer-1 adapter that recognizes its structure (StripeAdapter.decode_retained; 0 for most decoders,
-    and for those no adapter recognizes). Layer 2 runs that decode."""
+def _decoder_terms(vae, samples, vae_options):
+    """{"retained": ..., "copies": ...} for estimate(): what the decoder's own decode of one sample of `samples`
+    keeps alive besides the activations the shape probe sees (StripeAdapter.decode_retained: Wan 2.2's feat_cache
+    clones), and how many activation copies bound its peak (StripeAdapter.activation_copies: HunyuanImage 2.1's
+    depth-to-space upsampling), from the layer-1 adapter that recognizes its structure; ACTIVATION_COPIES and nothing
+    retained for the others and for decoders no adapter recognizes. Layer 2 runs that decode."""
     for a in STRIPE_ADAPTERS:
         bound, _ = a.match(vae, samples, vae_options)
         if bound is not None:
             h, w = bound.decoder_hw(samples)
-            return bound.decode_retained(h, w, mm.dtype_size(vae.vae_dtype))
-    return 0
+            return {"retained": bound.decode_retained(h, w, mm.dtype_size(vae.vae_dtype)), "copies": bound.activation_copies}
+    return {"retained": 0, "copies": ACTIVATION_COPIES}
 
 
 # ---------------------------------------------------------------------------
@@ -1134,10 +1138,10 @@ def _layer2_estimate(vae, samples_in, vae_options, ws):
         # latent, not under OpChunking: no workspace in what it asks for (with ws it asked ~2 GiB for tens of MiB;
         # load_models_gpu adds its minimum_inference_memory on top anyway; review 2026-10 item 23)
         small = samples_in[0:1, ..., :PROBE_SIZE, :PROBE_SIZE]
-        mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, small, 0, retained=_decode_retained(vae, small, vae_options))["total"],
+        mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, small, 0, **_decoder_terms(vae, small, vae_options))["total"],
                            force_full_load=vae.disable_offload)
         probe = _shape_probe(vae, samples_in, vae_options)
-    return estimate(vae, samples_in, ws, probe, retained=_decode_retained(vae, samples_in, vae_options)), probe
+    return estimate(vae, samples_in, ws, probe, **_decoder_terms(vae, samples_in, vae_options)), probe
 
 
 def _shape_probe(vae, samples_in, vae_options):

@@ -156,7 +156,7 @@ def ldm_structure(fsm):
         return "first-stage model is {}, not comfy.ldm.models.autoencoder.AutoencoderKL / AutoencodingEngine".format(type(fsm).__name__), None
     dec = getattr(fsm, "decoder", None)
     if type(dec) is not ldm.Decoder:
-        return "decoder is {}, not comfy.ldm.modules.diffusionmodules.model.Decoder".format(type(dec).__name__), None
+        return "decoder is {}.{}, not comfy.ldm.modules.diffusionmodules.model.Decoder".format(type(dec).__module__, type(dec).__name__), None
     pqc = None
     if type(fsm) is not ae.AutoencodingEngine:
         pqc = fsm.post_quant_conv

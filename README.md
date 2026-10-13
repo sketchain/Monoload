@@ -266,7 +266,7 @@ MODELS=/path/to/models tests/run_all.sh
 # 缺模型文件的测试组会被跳过并计数（「skipped (missing model files): N」），退出码 = 失败组数 + 跳过组数，跳过不算通过
 ```
 
-`run_all.sh` 先跑入口测试（8 种开关组合）、消息、释放链、Info 节点、总开关、LoRA 节点和全部 VAE 测试（`test_vae.py`、`test_vae_stripe.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_wan22.py`、`test_vae_node.py`，不需要模型文件），然后把下面每个 LoRA 功能测试在两种合并路径下各跑一遍：先 `MONOLOAD_EXACT=1`（逐位一致），再默认路径。只想跑 VAE 部分时：`MODELS=/path/to/models tests/docker_run.sh python tests/test_vae.py`（不需要任何模型文件，`$MODELS` 可以是空目录）。
+`run_all.sh` 先跑入口测试（8 种开关组合）、消息、释放链、Info 节点、总开关、LoRA 节点和全部 VAE 测试（`test_vae.py`、`test_vae_stripe.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_wan22.py`、`test_vae_hunyuan.py`、`test_vae_node.py`，不需要模型文件），然后把下面每个 LoRA 功能测试在两种合并路径下各跑一遍：先 `MONOLOAD_EXACT=1`（逐位一致），再默认路径。只想跑 VAE 部分时：`MODELS=/path/to/models tests/docker_run.sh python tests/test_vae.py`（不需要任何模型文件，`$MODELS` 可以是空目录）。
 
 | 脚本 | 内容 |
 |---|---|
@@ -276,6 +276,7 @@ MODELS=/path/to/models tests/run_all.sh
 | `tests/test_quant.py` | fp8 scaled UNet + LoRA：与「先反量化被改到的层 + 同一合并路径」逐位一致、无备份、fp8 权重不变；与原生的误差只报告 |
 | `tests/test_vae.py` | VAE 解码管理（§12），不需要模型文件：分块卷积 / 分块注意力与不分块的结果一致（含各种 kernel、stride、dilation、groups、padding、cast 路径 + weight_function、Wan CausalConv3d）；用 ComfyUI 自己的 LDM `Decoder` / `WanVAE`（小通道、随机权重）构造 SDXL 式、Flux 式、Qwen 式 VAE，受管理的解码与原生 `VAE.decode` 比较；多帧交给原生、OOM 缩小分块重试、下限时报错、绝不调用 tiled；SVD / 2D latent 的音频 / 像素空间交给原生（DESIGN §9.17） |
 | `tests/test_vae_wan22.py` | Wan 2.2 VAE 单帧走第一层（DESIGN §9.23），不需要模型文件：识别（含不认的结构走第二层、多帧仍原生）、复合单元的 halo 恰好是精确边界、条带高度 / 奇数和 1×1 latent / batch 2 / 小工作区与原生比较、bf16 对 fp32 真值、自检的 fp32 副本（只留时间核最后一片）与模型自己的 decode 相同、注入错误、OOM、第二层估算含 feat_cache 克隆、预算、VAE 设置 / Info 节点、alloc_sim 上第一层 reserved ≤ 估算、自检 ≤ 上界、第二层 ≤ 第二层估算 |
+| `tests/test_vae_hunyuan.py` | HunyuanImage 2.1 VAE 走第一层（DESIGN §9.24），不需要模型文件：识别（含不认的结构走第二层）、`conv_in + repeat` 一步与原生逐位相同、`PixelUnshuffle2D` 的 halo 是精确边界、四种方案 × 条带高度 / 奇数和 1×1 latent / batch 2 / 小工作区与原生比较、bf16 对 fp32 真值、自检和注入错误、OOM、第二层估算按 6 份激活、预算、VAE 设置 / Info 节点（HunyuanImage 自己的方案说明）、alloc_sim 上第一层 reserved ≤ 估算、自检 ≤ 上界、第二层 ≤ 第二层估算 |
 | `tests/test_vae_flux2.py` | Flux 2 VAE 走第一层（DESIGN §9.18），不需要模型文件：识别、latent 步骤与原生逐位相同、四种方案 × 条带高度与原生比较、自检和注入错误、OOM、预算、VAE 设置 / Info 节点、alloc_sim 上 reserved ≤ 估算 |
 | `tests/test_vae_stripe.py` | VAE 第一层（§12.7），不需要模型文件：区间倒推对照暴力依赖展开；每个单元（残差块、上采样、head 卷积）在任意切片上「有效行」与整图逐行一致、紧邻的下一行不一致；用 ComfyUI 的 `WanVAE`（小通道、随机权重）在 fp32 下比较第一层与原生整图解码（条带 1 行、不整除、等于整图、按预算自动、默认策略、奇数尺寸、很小的 latent、batch 2、条带内再分块、bf16），块边界附近的误差不比其他区域大；识别（Dropout 训练态、forward hook、开关）；故意少算一行 halo 时自检能抓到并回退第二层；预算报错；OOM 缩小条带、到下限报错、不退回 tiled 也不退回第二层；默认策略（128 行条带的估算为目标）和开关的优先级；内存模型单调、最大的条带先跑；自检后和前缀 / 条带之间清空缓存；SDXL / Flux 结构不归 Wan 适配器（归 LDM 适配器）；单帧 Conv3d 改走 conv2d 与模块原样一致、只在该改的时候改 |
 | `tests/test_master_switch.py` | 总开关和全局默认（§4），不需要模型文件：`MONOLOAD` 的解析；`MONOLOAD=0` 且没有节点时，挂 LoRA 的模型（整体加载、lowvram 部分加载、Hook LoRA）和 VAE 解码与卸掉钩子的原版 ComfyUI 逐位一致，备份也和原生一样；释放不运行；包装每次调用的开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `mode auto` 打开管理、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 时节点原样透传 |
@@ -1073,6 +1074,77 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae
 
 把 W / XW / YW / ZW 的输出和 JSON 发给我。
 
+### 9.17 HunyuanImage 2.1 VAE 走第一层：真机 bench（命令 W / XH / YH / ZH）
+
+**状态：待 CT 700 验收（DESIGN §9.24）。**
+
+**先放 VAE 文件**（只需要 VAE）：
+
+* 文件：`hunyuan_image_2.1_vae_fp16.safetensors`，811,184,822 字节，sha256 `f2ae19863609206196b5e3a86bfd94f67bd3866f5042004e3994f07e3c93b2f9`（ComfyUI 官方打包，Comfy-Org/HunyuanImage_2.1_ComfyUI，不用登录）。
+* 放到 CT 700 的 `/models/comfy/vae/`（容器里 `/opt/ComfyUI/models/vae/`），不用重启容器：
+
+```bash
+cd /models/comfy/vae
+wget -O hunyuan_image_2.1_vae_fp16.safetensors https://huggingface.co/Comfy-Org/HunyuanImage_2.1_ComfyUI/resolve/main/split_files/vae/hunyuan_image_2.1_vae_fp16.safetensors
+sha256sum hunyuan_image_2.1_vae_fp16.safetensors   # f2ae19863609206196b5e3a86bfd94f67bd3866f5042004e3994f07e3c93b2f9
+```
+
+**注意分辨率：** 这个 VAE 是 32 倍，`bench_vae.py` 要求宽高都是 32 的倍数，4K 用 **3840×2176**（3840×2160 会直接报错退出）。
+
+拉新代码、重启容器后（每条 bench 前先 `/free`）：
+
+```bash
+# W. 识别（只读文件头，不占 GPU）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_models.py
+# XH. HunyuanImage 2.1 三档：原生 / 默认（第一层方案 B）/ 只用第二层，带 fp32 参照
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae hunyuan_image_2.1_vae_fp16.safetensors --res 1344x768,2688x1536,3840x2176 --modes native,monoload,monoload-l2 --warm 1 --fp32-ref \
+  --json /opt/ComfyUI/output/bench_vae_hy21.json 2>&1 | tee bench_vae_hy21.txt
+# YH. 4K（3840x2176）四种 GroupNorm 方案
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae hunyuan_image_2.1_vae_fp16.safetensors --res 3840x2176 --modes monoload --gn-schemes ADBC --warm 1 \
+  --json /opt/ComfyUI/output/bench_vae_hy21_schemes.json 2>&1 | tee bench_vae_hy21_schemes.txt
+# ZH. 预算 3G / 1.5G（按预算选），以及 VAE 设置节点（4K，节点预算 3G）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae hunyuan_image_2.1_vae_fp16.safetensors --res 1344x768,2688x1536,3840x2176 --modes native --budgets 3,1.5 --warm 1 \
+  --json /opt/ComfyUI/output/bench_vae_hy21_budget.json 2>&1 | tee bench_vae_hy21_budget.txt
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae_node.py \
+  --vae hunyuan_image_2.1_vae_fp16.safetensors --res 3840x2176 --budget 3 2>&1 | tee check_vae_node_hy21.txt
+```
+
+**W 的预期：** `hunyuan_image_2.1_vae_fp16.safetensors` → `VAE: AutoencodingEngine / decoder Decoder | latent 64 ch, latent_dim 2, x32 | 406 M params`；`1344x768 latent [1, 64, 24, 42]` 和 `3840x2160 latent [1, 64, 68, 120]` 都是 `Monoload layer 1 (HunyuanImage 2.1 stripes, GroupNorm scheme B)`（云端用同一个文件跑出的就是这几行）。
+
+**预测依据：** GiB 都是 `tests/alloc_sim.py` 的模拟（GTT ≈ reserved）。耗时是**粗估**：原生 / 第二层按 SDXL 在 CT 700 上每 10¹² 次乘加的实测（1344 / 2688 / 4K：0.18 / 0.24 / 0.30 s）换算，HunyuanImage 整图卷积 4.2 / 16.7 / 33.8 万亿次乘加；第一层用 `vae_ldm` 的耗时模型（按 SDXL 拟合，层级按相对输出的分辨率对应），**没有对这个 decoder 校准**，误差可能到 ±40%。
+
+**XH 的逐行预测**（GTT 增量 GiB / 热启动 s；估算 = Monoload 交给 `load_models_gpu` 的值）：
+
+| 行 | 1344×768 | 2688×1536 | 3840×2176 |
+|---|---|---|---|
+| `native` | 4.66 / ~0.8 | 16.7 / ~4 | 38.1 / ~10 |
+| `monoload`（第一层 B） | 0.53 / ~3.4，6 条 128 行，估算 0.68；**冷启动那次含自检，峰值约 1.41** | 1.19 / ~15，12 条 128 行，估算 1.45 | 2.13 / ~45，13 条 168 行，估算 2.41 |
+| `monoload-l2` | 2.34 / ~0.8，估算 3.49 | 5.22 / ~3.5，估算 7.95 | 11.1 / ~8.5，估算 14.05 |
+
+* `monoload` 行的日志是 `layer 1 (HunyuanImage 2.1 stripes, GroupNorm scheme B)`，31 个统计遍；进程里第一次多一次自检（12×12 的 decoder 输入、384×384 输出，`self-test passed ... 1e-06` 量级），日志的估算后面写「the first-use self-test before it up to 1.49 GiB」。bench 汇总表取各次的最大值，1344 的 `monoload` 一行会显示约 1.41（自检），逐次输出里热启动那次是 0.53。
+* **每一行（含冷启动）GTT ≤ 估算。** 第二层的估算按 6 份激活算（DESIGN §9.24：4 份在 4K 不是上界）。
+* `native est`（ComfyUI 自己的估算）1.3 / 5.4 / 10.9 GiB——**比原生实际用的少 3–4 倍**；`unload` 应为 0。
+* 精度：`monoload vs native` 应与 SDXL 第一层同一水平（PSNR 60 dB 以上），`monoload vs fp32` 与 `native vs fp32` 相同；条带边界附近不比别处差。
+
+**YH 的逐行预测**（3840×2176，GTT / 估算 / 粗估 s，重算倍数）：A 17 条 128 行 0.74 / 0.90 / ~76（18.2×）；D 17 × 128 0.81 / 0.97 / ~64（14.6×）；B 13 × 168 2.13 / 2.41 / ~45（8.3×）；C 17 × 128 4.67 / 4.81 / ~20（4.3×）。耗时的顺序 A > D > B > C 应该成立，绝对值不准；B 的预测风险最大：它有一个全分辨率的统计遍只分到 2 行的条带（约 1088 条，DESIGN §9.24），GPU 上的启动开销可能让 B 明显慢于 ~45 s。冷启动的那次（`monoload-gA`）含自检，A 的 0.74 会被 1.41 盖过（逐次输出里热启动那次是 0.74）。
+
+**ZH 的逐行预测**（GTT / 估算 / 粗估 s；估算是 max(计划, 首次自检 1.49)）：
+
+| 行 | 1344×768 | 2688×1536 | 3840×2176 |
+|---|---|---|---|
+| `monoload-b3` | B 整图 1 条 768 行（384 MiB），1.41 / 1.81 / ~0.6 | C 4 条 384 行（128 MiB），2.73 / 2.99 / ~8 | B 8 条 272 行（128 MiB），2.43 / 2.94 / ~26 |
+| `monoload-b1.5` | B 1 条 768 行（192 MiB），1.16 / 1.43 / ~0.6 | B 11 条 140 行（128 MiB），1.21 / 1.47 / ~14 | D 9 条 242 行（128 MiB），1.14 / 1.41 / ~58 |
+
+* 第二层估算 3.49 / 7.95 / 14.05 都大于 3G，所以全走第一层，在方案之间按耗时模型选。
+* 1.5G：自检上界 1.49 GiB 刚好在预算内，第一次也能用第一层（**低于 1.49 GiB 的预算第一次会报错**，DESIGN §9.24 的待定事项）。
+
+`check_vae_node.py`：`node copy` → B 8 条 272 行、`budget 3.00 GiB [node]`，GTT 约 2.43 / 估算 2.94（第一次含自检，自检 1.41 低于解码）；`original` → B 13 条 168 行，全部 `[default]`，2.13 / 2.41；`node copy again` 同第一行。
+
+把 W / XH / YH / ZH 的输出和 JSON 发给我。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
@@ -1401,7 +1473,7 @@ monoload/vae_overrides.py   单个 VAE 的设置（节点做的副本带的设�
 monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），lora_settings.py = Monoload LoRA Settings，vae_settings.py = Monoload VAE Settings，info.py = Monoload Info
 tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；保存挂 LoRA 的模型：test_lora_save.py、check_lora_save.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
                             bench_vae.py、check_vae_node.py、make_synthetic_vaes.py、alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10；
-                            第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16；Flux 2：test_vae_flux2.py；Wan 2.2：test_vae_wan22.py；
+                            第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16；Flux 2：test_vae_flux2.py；Wan 2.2：test_vae_wan22.py；HunyuanImage 2.1：test_vae_hunyuan.py；
                             自检峰值诊断：check_selftest_mem.py，DESIGN.md §9.19）
 tools/watch_mem.sh          GTT / cgroup 内存监视
 tools/compare_images.py     两张图逐像素比较
@@ -1530,7 +1602,9 @@ docs/HANDOFF.md             交接说明（当前状态、提交记录、规矩�
 
 **Wan 2.2 单帧走第一层**（DESIGN §9.23）：`vae2_2.WanVAE`（Wan 2.2 5B 用它）单帧解码按条带算；带 shortcut 的上采样块整块是一个单元。模拟：4K 原生 34.2 → 第二层 19.8 → 第一层 1.34 GiB。第一次使用的 fp32 自检约 1.5 GiB（比解码本身大）。顺带修了第二层对它的估算（以前 10.0 GiB，不是上界；现在 23.5）。真机命令 §9.16（W / XW / YW / ZW）。
 
-视频（多帧）的第二层、HunyuanImage 2.1 的第一层等以后定。
+**HunyuanImage 2.1 走第一层**（DESIGN §9.24）：与 LDM decoder 同样的块和 GroupNorm，多了第一步的 `conv_in + repeat`、depth-to-space 上采样（`PixelUnshuffle2D`）和 6 级。模拟：4K（3840×2176）原生 38.1 → 第二层 11.1 → 第一层（默认 B）2.13 GiB（A 0.74、C 4.67）。第一次使用的 fp32 自检约 1.4 GiB。顺带修了第二层对它的估算（4K 以前 10.06 GiB，不是上界；现在 14.05）。真机命令 §9.17（W / XH / YH / ZH）。
+
+视频（多帧）的第二层、HunyuanImage 2.1 Refiner 的第一层等以后定。
 ## 13. 高级选项（环境变量）
 
 一般不用设。它们都是**全局默认值**：`MONOLOAD` 开启（默认）时作用于所有模型 / VAE；`MONOLOAD=0` 时只作用于节点开启了的那个模型 / VAE 上节点没设的项。节点上明确选的值对那一个模型 / VAE 总是压过它们（§4 的优先级）。基准和测试脚本仍然用这些环境变量来配置。

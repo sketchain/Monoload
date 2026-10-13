@@ -1423,7 +1423,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 * 引擎的改动（不影响已有适配器，已有测试全过）：`need_in` 按 `scale > 1` 处理上采样类单元（以前只认 `kind == UP`，公式不变）；`Unit` 加 `extra` 字段（复合单元的块列表和时间因子）；`skeleton()`（在 meta 上建只换参数的骨架）；`StripeAdapter.decode_retained(h, w, e)`（模型自己的 `decode` 除了激活还留着的字节数，默认 0）。
 * 内存模型（照 62b3c94 的代码数活着的张量）：复合单元里块的输入一直活到最后；依次是第一个块（`vae_wan.res_peak`）、后面的块、`Resample`（输入 B + 上采样 4B + 卷积输出 4B + 卷积额外）、`DupUp3D`（x_main 4B + `repeat_interleave` 4ft·B + 它 permute 后的连续拷贝 4ft·B）、相加（4B + shortcut 4ft·B + 结果 4B）。`unpatchify` 一份拷贝。
 * 自检：沿用 fp32 自检（参照 = `vae2_2.WanVAE.decode` 本身，在 32 MiB 的第二层分块下）。fp32 副本里每个 `CausalConv3d` **只留时间核的最后一片**（单帧只读这一片，见上）：参数 555 M → 202 M，fp32 0.79 GiB（整核 2.2 GB）；测试核对副本自己的 `WanVAE.decode` 与原模型的 `decode` 逐位相同。自检上界 `selftest_memory` 多算参照解码留着的 feat_cache 克隆（`decode_retained`，24×24 latent fp32 约 0.5 GiB）：上界 1.61 GiB，alloc_sim 峰值 1.51 GiB（bf16 / fp32 VAE 相同，跑在预算的形状探测之后也一样）。**这比 4K 的解码本身还大**（见「要用户定的」）。
-* **第二层估算的修正（以前就有的问题）：** 盘点表二的第二层峰值 19.78 GiB，而 `vae.estimate` 给的是 10.01 GiB——形状探测只看模块的输入输出，看不到 feat_cache 的克隆（也看不到 `DupUp3D` 里 8B 的中间量）。现在 `estimate` 加上 `decode_retained`（`vae._decode_retained`：认得这个结构的适配器给出，Wan 2.2 = 所有带缓存调用的 `CausalConv3d` 输入之和，测试用原生解码核对字节数相等；其他结构 0，数字不变）。模拟：1344 / 2688 / 4K 第二层 4.01 / 11.66 / 19.78，估算 4.67 / 12.69 / 23.48（以前 3.00 / 5.99 / 10.01，不是上界）。预算模式据此比较第二层，交给 `load_models_gpu` 的也是这个。
+* **第二层估算的修正（以前就有的问题）：** 盘点表二的第二层峰值 19.78 GiB，而 `vae.estimate` 给的是 10.01 GiB——形状探测只看模块的输入输出，看不到 feat_cache 的克隆（也看不到 `DupUp3D` 里 8B 的中间量）。现在 `estimate` 加上 `decode_retained`（`vae._decoder_terms`：认得这个结构的适配器给出，Wan 2.2 = 所有带缓存调用的 `CausalConv3d` 输入之和，测试用原生解码核对字节数相等；其他结构 0，数字不变）。模拟：1344 / 2688 / 4K 第二层 4.01 / 11.66 / 19.78，估算 4.67 / 12.69 / 23.48（以前 3.00 / 5.99 / 10.01，不是上界）。预算模式据此比较第二层，交给 `load_models_gpu` 的也是这个。
 * 结构识别失败的原因写进日志（每个适配器各一句，`vae.l1_not_used`）；两种 WanVAE 的提示带模块名（`comfy.ldm.wan.vae2_2.WanVAE` 对 `comfy.ldm.wan.vae.WanVAE`）。名字 `Wan 2.2 stripes`；VAE 设置节点（条带高度、预算、`layer 2 only`、native）和 Info 节点不用改；启动日志的列表加上 Wan 2.2（`entry.vae_layer1`，中英文）。
 
 **模拟（`tests/alloc_sim.py --model wan22`，CT 700 后端，bf16，GiB）：**
@@ -1443,6 +1443,51 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 **真实权重（`wan2.2_vae.safetensors`，Comfy-Org/Wan_2.2_ComfyUI_Repackaged，1,409,400,960 字节，sha256 e40321bd…fed156）：** 命令 W：`WanVAE / decoder Decoder3d | latent 48 ch, latent_dim 3, x16 | 705 M params`，1344×768 / 4K `layer 1 (Wan 2.2 stripes)`，81 帧 native。CPU fp32 768×512：自检通过（1.1e-6），默认 4 × 128、40 行 13 条与原生 max|Δ| 1.1e-6 / 1.55e-6。
 
 **要用户定的：** 自检的峰值（模拟 1.51 GiB，上界 1.61）比所有图像尺寸的解码都大（4K 1.34），第一次解码的峰值就是自检的；而且 < 1.61 GiB 的预算永远报错。可选：不改；自检 latent 24 → 16（参照解码和克隆约减半，副本 0.79 GiB 不变，约 1.2 GiB）；自检放到 CPU 上跑（不占 GTT，Strix Halo 上多几秒；要改自检的设备）；只对 Wan 2.2 用更小的自检几何。
+
+### 9.24 第四阶段：HunyuanImage 2.1 VAE 走第一层（vae-hunyuan21-layer1）
+
+**结构核对（62b3c94，`comfy/ldm/hunyuan_video/vae.py`、`comfy/sd.py`）：** `comfy.sd.VAE` 看到 `decoder.conv_in.weight` 的输入通道是 64 就建 `AutoencodingEngine`（没有 `post_quant_conv`），decoder 是 `hunyuan_video.vae.Decoder`（`block_out_channels` [128, 256, 512, 512, 1024, 1024]，decoder 里倒过来，`num_res_blocks` 2，`ffactor_spatial` 32），latent 64 通道、32 倍。`forward` 是一串模块调用，**各级从最低分辨率往上排**（LDM 的 `Decoder` 是倒着遍历的）：
+
+    x = conv_in(z) + z.repeat_interleave(1024 // 64, 1)
+    -> mid.block_1 -> mid.attn_1 -> mid.block_2
+    -> up[0].block[*] -> up[0].upsample -> ... -> up[5].block[*]
+    -> norm_out -> F.silu -> conv_out
+
+块是 LDM 自己的 `ResnetBlock` / `AttnBlock`（`comfy.ldm.modules.diffusionmodules.model`，GroupNorm 32 组，`swish` 原地），所以 GroupNorm 的统计遍、方案、内存模型都可以照用 LDM 的。和预想不同的几处：
+
+* 名叫 `PixelUnshuffle2D` 的模块其实是 depth-to-space ×2：3×3 卷积到 4 × C_out 通道，`view(b, 2, 2, -1, h, w).permute(...).reshape(b, -1, 2h, 2w)`，再加上输入按通道 `repeat_interleave` 后同样重排的结果。输出第 2h + i 行只依赖卷积输出第 h 行，也就是输入第 h−1 … h+1 行：halo 在输出那一级是 2（测试量出切口后第 0、1 行不同，之后只差舍入）。
+* 各级通道：H/32 1024、H/16 1024、H/8 512、H/4 512、H/2 256、全分辨率 128——上面四级和 SDXL 的 decoder 一样，下面多两级；第一层的单元比 SDXL 多（31 个统计遍，SDXL 19 个）。
+* decoder 有 260 M 参数（文件 406 M 含 encoder），fp32 副本 0.99 GiB。
+* ComfyUI 自己的估算（`700 × latent 面积 × 32² × dtype`）比原生实际用的少 3–4 倍（4K 10.9 对 38.1 GiB）。
+
+**做法（`monoload/vae_hunyuan.py`）：**
+
+* 前缀：`ConvIn`（decoder 第一行，同样的运算和顺序，测试核对与原生逐位相同）、`mid`（含全局注意力）、`up[0]` 的三个块（H/32）；检查点 H/32、1024 通道（4K bf16 16 MiB）。
+* 单元：`PixelUnshuffle2D`（新 kind `PU`，×2，halo 2，行切片先做连续拷贝），每级的 `ResnetBlock`（`RES`，两个 GroupNorm 的 `NormRef`，与 LDM 相同）、`norm_out`、`F.silu`、`conv_out`。
+* 方案：与 LDM 同样的结构定义（`scheme_positions` 按 `scale > 1` 找上采样单元）：A 不存；D 存检查点之后第一级（H/16）的输出；B 存全分辨率以下每一级（H/16、H/8、H/4、H/2）；C 再加全分辨率每个块的输出。默认 B，设置节点、环境变量、预算的方案选择照常生效。
+* 内存模型：`PU` = 连续拷贝（S + A）之后，卷积输出 Y（4 × C_out，输入行数）+ 卷积额外 | 重排的拷贝 2Y | `repeat_interleave` 和它的重排拷贝、加上 y 3Y；其余用 `vae_ldm` 的。
+* 耗时模型：`vae_ldm` 的（按 SDXL 拟合），各级按相对输出的分辨率对应（全分辨率 = SDXL 的第 8 级，H/2 = 4，H/4 及以下 = 2）。**没有为这个 decoder 校准**，只用于预算模式里给方案排序。
+* 自检：沿用 fp32 自检（参照 = `AutoencodingEngine.decode`，第二层分块）。引擎加 `StripeAdapter.selftest_size`（默认 24 = `SELFTEST_LATENT`，其他适配器不变），这里取 12：decoder 输入 12×12、输出 384×384，`SELFTEST_ROWS` 40 行一条共 10 条，每一级都有内部边界。用 24 的话是 768×768 的 fp32 解码，自检 2.6 GiB。
+* **第二层估算（以前就有的问题）：** 4K 第二层模拟 11.10 GiB，而 `vae.estimate` 是 10.06：分配峰值 7.18 在 4 份激活 + 工作区以内，但每个 `PixelUnshuffle2D` 做五个输出大小的张量（卷积输出、它的重排拷贝、重复的输入、它的重排拷贝、和），这些段被缓存着进了全分辨率那一级，那里的 `ResnetBlock` 要的块尺寸不同，只好另开段：reserved = 5.6 × 最大激活 + 工作区。引擎加 `StripeAdapter.activation_copies`（默认 4 = `vae.ACTIVATION_COPIES`），这里取 6；`vae._decoder_terms` 从认得这个结构的适配器取它和 `decode_retained`，第二层估算和自检上界都用。模拟：1344 / 2688 / 4K 第二层 2.34 / 5.22 / 11.10，估算 3.49 / 7.95 / 14.05（以前 3.00 / 5.98 / 10.06）。自检上界 1.49 GiB（1525 MiB），模拟峰值 1444 / 1458 MiB（bf16 / fp32 VAE，跑在预算的形状探测之后也一样）。
+* Info 节点：方案说明按结构选（`scheme_hy.*`：H/32 检查点、H/16 … H/2 的存档、HunyuanImage 的模拟数字）；LDM VAE 照旧是 SDXL 的说明。`gn_scheme` 的 tooltip（节点和两份 nodeDefs.json）改成按结构描述方案，并写上两种 decoder 各自的级别和数字；启动日志的列表加上 HunyuanImage 2.1。两个 LDM 式适配器认不出时的原因带模块名（`hunyuan_video.vae.Decoder` 对 `diffusionmodules.model.Decoder`，类名都是 `Decoder`）。
+
+**模拟（`tests/alloc_sim.py --model hy21`，bf16，GiB；4K = 3840×2176，宽高要是 32 的倍数）：**
+
+| 输出 | 原生 | 第二层（估算） | 第一层默认 B（估算） | 计划 | 重算 | ComfyUI 估算 |
+|---|---|---|---|---|---|---|
+| 1344×768 | 4.66 | 2.34（3.49） | 0.53（0.68） | 6 × 128 | 4.65× | 1.3 |
+| 2688×1536 | 16.74 | 5.22（7.95） | 1.19（1.45） | 12 × 128 | 5.14× | 5.4 |
+| 3840×2176 | 38.11 | 11.10（14.05） | 2.13（2.41） | 13 × 168 | 8.29× | 10.9 |
+
+4K 各方案（reserved / 估算 / 重算 / 耗时模型的预测）：A 0.74 / 0.90 / 18.2× / ~76 s，D 0.81 / 0.97 / 14.6× / ~64 s，B 2.13 / 2.41 / 8.3× / ~45 s，C 4.67 / 4.81 / 4.3× / ~20 s（SDXL 4K 实测 A 1.10 / 75 s、B 2.17 / 42 s、C 4.70 / 36 s）。检查点在 H/32，所以 A / D 比 SDXL 低；级数多、halo 叠得深，所以重算比 SDXL（B 5.3×）多。B 的 4K 默认计划里，全分辨率第一个块的 norm1（`up.5.block.0.norm1`）那一遍从 H/4 存档出发、H/4 和 H/2 两个存档（510 + 1020 MiB）都活着，只分到 2 行的条带（共约 1088 条），这一遍的乘加（137.5 万亿次）占全部统计遍（269 万亿次）的一半多，重算因此偏高；这是现有的「统计遍在前缀 / 最后一遍的峰值以内取最高条带」的规则的结果，没有改。耗时模型按乘加和卷积调用次数算，GPU 上上千条 2 行条带的启动开销可能让 B 的实际耗时比预测的 45 s 高不少（要真机看；C 没有这个问题）。
+
+**按预算选（模拟，GiB，GTT / 估算）：** 第二层估算在三个尺寸都大于 3G。3G：1344 B 整图 1 条（384 MiB）1.41 / 1.81，2688 C 4 × 384 2.73 / 2.99，4K B 8 × 272 2.43 / 2.94；1.5G：1344 B 1 条（192 MiB）1.16 / 1.43，2688 B 11 × 140 1.21 / 1.47，4K D 9 × 242 1.14 / 1.41。自检上界 1.49 GiB 在 1.5G 以内，第一次也能用第一层；**低于 1.49 GiB 的预算第一次就报错**（与 Wan 2.2 同样的问题，见「要用户定的」）。
+
+**测试（`tests/test_vae_hunyuan.py`，57 项，不需要模型文件）：** 识别（`comfy.sd.VAE` 从小的 state dict 建模型，把 sd.py 写死的 `block_out_channels` 换成小的；`ConvIn` 与原生第一行逐位相同）；反例：`PixelUnshuffle2D` 卷积 `reflect`、forward hook → 第二层且与原生相同，`vae_options`、错的通道数不匹配，LDM 适配器不收它、它不收 Flux `ae`；`PixelUnshuffle2D` 的 halo；四种方案 × 条带 7 / 40 / 默认、奇数 3×5、1×1、batch 2、16 KiB 工作区与原生 max|Δ| ≤ 4.2e-6（fp32）；bf16 对 fp32 真值 RMSE 与原生相同（0.00817 对 0.00815）；自检通过（12×12），注入错误（`conv_in` 一步漏掉 repeat、条带内统计量）→ 自检失败、第二层、与原生相同；第一次解码的估算含自检；OOM；第二层估算按 6 份激活；预算；VAE 设置节点（方案 C、16 行、`layer 2 only`）和 Info 节点（HunyuanImage 自己的方案说明，LDM 的不变）；alloc_sim：第一层 6 个配置 reserved ≤ 估算，自检 ≤ 上界，第二层 1344 / 4K ≤ 第二层估算。
+
+**真实权重（`hunyuan_image_2.1_vae_fp16.safetensors`，Comfy-Org/HunyuanImage_2.1_ComfyUI，811,184,822 字节，sha256 f2ae1986…3b2f9）：** 命令 W：`AutoencodingEngine / decoder Decoder | latent 64 ch, latent_dim 2, x32 | 406 M params`，1344×768 / 4K `layer 1 (HunyuanImage 2.1 stripes, GroupNorm scheme B)`。CPU fp32 768×512：四种方案的自检都通过（3.8e-7 – 4.5e-7），A / D / B / C × 默认（4 × 128）/ 40 行（13 条）与原生 max|Δ| ≤ 8.3e-7。
+
+**要用户定的：** 自检峰值约 1.4 GiB（fp32 副本 0.99 GiB 占大头）高于 1344 和 2688 的解码本身，低于 1.49 GiB 的预算永远报错——与 Wan 2.2 是同一个问题，一起定。
 
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 

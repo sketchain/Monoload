@@ -411,7 +411,7 @@ def allocator_tests():
         lat = torch.empty(shape, device="meta", dtype=v.vae_dtype)
         with alloc_sim._patched(mvae.mm, "get_free_memory", lambda dev=None, torch_free_too=False: (48 << 30, 48 << 30) if torch_free_too else 48 << 30):
             p = mvae._probe(v, lat, {})
-        est = mvae.estimate(v, lat, mvae.DEFAULT_WORKSPACE, p, retained=mvae._decode_retained(v, lat, {}))
+        est = mvae.estimate(v, lat, mvae.DEFAULT_WORKSPACE, p, **mvae._decoder_terms(v, lat, {}))
         check("Wan 2.2 {}x{} layer 2: simulated reserved {:.2f} GiB <= estimate {:.2f} GiB (of which feat_cache clones {:.2f}; without them "
               "{:.2f})".format(w, h, t["reserved"] / G, est["total"] / G, est["retained"] / G, (est["total"] - est["retained"]) / G),
               t["reserved"] <= est["total"])

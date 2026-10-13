@@ -58,10 +58,10 @@ M = {
         "自己估算内存，OOM 时缩小分块，绝不退回 tiled；只管图像（4D / T=1 的 5D），设 MONOLOAD_DISABLE_VAE=1 恢复原生"),
     "entry.vae_layer1": (
         "[Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae and Wan 2.2 single frame; LDM Decoder of "
-        "SD1.5 / SDXL / SD3 / Flux ae / Flux 2 with whole-image GroupNorm statistics, scheme {scheme}; self-tested on first use): {policy}{rows}; "
+        "SD1.5 / SDXL / SD3 / Flux ae / Flux 2 and the HunyuanImage 2.1 decoder with whole-image GroupNorm statistics, scheme {scheme}; self-tested on first use): {policy}{rows}; "
         "other decoders use layer 2; set MONOLOAD_DISABLE_VAE_STRIPE=1 to use layer 2 everywhere",
         "[Monoload] VAE 第一层（条带解码）对认得的 decoder 开启（Wan 2.1 / qwen_image_vae 和 Wan 2.2 单帧；SD1.5 / SDXL / SD3 / Flux ae / Flux 2 的 LDM "
-        "Decoder，GroupNorm 用整图统计量，方案 {scheme}；第一次使用时自检）：{policy}{rows}；其他 decoder 走第二层；"
+        "Decoder 和 HunyuanImage 2.1 的 decoder，GroupNorm 用整图统计量，方案 {scheme}；第一次使用时自检）：{policy}{rows}；其他 decoder 走第二层；"
         "设 MONOLOAD_DISABLE_VAE_STRIPE=1 全部走第二层"),
     "entry.scheme_forced": ("{scheme} (forced, MONOLOAD_VAE_GN_SCHEME)", "{scheme}（强制，MONOLOAD_VAE_GN_SCHEME）"),
     "entry.scheme_default": ("{scheme} (default)", "{scheme}（默认）"),
@@ -391,6 +391,14 @@ M = {
                  "存 H/4 和 H/2 级的输出——内置默认（SDXL 4K 约 2.2 GiB / 42 s）"),
     "scheme.C": ("also keeps every full-resolution block's output - most memory, fastest (SDXL 4K ~4.7 GiB / 36 s)",
                  "再存全分辨率每个块的输出——内存最高、最快（SDXL 4K 约 4.7 GiB / 36 s）"),
+    "scheme_hy.A": ("keeps nothing, recomputes from the H/32 checkpoint - lowest memory, slowest (HunyuanImage 2.1 4K, simulated ~0.7 GiB)",
+                    "什么都不存，从 H/32 存档重算——内存最低、最慢（HunyuanImage 2.1 4K 模拟约 0.7 GiB）"),
+    "scheme_hy.D": ("keeps the H/16 level output - little more memory than A (HunyuanImage 2.1 4K, simulated ~0.8 GiB)",
+                    "存 H/16 级的输出——比 A 多一点内存（HunyuanImage 2.1 4K 模拟约 0.8 GiB）"),
+    "scheme_hy.B": ("keeps the H/16, H/8, H/4 and H/2 level outputs - the built-in default (HunyuanImage 2.1 4K, simulated ~2.1 GiB)",
+                    "存 H/16、H/8、H/4、H/2 级的输出——内置默认（HunyuanImage 2.1 4K 模拟约 2.1 GiB）"),
+    "scheme_hy.C": ("also keeps every full-resolution block's output - most memory, fastest (HunyuanImage 2.1 4K, simulated ~4.7 GiB)",
+                    "再存全分辨率每个块的输出——内存最高、最快（HunyuanImage 2.1 4K 模拟约 4.7 GiB）"),
     "info.unused_native": (" (not used in native mode)", "（原生模式下不使用）"),
     "info.unused_layer2": (" (not used: layer 2 only)", "（只用第二层时不使用）"),
     "info.model_head": ("MODEL ({model}):", "MODEL（{model}）："),
