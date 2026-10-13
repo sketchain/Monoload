@@ -75,7 +75,7 @@ docker logs comfyui 2>&1 | grep -i monoload
 #   [Monoload] master switch MONOLOAD: on
 #   [Monoload] LoRA: runtime merge (no in-place LoRA, no weight backups), merge fused fp16 addmm / relaxed (MONOLOAD_EXACT=1 for bit-exact); released after every prompt (base models stay loaded)
 #   [Monoload] VAE decode managed: op-level chunking (conv row blocks, attention query blocks), workspace 1.00 GiB ...
-#   [Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae single frame; ...): default stripe policy: the peak of 128-row stripes, tallest stripes within it ...
+#   [Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae and Wan 2.2 single frame; ...): default stripe policy: the peak of 128-row stripes, tallest stripes within it ...
 ```
 
 `MONOLOAD=0` 时第一行是 `master switch MONOLOAD: off (MONOLOAD=0): native ComfyUI unless a Monoload node enables Monoload for its model / VAE`，VAE 一行是 `VAE decode: native by default (MONOLOAD=0) ...`。
@@ -266,7 +266,7 @@ MODELS=/path/to/models tests/run_all.sh
 # 缺模型文件的测试组会被跳过并计数（「skipped (missing model files): N」），退出码 = 失败组数 + 跳过组数，跳过不算通过
 ```
 
-`run_all.sh` 先跑入口测试（8 种开关组合）、消息、释放链、Info 节点、总开关、LoRA 节点和全部 VAE 测试（`test_vae.py`、`test_vae_stripe.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_node.py`，不需要模型文件），然后把下面每个 LoRA 功能测试在两种合并路径下各跑一遍：先 `MONOLOAD_EXACT=1`（逐位一致），再默认路径。只想跑 VAE 部分时：`MODELS=/path/to/models tests/docker_run.sh python tests/test_vae.py`（不需要任何模型文件，`$MODELS` 可以是空目录）。
+`run_all.sh` 先跑入口测试（8 种开关组合）、消息、释放链、Info 节点、总开关、LoRA 节点和全部 VAE 测试（`test_vae.py`、`test_vae_stripe.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_wan22.py`、`test_vae_node.py`，不需要模型文件），然后把下面每个 LoRA 功能测试在两种合并路径下各跑一遍：先 `MONOLOAD_EXACT=1`（逐位一致），再默认路径。只想跑 VAE 部分时：`MODELS=/path/to/models tests/docker_run.sh python tests/test_vae.py`（不需要任何模型文件，`$MODELS` 可以是空目录）。
 
 | 脚本 | 内容 |
 |---|---|
@@ -275,6 +275,7 @@ MODELS=/path/to/models tests/run_all.sh
 | `tests/test_lora_hot.py` | 两条管线：`CheckpointLoaderSimple`；`UNETLoader` + `CLIPLoader`。同一串 LoRA 组合先用原生跑、再装上 Monoload 连续切换着跑。`EXACT=1`：TE 输出和采样结果与原生逐位一致。默认路径：UNet 和 TE 所有被 patch 的权重与原生合并的差异在容差以内（DESIGN.md §5.5），同样的 key 上重算逐位一致路径与原生逐位一致；latent 差异只报告。两种模式都检查无备份、权重不变、撤掉 LoRA 后逐位一致，加上 Hook LoRA、模型合并和报错场景 |
 | `tests/test_quant.py` | fp8 scaled UNet + LoRA：与「先反量化被改到的层 + 同一合并路径」逐位一致、无备份、fp8 权重不变；与原生的误差只报告 |
 | `tests/test_vae.py` | VAE 解码管理（§12），不需要模型文件：分块卷积 / 分块注意力与不分块的结果一致（含各种 kernel、stride、dilation、groups、padding、cast 路径 + weight_function、Wan CausalConv3d）；用 ComfyUI 自己的 LDM `Decoder` / `WanVAE`（小通道、随机权重）构造 SDXL 式、Flux 式、Qwen 式 VAE，受管理的解码与原生 `VAE.decode` 比较；多帧交给原生、OOM 缩小分块重试、下限时报错、绝不调用 tiled；SVD / 2D latent 的音频 / 像素空间交给原生（DESIGN §9.17） |
+| `tests/test_vae_wan22.py` | Wan 2.2 VAE 单帧走第一层（DESIGN §9.23），不需要模型文件：识别（含不认的结构走第二层、多帧仍原生）、复合单元的 halo 恰好是精确边界、条带高度 / 奇数和 1×1 latent / batch 2 / 小工作区与原生比较、bf16 对 fp32 真值、自检的 fp32 副本（只留时间核最后一片）与模型自己的 decode 相同、注入错误、OOM、第二层估算含 feat_cache 克隆、预算、VAE 设置 / Info 节点、alloc_sim 上第一层 reserved ≤ 估算、自检 ≤ 上界、第二层 ≤ 第二层估算 |
 | `tests/test_vae_flux2.py` | Flux 2 VAE 走第一层（DESIGN §9.18），不需要模型文件：识别、latent 步骤与原生逐位相同、四种方案 × 条带高度与原生比较、自检和注入错误、OOM、预算、VAE 设置 / Info 节点、alloc_sim 上 reserved ≤ 估算 |
 | `tests/test_vae_stripe.py` | VAE 第一层（§12.7），不需要模型文件：区间倒推对照暴力依赖展开；每个单元（残差块、上采样、head 卷积）在任意切片上「有效行」与整图逐行一致、紧邻的下一行不一致；用 ComfyUI 的 `WanVAE`（小通道、随机权重）在 fp32 下比较第一层与原生整图解码（条带 1 行、不整除、等于整图、按预算自动、默认策略、奇数尺寸、很小的 latent、batch 2、条带内再分块、bf16），块边界附近的误差不比其他区域大；识别（Dropout 训练态、forward hook、开关）；故意少算一行 halo 时自检能抓到并回退第二层；预算报错；OOM 缩小条带、到下限报错、不退回 tiled 也不退回第二层；默认策略（128 行条带的估算为目标）和开关的优先级；内存模型单调、最大的条带先跑；自检后和前缀 / 条带之间清空缓存；SDXL / Flux 结构不归 Wan 适配器（归 LDM 适配器）；单帧 Conv3d 改走 conv2d 与模块原样一致、只在该改的时候改 |
 | `tests/test_master_switch.py` | 总开关和全局默认（§4），不需要模型文件：`MONOLOAD` 的解析；`MONOLOAD=0` 且没有节点时，挂 LoRA 的模型（整体加载、lowvram 部分加载、Hook LoRA）和 VAE 解码与卸掉钩子的原版 ComfyUI 逐位一致，备份也和原生一样；释放不运行；包装每次调用的开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `mode auto` 打开管理、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 时节点原样透传 |
@@ -1003,6 +1004,75 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 
 **可选：** `run_all.sh`（测试素材同 §10.7，`/models/monoload-test`）：现在 41 组（多了 `test_lora_save` 和「ComfyUI 的 VAE 接口变了」的入口测试），最后一行 `suites failed: 0, skipped (missing model files): 0`；缺合成 checkpoint 时跳过的组会计数、退出码非零。
 
+### 9.16 Wan 2.2 VAE 单帧走第一层：真机 bench（命令 W / XW / YW / ZW）
+
+**状态：待 CT 700 验收（DESIGN §9.23）。**
+
+**先放 VAE 文件**（只需要 VAE）：
+
+* 文件：`wan2.2_vae.safetensors`，1,409,400,960 字节，sha256 `e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156`（ComfyUI 官方打包，Comfy-Org/Wan_2.2_ComfyUI_Repackaged，不用登录）。
+* 放到 CT 700 的 `/models/comfy/vae/`（容器里 `/opt/ComfyUI/models/vae/`），不用重启容器：
+
+```bash
+cd /models/comfy/vae
+wget -O wan2.2_vae.safetensors https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan2.2_vae.safetensors
+sha256sum wan2.2_vae.safetensors   # e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156
+```
+
+拉新代码、重启容器后（每条 bench 前先 `/free`）：
+
+```bash
+# W. 识别（只读文件头，不占 GPU）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_models.py
+# XW. Wan 2.2 三档：原生 / 默认（第一层）/ 只用第二层，带 fp32 参照
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae wan2.2_vae.safetensors --modes native,monoload,monoload-l2 --warm 1 --fp32-ref \
+  --json /opt/ComfyUI/output/bench_vae_wan22.json 2>&1 | tee bench_vae_wan22.txt
+# YW. 4K 条带高度扫参（monoload = 默认 17 x 128）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae wan2.2_vae.safetensors --res 3840x2160 --modes monoload --stripe-rows 32,64,256,512 --warm 1 \
+  --json /opt/ComfyUI/output/bench_vae_wan22_rows.json 2>&1 | tee bench_vae_wan22_rows.txt
+# ZW. 预算 3G / 2G（按预算选），以及 VAE 设置节点（4K，节点预算 3G）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae wan2.2_vae.safetensors --modes native --budgets 3,2 --warm 1 \
+  --json /opt/ComfyUI/output/bench_vae_wan22_budget.json 2>&1 | tee bench_vae_wan22_budget.txt
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae_node.py \
+  --vae wan2.2_vae.safetensors --res 3840x2160 --budget 3 2>&1 | tee check_vae_node_wan22.txt
+```
+
+**W 的预期：** `wan2.2_vae.safetensors` → `VAE: WanVAE / decoder Decoder3d | latent 48 ch, latent_dim 3, x16 | 705 M params`；`1344x768 latent [1, 48, 1, 48, 84]` 和 `3840x2160 latent [1, 48, 1, 135, 240]` 都是 `Monoload layer 1 (Wan 2.2 stripes)`；`832x480 x81 frames` 是 `native: multi-frame video latent (T=21) ...`（云端用同一个文件跑出的就是这几行）。
+
+**预测依据：** GiB 都是 `tests/alloc_sim.py` 的模拟（CT 700 后端；以前 63 个读数的误差 ≤ 0.02 GiB），GTT ≈ reserved。耗时是**粗估**（±40%）：没有 Wan 2.2 的实测，按 Qwen（Wan 2.1）在 CT 700 上的实测换算——原生约 0.31 / 0.40 / 0.46 s 每 10¹² 次乘加（1344 / 2688 / 4K），第一层 ≈ 原生 ×（0.56 + 0.45 × 重算倍数）；Wan 2.2 的整图卷积 4.9 / 19.6 / 39.3 万亿次乘加，是 Qwen 的 2.3 倍。
+
+**XW 的逐行预测**（GTT 增量 GiB / 热启动 s；估算 = Monoload 交给 `load_models_gpu` 的值）：
+
+| 行 | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| `native` | 5.21 / ~1.5 | 17.2 / ~8 | 34.2 / ~18 |
+| `monoload`（第一层） | 0.45 / ~2.1，6 条 128 行，估算 0.59；**冷启动那次含自检，峰值约 1.51** | 0.92 / ~11，12 条 128 行，估算 0.94 | 1.34 / ~26，17 条 128 行，估算 1.35 |
+| `monoload-l2` | 4.01 / ~1.5，估算 4.67 | 11.7 / ~7，估算 12.7 | 19.8 / ~16，估算 23.5 |
+
+* `monoload` 行的日志是 `layer 1 (Wan 2.2 stripes)`；进程里第一次多一次自检（`self-test passed ... 1e-06` 量级，几秒），日志的估算后面写「the first-use self-test before it up to 1.61 GiB」。bench 的汇总表取各次的最大值，所以 1344 的 `monoload` 一行会显示约 1.51（自检），逐次输出里热启动那次是 0.45。
+* **每一行（含冷启动）GTT ≤ 估算**（冷启动的估算是 max(计划, 自检 1.61)）。4K 第一层的 GTT 紧贴估算（1.34 / 1.35）是预料中的：`DupUp3D` 的两个 300 MiB 中间量有一个落在 arena 外，估算里的 largest 正好是它。
+* `native est`（ComfyUI 自己的估算）15.4 / 61.5 / 123.6 GiB：2688 和 4K 的原生 `unload` 可能是 1（要的比整机还多，把 VAE 自己也卸了再装）；Monoload 的行 `unload` 应为 0。
+* 精度：`monoload vs native` 应与 Qwen 第一层同一水平（PSNR 60 dB 以上），`monoload vs fp32` 与 `native vs fp32` 相同；条带边界附近不比别处差。fp32 参照：4K 原生 fp32 约 68 GiB 放不下，会用 Monoload 的 fp32（第一层）当参照。
+
+**YW 的逐行预测**（4K，GTT / 估算 / 粗估 s；重算倍数）：32 行 68 条 1.01 / 1.03 / ~49（4.80×）；64 行 34 条 1.12 / 1.13 / ~34（2.88×）；默认 128 行 17 条 1.34 / 1.35 / ~26（1.92×）；256 行（9 条 240 行）1.73 / 1.75 / ~22（1.46×）；512 行（5 条 432 行）2.54 / 2.56 / ~20（1.23×）。冷启动的 `monoload` 那次含自检（约 1.51）。
+
+**ZW 的逐行预测**（Wan 2.2 只有一个第一层变体；第二层估算 4.67 / 12.7 / 23.5 都大于预算，所以全走第一层，取预算内最大的工作区和最高的条带）：
+
+| 行 | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| `monoload-b3` | 整图 1 条 768 行（工作区 384 MiB），1.37 / 估算 1.76，~1.5 s | 2 条 768 行（384 MiB），2.68 / 2.73，~8 s | 5 条 432 行（384 MiB），2.57 / 2.69，~20 s |
+| `monoload-b2` | 1 条 768 行（256 MiB），1.19 / 1.46，~1.5 s | 4 条 384 行（256 MiB），1.37 / 1.75，~9 s | 8 条 270 行（256 MiB），1.94 / 1.95，~21 s |
+
+* 1344 的 `monoload-b3` 是这个进程第一次用第一层：日志的候选写「first use: the self-test before it reserves up to 1.61 GiB」，峰值仍是解码自己的 1.37（自检 1.51 只略高于它的话也 ≤ 估算 1.76）。
+* **不要用 < 1.61 GiB 的预算**：第一次解码会报「does not fit the peak budget ... first use: the self-test before it reserves up to 1.61 GiB」（DESIGN §9.23 的待定事项）。
+
+`check_vae_node.py`：`node copy` → 第一层 5 条 432 行、`budget 3.00 GiB [node]`，GTT 约 2.57 / 估算 2.69（含第一次的自检，自检 1.51 低于解码）；`original` → 17 条 128 行，全部 `[default]`，1.34 / 1.35；`node copy again` 同第一行。
+
+把 W / XW / YW / ZW 的输出和 JSON 发给我。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
@@ -1331,7 +1401,7 @@ monoload/vae_overrides.py   单个 VAE 的设置（节点做的副本带的设�
 monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），lora_settings.py = Monoload LoRA Settings，vae_settings.py = Monoload VAE Settings，info.py = Monoload Info
 tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；保存挂 LoRA 的模型：test_lora_save.py、check_lora_save.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
                             bench_vae.py、check_vae_node.py、make_synthetic_vaes.py、alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10；
-                            第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16；Flux 2：test_vae_flux2.py；
+                            第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16；Flux 2：test_vae_flux2.py；Wan 2.2：test_vae_wan22.py；
                             自检峰值诊断：check_selftest_mem.py，DESIGN.md §9.19）
 tools/watch_mem.sh          GTT / cgroup 内存监视
 tools/compare_images.py     两张图逐像素比较
@@ -1458,7 +1528,9 @@ docs/HANDOFF.md             交接说明（当前状态、提交记录、规矩�
 
 **4b-1 Flux 2 走第一层**（§9.18）：Flux 2 VAE（Flux 2、Ideogram 4、Lens、Ernie-Image 都用它）与 Flux `ae` 是同一个 LDM decoder，只多了 latent 的 BatchNorm 反归一化和 2×2 还原，作为前缀的第一步。模拟：4K 原生 52.5 → 第二层 15.05 → 第一层（默认 B）2.18 GiB，与 Flux `ae` 相同。真机命令 §9.12（X / Y / Z）。
 
-视频（多帧）的第二层、Wan 2.2 / HunyuanImage 2.1 的第一层等以后定。
+**Wan 2.2 单帧走第一层**（DESIGN §9.23）：`vae2_2.WanVAE`（Wan 2.2 5B 用它）单帧解码按条带算；带 shortcut 的上采样块整块是一个单元。模拟：4K 原生 34.2 → 第二层 19.8 → 第一层 1.34 GiB。第一次使用的 fp32 自检约 1.5 GiB（比解码本身大）。顺带修了第二层对它的估算（以前 10.0 GiB，不是上界；现在 23.5）。真机命令 §9.16（W / XW / YW / ZW）。
+
+视频（多帧）的第二层、HunyuanImage 2.1 的第一层等以后定。
 ## 13. 高级选项（环境变量）
 
 一般不用设。它们都是**全局默认值**：`MONOLOAD` 开启（默认）时作用于所有模型 / VAE；`MONOLOAD=0` 时只作用于节点开启了的那个模型 / VAE 上节点没设的项。节点上明确选的值对那一个模型 / VAE 总是压过它们（§4 的优先级）。基准和测试脚本仍然用这些环境变量来配置。

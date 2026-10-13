@@ -44,8 +44,13 @@ The adapter interface (StripeAdapter):
   reference_decode(z)  the decoder's own whole-image decode (on such a copy)
   selftest_latent(n)   the latent shape of the self-test
   selftest_params()    parameter count of what fp32_copy copies
+  decode_retained(h, w, e)  bytes the model's own whole-image decode of an h x w (decoder
+                       resolution) sample keeps alive beyond its live activations, e.g. Wan
+                       2.2's feat_cache clones (0 by default): part of the self-test's bound
+                       (its reference is that decode) and of the layer-2 estimate
 """
 
+import contextlib
 import gc
 import os
 import time
@@ -80,21 +85,27 @@ class StripeError(MonoloadError):
 class Unit:
     """One step of the stripe part: kind, halo (rows on each side a unit
     needs, at its output level), scale (output rows per input row), channels."""
-    __slots__ = ("kind", "module", "halo", "scale", "cin", "cout", "name", "macs_row", "shortcut", "norms", "contiguous")
+    __slots__ = ("kind", "module", "halo", "scale", "cin", "cout", "name", "macs_row", "shortcut", "norms", "contiguous", "extra")
 
-    def __init__(self, kind, module, halo, scale, cin, cout, name, macs_row=0, shortcut=False, norms=(), contiguous=False):
+    def __init__(self, kind, module, halo, scale, cin, cout, name, macs_row=0, shortcut=False, norms=(), contiguous=False, extra=None):
         self.kind, self.module, self.halo, self.scale = kind, module, halo, scale
         self.cin, self.cout, self.name, self.macs_row = cin, cout, name, macs_row
         self.shortcut = shortcut   # residual block with a 1x1 conv shortcut
         self.norms = tuple(norms)  # NormRef: norms in this unit that need whole-image statistics, in call order
         self.contiguous = contiguous   # its row slice is made contiguous before the call (as for the CONTIGUOUS_INPUT kinds)
+        self.extra = extra         # what the adapter's cost model needs besides the above (e.g. the blocks of a compound unit)
 
 
 def need_in(unit, a, b, h_in, h_out):
-    """Input rows unit needs to produce output rows [a, b), within the image."""
-    if unit.kind == UP:  # nearest x2, then a conv with `halo` rows on each side at the output level
+    """Input rows unit needs to produce output rows [a, b), within the image.
+    An upsampling unit (scale s > 1: nearest x2 then a conv, depth-to-space, a
+    compound block, ...) is described at its output level: output row o reads
+    input row o // s, and `halo` output rows on each side are needed (or, where
+    the slice is not at the image edge, inexact: valid_out)."""
+    if unit.scale > 1:
+        s = unit.scale
         c0, c1 = max(0, a - unit.halo), min(h_out, b + unit.halo)
-        return c0 // 2, min(h_in, -(-c1 // 2))
+        return c0 // s, min(h_in, -(-c1 // s))
     return max(0, a - unit.halo), min(h_in, b + unit.halo)
 
 
@@ -138,6 +149,15 @@ def hooked_module(model):
     if torch.nn.modules.module._global_forward_hooks or torch.nn.modules.module._global_forward_pre_hooks:
         return "<global module hooks>"
     return None
+
+
+@contextlib.contextmanager
+def skeleton():
+    """Build modules whose parameters are all replaced before use (an fp32 copy
+    with other shapes): on the meta device, no memory. tests/alloc_sim.py,
+    whose device is the meta device, keeps what is built here out of its trace."""
+    with torch.device("meta"):
+        yield
 
 
 def conv_io(m):
@@ -960,6 +980,10 @@ class StripeAdapter:
     def norm_refs(self):
         return [nr for u in self.units for nr in u.norms]
 
+    def decode_retained(self, h, w, e):
+        """Bytes the model's own decode of one h x w sample keeps alive besides its activations (see the module docstring)."""
+        return 0
+
     def prefix_pass(self, z):
         """The prefix on the whole image -> the checkpoint."""
         return run_prefix(self.prefix, z)
@@ -1043,8 +1067,9 @@ class StripeAdapter:
         and the first decode's estimate / budget, DESIGN §9.20): the fp32 copy of
         the weights, then the larger of the reference decode (whole image, layer-2
         chunked at SELFTEST_REF_WORKSPACE: 4 x its largest activation + 2 x the
-        workspace, the layer-2 bound of vae.estimate) and the stripe pass (its
-        plan's estimate), the reference's output alive through both, a margin.
+        workspace, the layer-2 bound of vae.estimate, plus what that decode keeps
+        alive, decode_retained) and the stripe pass (its plan's estimate), the
+        reference's output alive through both, a margin.
         All fp32, at the self-test's geometry: the same for every image."""
         key = ("selftest_memory", self.key)
         hit = _PASS_COST.get(key)
@@ -1055,7 +1080,7 @@ class StripeAdapter:
         act = max(c * h * w for c, h, w in zip(plan.channels, plan.heights, plan.widths))
         act = max(act, max(self.prefix_out_channels(m) for _, m in self.prefix) * n * n) * 4
         out = self.out_channels * plan.h_out * plan.w_out * 4
-        ref = 4 * act + 2 * SELFTEST_REF_WORKSPACE + out
+        ref = 4 * act + 2 * SELFTEST_REF_WORKSPACE + out + self.decode_retained(n, n, 4)
         need = int(self.selftest_params() * 4 + max(ref, plan.estimate + out) + out + SELFTEST_MARGIN)
         _PASS_COST[key] = need
         return need

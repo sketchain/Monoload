@@ -234,6 +234,7 @@ def make_tracer(sim):
             super().__init__()
             self.live = {}
             self.static = set()   # storages allocated outside the trace (weights): views of them are not allocations
+            self.paused = False
 
         def poll(self):
             dead = [k for k, (w, _) in self.live.items() if w.expired()]
@@ -249,6 +250,8 @@ def make_tracer(sim):
 
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
             kwargs = kwargs or {}
+            if self.paused:   # vae_engine.skeleton(): modules built on the meta device for real, no memory
+                return func(*args, **kwargs)
             self.poll()
             temps, after = [], []
             name = func.name()
@@ -284,12 +287,14 @@ def make_tracer(sim):
 
 WAN_QWEN = dict(dim=96, z_dim=16, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_scales=[],
                 temperal_downsample=[False, True, True], dropout=0.0)
+# the Wan 2.2 VAE as comfy.sd.VAE builds it (vae2_2.WanVAE, decoder dim 256 by default)
+WAN22 = dict(dim=160, z_dim=48, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_scales=[], temperal_downsample=[False, True, True], dropout=0.0)
 # the LDM ddconfig comfy.sd.VAE builds for SDXL / SD1.5 (z 4, AutoencoderKL with post_quant_conv) and Flux ae /
 # SD3 (z 16, AutoencodingEngine, no post_quant_conv)
 LDM_DDCONFIG = {'double_z': True, 'z_channels': 4, 'resolution': 256, 'in_channels': 3, 'out_ch': 3, 'ch': 128,
                 'ch_mult': [1, 2, 4, 4], 'num_res_blocks': 2, 'attn_resolutions': [], 'dropout': 0.0}
 # model name -> (latent channels, latent dims[, spatial ratio (default 8)])
-LATENT = {"qwen": (16, 5), "sdxl": (4, 4), "flux": (16, 4), "flux2": (128, 4, 16)}
+LATENT = {"qwen": (16, 5), "sdxl": (4, 4), "flux": (16, 4), "flux2": (128, 4, 16), "wan22": (48, 5, 16)}
 
 
 class _MetaVAE:
@@ -315,6 +320,9 @@ def _build(model):
     if model == "qwen":
         import comfy.ldm.wan.vae as wan
         return wan.WanVAE(**WAN_QWEN)
+    if model == "wan22":
+        import comfy.ldm.wan.vae2_2 as wan22
+        return wan22.WanVAE(**WAN22)
     from comfy.ldm.models.autoencoder import AutoencoderKL, AutoencodingEngine
     if model == "sdxl":
         return AutoencoderKL(ddconfig=dict(LDM_DDCONFIG), embed_dim=4)
@@ -338,6 +346,22 @@ def meta_vae(dtype, model="qwen"):
         fsm.to(dtype).eval()
         _MODELS[key] = _MetaVAE(fsm, dtype)
     return _MODELS[key]
+
+
+def _skeleton(tracer):
+    """vae_engine.skeleton for a trace: modules built there are on the meta device in reality too (their parameters
+    are replaced before use), not on the device the trace stands for."""
+    @contextlib.contextmanager
+    def skeleton():
+        import torch
+        old = tracer.paused
+        tracer.paused = True
+        try:
+            with torch.device("meta"):
+                yield
+        finally:
+            tracer.paused = old
+    return skeleton
 
 
 @contextlib.contextmanager
@@ -365,7 +389,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     layer1_ws  monoload.vae.LAYER1_WORKSPACE for this decode (384 MiB up to 5d668b6, 128 MiB since)
     contiguous the row slice into a Resample is made contiguous first (False: up to 725a010)
     model   "qwen" (Wan 2.1, qwen_image_vae), "sdxl" (LDM AutoencoderKL, z 4), "flux" (LDM AutoencodingEngine, z 16),
-            "flux2" (LDM AutoencoderKL with a batch-norm latent, z 32, latent 128 x H/16)
+            "flux2" (LDM AutoencoderKL with a batch-norm latent, z 32, latent 128 x H/16), "wan22" (Wan 2.2 VAE, z 48, H/16)
     scheme  GroupNorm scheme of an LDM layer-1 decode (None: the current setting)
     units   tag every allocation with the layer-1 unit / prefix module that made it (for --peak)
     output_in_arena  the layer-1 layout up to 6324592 (vae_engine.OUTPUT_IN_ARENA): no cache emptied before / after the
@@ -419,6 +443,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
 
     with contextlib.ExitStack() as es:
         es.enter_context(_patched(vae_ops, "slow_dilated3d", lambda x: conv2d))
+        es.enter_context(_patched(eng, "skeleton", _skeleton(tracer)))
         es.enter_context(_patched(vae_ops, "OUT_FIRST", out_first))
         es.enter_context(_patched(mm, "soft_empty_cache", soft_empty_cache))
         es.enter_context(_patched(eng, "arena_supported", lambda device: True))
@@ -544,6 +569,7 @@ def selftest_trace(model, dtype="bf16", tail=True, info=None, probe=False):
     free = 48 << 30
     with contextlib.ExitStack() as es:
         es.enter_context(_patched(vae_ops, "slow_dilated3d", lambda x: True))
+        es.enter_context(_patched(eng, "skeleton", _skeleton(tracer)))
         es.enter_context(_patched(mm, "soft_empty_cache", soft_empty_cache))
         es.enter_context(_patched(mm, "get_free_memory", lambda dev=None, torch_free_too=False: (free, free) if torch_free_too else free))
         es.enter_context(torch.inference_mode())
@@ -690,7 +716,7 @@ def main():
     ap.add_argument("--rows", default=None)
     ap.add_argument("--dtype", default="bf16")
     ap.add_argument("--version", default="current", help="current / v1 / v2 / v3 / w128")
-    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux / flux2")
+    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux / flux2 / wan22")
     ap.add_argument("--scheme", default=None, help="GroupNorm scheme of an LDM layer-1 decode: A / B / C / D")
     ap.add_argument("--layer", type=int, default=1)
     ap.add_argument("--ws", default=None, help="workspace MiB (layer 2: default 1024; layer 1: the layer-1 default)")

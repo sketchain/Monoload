@@ -50,6 +50,7 @@ step "VAE decode: op-level chunking vs native (synthetic decoders, no model file
 step "VAE decode: layer 1, Wan 2.1 stripes vs native (synthetic decoder, no model files)"; run $R python tests/test_vae_stripe.py
 step "VAE decode: layer 1, LDM stripes (SDXL / Flux ae) vs native (synthetic decoders, no model files)"; run $R python tests/test_vae_ldm.py
 step "VAE decode: layer 1, Flux 2 VAE vs native (synthetic decoder, no model files)"; run $R python tests/test_vae_flux2.py
+step "VAE decode: layer 1, Wan 2.2 VAE single frame vs native (synthetic decoder, no model files)"; run $R python tests/test_vae_wan22.py
 step "VAE Settings node (synthetic decoders, no model files)"; run $R python tests/test_vae_node.py
 step "VAE layer-1 OOM retries (injected; synthetic decoder, no model files)"; run $R python tests/test_vae_retry.py
 step "forced layer-1 settings whose self-test fails, under a budget (synthetic decoder, no model files)"; run $R python tests/test_vae_selftest_budget.py

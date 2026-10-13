@@ -104,7 +104,7 @@ def _check_resample(rs, name):
 def wan_structure(fsm):
     """(None, info) if fsm is a Wan 2.1 VAE the stripe decoder handles, else (reason, None)."""
     if not _is_wan(fsm):
-        return "first-stage model is {}, not comfy.ldm.wan.vae.WanVAE".format(type(fsm).__name__), None
+        return "first-stage model is {}.{}, not comfy.ldm.wan.vae.WanVAE".format(type(fsm).__module__, type(fsm).__name__), None
     dec = getattr(fsm, "decoder", None)
     if type(dec) is not wan.Decoder3d:
         return "decoder is {}, not Decoder3d".format(type(dec).__name__), None
