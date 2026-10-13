@@ -33,10 +33,10 @@ VAEDecodeTiled / VAE.decode_tiled -- stays native (logged).
 Layer 1 (stripe decoding for recognized decoders) plugs in through
 STRIPE_ADAPTERS: the engine (monoload/vae_engine.py) plus one adapter per
 decoder structure (monoload/vae_wan.py: the Wan 2.1 VAE single frame;
-monoload/vae_ldm.py: the LDM Decoder of SD1.5 / SDXL / SD3 / Flux ae / Flux 2,
-with GroupNorm statistics gathered across stripes). A recognized, self-tested
-decoder is decoded in
-stripes of output rows from a low-resolution checkpoint instead of the
+monoload/vae_wan22.py: the Wan 2.2 VAE single frame; monoload/vae_ldm.py:
+the LDM Decoder of SD1.5 / SDXL / SD3 / Flux ae / Flux 2, with GroupNorm
+statistics gathered across stripes). A recognized, self-tested decoder is
+decoded in stripes of output rows from a low-resolution checkpoint instead of the
 whole-image activations; everything else keeps layer 2. Default stripe height:
 the lowest peak that does not cost speed (DEFAULT_POLICY_ROWS, DESIGN
 §9.13.4); MONOLOAD_VAE_STRIPE_ROWS overrides it. With MONOLOAD_VAE_BUDGET the
@@ -71,7 +71,7 @@ import comfy.ops
 import comfy.sd
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
-from . import settings, vae_engine, vae_ldm, vae_ops, vae_overrides, vae_wan
+from . import settings, vae_engine, vae_ldm, vae_ops, vae_overrides, vae_wan, vae_wan22
 from .errors import MonoloadError, MonoloadVAEOOMError
 from .messages import label, msg
 from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
@@ -445,7 +445,7 @@ class _MemProbe:
 #   bound.plan(vae, samples, budget, workspace, rows=None, out_bytes=0) -> plan (estimate, stripes, recompute,
 #                                       ckpt_bytes, describe()) or None when the budget cannot be met
 #   bound.run(vae, samples, plan, workspace, stats) -> pixel_samples (process_output applied), native layout
-STRIPE_ADAPTERS = [vae_wan, vae_ldm]
+STRIPE_ADAPTERS = [vae_wan, vae_wan22, vae_ldm]
 
 _L1_NOTED = weakref.WeakKeyDictionary()   # first_stage_model -> last logged layer-1 reason
 
@@ -659,13 +659,15 @@ def _same_device(a, b):
     return a.type == b.type and (a.index or 0) == (b.index or 0)
 
 
-def estimate(vae, samples, budget, probe=None):
+def estimate(vae, samples, budget, probe=None, retained=0):
     """Upper bound (bytes) of what one managed decode of `samples` adds on the
     VAE's device (docs/DESIGN.md §9.4):
         ACTIVATION_COPIES x largest activation of one sample
       + 2 x workspace         (conv columns or attention scores, plus the block copies around them)
       + output buffer         (the whole batch, intermediate dtype, if it lives on the same device)
-      + one latent sample"""
+      + one latent sample
+      + retained              (what the decoder's own decode keeps alive besides its activations, one sample:
+                               _decode_retained; Wan 2.2's feat_cache clones, DESIGN §9.23)"""
     px = _latent_px(samples)
     if probe is not None:
         act = probe.act_bytes_per_px * px
@@ -678,8 +680,21 @@ def estimate(vae, samples, budget, probe=None):
     if _same_device(vae.output_device, vae.device):
         out_bytes = out_numel * samples.shape[0] * mm.dtype_size(vae.vae_output_dtype())
     lat = (samples[0:1].numel()) * mm.dtype_size(vae.vae_dtype)
-    total = ACTIVATION_COPIES * act + 2 * budget + out_bytes + lat
-    return {"total": int(total), "activation": int(act), "workspace": int(budget), "output": int(out_bytes), "latent": int(lat)}
+    total = ACTIVATION_COPIES * act + 2 * budget + out_bytes + lat + retained
+    return {"total": int(total), "activation": int(act), "workspace": int(budget), "output": int(out_bytes), "latent": int(lat),
+            "retained": int(retained)}
+
+
+def _decode_retained(vae, samples, vae_options):
+    """What the decoder's own decode of one sample of `samples` keeps alive besides the activations the shape probe
+    sees, from the layer-1 adapter that recognizes its structure (StripeAdapter.decode_retained; 0 for most decoders,
+    and for those no adapter recognizes). Layer 2 runs that decode."""
+    for a in STRIPE_ADAPTERS:
+        bound, _ = a.match(vae, samples, vae_options)
+        if bound is not None:
+            h, w = bound.decoder_hw(samples)
+            return bound.decode_retained(h, w, mm.dtype_size(vae.vae_dtype))
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1118,10 +1133,11 @@ def _layer2_estimate(vae, samples_in, vae_options, ws):
         # the shape probe needs the weights where they compute. It is one plain decode of a PROBE_SIZE x PROBE_SIZE
         # latent, not under OpChunking: no workspace in what it asks for (with ws it asked ~2 GiB for tens of MiB;
         # load_models_gpu adds its minimum_inference_memory on top anyway; review 2026-10 item 23)
-        mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, samples_in[0:1, ..., :PROBE_SIZE, :PROBE_SIZE], 0)["total"],
+        small = samples_in[0:1, ..., :PROBE_SIZE, :PROBE_SIZE]
+        mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, small, 0, retained=_decode_retained(vae, small, vae_options))["total"],
                            force_full_load=vae.disable_offload)
         probe = _shape_probe(vae, samples_in, vae_options)
-    return estimate(vae, samples_in, ws, probe), probe
+    return estimate(vae, samples_in, ws, probe, retained=_decode_retained(vae, samples_in, vae_options)), probe
 
 
 def _shape_probe(vae, samples_in, vae_options):

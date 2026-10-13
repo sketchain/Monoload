@@ -1406,6 +1406,44 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
   * `probe`：先跑预算的形状探测；
   * `info["stays"]`：输出活着时清缓存后留下的量。
 
+### 9.23 第四阶段：Wan 2.2 VAE 单帧走第一层（vae-wan22-layer1）
+
+**结构核对（62b3c94，`comfy/ldm/wan/vae2_2.py`、`comfy/sd.py`）：** `comfy.sd.VAE` 看到 `decoder.middle.0.residual.0.gamma` 和 `decoder.upsamples.0.upsamples.0.residual.2.weight` 就建 `vae2_2.WanVAE(dim=160, z_dim=48, ...)`（decoder 宽度用默认的 `dec_dim=256`），`latent_dim` 3，latent 48 通道，空间 16 倍。与 Wan 2.1 是**不同的类**（`vae2_2.WanVAE` / `Decoder3d` / `ResidualBlock` / `Resample` / `Up_ResidualBlock` / `DupUp3D`），只共用 `vae.CausalConv3d`、`RMS_norm`、`AttentionBlock`。和需求预想不同的几处：
+
+* `WanVAE.decode` **总是**带 `feat_cache`（T=1 也是），不像 Wan 2.1 在 T=1 时 `feat_map=None`。但第一个 chunk 里所有带缓存的调用都走无缓存的路：`CausalConv3d` 拿到的 `cache_x` 是 None、T=1，走 `autopad="causal_zero"`（只用 `weight[:, :, -1:]`）；`Resample("upsample3d")` 只把缓存标成 `"Rep"`、跳过 `time_conv`。所以单帧解码 = `conv2 → decoder.conv1 → middle → upsamples[i](first_chunk=True) → head → unpatchify(2)`，不带缓存调用这些模块结果相同（测试逐位核对）。
+* 带缓存的代价在原生里：每个带缓存调用的 `CausalConv3d`（`decoder.conv1`、每个 `ResidualBlock` 的两个卷积、head 的卷积）先把输入整份 `clone()` 进 `feat_cache`，一直留到 `decode` 返回。4K 时约 13.5 GiB——这就是第二层不够（19.8 GiB）的原因。
+* `Up_ResidualBlock` = `x_main`（3 个 `ResidualBlock`，然后 `Resample`：nearest ×2 + 3×3 卷积）+ `avg_shortcut`（`DupUp3D`：通道 `repeat_interleave` 后 2×2 depth-to-space，时间上采样块取两片中的后一片 `first_chunk`）。shortcut 要用块的输入，所以这个块不能拆成单元链。最后一级（`upsamples[3]`）没有 `Resample` 也没有 shortcut。
+* decoder 输出 12 通道（H/2），`unpatchify(patch_size=2)` 按行 2×2 还原成 3 通道。
+* decoder 有 555 M 参数（3×3×3 的 Conv3d 核），全精度 fp32 副本 2.2 GB。
+
+**做法（`monoload/vae_wan22.py`）：**
+
+* 前缀：`conv2`、`decoder.conv1`、`middle`（含全局注意力）；检查点在 latent 分辨率（H/16，1024 通道，4K bf16 66 MiB）。
+* 单元：每个带 shortcut 的 `Up_ResidualBlock` 是一个复合单元（`DUPUP`，×2，按原生的方式调用 `blk(x, None, [0], True)`），halo 在输出那一级是 4k+1 = 13（k 个块每个两次 3×3 卷积要 2k 行输入，上采样后的卷积 1 行输出，shortcut 逐行）：`need_in` 用这个 halo 算出的输入行恰好就是块读到的行，测试在每个块上量出切口后第 0–12 行不同、13 行起逐位相同。最后一级的三个 `ResidualBlock`、head 的 RMS / SiLU / 卷积各是一个单元，`unpatchify` 是最后一个单元（×2，halo 0）。没有整图统计的归一化（RMS 逐位置），没有统计遍、没有方案，只有一个变体。
+* 引擎的改动（不影响已有适配器，已有测试全过）：`need_in` 按 `scale > 1` 处理上采样类单元（以前只认 `kind == UP`，公式不变）；`Unit` 加 `extra` 字段（复合单元的块列表和时间因子）；`skeleton()`（在 meta 上建只换参数的骨架）；`StripeAdapter.decode_retained(h, w, e)`（模型自己的 `decode` 除了激活还留着的字节数，默认 0）。
+* 内存模型（照 62b3c94 的代码数活着的张量）：复合单元里块的输入一直活到最后；依次是第一个块（`vae_wan.res_peak`）、后面的块、`Resample`（输入 B + 上采样 4B + 卷积输出 4B + 卷积额外）、`DupUp3D`（x_main 4B + `repeat_interleave` 4ft·B + 它 permute 后的连续拷贝 4ft·B）、相加（4B + shortcut 4ft·B + 结果 4B）。`unpatchify` 一份拷贝。
+* 自检：沿用 fp32 自检（参照 = `vae2_2.WanVAE.decode` 本身，在 32 MiB 的第二层分块下）。fp32 副本里每个 `CausalConv3d` **只留时间核的最后一片**（单帧只读这一片，见上）：参数 555 M → 202 M，fp32 0.79 GiB（整核 2.2 GB）；测试核对副本自己的 `WanVAE.decode` 与原模型的 `decode` 逐位相同。自检上界 `selftest_memory` 多算参照解码留着的 feat_cache 克隆（`decode_retained`，24×24 latent fp32 约 0.5 GiB）：上界 1.61 GiB，alloc_sim 峰值 1.51 GiB（bf16 / fp32 VAE 相同，跑在预算的形状探测之后也一样）。**这比 4K 的解码本身还大**（见「要用户定的」）。
+* **第二层估算的修正（以前就有的问题）：** 盘点表二的第二层峰值 19.78 GiB，而 `vae.estimate` 给的是 10.01 GiB——形状探测只看模块的输入输出，看不到 feat_cache 的克隆（也看不到 `DupUp3D` 里 8B 的中间量）。现在 `estimate` 加上 `decode_retained`（`vae._decode_retained`：认得这个结构的适配器给出，Wan 2.2 = 所有带缓存调用的 `CausalConv3d` 输入之和，测试用原生解码核对字节数相等；其他结构 0，数字不变）。模拟：1344 / 2688 / 4K 第二层 4.01 / 11.66 / 19.78，估算 4.67 / 12.69 / 23.48（以前 3.00 / 5.99 / 10.01，不是上界）。预算模式据此比较第二层，交给 `load_models_gpu` 的也是这个。
+* 结构识别失败的原因写进日志（每个适配器各一句，`vae.l1_not_used`）；两种 WanVAE 的提示带模块名（`comfy.ldm.wan.vae2_2.WanVAE` 对 `comfy.ldm.wan.vae.WanVAE`）。名字 `Wan 2.2 stripes`；VAE 设置节点（条带高度、预算、`layer 2 only`、native）和 Info 节点不用改；启动日志的列表加上 Wan 2.2（`entry.vae_layer1`，中英文）。
+
+**模拟（`tests/alloc_sim.py --model wan22`，CT 700 后端，bf16，GiB）：**
+
+| 输出 | 原生 | 第二层（估算） | 第一层默认（估算） | 计划 | 重算 | ComfyUI 估算 |
+|---|---|---|---|---|---|---|
+| 1344×768 | 5.21 | 4.01（4.67） | 0.45（0.59） | 6 × 128 | 1.80× | 15.4 |
+| 2688×1536 | 17.19 | 11.66（12.69） | 0.92（0.94） | 12 × 128 | 1.89× | 61.5 |
+| 3840×2160 | 34.23 | 19.78（23.48） | 1.34（1.35） | 17 × 128 | 1.92× | 123.6 |
+
+4K 其他条带高度（reserved / 估算）：16 行 0.96 / 0.97，32 行 1.01 / 1.03，64 行 1.12 / 1.13，256 行 1.73 / 1.75，512 行 2.54 / 2.56，整图一条 10.00 / 10.01；fp32 4K 默认 2.52 / 2.53；8K 默认 2.93 / 3.10。4K 的 reserved 紧贴估算：`DupUp3D` 的 `repeat_interleave` 和它的连续拷贝（4K 默认各 300 MiB）同时活着，第二块找不到放得下的洞，落在 arena 外单开一段——这正是估算里 `largest` 那一项（out 段 + arena + largest + 16 MiB）兜住的情况，所以是结构上的上界，不是巧合；1344 不发生。重算比 Wan 2.1（1.21–1.25×）高，因为每个复合单元要 13 行 halo。
+
+**按预算选（模拟，GiB）：** 第二层估算在三个尺寸都大于 3G，所以 3G / 2G 都走第一层（只有一个变体，取预算内最大的工作区和最高的条带）：1344 3G 整图 1 条（384 MiB 工作区）1.37 / 估算 1.76，2G 1.19 / 1.46；2688 3G 2 × 768 2.68 / 2.73，2G 4 × 384 1.37 / 1.75；4K 3G 5 × 432 2.57 / 2.69，2G 8 × 270 1.94 / 1.95。**1.5G：第一次解码报错**（自检上界 1.61 > 1.5，第二层更大），而自检不跑就永远「第一次」，所以 < 1.61 GiB 的预算对 Wan 2.2 一直报错（同一进程里先有一次不设预算的解码跑过自检之后才行：4K 1.5G 选 14 × 155，1.45 / 1.47）。
+
+**测试（`tests/test_vae_wan22.py`，50 项，不需要模型文件）：** 识别（`comfy.sd.VAE` 从小的 Wan 2.2 state dict 建模型，把 sd.py 写死的 dim 160 / 256 换成小的）；反例走第二层且与原生相同：卷积 `reflect` 补边、bilinear 上采样、forward hook；`vae_options`、错的通道数不匹配；3 帧仍原生；三个复合单元的 halo 恰好是精确边界；条带 7 / 40 / 默认、奇数 7×3、1×1、batch 2、16 KiB 工作区与原生 max|Δ| ≤ 1.7e-6（fp32）；bf16 对 fp32 真值 RMSE 与原生相同（0.00464）；fp32 副本与原模型 decode 逐位相同、参数数 = `selftest_params`；自检通过并与 Wan 2.1 分开缓存；注入错误（halo 远小于需要、`unpatchify` 的 2×2 转置）→ 自检失败、第二层、与原生相同；第一次解码的估算含自检；OOM 缩条带、到底 `MonoloadVAEOOMError`；第二层估算的 `retained` = 原生解码里 30 次带缓存卷积的输入字节之和；预算（等于第二层估算 → 第二层，略低 → 第一层，1 KiB → 报错）；VAE 设置节点（16 行、`layer 2 only`）和 Info 节点；alloc_sim：第一层 6 个配置 reserved ≤ 估算，自检峰值 ≤ 上界，第二层 1344 / 4K 的模拟 ≤ 第二层估算。注：halo 少几行时误差衰减得很快（复合单元少 4 行，自检误差只有 6e-7），自检只能抓住大的 halo 错误；halo 的正确性由逐块的边界测试保证。
+
+**真实权重（`wan2.2_vae.safetensors`，Comfy-Org/Wan_2.2_ComfyUI_Repackaged，1,409,400,960 字节，sha256 e40321bd…fed156）：** 命令 W：`WanVAE / decoder Decoder3d | latent 48 ch, latent_dim 3, x16 | 705 M params`，1344×768 / 4K `layer 1 (Wan 2.2 stripes)`，81 帧 native。CPU fp32 768×512：自检通过（1.1e-6），默认 4 × 128、40 行 13 条与原生 max|Δ| 1.1e-6 / 1.55e-6。
+
+**要用户定的：** 自检的峰值（模拟 1.51 GiB，上界 1.61）比所有图像尺寸的解码都大（4K 1.34），第一次解码的峰值就是自检的；而且 < 1.61 GiB 的预算永远报错。可选：不改；自检 latent 24 → 16（参照解码和克隆约减半，副本 0.79 GiB 不变，约 1.2 GiB）；自检放到 CPU 上跑（不占 GTT，Strix Halo 上多几秒；要改自检的设备）；只对 Wan 2.2 用更小的自检几何。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
