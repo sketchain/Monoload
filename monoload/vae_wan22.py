@@ -41,6 +41,7 @@ import torch
 
 import comfy.ldm.wan.vae as wan
 import comfy.ldm.wan.vae2_2 as wan22
+import comfy.model_management as mm
 
 from . import vae_engine as eng
 from .vae_engine import CONV, POINT, RES, Unit, conv_extra, conv_io
@@ -370,24 +371,7 @@ class Wan22Stripe(eng.StripeAdapter):
     prefix_macs = staticmethod(prefix_macs)
 
     def decode_retained(self, h, w, e):
-        """WanVAE.decode passes a feat_cache even for one frame: every CausalConv3d it calls with the cache (decoder.conv1,
-        the two convs of each ResidualBlock, the head's conv; not conv2, the 1x1 shortcuts, nor time_conv, which a first
-        chunk skips) first clones its input ("cache_x = x[:, :, -CACHE_T:].clone()": the whole input for T=1) into
-        feat_cache, which lives until decode returns. The sum of those inputs, at their resolution."""
-        dec = self.fsm.decoder
-        px = h * w
-        n = conv_io(dec.conv1)[0] * px
-        for m in dec.middle:
-            if isinstance(m, wan22.ResidualBlock):
-                n += (m.in_dim + m.out_dim) * px
-        for blk in dec.upsamples:
-            for m in blk.upsamples:
-                if isinstance(m, wan22.ResidualBlock):
-                    n += (m.in_dim + m.out_dim) * px
-            if blk.avg_shortcut is not None:
-                px *= 4
-        n += conv_io(dec.head[2])[0] * px
-        return n * e
+        return retained_bytes(self.fsm.decoder, h, w, e)
 
     def output_shape(self, samples):
         return (samples.shape[0], self.out_channels, samples.shape[2], int(samples.shape[-2]) * self.scale, int(samples.shape[-1]) * self.scale)
@@ -449,6 +433,36 @@ class Wan22Stripe(eng.StripeAdapter):
 
     def reference_decode(self, z):
         return wan22.WanVAE.decode(self.module, z)
+
+
+def retained_bytes(dec, h, w, e):
+    """WanVAE.decode passes a feat_cache even for one frame: every CausalConv3d it calls with the cache (decoder.conv1,
+    the two convs of each ResidualBlock, the head's conv; not conv2, the 1x1 shortcuts, nor time_conv, which a first
+    chunk skips) first clones its input ("cache_x = x[:, :, -CACHE_T:].clone()": the whole input for T=1) into
+    feat_cache, which lives until decode returns. The sum of those inputs, at their resolution, for an h x w decoder
+    input (dec a vae2_2.Decoder3d)."""
+    px = h * w
+    n = conv_io(dec.conv1)[0] * px
+    for m in dec.middle:
+        if isinstance(m, wan22.ResidualBlock):
+            n += (m.in_dim + m.out_dim) * px
+    for blk in dec.upsamples:
+        for m in blk.upsamples:
+            if isinstance(m, wan22.ResidualBlock):
+                n += (m.in_dim + m.out_dim) * px
+        if blk.avg_shortcut is not None:
+            px *= 4
+    n += conv_io(dec.head[2])[0] * px
+    return n * e
+
+
+def decoder_terms(vae, samples):
+    """The layer-2 estimate's terms (vae._decoder_terms) for any vae2_2.WanVAE, by its class: a forward hook or
+    vae_options keep the stripe decoder off it (match), not the feat_cache clones of its own decode. None for others."""
+    fsm = getattr(vae, "first_stage_model", None)
+    if type(fsm) is not wan22.WanVAE or type(getattr(fsm, "decoder", None)) is not wan22.Decoder3d:
+        return None
+    return {"retained": retained_bytes(fsm.decoder, int(samples.shape[-2]), int(samples.shape[-1]), mm.dtype_size(vae.vae_dtype))}
 
 
 def match(vae, samples, vae_options):

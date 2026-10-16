@@ -337,6 +337,15 @@ class _CopyStripe(HunyuanStripe):
         return ae.AutoencodingEngine.decode(self.module, z)
 
 
+def decoder_terms(vae, samples):
+    """The layer-2 estimate's terms (vae._decoder_terms) for any hunyuan_video.vae.Decoder, by its class: a forward
+    hook or vae_options keep the stripe decoder off it (match), not the depth-to-space copies of its own decode. None
+    for others."""
+    if type(getattr(getattr(vae, "first_stage_model", None), "decoder", None)) is not hy.Decoder:
+        return None
+    return {"copies": HunyuanStripe.activation_copies}
+
+
 def match(vae, samples, vae_options):
     """(bound adapter, None) or (None, reason)."""
     fsm = vae.first_stage_model

@@ -1587,6 +1587,14 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 * **C（不推荐）：** 在 Wan 2.2 的估算上加一个固定余量（约 0.6 GiB，再加 reserved 的碎片）。没有找到原因，余量是猜的，而且估算变大会让按预算选更早放弃第一层。
 * **按预算选不受影响**（12 个配置都 ≤ 估算），预算模式下不用改。
 
+### 9.27 第二层估算的 retained / copies 按 decoder 类型取（审查 2026-10 第七项）
+
+**问题（已确认）：** `vae._decoder_terms` 以前只在某个第一层适配器的 `match` 成功时才取 `decode_retained` / `activation_copies`。Wan 2.2 或 HunyuanImage 2.1 被 `match` 拒掉时（模块上有 forward hook / 实例级 forward，或者给了 `vae_options`），解码走第二层，估算却退回 4 份激活、不算 feat_cache 克隆——不是上界。用 alloc_sim 的全尺寸 meta 模型确认：Wan 2.2 4K 识别时 retained 13.47 GiB，挂一个 forward hook 或给 `vae_options` 后 retained 0（少算 13.47 GiB）；HunyuanImage 2.1 识别时 6 份激活，被拒后 4 份（少算 2 份全尺寸激活）。
+
+**改法：** 这两项描述的是模型**自己的** decode（第二层跑的就是它）留了什么、峰值有几份激活，与第一层认不认无关；hook 和 `vae_options` 不改变它。所以按 decoder 的类取：每个适配器模块可以有 `decoder_terms(vae, samples)`，类对得上就返回它的项（`vae_wan22`：`first_stage_model` 是 `vae2_2.WanVAE`、decoder 是 `Decoder3d` → `retained_bytes`，就是以前的 `decode_retained`，改成按 decoder 算的模块函数；`vae_hunyuan`：decoder 是 `hunyuan_video.vae.Decoder` → 6 份），否则 None；`_decoder_terms` 取第一个非 None 的，都没有就是 4 份、不留。`retained_bytes` 只读 `Decoder3d` 的子模块列表（`middle`、`upsamples` 里的 `ResidualBlock` 和 `avg_shortcut`、`conv1` / `head[2]` 的通道数），这些是这个类自己的构造，hook 不影响。`_decoder_terms` 不再需要 `vae_options` 参数。
+
+**测试：** `test_vae_wan22.py`：挂 forward hook 后 `match` 拒绝，`_decoder_terms` 的 retained 仍等于识别时的值（= 原生解码里 30 次带缓存卷积的输入字节之和），copies 4；`test_vae_hunyuan.py`：挂 hook 后仍是 6 份。其他 decoder 的估算不变。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
