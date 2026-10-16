@@ -502,11 +502,19 @@ def run_mode(vae, latent, mode, a, label):
     summary = {"mode": mode, "res": label, "status": runs[0]["status"] if not ok else ("ok" if len(ok) == len(runs) else "partial"),
                "cold": runs[0]["seconds"], "warm": statistics.median([r["seconds"] for r in runs[1:] if r["status"] == "ok"]) if len(ok) > 1 else None,
                "runs": runs}
-    for k in ("alloc_peak", "alloc_delta", "res_peak", "res_delta", "gtt_delta", "vram_delta", "cg_delta", "cg_mempeak_delta", "unloaded"):
-        vals = [r.get(k) for r in runs if r.get(k) is not None]
-        summary[k] = max(vals) if vals else None
+    # the memory columns and the estimate come from one run: the one with the largest increase (GTT, else reserved, else
+    # alloc), so that a cold run's peak (first GPU work, first-use self-test) is never set against a warm run's estimate
+    pool = ok or runs
+    key = next((k for k in ("gtt_delta", "res_delta", "alloc_delta") if any(r.get(k) is not None for r in pool)), None)
+    peak = max(pool, key=lambda r: r.get(key) or 0) if key else pool[-1]
+    for k in ("alloc_peak", "alloc_delta", "res_peak", "res_delta", "gtt_delta", "vram_delta", "cg_delta", "cg_mempeak_delta"):
+        summary[k] = peak.get(k)
+    summary["peak_run"] = peak["run"]
+    vals = [r.get("unloaded") for r in runs if r.get("unloaded") is not None]
+    summary["unloaded"] = max(vals) if vals else None
     if mode.startswith("monoload") and ok:
-        summary["mono"] = ok[-1]["mono"]
+        summary["mono"] = ok[-1]["mono"]          # the captured (last) run: its stripes are the boundaries of the comparison
+        summary["peak_mono"] = peak.get("mono")
     return summary, raw, px
 
 
@@ -1041,12 +1049,13 @@ def main():
         gc.collect()
     mvae.uninstall()
 
-    print("\n=== summary: time and memory (GiB; Δ = increase over the value right before the run; peaks = max over the runs) ===")
+    print("\n=== summary: time and memory (GiB; Δ = increase over the value right before the run; the memory columns and the estimate "
+          "are those of one run, the one with the largest increase: [cold] after the layer when that is the cold run) ===")
     hdr = "{:11s} {:13s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6s} | {}"
     print(hdr.format("res", "mode", "status", "cold s", "warm s", "alloc pk", "alloc Δ", "resv Δ", "GTT Δ", "cg peakΔ", "cg sampΔ", "estimate",
                      "native est", "unload", "layer"))
     for s in results:
-        m = s.get("mono") or {}
+        m = s.get("peak_mono") or s.get("mono") or {}
         est = (m.get("estimate") or {}).get("total")
         nat = mvae._native_estimate(vae32 if s["mode"].endswith("fp32") else vae, next(l for lb, l, _ in inputs if lb == s["res"]).shape)
         if m.get("strategy") == "layer1":
@@ -1062,6 +1071,8 @@ def main():
             layer = ""
         if m.get("candidates"):
             layer += " [budget {}, {} candidates]".format(vae_ops.fmt_bytes(m.get("budget")), len(m["candidates"]))
+        if s.get("peak_run") == "cold" and len(s.get("runs", ())) > 1:
+            layer += " [cold{}]".format(": incl. the first-use self-test" if (m.get("estimate") or {}).get("selftest") else "")
         print("{:11s} {:13s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6} | {}".format(
             s["res"], s["mode"], s["status"], "{:.3f}".format(s["cold"]), "{:.3f}".format(s["warm"]) if s["warm"] is not None else "n/a",
             gib(s.get("alloc_peak")), gib(s.get("alloc_delta")), gib(s.get("res_delta")), gib(s.get("gtt_delta")), gib(s.get("cg_mempeak_delta")),

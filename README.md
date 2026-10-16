@@ -469,7 +469,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 * monoload 各模式的每次运行下面多一行，写明用了哪一层：第一层是条带数 × 核心行数、重算比例（卷积算量相对整图解码）、存档大小、预算、工作区、OOM 重试次数、估算（前缀 / 条带 / 常驻三部分），后面是实测的 alloc / reserved 增量，便于对比估算和实测；第二层是没用第一层的原因和分块统计。汇总表最后一列 `layer` 同样标出 L1（条带数 × 行数、重算比例、存档）或 L2。第一层的「块边界附近」统计按条带边界算。
 * 逐行：每个模式、每个分辨率、每次运行一行：耗时；`alloc peak (+Δ)` = `torch.cuda.max_memory_allocated`（运行前 reset）及相对运行前的增量；`reserved` 同理（含分配器缓存，每次运行前 `empty_cache`）；`GTT peak +` = 后台线程每 10 ms 读 `mem_info_gtt_used`（所有 card，不写死卡号）得到的峰值增量，`VRAM +` 同理；`cgroup peak +` = `memory.peak`（内核支持时每次运行前 reset），括号里是采样 `memory.current` 得到的峰值增量；`models unloaded` = 这次运行里 `load_models_gpu` 卸载了几个模型（脚本进程里只有 VAE，所以 1 表示原生的大估算把 VAE 自己卸掉又重新加载）。monoload 行下面还有一行：Monoload 给 `load_models_gpu` 的估算（和原生 `memory_used_decode` 对比）、实际预算、OOM 重试次数、被分块的卷积调用数和总块数、最大的块工作区和最大的整层工作区、注意力每块 query 数。
 * 精度（两边都成功时）：`monoload vs native`、`native2 vs native` 各一组。`raw` 是 `process_output` 之前的 decoder 原始输出，`pixels` 是 clamp 后的 fp32 像素；指标是 max|Δ|、mean|Δ|、RMSE、PSNR（像素按 [0,1] 取 20·log10(1/RMSE)，raw 按范围 2）、p99|Δ|。另外：卷积块边界映射到输出行、上下各 4 行的「边界附近」与其余行分开统计（第二层的块边界在每层分辨率上都不同，所以这一块可能覆盖相当多的行）；每个通道的均值偏移；两边的 NaN/Inf 个数。
-* 最后两张汇总表：时间和内存（每个分辨率 × 模式；峰值取各次运行的最大值；`estimate` 是 Monoload 的估算，`native est` 是原生的估算）；精度。
+* 最后两张汇总表：时间和内存（每个分辨率 × 模式；内存各列和 `estimate` 取自同一次运行——增量最大的那次（GTT，没有 GTT 时 reserved），是冷启动那次时 `layer` 列后面标 `[cold]`，含首次自检时标 `[cold: incl. the first-use self-test]`；`estimate` 是 Monoload 的估算，`native est` 是原生的估算）；精度。
 * `--profile`：① torch.profiler（`profile_memory=True`、`record_shapes`、`with_stack`）跑一次原生解码：按自身显存分配排序的算子表，以及分配最大的单次算子调用（名字、输入形状、Python 调用栈），用来看 `aten::slow_conv2d_forward` / `im2col` 这类展开操作占多少；② 打开 CUDA 分配器的内存历史再跑一次：回放分配/释放事件，找到这次解码中已分配张量总量最大的时刻，列出那一刻存活的最大分配和各自的调用栈（只统计解码期间分配的，权重等事先存在的不算）。
 
 **通过标准 / 看什么：**
