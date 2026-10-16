@@ -1,4 +1,4 @@
-# Monoload 交接说明（第四阶段：VAE 解码管理推广到全部 VAE；4a 盘点、4b-0 修缺口、4b-1 Flux 2 第一层已完成并验收；第二轮代码审查的修正已完成并在 CT 700 上验收；图像补齐：Wan 2.2 单帧、HunyuanImage 2.1 第一层已完成、待 CT 700 验收，Refiner 已分析、等用户定，2026-10）
+# Monoload 交接说明（第四阶段：VAE 解码管理推广到全部 VAE；4a 盘点、4b-0 修缺口、4b-1 Flux 2 第一层已完成并验收；第二轮代码审查的修正已完成并在 CT 700 上验收；图像补齐：HunyuanImage 2.1 第一层已验收，Wan 2.2 单帧第一层矮条带显存超估算、在诊断，Refiner 已分析、先不动，2026-10）
 
 给下一个对话用。到这里为止的功能都已在 CT 700 上验收；这份文档讲：现在是什么状态（§1）、节点和设置体系（§2）、必须遵守的规矩（§3）、第四阶段的盘点结果和下一步（§4）、环境和工具（§5）、代码地图（§6）、提交记录（§7）。细节在 README.md（使用、真机结果、bench 命令）和 docs/DESIGN.md（§9 VAE 设计，§10–§13 总开关 / LoRA 节点 / Info 节点 / 多语言）。
 
@@ -9,7 +9,7 @@
 * **LoRA 运行时合并**（`monoload/hotpatch.py`、`release.py`）：所有 `ModelPatcher` 的 LoRA 不写进权重、不留备份，每一层计算时在临时权重上合并；默认融合 fp16 `addmm_`，可选逐位一致；每个 prompt 结束后释放 LoRA，底模常驻。CT 700：SDXL 比原生少用约 4.7 GiB（8.2 对 12.9 GiB），每步 fused 0.73 s、exact 0.90 s、原生 0.654 s（19d7694，命令 V）。
 * **VAE 解码降峰值**（`monoload/vae*.py`）：包装 `comfy.sd.VAE.decode`。
   * 第二层（所有 VAE 的图像解码）：卷积按输出行分块，注意力按 query 分块，整图语义不变。
-  * 第一层（认得的 decoder）：低分辨率前缀整图算出存档，之后按输出行条带倒推重算；整个解码在一个 arena 里。适配器：Wan 2.1 单帧（`qwen_image_vae`，`vae_wan`）、Wan 2.2 单帧（`vae_wan22`，待验收）、LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae` / Flux 2，`vae_ldm`，GroupNorm 整图统计量用统计遍求，方案 A / D / B / C，默认 B）、HunyuanImage 2.1（`vae_hunyuan`，同样的方案，待验收）。
+  * 第一层（认得的 decoder）：低分辨率前缀整图算出存档，之后按输出行条带倒推重算；整个解码在一个 arena 里。适配器：Wan 2.1 单帧（`qwen_image_vae`，`vae_wan`）、Wan 2.2 单帧（`vae_wan22`，未验收：矮条带超估算，DESIGN §9.26）、LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae` / Flux 2，`vae_ldm`，GroupNorm 整图统计量用统计遍求，方案 A / D / B / C，默认 B）、HunyuanImage 2.1（`vae_hunyuan`，同样的方案，已验收）。
   * 不设预算：默认条带策略；设了预算（环境变量或节点）：预算内预计最快（第二层放得下就用第二层）。
   * 自己的内存估算交给 `load_models_gpu`；OOM 只缩块重试；从不退回 tiled。
 * **三个节点**（分类 `Monoload`）：Monoload LoRA Settings、Monoload VAE Settings、Monoload Info（§2）。
@@ -30,11 +30,23 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 
 **4b-1（vae-flux2-layer1，4fbaa22，CT 700 验收通过）**：Flux 2 VAE（`AutoencoderKL` + batch-norm latent）走第一层，复用 LDM 适配器：latent 的反归一化和 2×2 还原是前缀第一个模块（`vae_ldm.LatentUnpatch`），引擎加 `decoder_hw` 钩子在 decoder 的分辨率上做计划。模拟与 Flux `ae` 相同（4K 默认 B 2.18 GiB）。DESIGN §9.18，测试 `tests/test_vae_flux2.py`，真机命令 README §9.12。
 
-**图像补齐（2026-10，待 CT 700 验收）**：
+**图像补齐（2026-10）——CT 700 结果（dev 189741e，README §10.9 / §10.10）**：
+* **HunyuanImage 2.1：验收通过**（README §10.9）。XH / YH / ZH 与预测一致，8 次自检通过、峰值 1.43 ≤ 上界 1.49 GiB。
+* **Wan 2.2：未验收**（README §10.10）。识别、精度、耗时（比粗估快 49–66%）、按预算选都对；**默认 128 行和更矮的条带 alloc / reserved 超过估算**（4K 默认 1.49 / 3.27 对 1.35），模拟复现不出来。分析 DESIGN §9.26：多出来的活张量 E（4K 约 0.55 GiB）不随 dtype 翻倍、只在 ≤ 128 行出现，DUPUP / UNPATCH 的计数与 62b3c94 源码一致、模拟逐单元与模型一致，E 来自 meta 跟踪看不到的东西（内核 / 库的临时分配或 stride 差异）；reserved 的超出是 E 放大的碎片。**诊断命令 D1–D4（README §9.18，新脚本 `tests/check_l1_units.py`，`bench_vae --profile` 加了 reserved 峰值的段）等用户跑；修法 A（算进模型）/ B（Wan 2.2 默认改 256 行条带）/ C（固定余量，不推荐）等结果出来再定，没改代码。**
+
+图像补齐（实现，2026-10）：
 * **Wan 2.2 单帧（vae-wan22-layer1，合并 d6473d3）**：`vae2_2.WanVAE`；带 `DupUp3D` 捷径的上采样块整块是一个 ×2 单元（halo 13，逐块测过是精确边界），最后 `unpatchify` 也是单元。4K 模拟：原生 34.2 → 第二层 19.8 → 第一层 1.34 GiB。自检的 fp32 副本只留每个 CausalConv3d 时间核的最后一片（单帧只读它；0.79 GiB 而不是 2.2 GB）。顺带修了第二层估算（`decode_retained`：`WanVAE.decode` 单帧也把每个卷积的输入克隆进 feat_cache，4K 13.5 GiB；以前估算 10.0 < 模拟 19.8）。DESIGN §9.23，测试 `test_vae_wan22.py`（50 项），真机命令 README §9.16（W / XW / YW / ZW）。
 * **HunyuanImage 2.1（vae-hunyuan21-layer1，合并 838f7fc）**：LDM 的块和 GroupNorm 统计遍，多了第一步 `conv_in + repeat`、`PixelUnshuffle2D`（depth-to-space ×2，halo 2）、6 级；方案按结构定义（D = H/16，B = H/16…H/2）。4K（3840×2176）模拟：原生 38.1 → 第二层 11.1 → 第一层 B 2.13（A 0.74、C 4.67）GiB。自检几何按适配器（`selftest_size` 12）；第二层估算按 6 份激活（`activation_copies`；以前 4K 10.06 < 模拟 11.10）。Info 节点有 HunyuanImage 自己的方案说明，`gn_scheme` tooltip 改成按结构描述。DESIGN §9.24，测试 `test_vae_hunyuan.py`（57 项），真机命令 README §9.17（W / XH / YH / ZH，4K 用 3840×2176）。
 * **HunyuanImage 2.1 Refiner：只做了分析**（DESIGN §9.25）：能做（条带带着全部帧，跨帧 GroupNorm 和时间补零都不用特殊处理），要加一个引擎因子（时间上采样使每行元素多一倍）和一个适配器；代理模拟：1344 第二层 4.4 → 第一层 0.6–2.1，2048² 23.4 → 1.8–4.1 GiB；代价是耗时（几分钟到十几分钟）和约 3 GiB 的自检。**等用户定。**
-* **待用户定（两种新 VAE 共同）**：fp32 自检峰值（Wan 2.2 1.51、HunyuanImage 1.41 GiB）比多数尺寸的解码本身大，低于自检上界（1.61 / 1.49 GiB）的预算永远报错。
+* **用户定的（两种新 VAE 共同，接受的行为）**：自检不改。fp32 自检峰值（Wan 2.2 1.51、HunyuanImage 1.41 GiB）比多数尺寸的解码本身大；预算低于自检上界（Wan 2.2 1.61、HunyuanImage 2.1 1.49 GiB）时第一次解码报错是接受的行为。**任何方案都不许放到 CPU 上。**
+* **Refiner：先不动**，等这一轮（Wan 2.2 显存）结束再说。
+
+**这一轮其余各项（2026-10，基于 dev 189741e 的真机日志）**：
+* 三 `test_entry.py` 的适配器列表改成 `vae_wan, vae_wan22, vae_ldm, vae_hunyuan`（`run_all.sh` 的 9 组入口测试本地都过：17 / 17 / 17 / 8 / 17 / 17 / 17 / 17 / 11 项）。
+* 四 `check_vae_node.py` 先 `load_models_gpu` 再测（以前第一行含整个权重：Wan 2.2 1.31、HunyuanImage 0.755 GiB）。
+* 五 `bench_vae.py` 汇总表的内存各列和估算取自同一次运行（增量最大的那次），是冷启动那次时标 `[cold]` / `[cold: incl. the first-use self-test]`。
+* 六 没有 GroupNorm 方案的 decoder（Wan 2.1 / 2.2、第一层不认的）：解码日志的设置不写方案这一项，节点 / 环境变量设了时写「not applicable」，Info 节点标「不适用」，不显示方案说明（`vae.gn_schemes_apply`，适配器的 `has_schemes`）。HunyuanImage 的方案数字改成实测。
+* 七 第二层估算的 retained / copies 按 decoder 的类取（适配器的 `decoder_terms`），第一层拒绝（forward hook、`vae_options`）时也算：以前 Wan 2.2 4K 少算 13.47 GiB、HunyuanImage 少 2 份激活（DESIGN §9.27）。
 
 **4b-0（vae-coverage-fixes）**：盘点的缺口 1–3 已修（DESIGN §9.17）：SVD 这类在 batch 各帧之间混合的 decoder、2D latent 的音频 VAE、没有可分块算子的像素空间 VAE 都走原生；`_native_reason` 的理由改走消息表。缺口 4（TAESD 小图）不在范围内。
 
@@ -87,7 +99,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * **现有缺口**（这一步只报告）：① SVD 的 `VideoDecoder` 以 batch 为时间轴，第二层逐样本解码改变了结果；② ACE-Step / LTX 2 音频 / MiniMax 音频（2D latent）被管理，ACE 的估算约 1 PiB（`load_models_gpu` 会卸载一切）；③ 像素空间被管理（估算 2 GiB）；④ TAESD 1344 第二层 2.66 > 原生 1.77 GiB。
 * **建议顺序**：0 修缺口 ① – ③ → 1 Flux 2 第一层 → 2 多帧视频第二层（通用）→ 3 Wan 2.2 单帧第一层 → 4 HunyuanImage 2.1 第一层 → 5 视频第一层（等有需要）。不建议做：TAE 系列、Stage A / C、Mage、MiniMax 视频、SeedVR2 第一层、音频、3D。
 * **用户定的（4a 之后）**：顺序 ① 修缺口 1–3 → ② Flux 2 第一层（一定会用）→ ③ 视频等用户定了再说（不是不做，往后放）。SVD 先走原生（并进 ①），以后做视频第二层时把 SVD 整批第二层一起做。每项一个分支，分开提交，合进 dev。
-* **进度**：① 完成（4b-0，DESIGN §9.17）；② 完成并在 CT 700 上**验收通过**（4b-1，DESIGN §9.18，实测 README §10.5：W / X / Y / Z / check_vae_node 都与预测一致）；③ 视频等用户定。之后用户定的「图像补齐」：Wan 2.2 单帧、HunyuanImage 2.1 第一层完成（待验收，见 §1），Refiner 先分析（DESIGN §9.25，等用户定）；视频（多帧）这次不做、路由不变。
+* **进度**：① 完成（4b-0，DESIGN §9.17）；② 完成并在 CT 700 上**验收通过**（4b-1，DESIGN §9.18，实测 README §10.5：W / X / Y / Z / check_vae_node 都与预测一致）；③ 视频等用户定。之后用户定的「图像补齐」：Wan 2.2 单帧、HunyuanImage 2.1 第一层完成（HunyuanImage 已验收；Wan 2.2 矮条带超估算、在诊断，见 §1），Refiner 先分析（DESIGN §9.25，先不动）；视频（多帧）这次不做、路由不变。
 * **自检峰值（DESIGN §9.19 → §9.20）**：用户选 B + A，已实现（vae-selftest-budget）：参照解码在第二层分块下跑（自检 0.74 → 约 0.38 GiB），自检上界（430 MiB）算进第一次解码的估算和预算比较。
 * **第一次解码多 0.13 GiB / arena 被输出钉住（DESIGN §9.21 → §9.22）**：用户选 ① a、② a + 结束时清缓存，已实现（vae-arena-output）：`StripeAdapter.run` 先清缓存、再分配输出（单独一段）、再预留 arena，解码完清缓存；估算 = 输出段 + arena + largest + 16 MiB。布局变了使方案 A（无存档）4K 128 MiB 工作区高了 0.12 GiB（前缀在检查点前留下的洞以前被输出填上），加了 `move_low`（检查点挪进下面的洞，只在洞放得下时）。alloc_sim：37 个配置峰值都不升、≤ 估算（手工跑的结果；自动测试只断言其中一部分），解码后只留输出；63 个 CT 700 读数（含新加的 Flux 2 的 12 个）按旧布局重放都对得上；预算选择不变。
 * **代码审查（基准 4f140ea，ComfyUI 62b3c94）**，每项一个分支：
@@ -136,6 +148,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * **CT 700 的事实**：`--gpu-only --bf16-vae`；AMD 上 `cudnn.enabled = False`，4D 卷积走 Slow2d（im2col + GEMM），5D 走 SlowDilated3d；VAE 注意力是 split；统一内存，看 GTT。用户终端是 `LANG=C`，中文日志显示成下划线（字节是正确的 UTF-8，不用改）。
 * **`tests/bench_vae.py`**（README §9.7）：`--checkpoint` / `--vae`；`--res`；`--modes native,monoload,monoload-l2,monoload-r<N>,native2`，模式名后缀 `-g<S>`（方案）、`-b<GiB>`（预算）、`-w<MiB>`（工作区）；`--stripe-rows`；`--budgets`；`--gn-schemes`；`--fp32-ref`；`--profile-only`；`--json`。
 * **`tests/alloc_sim.py`**（DESIGN §9.13.10、§9.14.6；模型 `qwen` / `sdxl` / `flux` / `flux2` / `wan22` / `hy21`，`hy21` 的宽高要是 32 的倍数，4K 用 3840×2176）：meta 设备上跑全尺寸 decoder，按缓存分配器的规则重放，复现了 63 个 CT 700 读数（手工跑全表时 ≤ 0.02 GiB；自动测试只抽查其中一部分，阈值 0.03 GiB（`test_vae_stripe` / `test_vae_flux2`）/ 0.05 GiB（`test_vae_ldm`）；第一层的旧布局用 `output_in_arena` 重放，DESIGN §9.22）。改内存相关代码先用它看。
+* **`tests/check_l1_units.py`**（DESIGN §9.26）：第一层逐单元的真机显存——每次调用自己的峰值、模型对同一次调用的计数、调用中新开的段；`--sim MODEL` 用 alloc_sim 出同样的表（无 GPU）对照。`bench_vae.py --profile` 另有 reserved 峰值时的段和开段请求的栈。
 * **盘点脚本**（DESIGN §9.16）：`tests/vae_inventory.py`（`--only` / `--no-trace` / `--json`；每种 VAE 的结构、路径、原生 / 第二层 / 第一层模拟峰值，带 60 GiB 设备上限；新适配器的 meta 构造可以从这里的 `KINDS` 抄）、`tests/probe_vae_gaps.py`（缺口和多帧第二层精度的小解码）、`tests/check_models.py`（CT 700 的命令 W）。
 * **检查脚本**：`tests/check_vae_node.py`（命令 U）、`tests/check_lora_node.py`（命令 V，不带 `--lora` 时列文件）。
 
@@ -188,6 +201,9 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | 第二轮审查的真机结果 | e924a77 |
 | 复查结果（21 / 23 / 测试工具修正后） | 531bf32 |
 | 图像补齐：Wan 2.2 单帧第一层 / HunyuanImage 2.1 第一层 | d6473d3 / 838f7fc |
-| 图像补齐的文档、Refiner 分析、本文件 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
+| 图像补齐的文档、Refiner 分析 | 189741e |
+| HunyuanImage 2.1 验收结果 / Wan 2.2 矮条带超估算的分析和诊断 | 8c432bd / c1e8be6 |
+| test_entry 适配器列表 / check_vae_node 先装权重 / bench 汇总同一次 / 无方案不写方案 / 第二层估算按类型 | 5dd96b7 / 161155d / 403c366 / 3c6786b / 23391cd |
+| 本文件 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。
