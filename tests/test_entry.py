@@ -99,7 +99,7 @@ else:
     no_stripe = flag("MONOLOAD_DISABLE_VAE_STRIPE")
     names = [a.__name__.rsplit(".", 1)[-1] for a in vae.STRIPE_ADAPTERS]
     check("VAE layer 1 (stripes) {}, adapters {}".format("off (MONOLOAD_DISABLE_VAE_STRIPE=1)" if no_stripe else "on", names),
-          vae.stripe_enabled() == (not no_stripe) and names == ["vae_wan", "vae_ldm"])
+          vae.stripe_enabled() == (not no_stripe) and names == ["vae_wan", "vae_wan22", "vae_ldm", "vae_hunyuan"])
     want = os.environ.get("MONOLOAD_VAE_GN_SCHEME", "").strip().upper()
     check("LDM GroupNorm scheme {} ({})".format(vae.gn_scheme(), "MONOLOAD_VAE_GN_SCHEME={}: forced".format(want) if want else "unset: default, not forced"),
           vae.gn_scheme() == (want or "B") and vae.gn_scheme_forced() == bool(want))
