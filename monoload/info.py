@@ -169,12 +169,15 @@ def vae_section(v):
     mode_src = msg("info.src_envvar", var=eff["mode_env"]) if eff.get("mode_env") else _src(src["mode"])
     mode = {"layer2": msg("vae.layer2_only"), "native": msg("info.native"), "auto": msg("vae.auto")}.get(eff["mode"], eff["mode"])
     rows = str(eff["stripe_rows"] or msg("vae.auto"))
+    schemes = vae.gn_schemes_apply(v)
     if eff["mode"] == "native":      # ComfyUI's own decode: none of the other items is used
         unused = msg("info.unused_native")
         budget, scheme, rows = budget + unused, scheme + unused, rows + unused
     elif eff["mode"] == "layer2":    # no stripes: scheme and stripe height do not apply
         unused = msg("info.unused_layer2")
-        scheme, rows = scheme + unused, rows + unused
+        scheme, rows = scheme + (unused if schemes else msg("info.unused_noscheme")), rows + unused
+    elif not schemes:                # Wan 2.1 / 2.2, or a decoder layer 1 does not handle
+        scheme = eff["gn_scheme"] + msg("info.unused_noscheme")
     lines.append(msg("info.vae_settings", mode=mode, mode_src=mode_src, budget=budget, budget_src=_src(src["budget"]), scheme=scheme,
                      scheme_src=_src(src["gn_scheme"]), rows=rows, rows_src=_src(src["stripe_rows"])))
     r = vae.decode_record(v)
@@ -182,7 +185,7 @@ def vae_section(v):
     shown = None   # the scheme to explain: the one the last decode used, else the one the settings fix
     if r is not None and r.get("strategy") == "layer1" and r.get("gn_scheme"):
         shown = r["gn_scheme"]
-    elif eff["mode"] != "native" and eff["mode"] != "layer2" and (eff["gn_forced"] or not eff["budget"]):
+    elif eff["mode"] != "native" and eff["mode"] != "layer2" and schemes and (eff["gn_forced"] or not eff["budget"]):
         shown = eff["gn_scheme"]
     if shown in ("A", "B", "C", "D"):
         from . import vae_hunyuan

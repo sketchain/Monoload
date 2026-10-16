@@ -370,3 +370,6 @@ def _is_hunyuan(fsm):
 def is_hunyuan(fsm):
     """Whether fsm has the HunyuanImage 2.1 decoder this adapter handles (the Info node's scheme hints)."""
     return hunyuan_structure(fsm)[0] is None if fsm is not None else False
+
+
+has_schemes = is_hunyuan   # the GroupNorm schemes apply to it (vae.gn_schemes_apply)

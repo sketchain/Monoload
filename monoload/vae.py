@@ -293,12 +293,27 @@ def resolve_settings(vae):
     return eff, src
 
 
-def settings_note(eff, src):
-    """The decode log's account of its settings and where each came from."""
+def gn_schemes_apply(vae):
+    """Whether the GroupNorm scheme setting means anything for this VAE: its decoder is one a layer-1 adapter with
+    schemes handles (LDM, HunyuanImage 2.1). Wan 2.1 / 2.2 (RMS norm, no GroupNorm) and decoders layer 1 does not
+    handle have none."""
+    fsm = getattr(vae, "first_stage_model", None)
+    return any(getattr(a, "has_schemes", None) is not None and a.has_schemes(fsm) for a in STRIPE_ADAPTERS)
+
+
+def settings_note(eff, src, schemes=True):
+    """The decode log's account of its settings and where each came from. schemes False (gn_schemes_apply): the
+    GroupNorm scheme item is left out, or marked not applicable when it was set (node / environment)."""
     scheme = eff["gn_scheme"] if eff["gn_forced"] or not eff["budget"] else msg("vae.by_budget")
+    if schemes:
+        scheme_item = msg("vae.settings_scheme", scheme=scheme, src=label(src["gn_scheme"]))
+    elif src["gn_scheme"] != "default":
+        scheme_item = msg("vae.settings_scheme_na", scheme=eff["gn_scheme"], src=label(src["gn_scheme"]))
+    else:
+        scheme_item = ""
     return msg("vae.settings_note",
                budget=fmt_bytes(eff["budget"]) if eff["budget"] else msg("vae.unlimited") if src["budget"] == "node" else msg("vae.none"),
-               budget_src=label(src["budget"]), scheme=scheme, scheme_src=label(src["gn_scheme"]), rows=eff["stripe_rows"] or msg("vae.auto"),
+               budget_src=label(src["budget"]), scheme_item=scheme_item, rows=eff["stripe_rows"] or msg("vae.auto"),
                rows_src=label(src["stripe_rows"]), mode=msg("vae.layer2_only") if eff["mode"] == "layer2" else label(eff["mode"]),
                mode_src="{} {}".format(label("env"), eff["mode_env"]) if eff.get("mode_env") else label(src["mode"]))
 
@@ -742,7 +757,7 @@ def _native_estimate(vae, shape):
 
 def _decode(self, samples_in, vae_options={}):
     eff, src = resolve_settings(self)
-    note = settings_note(eff, src)
+    note = settings_note(eff, src, gn_schemes_apply(self))
     if eff["mode"] == "native":
         # a global native default (MONOLOAD=0 ...) is ComfyUI's own decode, not worth a line per decode
         reason = msg("vae.native_node") if src["mode"] == "node" else msg("vae.native_global", var=eff.get("mode_env"))

@@ -589,6 +589,11 @@ class _CopyStripe(LDMStripe):
         return self.cls.decode(self.module, z)
 
 
+def has_schemes(fsm):
+    """Whether fsm is a decoder this adapter handles, i.e. one the GroupNorm schemes apply to (vae.gn_schemes_apply)."""
+    return fsm is not None and ldm_structure(fsm)[0] is None
+
+
 def match(vae, samples, vae_options):
     """(bound adapter, None) or (None, reason)."""
     fsm = vae.first_stage_model

@@ -110,11 +110,11 @@ docker logs comfyui 2>&1 | grep -i monoload
 |---|---|---|
 | `budget` | `default` / `unlimited` / `custom` | 峰值预算。`default`：跟随全局（`MONOLOAD_VAE_BUDGET`，没设就是默认策略）；`unlimited`：这个 VAE 不限预算（默认策略），即使全局设了预算；`custom`：用 `budget_gib`——估算不超过它的做法里选预计最快的，一个都放不下就报错并写明各需要多少 |
 | `budget_gib` | GiB，精度 0.01 | 只在 `budget` 选 `custom` 时生效（这时必须大于 0）；选别的时填了也不用，日志里说明 |
-| `gn_scheme` | `default` / `A` / `B` / `C` / `D` | 强制 LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae` / Flux 2）第一层的 GroupNorm 方案（§12.8）；`default` 跟随全局 |
+| `gn_scheme` | `default` / `A` / `B` / `C` / `D` | 强制 LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae` / Flux 2）和 HunyuanImage 2.1 第一层的 GroupNorm 方案（§12.8）；`default` 跟随全局；Wan 2.1 / 2.2 没有 GroupNorm，不适用 |
 | `stripe_rows` | 输出行数，`0` = 跟随全局 | 强制第一层的条带高度 |
 | `mode` | `default` / `auto` / `layer 2 only` / `native` | `default`：跟随全局（默认开启时是 `auto`；`MONOLOAD=0`、`MONOLOAD_DISABLE_VAE=1`、`MONOLOAD_EXACT=1` 时是原生；`MONOLOAD_DISABLE_VAE_STRIPE=1` 时是 `layer 2 only`）；`auto`：**为这个 VAE 打开**解码管理，认得的 decoder 走第一层（条带），其余走第二层——全局关着（包括 `MONOLOAD=0`）也打开；`layer 2 only`：只用第二层；`native`：这个 VAE 用 ComfyUI 自己的解码 |
 
-**GroupNorm 方案（`gn_scheme`）是什么：** 只对 LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae` / Flux 2）的第一层（条带解码）有意义。GroupNorm 要用整张图的统计量，所以第一层在出图之前要先跑几遍「统计遍」；方案决定把哪些中间结果整张存下来，让这几遍从存档出发，而不必每遍都从 H/8 的存档重算：
+**GroupNorm 方案（`gn_scheme`）是什么：** 只对 LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae` / Flux 2）和 HunyuanImage 2.1 的第一层（条带解码）有意义（Wan 2.1 / 2.2 用 RMS norm，没有方案）。GroupNorm 要用整张图的统计量，所以第一层在出图之前要先跑几遍「统计遍」；方案决定把哪些中间结果整张存下来，让这几遍从存档出发，而不必每遍都从 H/8 的存档重算：
 
 | 方案 | 存什么 | 取舍 | SDXL 4K 实测（GTT / 耗时） |
 |---|---|---|---|
@@ -129,7 +129,7 @@ docker logs comfyui 2>&1 | grep -i monoload
 
 **控件顺序：** `budget` 下拉框紧挨在 `budget_gib` 前面。`budget_gib` 精度 0.01 GiB（填 0.25 就存 0.25）。dev 不做旧工作流兼容：之前存的用到这个节点的工作流，控件值会错位，要重新设一次。
 
-**日志**：每次解码的那一行末尾写明设置和来源，例如 `settings: budget 3.00 GiB (node), GroupNorm scheme chosen by the budget (default), stripe rows auto (default), mode auto (default)`；`last_decode()` 里是 `settings` / `settings_source`。
+**日志**：每次解码的那一行末尾写明设置和来源，例如 `settings: budget 3.00 GiB (node), GroupNorm scheme chosen by the budget (default), stripe rows auto (default), mode auto (default)`；没有 GroupNorm 方案的 decoder（Wan 2.1 / 2.2、第一层不认的）不写方案这一项，方案是节点或环境变量设的时写「not applicable」（Info 节点同样标「不适用」）；`last_decode()` 里是 `settings` / `settings_source`。
 
 **例子：** 同一个 SDXL checkpoint，生成 4K 时想把 VAE 解码的峰值压在 3 GiB 以内，其他工作流不变：
 
