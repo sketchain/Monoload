@@ -1007,7 +1007,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 
 ### 9.16 Wan 2.2 VAE 单帧走第一层：真机 bench（命令 W / XW / YW / ZW）
 
-**状态：未验收（CT 700，dev 189741e，结果见 §10.10）：识别、精度、耗时、按预算选都对；默认和矮条带（≤ 128 行）的第一层 GTT 超过估算，在分析（DESIGN §9.23）。**
+**状态：未验收（CT 700，dev 189741e，结果见 §10.10）：识别、精度、耗时、按预算选都对；默认和矮条带（≤ 128 行）的第一层 GTT 超过估算，在分析（DESIGN §9.26，诊断命令 §9.18）。**
 
 **先放 VAE 文件**（只需要 VAE）：
 
@@ -1144,6 +1144,46 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae
 `check_vae_node.py`：`node copy` → B 8 条 272 行、`budget 3.00 GiB [node]`，GTT 约 2.43 / 估算 2.94（第一次含自检，自检 1.41 低于解码）；`original` → B 13 条 168 行，全部 `[default]`，2.13 / 2.41；`node copy again` 同第一行。
 
 把 W / XH / YH / ZH 的输出和 JSON 发给我。
+
+### 9.18 Wan 2.2 第一层矮条带超过估算：诊断（命令 D1–D4）
+
+**状态：待 CT 700 跑（分析见 DESIGN §9.26；结果出来之前不改代码）。** 拉新代码、重启容器后（每条前先 `/free`）：
+
+```bash
+# D1. 逐单元：每次调用自己的峰值 / 模型的计数 / 新开的段（4K bf16：64 行、默认 128 行、256 行；再 4K fp32 默认、2688 默认）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_l1_units.py \
+  --vae wan2.2_vae.safetensors --res 3840x2160 --rows 64,0,256 --json /opt/ComfyUI/output/l1_units_wan22_4k.json 2>&1 | tee l1_units_wan22_4k.txt
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_l1_units.py \
+  --vae wan2.2_vae.safetensors --res 3840x2160 --rows 0 --fp32 --json /opt/ComfyUI/output/l1_units_wan22_4k_fp32.json 2>&1 | tee l1_units_wan22_4k_fp32.txt
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_l1_units.py \
+  --vae wan2.2_vae.safetensors --res 2688x1536 --rows 0 --json /opt/ComfyUI/output/l1_units_wan22_2688.json 2>&1 | tee l1_units_wan22_2688.txt
+# D2. 不保留 arena：alloc = 张量自己的峰值
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae wan2.2_vae.safetensors --res 3840x2160 --modes monoload --stripe-rows 64,256 --warm 1 --no-arena \
+  --json /opt/ComfyUI/output/bench_vae_wan22_noarena.json 2>&1 | tee bench_vae_wan22_noarena.txt
+# D3. 分配器历史：alloc 峰值时活着的块（Python 栈）、reserved 峰值时的段和开段的请求
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae wan2.2_vae.safetensors --profile-only --profile-res 3840x2160 --profile-modes monoload,monoload-r64,monoload-r256 --top 15 \
+  2>&1 | tee bench_vae_wan22_profile.txt
+# D4. A/B：不用 hipBLASLt（容器默认 TORCH_BLAS_PREFER_HIPBLASLT=1）
+docker exec -e TORCH_BLAS_PREFER_HIPBLASLT=0 -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_l1_units.py \
+  --vae wan2.2_vae.safetensors --res 3840x2160 --rows 0 --json /opt/ComfyUI/output/l1_units_wan22_4k_rocblas.json 2>&1 | tee l1_units_wan22_4k_rocblas.txt
+```
+
+**怎么读 D1：** 每个 `rows` 一段：计划（live peak / arena / 输出段 / 估算）、调用里量到的 alloc / reserved 峰值，然后每个单元一行——`real` 是这次调用自己的峰值（调用前已分配的不算），`model` 是适配器对同一次调用的计数，`excess` = real − model（取各条带里最大的），`resv+` / `segs` 是调用中新开的段。云端用 `--sim wan22` 跑出的同一张表（模型 + 分配器模拟，没有 GPU）就是「模型对的话」应该看到的：
+
+* 4K 默认（17 × 128）：每个单元 `excess` ≤ 4 MiB（注意力、`head.1` 是负的），峰值在 `decoder.upsamples.1`（40 行 × 480）real 750.0 / model 750.0，之前已分配 222 → 972 = arena；alloc 峰值 972、reserved 1368 MiB；开新段的只有 `decoder.upsamples.1` 一次（300 MiB，`DupUp3D` 落在 arena 外的那一份，在估算的 largest 里）。
+* 4K 64 行：alloc 815 / reserved 1146 MiB；256 行：alloc 1261 / reserved 1772 MiB。fp32 默认：alloc 1849 / reserved 2578 MiB。2688 默认：alloc 649 / reserved 944 MiB。
+
+实测里 `excess` 明显大于 0 的那一行（或那几行）就是多出来的 E（DESIGN §9.26 的表：4K 默认约 550 MiB）所在。
+
+**D2 的预期（模型）：** `--no-arena` 时 alloc = 输出 + live peak：4K 64 行 0.80、默认 0.95、256 行 1.24 GiB。实测超出这个的量就是 E。
+
+**D3：** 每个模式两段：alloc 峰值时活着的块（最大的 15 个，带 Python 栈），以及新加的「reserved during the decode: segments when their sum peaked」：每段的大小、当时段里分配了多少、开这段的请求的栈。
+
+**D4：** 与 D1 的 4K 默认比：E 变了说明和 BLAS 后端有关。
+
+**发回：** D1–D4 的 txt 和 JSON（`/opt/ComfyUI/output/l1_units_wan22_*.json`、`bench_vae_wan22_noarena.json`）。D3 如果栈停在 `torch/nn/functional.py` 或 `F.conv2d` 一层看不出是哪个内核，再加 `--profile-cpp` 跑一次 `--profile-modes monoload`。
 
 ## 10. 真机验收结果（CT 700，2026-10）
 
@@ -1489,7 +1529,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae
 
 ### 10.10 第四阶段：Wan 2.2 VAE 单帧走第一层（`bench_vae_wan22*`、`check_vae_node_wan22`，2026-10，189741e）
 
-命令 W / XW / YW / ZW（§9.16）。**未验收**：识别、精度、耗时、按预算选都对，但默认（128 行）和更矮的条带第一层的显存超过估算（DESIGN §9.23 的分析）。
+命令 W / XW / YW / ZW（§9.16）。**未验收**：识别、精度、耗时、按预算选都对，但默认（128 行）和更矮的条带第一层的显存超过估算（分析 DESIGN §9.26，诊断命令 §9.18）。
 
 * **W：** 识别的几行与 §9.16 的预期逐字相同。
 * **耗时（热启动 s）：** 比 §9.16 的粗估快 49–66%（粗估是按 Qwen 的每次乘加耗时换算的，对 Wan 2.2 偏保守）。
@@ -1546,7 +1586,7 @@ monoload/vae_overrides.py   单个 VAE 的设置（节点做的副本带的设�
 monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），lora_settings.py = Monoload LoRA Settings，vae_settings.py = Monoload VAE Settings，info.py = Monoload Info
 tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；保存挂 LoRA 的模型：test_lora_save.py、check_lora_save.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
                             bench_vae.py、check_vae_node.py、make_synthetic_vaes.py、alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10；
-                            第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16；Flux 2：test_vae_flux2.py；Wan 2.2：test_vae_wan22.py；HunyuanImage 2.1：test_vae_hunyuan.py；
+                            第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16；Flux 2：test_vae_flux2.py；Wan 2.2：test_vae_wan22.py、check_l1_units.py（第一层逐单元的真机显存，DESIGN.md §9.26）；HunyuanImage 2.1：test_vae_hunyuan.py；
                             自检峰值诊断：check_selftest_mem.py，DESIGN.md §9.19）
 tools/watch_mem.sh          GTT / cgroup 内存监视
 tools/compare_images.py     两张图逐像素比较

@@ -797,6 +797,53 @@ def profile_decode(vae, latent, label, top, mode, cpp):
         print("  {:>9s}".format(vae_ops.fmt_bytes(ev["size"])))
         for s in _frames_str(ev.get("frames", []), 12 if cpp else 8):
             print("             at {}".format(s))
+    reserved_peak_report(trace, free_act, top, cpp)
+
+
+def reserved_peak_report(trace, free_act, top, cpp):
+    """The segments the allocator reserved during the decode, at the moment their sum peaked: each one's size, what was
+    allocated in it at that moment, and the request that made the allocator reserve it (DESIGN §9.26)."""
+    segs, cur, peak, peak_i = {}, 0, 0, -1
+    for i, ev in enumerate(trace):
+        act = ev.get("action")
+        if act in ("segment_alloc", "segment_map"):
+            segs[ev["addr"]] = ev
+            cur += ev["size"]
+            if cur > peak:
+                peak, peak_i = cur, i
+        elif act in ("segment_free", "segment_unmap"):
+            s = segs.pop(ev["addr"], None)
+            if s is not None:
+                cur -= s["size"]
+    print("\n=== reserved during the decode: segments when their sum peaked ({}; segments reserved before the decode not included) ===".format(
+        vae_ops.fmt_bytes(peak)))
+    if peak_i < 0:
+        print("no segment was reserved during the decode")
+        return
+    segs, live, order = {}, {}, []
+    for ev in trace[:peak_i + 1]:
+        act = ev.get("action")
+        if act in ("segment_alloc", "segment_map"):
+            segs[ev["addr"]] = ev
+            order.append(ev["addr"])
+        elif act in ("segment_free", "segment_unmap"):
+            segs.pop(ev["addr"], None)
+        elif act == "alloc":
+            live[ev["addr"]] = ev["size"]
+        elif act == free_act:
+            live.pop(ev["addr"], None)
+    shown = [a for a in order if a in segs]
+    for n, addr in enumerate(shown):
+        s = segs[addr]
+        inside = [sz for a, sz in live.items() if addr <= a < addr + s["size"]]
+        if n >= top and len(shown) > top + 1:
+            rest = shown[n:]
+            print("  ... {} more segments, {}".format(len(rest), vae_ops.fmt_bytes(sum(segs[a]["size"] for a in rest))))
+            break
+        print("  {:>9s} segment, {} allocated in it ({} blocks, largest {}); reserved for:".format(
+            vae_ops.fmt_bytes(s["size"]), vae_ops.fmt_bytes(sum(inside)), len(inside), vae_ops.fmt_bytes(max(inside) if inside else 0)))
+        for f in _frames_str(s.get("frames", []), 12 if cpp else 8):
+            print("             at {}".format(f))
 
 
 # ---------------------------------------------------------------------------

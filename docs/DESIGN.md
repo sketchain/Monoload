@@ -1536,6 +1536,57 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 **要用户定的：** ① 做不做（建议做，收益在 2K）；② 自检怎么处理（与 Wan 2.2 / HunyuanImage 2.1 一起定：不改 / 缩小自检几何 / 自检放 CPU / 其他）；③ 默认方案和条带目标（B + 128 行，还是对它用 A 或更矮的目标）；④ 不论做不做，先修第二层估算吗。
 
+### 9.26 Wan 2.2 第一层：矮条带的实测超过估算（分析，先不改）
+
+CT 700 实测（dev 189741e，README §10.10）：默认 128 行和更矮的条带，alloc 和 reserved 都超过估算；240 / 432 行和按预算选（工作区 384 / 256 MiB，条带 ≥ 270 行）都在估算以内。bench 先装好了权重，所以是真的超。
+
+**1. 数据说明的两件事**
+
+bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserve_arena` 分配又立刻释放），所以 alloc 至少是输出段 + arena。超出的部分 E = alloc − 输出 − 模型的 live peak，就是真实的活张量比模型多出来的量（输出 fp32：1344 / 2688 / 4K 为 12 / 47 / 95 MiB）：
+
+| 配置 | alloc | 输出 + arena | 模型 live | E（MiB） |
+|---|---|---|---|---|
+| bf16 1344 6 × 128 | 614 | 460 | 372 | 230 |
+| bf16 2688 12 × 128 | 1280 | 733 | 603 | 630 |
+| bf16 4K 17 × 128 | 1526 | 1067 | 880 | 551 |
+| bf16 4K 34 × 64 | 1393 | 905 | 722 | 576 |
+| bf16 4K 68 × 32 | 1239 | 823 | 644 | 500 |
+| bf16 4K 9 × 240 | 1362 | 1365 | 1167 | ≤ 100（被 arena 那一刻盖住） |
+| bf16 4K 5 × 432 | 2017 | 2020 | 1802 | ≤ 120（同上） |
+| fp32 1344 6 × 128 | 686 | 682 | 586 | ≤ 100（同上） |
+| fp32 2688 12 × 128 | 1413 | 1358 | 1208 | 158 |
+| fp32 4K 17 × 128 | 1976 | 1979 | 1761 | ≤ 120（同上） |
+
+* **E 不随数据类型翻倍**：同样 2688 12 × 128，bf16 630、fp32 158。模型里的每一项都是按元素大小算的（fp32 是 bf16 的两倍），所以 E 不是「模型漏算了某个解码 dtype 的激活」。
+* **E 在 32–128 行之间几乎不随条带高度变**（4K 500 / 576 / 551），240 行以上至多 100 左右。
+* **reserved 的超出是 E 放大出来的**：E 落在 arena 外（或者挤占 arena 里的块，把后面的请求挤出去），分配器就要新开段；每条带的尺寸不同（边上的条带矮），best fit 把新段切碎，段越积越多，所以超出量随条带高度不单调（r32 +0.77、r128 +1.92、r64 +2.89 GiB）——与 arena 之前 SDXL / Qwen 的碎片是同一个机制（§9.13.4）。fp32 2688 只有 E ≈ 0.16，reserved 也多出 1.05 GiB。
+
+**2. 读代码确认的（62b3c94 `comfy/ldm/wan/vae2_2.py`、`vae.py`、`ops.py`；PyTorch 3f8a4a1862）**
+
+* **DUPUP 的计数与源码一致。** `Up_ResidualBlock.forward`（337–380 行）：`x_main` 依次过 ResidualBlock 和 `Resample`，`x`（单元输入）一直活到 `avg_shortcut(x, first_chunk)`；`DupUp3D.forward`（272–295 行）是 `repeat_interleave`（输出 = 4·ft·b）→ `view` → `permute(...).contiguous()`（再一份 4·ft·b，之后前一份释放）→ `view` → `first_chunk` 时 `x[:, :, ft-1:]`（视图，ft = 2 时整块 8b 仍活着）；最后 `x_main + x_shortcut`。`Resample.forward`（57–114 行）在单帧、无缓存时只有 `rearrange`（视图）→ `Upsample`（4b）→ `Conv2d`（4b）。这正是 `dupup_peak` 的各阶段：块 1 `res_peak(S)`、块 j `S + res_peak(b)`、上采样 `S + 9b + 卷积额外量`、shortcut `S + 4b + 8·ft·b`、相加 `S + 8b + 4·ft·b`。`repeat_interleave.self_int` 在这个 PyTorch 里是 CompositeImplicit（unsqueeze + expand + clone + flatten），只分配输出。
+* **UNPATCH 的计数与源码一致。** `unpatchify`（181–196 行）是 einops `rearrange`：拆通道（视图）→ permute → 合并（行切片不连续，拷贝一次），即 `S + A`。
+* **模拟与模型逐单元一致。** 新的 `tests/check_l1_units.py --sim wan22`（同一份 Python 代码在 meta 设备上跑，加上分配器模型）给出每个单元自己的峰值：4K 默认时 `decoder.upsamples.1`（第二个 DUPUP，40 行 × 480，ft = 2）750.0 = 模型 750.0 MiB，是整个解码的峰值（之前已分配 222 + 750 = arena 972）；其余单元模拟 ≤ 模型（注意力 444 / 638、`head.1` 61 / 122 是模型保守）。所以「DUPUP / UNPATCH 少算了」在 Python / aten 这一层不成立。
+* **排除的：**
+  * 权重的隐性拷贝：`CausalConv3d.forward` 单帧走 `super().forward(x, autopad="causal_zero")`，ops 的 `Conv3d.forward` 见到 `autopad` 走 `forward_comfy_cast_weights` → `cast_bias_weight`：权重已在设备上、dtype 相同、没有 `_v`（vbar），`offload_stream` 为 None，原样返回，不拷贝；`weight[:, :, -1:]` 是视图，Slow2d 对不连续的权重 `expect_contiguous`（一层 3×3 1024→1024 bf16 18 MiB，用完即放，模拟有这一项）。
+  * BLAS 工作区：rocBLAS（32 MiB）和 hipBLASLt（76 MB）的工作区按（handle, stream）各分配一次、常驻（`CublasHandlePool.cpp`），第一次解码之后就在基线里，热启动不会再算进增量。
+  * 跨 stream 的延迟释放：`free()` 立即减 `allocated_bytes`（块要等事件完成才能复用），只能让 reserved 变多，不能让 alloc 变多。
+  * Slow2d（`ConvolutionMM2d.cu`）只分配输出和 im2col 列（不连续的输入 / 权重先拷贝）；`upsample_nearest2d`（`UpSampleNearest2d.cu`）只在输入不连续时拷贝——这些模拟都按源码手工加了。
+* **剩下的可能（离线定不了）：** E 来自 meta 跟踪看不到的东西——GPU 内核或库自己经由缓存分配器申请的临时量（某个 bf16 路径里的 fp32 临时量、某些 GEMM 形状的 hipBLASLt 临时分配），或者 CUDA 上某个算子的输出 stride 与 meta 上不同，导致后面多一次拷贝。E 不随 dtype 翻倍、在小条带才出现，更像前一类。要真机上逐单元量。
+
+**3. 诊断（README §9.18，命令 D1–D4）**
+
+* **D1 `tests/check_l1_units.py`：** 每个前缀模块 / 单元调用前后同步，记下调用前已分配、这次调用自己的峰值（调用前 reset peak）、模型对同一次调用的计数、调用中 reserved 新开的段（`memory_snapshot` 的段大小、调用后段里还有多少）。按单元汇总（最大的「实测 − 模型」），列出 alloc 峰值那次调用和开新段的调用。热身解码（自检、第一批 GPU 计算）不计。`--sim MODEL` 用 alloc_sim 出同样的表（上面的模拟数字就是它），两张表逐行对比，多出来的那一行就是 E 的位置。
+* **D2 `bench_vae.py --no-arena`：** 不保留 arena，alloc 就是张量自己的峰值（模型：输出 + live peak，4K 64 行 0.80、默认 0.95、256 行 1.24 GiB），直接看 E 有多大、在 240 行时是不是真的消失。
+* **D3 `bench_vae.py --profile-only`：** 分配器历史里 alloc 峰值那一刻活着的块（带 Python 栈，`--profile-cpp` 带 C++ 栈）；新加 reserved 峰值那一刻的段：每段的大小、当时段里分配了多少、是哪个请求让分配器开的这段（栈）。
+* **D4 A/B：** 同 D1 的 4K 默认，加 `-e TORCH_BLAS_PREFER_HIPBLASLT=0`（容器里默认是 1），看 E 是否随 BLAS 后端变化。
+
+**4. 修法的方案（等 D1–D4 的结果再定）**
+
+* **A（首选，取决于诊断）：** 找到 E 的来源后把它算进模型——`unit_peak` / `unit_largest` 加上那一项（alloc_sim 的跟踪器同样手工加上，使 `--sim` 与实测一致），arena 和估算随之变大，回到上界；如果是能避开的临时量（例如某个算子换成不需要它的调用方式、先做连续化），就避开它，估算不变。
+* **B（临时止血，不等诊断）：** Wan 2.2 的默认条带策略从「128 行条带的峰值」改成「256 行条带的峰值」（4K 选 9 × 240：实测 alloc 1.33 / reserved 1.73 ≤ 估算 1.75，而且更快：7.8 s 对 9.7 s）。1344 / 2688 在 256 行下没有实测，要先跑一次 XW 确认；只改 Wan 2.2，不改其他 VAE。
+* **C（不推荐）：** 在 Wan 2.2 的估算上加一个固定余量（约 0.6 GiB，再加 reserved 的碎片）。没有找到原因，余量是猜的，而且估算变大会让按预算选更早放弃第一层。
+* **按预算选不受影响**（12 个配置都 ≤ 估算），预算模式下不用改。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
