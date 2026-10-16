@@ -325,6 +325,15 @@ def oom_budget_tests(v, lat):
     check("layer-2 estimate with {} activation copies for this decoder: {} (the generic 4 copies: {}), nothing retained".format(
         vh.HunyuanStripe.activation_copies, vae_ops.fmt_bytes(est["total"]), vae_ops.fmt_bytes(four["total"])),
         est["total"] == four["total"] + 2 * four["activation"] and est["retained"] == 0)
+    # a forward hook keeps layer 1 off this VAE, not the copies of its own decode: the layer-2 terms go by the decoder's class
+    hk = v.first_stage_model.decoder.conv_out.register_forward_hook(lambda *a: None)
+    try:
+        hooked, why = vh.match(v, lat, {})
+        terms = mvae._decoder_terms(v, lat)
+    finally:
+        hk.remove()
+    check("forward hook: layer 1 refuses the VAE ({}), the layer-2 estimate still takes {} activation copies".format((why or "")[:60], terms["copies"]),
+          hooked is None and terms == {"retained": 0, "copies": vh.HunyuanStripe.activation_copies})
     for bud, want in ((est["total"], "layer2"), (est["total"] - 1, "layer1")):
         mvae.set_budget(bud)
         try:
@@ -400,7 +409,7 @@ def allocator_tests():
         lat = torch.empty(shape, device="meta", dtype=v.vae_dtype)
         with alloc_sim._patched(mvae.mm, "get_free_memory", lambda dev=None, torch_free_too=False: (48 << 30, 48 << 30) if torch_free_too else 48 << 30):
             p = mvae._probe(v, lat, {})
-        est = mvae.estimate(v, lat, mvae.DEFAULT_WORKSPACE, p, **mvae._decoder_terms(v, lat, {}))
+        est = mvae.estimate(v, lat, mvae.DEFAULT_WORKSPACE, p, **mvae._decoder_terms(v, lat))
         four = mvae.estimate(v, lat, mvae.DEFAULT_WORKSPACE, p)
         check("HunyuanImage 2.1 {}x{} layer 2: simulated reserved {:.2f} GiB <= estimate {:.2f} GiB (6 activation copies; 4 would give {:.2f})".format(
             w, h, t["reserved"] / G, est["total"] / G, four["total"] / G), t["reserved"] <= est["total"])

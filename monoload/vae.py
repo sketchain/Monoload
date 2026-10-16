@@ -702,18 +702,21 @@ def estimate(vae, samples, budget, probe=None, retained=0, copies=ACTIVATION_COP
             "retained": int(retained)}
 
 
-def _decoder_terms(vae, samples, vae_options):
+def _decoder_terms(vae, samples):
     """{"retained": ..., "copies": ...} for estimate(): what the decoder's own decode of one sample of `samples`
-    keeps alive besides the activations the shape probe sees (StripeAdapter.decode_retained: Wan 2.2's feat_cache
-    clones), and how many activation copies bound its peak (StripeAdapter.activation_copies: HunyuanImage 2.1's
-    depth-to-space upsampling), from the layer-1 adapter that recognizes its structure; ACTIVATION_COPIES and nothing
-    retained for the others and for decoders no adapter recognizes. Layer 2 runs that decode."""
+    keeps alive besides the activations the shape probe sees (Wan 2.2's feat_cache clones), and how many activation
+    copies bound its peak (HunyuanImage 2.1's depth-to-space upsampling). Layer 2 runs that decode. By the decoder's
+    class (the adapters' decoder_terms), whether or not its layer-1 adapter takes this VAE: a forward hook or
+    vae_options send it to layer 2 without changing what its decode keeps (DESIGN §9.27). ACTIVATION_COPIES and
+    nothing retained for the other decoders."""
+    terms = {"retained": 0, "copies": ACTIVATION_COPIES}
     for a in STRIPE_ADAPTERS:
-        bound, _ = a.match(vae, samples, vae_options)
-        if bound is not None:
-            h, w = bound.decoder_hw(samples)
-            return {"retained": bound.decode_retained(h, w, mm.dtype_size(vae.vae_dtype)), "copies": bound.activation_copies}
-    return {"retained": 0, "copies": ACTIVATION_COPIES}
+        f = getattr(a, "decoder_terms", None)
+        t = f(vae, samples) if f is not None else None
+        if t:
+            terms.update(t)
+            break
+    return terms
 
 
 # ---------------------------------------------------------------------------
@@ -1153,10 +1156,10 @@ def _layer2_estimate(vae, samples_in, vae_options, ws):
         # latent, not under OpChunking: no workspace in what it asks for (with ws it asked ~2 GiB for tens of MiB;
         # load_models_gpu adds its minimum_inference_memory on top anyway; review 2026-10 item 23)
         small = samples_in[0:1, ..., :PROBE_SIZE, :PROBE_SIZE]
-        mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, small, 0, **_decoder_terms(vae, small, vae_options))["total"],
+        mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, small, 0, **_decoder_terms(vae, small))["total"],
                            force_full_load=vae.disable_offload)
         probe = _shape_probe(vae, samples_in, vae_options)
-    return estimate(vae, samples_in, ws, probe, **_decoder_terms(vae, samples_in, vae_options)), probe
+    return estimate(vae, samples_in, ws, probe, **_decoder_terms(vae, samples_in)), probe
 
 
 def _shape_probe(vae, samples_in, vae_options):

@@ -339,6 +339,16 @@ def oom_budget_tests(v, lat):
     check("layer-2 estimate counts the feat_cache clones WanVAE.decode keeps: retained {} = the inputs of the {} cached CausalConv3d calls "
           "of a native decode ({})".format(vae_ops.fmt_bytes(est["retained"]), len(kept), vae_ops.fmt_bytes(sum(kept))),
           est["retained"] == want == sum(kept) > 0)
+    # a forward hook keeps layer 1 off this VAE, not the clones of its own decode: the layer-2 terms go by the decoder's class
+    hk = v.first_stage_model.decoder.head[1].register_forward_hook(lambda *a: None)
+    try:
+        hooked, why = w22.match(v, lat, {})
+        terms = mvae._decoder_terms(v, lat)
+    finally:
+        hk.remove()
+    check("forward hook: layer 1 refuses the VAE ({}), the layer-2 estimate still counts the clones (retained {})".format(
+        (why or "")[:60], vae_ops.fmt_bytes(terms["retained"])),
+        hooked is None and terms["retained"] == want and terms["copies"] == mvae.ACTIVATION_COPIES)
     for bud, want_s in ((est["total"], "layer2"), (est["total"] - 1, "layer1")):
         mvae.set_budget(bud)
         try:
@@ -431,7 +441,7 @@ def allocator_tests():
         lat = torch.empty(shape, device="meta", dtype=v.vae_dtype)
         with alloc_sim._patched(mvae.mm, "get_free_memory", lambda dev=None, torch_free_too=False: (48 << 30, 48 << 30) if torch_free_too else 48 << 30):
             p = mvae._probe(v, lat, {})
-        est = mvae.estimate(v, lat, mvae.DEFAULT_WORKSPACE, p, **mvae._decoder_terms(v, lat, {}))
+        est = mvae.estimate(v, lat, mvae.DEFAULT_WORKSPACE, p, **mvae._decoder_terms(v, lat))
         check("Wan 2.2 {}x{} layer 2: simulated reserved {:.2f} GiB <= estimate {:.2f} GiB (of which feat_cache clones {:.2f}; without them "
               "{:.2f})".format(w, h, t["reserved"] / G, est["total"] / G, est["retained"] / G, (est["total"] - est["retained"]) / G),
               t["reserved"] <= est["total"])
