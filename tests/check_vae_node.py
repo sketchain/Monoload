@@ -5,7 +5,10 @@ Loads the VAE (from a checkpoint or models/vae), makes a copy with the node
 with the original VAE, and prints for each: what Monoload chose (layer,
 scheme, stripes, workspace), where each setting came from, the estimate, the
 GTT / reserved increase and the time. The copy should follow the node's
-budget; the original VAE should keep the default (scheme B for SDXL).
+budget; the original VAE should keep the default (scheme B for SDXL). The
+weights are loaded before the first decode, so no row includes them; the
+first row includes the process's first GPU work and, for a structure not yet
+self-tested, the self-test.
 
     docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae_node.py \\
         --checkpoint waiIllustriousSDXL_v170.safetensors --res 3840x2160 --budget 3
@@ -56,6 +59,7 @@ def main():
     mvae.install()
     B.configure("monoload")          # the plugin's settings from the environment
     vae, what = B.load_vae(a)
+    B.mm.load_models_gpu([vae.patcher])   # the weights before the first measurement (as bench_vae.py; the copy shares them)
     w, h = (int(x) for x in a.res.split("x"))
     lat = B.random_latent(vae, w, h, a.seed, 1.0)
     node = NODE_CLASS_MAPPINGS["MonoloadVAESettings"]
