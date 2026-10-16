@@ -383,6 +383,26 @@ def node_tests(v, lat):
     managed_decode(l2, lat)
     check("VAE Settings node mode 'layer 2 only' on Wan 2.2: layer 2", mvae.last_decode().get("strategy") == "layer2")
 
+    # no GroupNorm in this decoder: the settings note leaves the scheme out, or marks a set one not applicable
+    from test_vae_node import LogCapture
+    check("Wan 2.2: the GroupNorm schemes do not apply (gn_schemes_apply False)", not mvae.gn_schemes_apply(v))
+    with LogCapture() as cap:
+        managed_decode(v, lat)
+    line = next((x for x in cap.lines if "layer 1 (Wan 2.2 stripes)" in x), "")
+    check("Wan 2.2 decode log, scheme at its default: no GroupNorm scheme item ({})".format(line[line.find("settings:"):][:120]),
+          "settings: budget" in line and "GroupNorm" not in line)
+    t = getattr(info(), info.FUNCTION)(vae=v)["result"][0]
+    sline = next((x for x in t.splitlines() if "settings: mode" in x), "")
+    check("Info node on Wan 2.2: scheme marked not applicable, no scheme explanation ({})".format(sline.strip()[:150]),
+          "not applicable: this decoder has no GroupNorm schemes" in sline and "GroupNorm scheme B:" not in t)
+    forced = node_apply(settings, v, gn_scheme="D")
+    with LogCapture() as cap:
+        managed_decode(forced, lat)
+    line = next((x for x in cap.lines if "layer 1 (Wan 2.2 stripes)" in x), "")
+    check("Wan 2.2 decode log, scheme D set by the node: marked not applicable ({})".format(line[line.find("GroupNorm"):][:110]),
+          "GroupNorm scheme D (node; not applicable: this decoder has no GroupNorm schemes)" in line
+          and mvae.last_decode().get("strategy") == "layer1")
+
 
 # ---------------------------------------------------------------------------
 # 7. caching allocator
