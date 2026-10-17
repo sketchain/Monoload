@@ -1560,6 +1560,26 @@ docker exec -e TORCH_BLAS_PREFER_HIPBLASLT=0 -w /opt/ComfyUI/custom_nodes/monolo
   * 按预算选（ZW，工作区 384 / 256 MiB，条带 ≥ 270 行）12 个配置全部 ≤ 估算，与模拟差 ≤ 0.01；选择与预测相同。
   * 第二层 4.04 / 11.49 / 20.94 ≤ 估算 4.67 / 12.69 / 23.48。
 
+### 10.11 第三轮修正的真机复查（`run_all`、`check_vae_node_*`、`bench_vae_hy21_summary`，2026-10，1dc61b2）
+
+DESIGN §9.26 之后的第 3–7 项（test_entry 的适配器列表、check_vae_node 先装权重、bench 汇总取同一次、没有方案的 decoder 不写方案、第二层估算按 decoder 类型），**复查通过**。
+
+* **`run_all.sh`：** 43 组、1603 项检查，`suites failed: 0, skipped (missing model files): 0`（= 上次 41 组 1490 + `test_vae_wan22` 55 + `test_vae_hunyuan` 58）；`test_entry` 各组 17 项，`MONOLOAD_DISABLE=1` 8 项，「VAE 接口变了」11 项。
+* **`check_vae_node.py`（4K，节点预算 3G；权重已在测量前装好）：**
+
+| VAE | 行 | GTT | reserved | 估算 |
+|---|---|---|---|---|
+| Wan 2.2 | 节点副本（第一次） | 2.76 | 2.65 | 2.69 |
+| Wan 2.2 | 原 VAE | 3.27 | 3.27 | 1.35（§10.10 的问题，DESIGN §9.26 / §9.28） |
+| Wan 2.2 | 节点副本再次 | 2.58 | 2.58 | 2.69 |
+| HunyuanImage 2.1 | 节点副本（第一次） | 2.63 | 2.50 | 2.94 |
+| HunyuanImage 2.1 | 原 VAE | 2.13 | 2.13 | 2.41 |
+| HunyuanImage 2.1 | 节点副本再次 | 2.43 | 2.43 | 2.94 |
+
+  以前 Wan 2.2 第一行 reserved 3.98（含权重 1.31）、HunyuanImage 3.26（含 0.755）。Wan 2.2 第一行的 GTT 比估算多 0.07，reserved 在估算内：是进程第一批 GPU 计算（DESIGN §9.19，接受的事项）。
+* **解码日志：** Wan 2.2 的设置里已经没有 GroupNorm 方案这一项（`check_vae_node.py` 自己打印的那行当时仍写 `gn_scheme B [default]`，是测试脚本的输出，之后改成只对有方案的 decoder 打印）。
+* **bench 汇总表：** HunyuanImage 1344 的 `monoload` 一行是 `1.47 / 1.49 [cold: incl. the first-use self-test]`（峰值和估算取自同一次）。
+
 ## 11. 仓库结构
 
 ```
