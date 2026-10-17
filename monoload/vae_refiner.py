@@ -1,5 +1,5 @@
 """Layer-1 adapter: the HunyuanImage 2.1 Refiner VAE decoder (comfy.ldm.hunyuan_video.vae_refiner.Decoder with
-refiner_vae=False; z 32, 16x) decoding an image (docs/DESIGN.md §9.25, §9.31).
+refiner_vae=False; z 32, 16x) decoding an image (docs/DESIGN.md §9.25, §9.34).
 
 comfy.sd.VAE builds it for a state dict whose decoder.conv_in is 5D with 32 input channels: an AutoencodingEngine
 with vae_refiner.Decoder (block_out_channels [128, 256, 512, 1024, 1024], reversed in the decoder, num_res_blocks 2,
@@ -445,7 +445,7 @@ class RefinerStripe(eng.StripeAdapter):
         """vae_ldm's time model (fitted to SDXL's 2D convs on CT 700) on this decoder's MACs (every frame counted), the
         levels mapped by their resolution relative to the output (full resolution = SDXL's level 8, H/2 = 4, below = 2).
         Not calibrated for the 5D convs (SlowDilated3d): for ranking the schemes of one decode; absolute seconds are
-        rough (DESIGN §9.31)."""
+        rough (DESIGN §9.34)."""
         top = TIME_COEF[max(TIME_COEF)]
         f = self.scale // 8
         macs = sum(TIME_COEF.get(max(2, lv // f), top) * m for lv, m in plan.work_levels.items() if lv > 1)

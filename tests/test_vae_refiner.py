@@ -1,5 +1,5 @@
 """The HunyuanImage 2.1 Refiner VAE (monoload/vae_refiner.py; vae_refiner.Decoder, refiner_vae=False; DESIGN §9.25,
-§9.30, §9.31).
+§9.30, §9.34).
 
 No model files needed: ComfyUI's own AutoencodingEngine with vae_refiner.Decoder / Encoder with small channels and
 random weights, through comfy.sd.VAE (it detects the kind from the 5D decoder.conv_in with 32 input channels; its

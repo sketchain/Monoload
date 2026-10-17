@@ -277,7 +277,7 @@ MODELS=/path/to/models tests/run_all.sh
 | `tests/test_vae.py` | VAE 解码管理（§12），不需要模型文件：分块卷积 / 分块注意力与不分块的结果一致（含各种 kernel、stride、dilation、groups、padding、cast 路径 + weight_function、Wan CausalConv3d）；用 ComfyUI 自己的 LDM `Decoder` / `WanVAE`（小通道、随机权重）构造 SDXL 式、Flux 式、Qwen 式 VAE，受管理的解码与原生 `VAE.decode` 比较；多帧交给原生、OOM 缩小分块重试、下限时报错、绝不调用 tiled；SVD / 2D latent 的音频 / 像素空间交给原生（DESIGN §9.17） |
 | `tests/test_vae_wan22.py` | Wan 2.2 VAE 单帧走第一层（DESIGN §9.23），不需要模型文件：识别（含不认的结构走第二层、多帧仍原生）、复合单元的 halo 恰好是精确边界、条带高度 / 奇数和 1×1 latent / batch 2 / 小工作区与原生比较、bf16 对 fp32 真值、自检的 fp32 副本（只留时间核最后一片）与模型自己的 decode 相同、注入错误、OOM、第二层估算含 feat_cache 克隆、预算、VAE 设置 / Info 节点、alloc_sim 上第一层 reserved ≤ 估算、自检 ≤ 上界、第二层 ≤ 第二层估算 |
 | `tests/test_vae_hunyuan.py` | HunyuanImage 2.1 VAE 走第一层（DESIGN §9.24），不需要模型文件：识别（含不认的结构走第二层）、`conv_in + repeat` 一步与原生逐位相同、`PixelUnshuffle2D` 的 halo 是精确边界、四种方案 × 条带高度 / 奇数和 1×1 latent / batch 2 / 小工作区与原生比较、bf16 对 fp32 真值、自检和注入错误、OOM、第二层估算按 6 份激活、预算、VAE 设置 / Info 节点（HunyuanImage 自己的方案说明）、alloc_sim 上第一层 reserved ≤ 估算、自检 ≤ 上界、第二层 ≤ 第二层估算 |
-| `tests/test_vae_refiner.py` | HunyuanImage 2.1 Refiner VAE 走第一层（DESIGN §9.25 / §9.30 / §9.31），不需要模型文件：识别（含不认的结构走第二层、多帧 / HunyuanVideo 1.5 不收）、`conv_in + repeat` 一步与原生逐位相同、`UpSmpl` 的 halo 是精确边界（带 / 不带时间上采样）、每级的平面数、四种方案 × 条带高度 / 奇数和 1×1 latent / batch 2 / 小工作区与原生比较、bf16 对 fp32 真值、自检（fp32 副本 T=1 的卷积只留时间核中间一片，副本自己的解码与模型相同）和注入错误、OOM、第二层估算按类型取 6 份激活、预算、VAE 设置 / Info 节点（Refiner 自己的方案说明）、alloc_sim 上第一层 reserved ≤ 估算、自检 ≤ 上界、第二层 ≤ 第二层估算 |
+| `tests/test_vae_refiner.py` | HunyuanImage 2.1 Refiner VAE 走第一层（DESIGN §9.25 / §9.30 / §9.34），不需要模型文件：识别（含不认的结构走第二层、多帧 / HunyuanVideo 1.5 不收）、`conv_in + repeat` 一步与原生逐位相同、`UpSmpl` 的 halo 是精确边界（带 / 不带时间上采样）、每级的平面数、四种方案 × 条带高度 / 奇数和 1×1 latent / batch 2 / 小工作区与原生比较、bf16 对 fp32 真值、自检（fp32 副本 T=1 的卷积只留时间核中间一片，副本自己的解码与模型相同）和注入错误、OOM、第二层估算按类型取 6 份激活、预算、VAE 设置 / Info 节点（Refiner 自己的方案说明）、alloc_sim 上第一层 reserved ≤ 估算、自检 ≤ 上界、第二层 ≤ 第二层估算 |
 | `tests/test_vae_flux2.py` | Flux 2 VAE 走第一层（DESIGN §9.18），不需要模型文件：识别、latent 步骤与原生逐位相同、四种方案 × 条带高度与原生比较、自检和注入错误、OOM、预算、VAE 设置 / Info 节点、alloc_sim 上 reserved ≤ 估算 |
 | `tests/test_vae_stripe.py` | VAE 第一层（§12.7），不需要模型文件：区间倒推对照暴力依赖展开；每个单元（残差块、上采样、head 卷积）在任意切片上「有效行」与整图逐行一致、紧邻的下一行不一致；用 ComfyUI 的 `WanVAE`（小通道、随机权重）在 fp32 下比较第一层与原生整图解码（条带 1 行、不整除、等于整图、按预算自动、默认策略、奇数尺寸、很小的 latent、batch 2、条带内再分块、bf16），块边界附近的误差不比其他区域大；识别（Dropout 训练态、forward hook、开关）；故意少算一行 halo 时自检能抓到并回退第二层；预算报错；OOM 缩小条带、到下限报错、不退回 tiled 也不退回第二层；默认策略（128 行条带的估算为目标）和开关的优先级；内存模型单调、最大的条带先跑；自检后和前缀 / 条带之间清空缓存；SDXL / Flux 结构不归 Wan 适配器（归 LDM 适配器）；单帧 Conv3d 改走 conv2d 与模块原样一致、只在该改的时候改 |
 | `tests/test_master_switch.py` | 总开关和全局默认（§4），不需要模型文件：`MONOLOAD` 的解析；`MONOLOAD=0` 且没有节点时，挂 LoRA 的模型（整体加载、lowvram 部分加载、Hook LoRA）和 VAE 解码与卸掉钩子的原版 ComfyUI 逐位一致，备份也和原生一样；释放不运行；包装每次调用的开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `mode auto` 打开管理、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 时节点原样透传 |
@@ -1330,7 +1330,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 
 ### 9.22 `vae_refiner.Decoder(refiner_vae=False)` 走第一层：没有真机命令
 
-**状态：分支 vae-refiner-layer1，未合并（DESIGN §9.31）。** 官方 Refiner 文件走的是 `refiner_vae=True` 那一支，这个适配器认不出它（仍走第二层）；手上没有走 `refiner_vae=False` 这一支的文件，所以没有真机命令。模拟的方案 × 条带高度、预算、耗时预测都在 DESIGN §9.31。
+**状态：分支 vae-refiner-layer1，未合并（DESIGN §9.34）。** 官方 Refiner 文件走的是 `refiner_vae=True` 那一支，这个适配器认不出它（仍走第二层）；手上没有走 `refiner_vae=False` 这一支的文件，所以没有真机命令。模拟的方案 × 条带高度、预算、耗时预测都在 DESIGN §9.34。
 
 ## 10. 真机验收结果（CT 700，2026-10）
 

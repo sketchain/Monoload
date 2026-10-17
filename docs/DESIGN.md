@@ -1536,7 +1536,7 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 3. **第二层估算对它也不是上界**（2048² 23.4 对 18.05），与 HunyuanImage 2.1 同类（深度到空间的上采样留下的缓存段）；做第一层时一起修（`activation_copies`），不做第一层也应该单独修。（**已修，§9.30**：按类型取 6 份。）
 4. 默认条带策略（以 128 行的峰值为目标）对这个 4 倍宽的 decoder 偏重：1344 B 128 行 2.07，32 行 1.25。也许默认目标要按结构换（或默认 A）。
 
-**要用户定的（已定，见 §9.30 / §9.31）：** ① 做不做（建议做，收益在 2K）；② 自检怎么处理（与 Wan 2.2 / HunyuanImage 2.1 一起定：不改 / 缩小自检几何 / 自检放 CPU / 其他）；③ 默认方案和条带目标（B + 128 行，还是对它用 A 或更矮的目标）；④ 不论做不做，先修第二层估算吗。
+**要用户定的（已定，见 §9.30 / §9.34）：** ① 做不做（建议做，收益在 2K）；② 自检怎么处理（与 Wan 2.2 / HunyuanImage 2.1 一起定：不改 / 缩小自检几何 / 自检放 CPU / 其他）；③ 默认方案和条带目标（B + 128 行，还是对它用 A 或更矮的目标）；④ 不论做不做，先修第二层估算吗。
 
 ### 9.26 Wan 2.2 第一层：矮条带的实测超过估算（分析，先不改）
 
@@ -1694,11 +1694,11 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **改法：** 照 §9.27，按 decoder 的类取：`vae_hunyuan.decoder_terms` 对 `vae_refiner.Decoder` 且 `refiner_vae is False` 返回 6 份激活（`REFINER_ACTIVATION_COPIES`），与 match / 第一层无关（hook、`vae_options` 不影响）。同一个类 `refiner_vae=True`（HunyuanVideo 1.5）不在这条里，仍是 4 份（它是视频 VAE，见 §9.32 的分析）。扫过的范围：宽 768–3072 × 高 768–2560（50 个尺寸）× 工作区 128 / 256 / 512 / 1024 MiB，bf16，以及 fp32 的 5 个尺寸：需要的份数最多 5.67（2816×768，1 GiB），fp32 最多 5.65；6 份在所有点上都是上界（最紧的 1536²：模拟 14.68、估算 15.53 GiB）。
 
-**估算变化：** 1344 7.92（以前 5.95）、2048² 26.05（18.05）。第二层的预算比较、`load_models_gpu` 的 `memory_required` 都用它。第一层（§9.31）的自检上界也读适配器的 `activation_copies`。
+**估算变化：** 1344 7.92（以前 5.95）、2048² 26.05（18.05）。第二层的预算比较、`load_models_gpu` 的 `memory_required` 都用它。第一层（§9.34）的自检上界也读适配器的 `activation_copies`。
 
 **测试（`tests/test_vae_refiner.py` 第 1、2 节）：** `comfy.sd.VAE` 从小的 state dict 建出 Refiner（`refiner_vae` False、`latent_dim` 3）；第二层估算 = 4 份 + 2 份激活，什么都不留；挂 forward hook 后仍是 6 份；托管解码走第二层、与原生相同；`refiner_vae=True` 的 decoder 是通用的 4 份；alloc_sim（全尺寸，meta）：1344 / 1536² / 2048² 模拟 ≤ 估算，2048² 时 4 份不是上界。
 
-### 9.31 `vae_refiner.Decoder(refiner_vae=False)` 走第一层（vae-refiner-layer1；**分支，未合并**）
+### 9.34 `vae_refiner.Decoder(refiner_vae=False)` 走第一层（vae-refiner-layer1；**分支，未合并**）
 
 **先说结论：这一支不是官方 Refiner 文件用的那一支。** 实现完之后用真实文件（`hunyuan_image_refiner_vae_fp16.safetensors`，Comfy-Org，2025-09-12 上传）核对：它的键是 `decoder.conv_in.conv.weight`（`CarriedConv3d`）和 `norm*.gamma`（RMS norm），`comfy.sd.VAE` 走 sd.py 第 713 行那一支（ComfyUI #9817，2025-09-11，Refiner 本来的支持），建出 `vae_refiner.Decoder` 的默认 `refiner_vae=True`——与 HunyuanVideo 1.5 是同一个 decoder（文件大小也几乎一样：2,521,292,694 对 2,521,292,758 字节）。第 599 行的 `refiner_vae=False`（5D `decoder.conv_in.weight`、GroupNorm、一张图解成 4 帧）是 #10150「Support the new hunyuan vae」（2025-10-01）加的另一种文件，我没找到对应的公开 ComfyUI 文件（也许是 HunyuanImage 3.0 的 VAE，没有核实）。§9.25 的分析、vae_inventory 的标签（`hy_refiner`）把两支弄反了。官方文件的单帧解码见 §9.32。**这一节的实现按用户的规格做完、测试都过，但对官方文件不起作用（它仍走第二层），所以没有合进 dev，等用户定**；下面的数字都是 `refiner_vae=False` 这一支的。
 
