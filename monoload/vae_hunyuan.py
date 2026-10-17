@@ -33,6 +33,7 @@ import torch
 import torch.nn.functional as F
 
 import comfy.ldm.hunyuan_video.vae as hy
+import comfy.ldm.hunyuan_video.vae_refiner as hyr
 from comfy.ldm.models import autoencoder as ae
 from comfy.ldm.modules.diffusionmodules import model as ldm
 
@@ -337,13 +338,26 @@ class _CopyStripe(HunyuanStripe):
         return ae.AutoencodingEngine.decode(self.module, z)
 
 
+# The HunyuanImage 2.1 Refiner's decoder (vae_refiner.Decoder with refiner_vae=False: Conv3d, GroupNorm; an image
+# decoded as 4 frames, DESIGN §9.25 / §9.30): its UpSmpl depth-to-space makes the same five output-sized tensors as
+# PixelUnshuffle2D, and every level's activation is 2-8x the one below, so each level's cached segments are too small
+# for the next one: tests/alloc_sim.py, layer 2 reserved up to 5.67 x the largest activation + 2 x the workspace
+# (1024-3072 wide, 768-2560 high, workspace 128 MiB - 1 GiB, bf16 / fp32); 4 copies are not an upper bound
+# (2048x2048: 23.4 GiB simulated, 18.05 estimated)
+REFINER_ACTIVATION_COPIES = 6
+
+
 def decoder_terms(vae, samples):
-    """The layer-2 estimate's terms (vae._decoder_terms) for any hunyuan_video.vae.Decoder, by its class: a forward
-    hook or vae_options keep the stripe decoder off it (match), not the depth-to-space copies of its own decode. None
-    for others."""
-    if type(getattr(getattr(vae, "first_stage_model", None), "decoder", None)) is not hy.Decoder:
-        return None
-    return {"copies": HunyuanStripe.activation_copies}
+    """The layer-2 estimate's terms (vae._decoder_terms) for any hunyuan_video.vae.Decoder and the Refiner's
+    vae_refiner.Decoder (refiner_vae=False), by their class: a forward hook or vae_options keep the stripe decoder off
+    it (match), not the depth-to-space copies of its own decode. None for others (HunyuanVideo 1.5's vae_refiner.Decoder
+    with refiner_vae=True included)."""
+    dec = getattr(getattr(vae, "first_stage_model", None), "decoder", None)
+    if type(dec) is hy.Decoder:
+        return {"copies": HunyuanStripe.activation_copies}
+    if type(dec) is hyr.Decoder and dec.refiner_vae is False:
+        return {"copies": REFINER_ACTIVATION_COPIES}
+    return None
 
 
 def match(vae, samples, vae_options):

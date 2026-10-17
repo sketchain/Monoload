@@ -266,7 +266,7 @@ MODELS=/path/to/models tests/run_all.sh
 # 缺模型文件的测试组会被跳过并计数（「skipped (missing model files): N」），退出码 = 失败组数 + 跳过组数，跳过不算通过
 ```
 
-`run_all.sh` 先跑入口测试（8 种开关组合）、消息、释放链、Info 节点、总开关、LoRA 节点和全部 VAE 测试（`test_vae.py`、`test_vae_stripe.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_wan22.py`、`test_vae_hunyuan.py`、`test_vae_node.py`，不需要模型文件），然后把下面每个 LoRA 功能测试在两种合并路径下各跑一遍：先 `MONOLOAD_EXACT=1`（逐位一致），再默认路径。只想跑 VAE 部分时：`MODELS=/path/to/models tests/docker_run.sh python tests/test_vae.py`（不需要任何模型文件，`$MODELS` 可以是空目录）。
+`run_all.sh` 先跑入口测试（8 种开关组合）、消息、释放链、Info 节点、总开关、LoRA 节点和全部 VAE 测试（`test_vae.py`、`test_vae_stripe.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_wan22.py`、`test_vae_hunyuan.py`、`test_vae_refiner.py`、`test_vae_node.py`，不需要模型文件），然后把下面每个 LoRA 功能测试在两种合并路径下各跑一遍：先 `MONOLOAD_EXACT=1`（逐位一致），再默认路径。只想跑 VAE 部分时：`MODELS=/path/to/models tests/docker_run.sh python tests/test_vae.py`（不需要任何模型文件，`$MODELS` 可以是空目录）。
 
 | 脚本 | 内容 |
 |---|---|
@@ -277,6 +277,7 @@ MODELS=/path/to/models tests/run_all.sh
 | `tests/test_vae.py` | VAE 解码管理（§12），不需要模型文件：分块卷积 / 分块注意力与不分块的结果一致（含各种 kernel、stride、dilation、groups、padding、cast 路径 + weight_function、Wan CausalConv3d）；用 ComfyUI 自己的 LDM `Decoder` / `WanVAE`（小通道、随机权重）构造 SDXL 式、Flux 式、Qwen 式 VAE，受管理的解码与原生 `VAE.decode` 比较；多帧交给原生、OOM 缩小分块重试、下限时报错、绝不调用 tiled；SVD / 2D latent 的音频 / 像素空间交给原生（DESIGN §9.17） |
 | `tests/test_vae_wan22.py` | Wan 2.2 VAE 单帧走第一层（DESIGN §9.23），不需要模型文件：识别（含不认的结构走第二层、多帧仍原生）、复合单元的 halo 恰好是精确边界、条带高度 / 奇数和 1×1 latent / batch 2 / 小工作区与原生比较、bf16 对 fp32 真值、自检的 fp32 副本（只留时间核最后一片）与模型自己的 decode 相同、注入错误、OOM、第二层估算含 feat_cache 克隆、预算、VAE 设置 / Info 节点、alloc_sim 上第一层 reserved ≤ 估算、自检 ≤ 上界、第二层 ≤ 第二层估算 |
 | `tests/test_vae_hunyuan.py` | HunyuanImage 2.1 VAE 走第一层（DESIGN §9.24），不需要模型文件：识别（含不认的结构走第二层）、`conv_in + repeat` 一步与原生逐位相同、`PixelUnshuffle2D` 的 halo 是精确边界、四种方案 × 条带高度 / 奇数和 1×1 latent / batch 2 / 小工作区与原生比较、bf16 对 fp32 真值、自检和注入错误、OOM、第二层估算按 6 份激活、预算、VAE 设置 / Info 节点（HunyuanImage 自己的方案说明）、alloc_sim 上第一层 reserved ≤ 估算、自检 ≤ 上界、第二层 ≤ 第二层估算 |
+| `tests/test_vae_refiner.py` | HunyuanImage 2.1 Refiner VAE（DESIGN §9.25 / §9.30），不需要模型文件：第二层估算按类型取 6 份激活（挂 hook 也一样，HunyuanVideo 1.5 仍是 4 份）、托管解码与原生相同、alloc_sim 上第二层 ≤ 第二层估算（1344 / 1536² / 2048²） |
 | `tests/test_vae_flux2.py` | Flux 2 VAE 走第一层（DESIGN §9.18），不需要模型文件：识别、latent 步骤与原生逐位相同、四种方案 × 条带高度与原生比较、自检和注入错误、OOM、预算、VAE 设置 / Info 节点、alloc_sim 上 reserved ≤ 估算 |
 | `tests/test_vae_stripe.py` | VAE 第一层（§12.7），不需要模型文件：区间倒推对照暴力依赖展开；每个单元（残差块、上采样、head 卷积）在任意切片上「有效行」与整图逐行一致、紧邻的下一行不一致；用 ComfyUI 的 `WanVAE`（小通道、随机权重）在 fp32 下比较第一层与原生整图解码（条带 1 行、不整除、等于整图、按预算自动、默认策略、奇数尺寸、很小的 latent、batch 2、条带内再分块、bf16），块边界附近的误差不比其他区域大；识别（Dropout 训练态、forward hook、开关）；故意少算一行 halo 时自检能抓到并回退第二层；预算报错；OOM 缩小条带、到下限报错、不退回 tiled 也不退回第二层；默认策略（128 行条带的估算为目标）和开关的优先级；内存模型单调、最大的条带先跑；自检后和前缀 / 条带之间清空缓存；SDXL / Flux 结构不归 Wan 适配器（归 LDM 适配器）；单帧 Conv3d 改走 conv2d 与模块原样一致、只在该改的时候改 |
 | `tests/test_master_switch.py` | 总开关和全局默认（§4），不需要模型文件：`MONOLOAD` 的解析；`MONOLOAD=0` 且没有节点时，挂 LoRA 的模型（整体加载、lowvram 部分加载、Hook LoRA）和 VAE 解码与卸掉钩子的原版 ComfyUI 逐位一致，备份也和原生一样；释放不运行；包装每次调用的开销；`MONOLOAD=0` / `MONOLOAD_DISABLE_VAE` / `MONOLOAD_EXACT` 下节点 `mode auto` 打开管理、`default` 原生；预算下拉框；`MONOLOAD_DISABLE` 时节点原样透传 |
@@ -1276,6 +1277,56 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 **`run_all.sh`：** 43 组，比 §10.11 多 11 项（`test_vae_wan22` 55 → 66），0 失败 0 跳过。
 
 **发回：** GA–GK 的 txt 和 JSON、`run_all` 的汇总。
+
+### 9.21 HunyuanImage 2.1 Refiner：第二层估算（命令 W / RA / RB）
+
+**状态：待 CT 700 跑（DESIGN §9.30）。**
+
+**先放 VAE 文件**（只需要 VAE）：
+
+* 文件：`hunyuan_image_refiner_vae_fp16.safetensors`，2,521,292,694 字节，sha256 `e1b74e85d61b65e18cc05ca390e387d93cfadf161e737de229ebb800ea3db769`（ComfyUI 官方打包，Comfy-Org/HunyuanImage_2.1_ComfyUI 的 `split_files/vae/`，不用登录）。
+* 放到 CT 700 的 `/models/comfy/vae/`（容器里 `/opt/ComfyUI/models/vae/`），不用重启容器：
+
+```bash
+cd /models/comfy/vae
+wget -O hunyuan_image_refiner_vae_fp16.safetensors https://huggingface.co/Comfy-Org/HunyuanImage_2.1_ComfyUI/resolve/main/split_files/vae/hunyuan_image_refiner_vae_fp16.safetensors
+sha256sum hunyuan_image_refiner_vae_fp16.safetensors   # e1b74e85d61b65e18cc05ca390e387d93cfadf161e737de229ebb800ea3db769
+```
+
+**注意分辨率：** 16 倍，宽高要是 16 的倍数。
+
+拉新代码、重启容器后（每条 bench 前先 `/free`）：
+
+```bash
+# W. 识别（只读文件头，不占 GPU）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_models.py
+# RA. 1344x768：原生 / 只用第二层（原生模拟 50.3 GiB，接近 GTT 上限，见下）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae hunyuan_image_refiner_vae_fp16.safetensors --res 1344x768 --modes native,monoload-l2 --warm 1 \
+  --json /opt/ComfyUI/output/bench_vae_hyr_l2_1344.json 2>&1 | tee bench_vae_hyr_l2_1344.txt
+# RB. 2048x2048：只用第二层（原生约 169 GiB，放不下，不跑）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae hunyuan_image_refiner_vae_fp16.safetensors --res 2048x2048 --modes monoload-l2 --warm 1 \
+  --json /opt/ComfyUI/output/bench_vae_hyr_l2_2048.json 2>&1 | tee bench_vae_hyr_l2_2048.txt
+```
+
+**预测依据：** GiB 是 `tests/alloc_sim.py --model hyr` 的模拟（真实结构，meta 设备；GTT ≈ reserved）。耗时是**粗估**：整图卷积 1344 51.4、2048² 209 万亿次乘加（其中约 1/5 乘在时间维补的零上：T=1 的几级用的是 3×3×3 核），按 SDXL 在 CT 700 上每 10¹² 次乘加 0.18–0.30 s 换算；但这个 decoder 的 5D 卷积走 SlowDilated3d（vol2col + GEMM），CT 700 上没有它的实测速度，**误差可能到 2 倍**。
+
+**W 的预期：** `hunyuan_image_refiner_vae_fp16.safetensors` → `VAE: AutoencodingEngine / decoder Decoder | latent 32 ch, latent_dim 3, x16 | 1263 M params`；`1344x768 latent [1, 32, 1, 48, 84]` 和 `3840x2160 latent [1, 32, 1, 135, 240]` 都是 `Monoload layer 2`（第一层还不认它，括号里列出四个适配器不收它的原因），`832x480 x81 frames latent [1, 32, 21, 30, 52]` 是 `Monoload native: multi-frame video latent`（云端用同一个文件跑出的就是这几行）。
+
+**RA / RB 的逐行预测**（GTT 增量 GiB / 热启动 s；估算 = Monoload 交给 `load_models_gpu` 的值）：
+
+| 行 | 1344×768 | 2048×2048 |
+|---|---|---|
+| `native` | 50.3 / ~10–25（模拟 alloc 29.5，最大一块 26.6 GiB：全分辨率卷积的 vol2col 列） | 不跑 |
+| `monoload-l2` | 4.43 / ~10–25，估算 **7.92**（以前 5.95） | 23.44 / ~40–100，估算 **26.05**（以前 18.05，不是上界） |
+
+* **每一行（含冷启动）GTT ≤ 估算。** 2048² 时以前的估算 18.05 会比实际少约 5.4 GiB；现在按 6 份激活（DESIGN §9.30）。
+* `native est`（ComfyUI 自己的估算）5.38 / 21.9 GiB，比原生实际用的少约 9 倍。
+* 原生 1344 的 50.3 GiB 加上权重 2.35 GiB 离 GTT 上限（62.47 GiB）不远；如果它 OOM 退到 tiled（日志 `Ran out of memory when regular VAE decoding`），那一行的数字不看，`monoload vs native` 也就没有，只看 `monoload-l2` 一行。
+* 精度（RA 有原生时）：`monoload-l2 vs native` 与其他 VAE 的第二层同一水平（PSNR 60 dB 以上）。
+
+把 W / RA / RB 的输出和 JSON 发给我。
 
 ## 10. 真机验收结果（CT 700，2026-10）
 
