@@ -1147,7 +1147,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae
 
 ### 9.18 Wan 2.2 第一层矮条带超过估算：诊断（命令 D1–D4）
 
-**状态：待 CT 700 跑（分析见 DESIGN §9.26；结果出来之前不改代码）。** 拉新代码、重启容器后（每条前先 `/free`）：
+**状态：已跑（dev 1dc61b2，结论见 §10.10 和 DESIGN §9.26 第 5 节：来源是 `F.normalize` 的归约临时缓冲，§9.28）。** 拉新代码、重启容器后（每条前先 `/free`）：
 
 ```bash
 # D1. 逐单元：每次调用自己的峰值 / 模型的计数 / 新开的段（4K bf16：64 行、默认 128 行、256 行；再 4K fp32 默认、2688 默认）
@@ -1184,6 +1184,26 @@ docker exec -e TORCH_BLAS_PREFER_HIPBLASLT=0 -w /opt/ComfyUI/custom_nodes/monolo
 **D4：** 与 D1 的 4K 默认比：E 变了说明和 BLAS 后端有关。
 
 **发回：** D1–D4 的 txt 和 JSON（`/opt/ComfyUI/output/l1_units_wan22_*.json`、`bench_vae_wan22_noarena.json`）。D3 如果栈停在 `torch/nn/functional.py` 或 `F.conv2d` 一层看不出是哪个内核，再加 `--profile-cpp` 跑一次 `--profile-modes monoload`。
+
+### 9.19 `F.normalize` 的归约临时缓冲：触发范围（命令 N）
+
+**状态：待 CT 700 跑（分析见 DESIGN §9.28；结果出来、用户定了之前不改插件）。** 纯 PyTorch，不加载 ComfyUI / Monoload，不用 `/free`（几分钟，最大的张量约 0.6 GiB）：
+
+```bash
+# N. bf16 / fp32 × 384 / 512 / 1024 通道 × 5D / 4D × 连续 / 行切片 × 7680–80640 位置 + Wan 2.2 的实际尺寸；同样的输入跑分组的方案 G
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_norm_reduce.py \
+  --json /opt/ComfyUI/output/norm_reduce.json 2>&1 | tee norm_reduce.txt
+```
+
+**怎么读：** 第一行是设备属性（`multiProcessorCount`、`maxThreadsPerMultiProcessor`、warp）。每个配置一行：`predicted` 是按 `Reduce.cuh` 的启动配置算出的临时缓冲（MiB），`extra` 是这次 `F.normalize` 在输入和输出之外多分配的（`max_memory_allocated`），`resv+` / `segs` 是它让分配器新开的（每次前清缓存）；右边是方案 G 的临时量、与 `F.normalize` 的 max|Δ|、对 fp64 的相对误差、两者的耗时（ms），最后一列是配置（vec、block、每线程值数、grid / target、每输出的块数）。最后是每种（dtype、通道、布局）触发的位置范围，以及预测是否与实测一致。
+
+**预期：**
+
+* 1024 通道（bf16 和 fp32 一样，连续和行切片一样，5D 和 4D 一样）：位置数是 4 的倍数且 ≤ 128 × target 时 `extra` = 32768 B × 位置数（40320 → 1260 MiB，32400 → 1012.5，35520 → 1110，34944 → 1092），大于时 0；target 是第一行的 `multiProcessorCount × (maxThreadsPerMultiProcessor / 128)`，按 D1 的数据在 315–389 之间（49920 位置不触发、40320 触发）。41 × 239 = 9799 位置（不是 4 的倍数）不触发。每一行 `predicted` 与 `extra` 一致（差的只有输出取整等几 KiB）。
+* 384 / 512 通道：任何位置数都不触发（`extra` ≈ 0）。
+* 方案 G：每一行临时量 < 1 MiB；fp32 与 `F.normalize` 的 max|Δ| 1e-7 量级，对 fp64 的误差不比 `F.normalize` 大；bf16 绝大多数位置逐位相同（`differing` 比例在 JSON 里）；耗时与 `F.normalize` 同量级。
+
+**发回：** `norm_reduce.txt` 和 `norm_reduce.json`。
 
 ## 10. 真机验收结果（CT 700，2026-10）
 
@@ -1559,6 +1579,12 @@ docker exec -e TORCH_BLAS_PREFER_HIPBLASLT=0 -w /opt/ComfyUI/custom_nodes/monolo
 
   * 按预算选（ZW，工作区 384 / 256 MiB，条带 ≥ 270 行）12 个配置全部 ≤ 估算，与模拟差 ≤ 0.01；选择与预测相同。
   * 第二层 4.04 / 11.49 / 20.94 ≤ 估算 4.67 / 12.69 / 23.48。
+* **诊断 D1–D4（§9.18，dev 1dc61b2）：来源找到了。**
+  * **D3：** 4K 默认 alloc 峰值时最大的活块 1.23 GiB，栈 `torch/functional.py:1888 norm` ← `torch/nn/functional.py:6127 normalize` ← `comfy/ldm/wan/vae.py:63 RMS_norm.forward` ← `vae2_2.py:158 ResidualBlock.forward`；reserved 峰值时还有这个 norm 开的 1014 MiB 和 1.23 GiB 两个空段。r64 同样（1.08 GiB 块，1014 MiB + 1.05 + 1.08 GiB 空段），r256 没有。
+  * **D1：** DUPUP、UNPATCH、head 的 excess 都是 0。excess 只在带 1024 通道 RMS_norm 的调用上：前缀 `middle.0 / 1 / 2` +775.7 / +374.3 / +775.7 MiB（三种条带高度都有）；`upsamples.2` r64 +645.3、默认 +753.1、r256 0；2688 默认 middle +298.7 / +115.9 / +298.7、`upsamples.2` +633.4；fp32 4K 默认 middle +693.5、`upsamples.2` +315.2。这块临时内存每个位置 32768 B（40320 → 1260 MiB、35520 → 1110、34944 → 1092、32400 → 1014），`upsamples.1`（约 19200 位置）和 r256 的 `upsamples.2`（76800）不出现。
+  * **D2（`--no-arena`）：** alloc 1.49 / 1.36 / 1.23 GiB，与有 arena 时相同：是真的张量。
+  * **D4（`TORCH_BLAS_PREFER_HIPBLASLT=0`）：** 与 D1 的 4K 默认逐个相同，与 BLAS 无关。
+  * **结论（DESIGN §9.26 第 5 节、§9.28）：** ROCm 上 `torch.linalg.vector_norm` 的归约内核在「每输出跨多个线程块」的配置下申请 4 B × 位置数 × 64 × 32 × 4 = 32 KiB / 位置的临时缓冲（ROCm 把每输出的块数至少设成 64）；1024 通道、位置数 ≤ 约 41k 时触发，384 / 512 通道不触发——Wan 2.1 不受影响。修法（避开这次分配，等用户定）见 DESIGN §9.28；触发范围的真机测试是命令 N（§9.19）。
 
 ### 10.11 第三轮修正的真机复查（`run_all`、`check_vae_node_*`、`bench_vae_hy21_summary`，2026-10，1dc61b2）
 
@@ -1606,7 +1632,7 @@ monoload/vae_overrides.py   单个 VAE 的设置（节点做的副本带的设�
 monoload/nodes/             ComfyUI 节点：__init__.py 是注册表（NODES → NODE_CLASS_MAPPINGS），lora_settings.py = Monoload LoRA Settings，vae_settings.py = Monoload VAE Settings，info.py = Monoload Info
 tests/                      测试和基准脚本（见第 8、9 节；总开关：test_master_switch.py；LoRA 节点：test_lora_node.py、check_lora_node.py、make_synthetic_checkpoint.py；保存挂 LoRA 的模型：test_lora_save.py、check_lora_save.py；VAE：test_vae.py、test_vae_stripe.py、test_vae_ldm.py、test_vae_node.py、
                             bench_vae.py、check_vae_node.py、make_synthetic_vaes.py、alloc_sim.py = 缓存分配器模拟，DESIGN.md §9.13.10；
-                            第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16；Flux 2：test_vae_flux2.py；Wan 2.2：test_vae_wan22.py、check_l1_units.py（第一层逐单元的真机显存，DESIGN.md §9.26）；HunyuanImage 2.1：test_vae_hunyuan.py；
+                            第四阶段盘点：vae_inventory.py、probe_vae_gaps.py、check_models.py，DESIGN.md §9.16；Flux 2：test_vae_flux2.py；Wan 2.2：test_vae_wan22.py、check_l1_units.py（第一层逐单元的真机显存，DESIGN.md §9.26）、check_norm_reduce.py（F.normalize 的归约临时缓冲，DESIGN.md §9.28）；HunyuanImage 2.1：test_vae_hunyuan.py；
                             自检峰值诊断：check_selftest_mem.py，DESIGN.md §9.19）
 tools/watch_mem.sh          GTT / cgroup 内存监视
 tools/compare_images.py     两张图逐像素比较

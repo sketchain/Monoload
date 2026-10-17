@@ -1571,7 +1571,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
   * BLAS 工作区：rocBLAS（32 MiB）和 hipBLASLt（76 MB）的工作区按（handle, stream）各分配一次、常驻（`CublasHandlePool.cpp`），第一次解码之后就在基线里，热启动不会再算进增量。
   * 跨 stream 的延迟释放：`free()` 立即减 `allocated_bytes`（块要等事件完成才能复用），只能让 reserved 变多，不能让 alloc 变多。
   * Slow2d（`ConvolutionMM2d.cu`）只分配输出和 im2col 列（不连续的输入 / 权重先拷贝）；`upsample_nearest2d`（`UpSampleNearest2d.cu`）只在输入不连续时拷贝——这些模拟都按源码手工加了。
-* **剩下的可能（离线定不了）：** E 来自 meta 跟踪看不到的东西——GPU 内核或库自己经由缓存分配器申请的临时量（某个 bf16 路径里的 fp32 临时量、某些 GEMM 形状的 hipBLASLt 临时分配），或者 CUDA 上某个算子的输出 stride 与 meta 上不同，导致后面多一次拷贝。E 不随 dtype 翻倍、在小条带才出现，更像前一类。要真机上逐单元量。
+* **剩下的可能（当时离线定不了；D1–D4 之后已确认是第一类，见第 5 节和 §9.28）：** E 来自 meta 跟踪看不到的东西——GPU 内核或库自己经由缓存分配器申请的临时量（某个 bf16 路径里的 fp32 临时量、某些 GEMM 形状的 hipBLASLt 临时分配），或者 CUDA 上某个算子的输出 stride 与 meta 上不同，导致后面多一次拷贝。E 不随 dtype 翻倍、在小条带才出现，更像前一类。要真机上逐单元量。
 
 **3. 诊断（README §9.18，命令 D1–D4）**
 
@@ -1580,12 +1580,20 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 * **D3 `bench_vae.py --profile-only`：** 分配器历史里 alloc 峰值那一刻活着的块（带 Python 栈，`--profile-cpp` 带 C++ 栈）；新加 reserved 峰值那一刻的段：每段的大小、当时段里分配了多少、是哪个请求让分配器开的这段（栈）。
 * **D4 A/B：** 同 D1 的 4K 默认，加 `-e TORCH_BLAS_PREFER_HIPBLASLT=0`（容器里默认是 1），看 E 是否随 BLAS 后端变化。
 
-**4. 修法的方案（等 D1–D4 的结果再定）**
+**4. 修法的方案（当时，等 D1–D4 的结果再定；已作废，见第 5 节）**
 
 * **A（首选，取决于诊断）：** 找到 E 的来源后把它算进模型——`unit_peak` / `unit_largest` 加上那一项（alloc_sim 的跟踪器同样手工加上，使 `--sim` 与实测一致），arena 和估算随之变大，回到上界；如果是能避开的临时量（例如某个算子换成不需要它的调用方式、先做连续化），就避开它，估算不变。
 * **B（临时止血，不等诊断）：** Wan 2.2 的默认条带策略从「128 行条带的峰值」改成「256 行条带的峰值」（4K 选 9 × 240：实测 alloc 1.33 / reserved 1.73 ≤ 估算 1.75，而且更快：7.8 s 对 9.7 s）。1344 / 2688 在 256 行下没有实测，要先跑一次 XW 确认；只改 Wan 2.2，不改其他 VAE。
 * **C（不推荐）：** 在 Wan 2.2 的估算上加一个固定余量（约 0.6 GiB，再加 reserved 的碎片）。没有找到原因，余量是猜的，而且估算变大会让按预算选更早放弃第一层。
 * **按预算选不受影响**（12 个配置都 ≤ 估算），预算模式下不用改。
+
+**5. D1–D4 的结果（CT 700，dev 1dc61b2，README §10.10）：来源找到了——`F.normalize` 的归约内核的临时缓冲（§9.28）**
+
+* **D3（分配器历史）：** 4K 默认在 alloc 峰值时活着的块里最大的一块 1.23 GiB，栈是 `torch/functional.py:1888 norm` ← `torch/nn/functional.py:6127 normalize` ← `comfy/ldm/wan/vae.py:63 RMS_norm.forward` ← `vae2_2.py:158 ResidualBlock.forward`；同一栈还有 79 KiB（norm 的输出，40320 × 2 B）和 1 KiB 的块。reserved 峰值时有 1014 MiB 和 1.23 GiB 两个已经空了的段，也是这个 norm 开的（前缀那一段 + 条带那一段，各自尺寸不同，都在 arena 外）。r64 同样（1.08 GiB 的块，1014 MiB + 1.05 GiB + 1.08 GiB 的空段）；r256 没有。
+* **D1（逐单元）：** DUPUP、UNPATCH、head 的 excess 都是 0——之前怀疑的 DUPUP / UNPATCH 计数没有问题。excess 只出现在带 1024 通道 RMS_norm 的调用上：前缀 `middle.0 / 1 / 2` +775.7 / +374.3 / +775.7 MiB（三种条带高度都有）；`upsamples.2` r64 +645.3、默认 +753.1、r256 0；2688 默认 middle +298.7 / +115.9 / +298.7、`upsamples.2` +633.4；fp32 4K 默认 middle +693.5、`upsamples.2` +315.2。这些调用自己的峰值 = 32768 B × 位置数（4K 默认 `upsamples.2` 40320 → 1260 MiB，r64 35520 → 1110，2688 34944 → 1092，前缀 32400 → 1012.5（+ 输出等 63 = 1075.8））——与 §9.28 推出的公式逐个吻合。`upsamples.1`（约 19200 位置，600 MiB）和 `upsamples.0` 也分配了，但比这些单元自己在 `DupUp3D` 那一段的峰值小，被盖住；r256 的 `upsamples.2`（76800 位置）和默认的最后一条（49920 / 50880）不分配。
+* **D2（`--no-arena`）：** alloc 1.49 / 1.36 / 1.23 GiB，与有 arena 时相同：E 是真的张量，不是 arena 的假象。
+* **D4（`TORCH_BLAS_PREFER_HIPBLASLT=0`）：** 每个数字与 D1 的 4K 默认完全相同，与 BLAS 无关。
+* **结论：** 不是模型漏算了哪一项激活，而是 ROCm 上 `torch.linalg.vector_norm` 的归约内核在一定的形状范围内额外申请一块与通道数无关、每个输出位置 32 KiB 的临时缓冲（§9.28）。它不随尺寸线性、时有时无，不作为一项算进模型（用户定）；修法是避开这次分配（§9.28 的方案，等用户定）。上面第 4 节的 A / B / C 作废（B、C 用户不要；A 改成 §9.28 的方案）。
 
 ### 9.27 第二层估算的 retained / copies 按 decoder 类型取（审查 2026-10 第七项）
 
@@ -1594,6 +1602,62 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 **改法：** 这两项描述的是模型**自己的** decode（第二层跑的就是它）留了什么、峰值有几份激活，与第一层认不认无关；hook 和 `vae_options` 不改变它。所以按 decoder 的类取：每个适配器模块可以有 `decoder_terms(vae, samples)`，类对得上就返回它的项（`vae_wan22`：`first_stage_model` 是 `vae2_2.WanVAE`、decoder 是 `Decoder3d` → `retained_bytes`，就是以前的 `decode_retained`，改成按 decoder 算的模块函数；`vae_hunyuan`：decoder 是 `hunyuan_video.vae.Decoder` → 6 份），否则 None；`_decoder_terms` 取第一个非 None 的，都没有就是 4 份、不留。`retained_bytes` 只读 `Decoder3d` 的子模块列表（`middle`、`upsamples` 里的 `ResidualBlock` 和 `avg_shortcut`、`conv1` / `head[2]` 的通道数），这些是这个类自己的构造，hook 不影响。`_decoder_terms` 不再需要 `vae_options` 参数。
 
 **测试：** `test_vae_wan22.py`：挂 forward hook 后 `match` 拒绝，`_decoder_terms` 的 retained 仍等于识别时的值（= 原生解码里 30 次带缓存卷积的输入字节之和），copies 4；`test_vae_hunyuan.py`：挂 hook 后仍是 6 份。其他 decoder 的估算不变。
+
+### 9.28 `F.normalize` 在 ROCm 上的归约临时缓冲（Wan 2.2 的 RMS_norm；分析，先不改）
+
+**1. 调用链（torch 3f8a4a1862，CT 700 的 2.14.0a0+rocm7.15）**
+
+`RMS_norm.forward`（62b3c94 `comfy/ldm/wan/vae.py:63`）是 `F.normalize(x, dim=1) * scale * gamma + bias`。`F.normalize`（`torch/nn/functional.py:6127`）算 `input.norm(p, dim, keepdim=True).clamp_min(eps).expand_as(input)`，再 `input / denom`。`Tensor.norm` → `torch.norm`（`torch/functional.py:1888`）→ `torch.linalg.vector_norm(input, 2.0, dim, keepdim, dtype=None)`。`linalg_vector_norm_out`（`aten/src/ATen/native/LinearAlgebra.cpp:2860`）在归约维不全是 1 时做 `make_reduction` + `norm_stub`；CUDA / HIP 上是 `ReduceNormKernel.cu` 的 `norm_kernel_cuda_impl<BFloat16, float>`（bf16 输入、fp32 累加；fp32 输入同样 fp32 累加）→ `gpu_reduce_kernel`（`aten/src/ATen/native/cuda/Reduce.cuh`）。
+
+**2. 什么时候申请临时缓冲、多大（`Reduce.cuh`）**
+
+`gpu_reduce_kernel` 先按 `setReduceConfig` 定启动配置；配置是「全局归约」（`should_global_reduce()`：一个输出的归约分给多个线程块）时，从缓存分配器申请
+
+* `buffer = allocate(global_memory_size())`，`global_memory_size = sizeof(arg_t) × num_outputs × ctas_per_output`，不做 block-x 归约时再 `× block.x × output_vec_size`；
+* `semaphores = allocate(sizeof(int) × grid.x)`，再 `hipMemsetAsync`；
+
+内核发出后函数返回，`DataPtr` 释放，块回到缓存（这次调用之内的临时量，`max_memory_allocated` 记得到，meta 上的 alloc_sim 看不到）。
+
+对 `[1, C, (1,) H, W]` 沿 dim 1 的归约（连续张量和按行切的条带输入都一样：输出维 H·W 合并成一维，通道维 stride 最大），配置是这样定的：
+
+* 归约维不是最快的维 → 「沿输出向量化」：`output_vec_size = get_output_vec_size`，从 4 开始，减半到同时整除输入首地址（按元素）、输出位置数、通道维的 stride（按元素）为止；`max_num_threads = 512 / vec`；`dim0 = 位置数 / vec`，`dim1 = C`；
+* `set_block_dimension`：`block_width = min(pow2(dim0), warp)`，`block_height = min(pow2(dim1), max_num_threads / block_width)`；vec 4、warp 32 时是 32 × 4；输出分到 block.x（`split_output(32)`）；
+* 每线程值数 = C；不小于 `min(block_height × 16, 256)` 时跨 warp 拆输入（`split_input(block_height)`），每线程值数变成 `ceil(C / block_height)`；
+* `grid.x = ceil(位置数 / vec / step_output)`；`target_grid_size = multiProcessorCount × (maxThreadsPerMultiProcessor / 每块线程数)`；
+* **跨块拆（全局归约）的条件**：跨 warp 拆了，且每线程值数 ≥ 256，且 `grid.x ≤ target_grid_size`。这时 `ctas_per_output = clamp(ceil(target / grid), ceil(值数 / 256), ceil(值数 / min_values_per_thread))`，ROCm 上 `min_values_per_thread = 128`；大于 1 时 **ROCm 上再取 `max(ctas, 64)`**（源码注释：更多的归约块性能更好）。
+
+代进去：C = 1024、vec 4、warp 32：block 32 × 4，每线程值数 256，`ctas = clamp(…, 1, 2) = 2` → ROCm 上 64；缓冲 = 4 B × 位置数 × 64 × 32 × 4 = **32768 B / 位置，与通道数和数据类型（bf16 / fp32 都是 fp32 累加）无关**。D1 的每个读数都对得上（§9.26 第 5 节）；r256 的 76800 位置 `grid.x = 600`、默认最后一条的 49920 位置 `grid.x = 390` 大于 target，不触发；40320 位置 `grid.x = 315` 触发——所以 CT 700 上 target 在 315 和 389 之间（例如 20 × 2048 / 128 = 320：位置数 ≤ 40960 时触发）。最大的一块 = 32768 B × 128 × target ≈ 1.25 GiB（target 320）。
+
+**触发的规则（CT 700，wave32）：** 通道数 ≥ 1021（`ceil(C / 4) ≥ 256`），位置数和通道 stride 都是 4 的倍数且首地址对齐（vec 4；vec 2 / 1 时 block_height 8 / 16，要 C ≥ 2041 / 4081），位置数 ≤ 128 × target。384 / 512 通道永远不触发（每线程值数 96 / 128）。warp 64 的设备（block_height 2）上 C ≥ 511 就可能触发。
+
+**说不清的（要真机的设备属性）：** `multiProcessorCount`、`maxThreadsPerMultiProcessor` 在 gfx1151 上 HIP 报多少（由此定 target，现在只从数据卡在 315–389）；warp 32 是从 32768 = 4 × 64 × 32 × 4 反推的。1 KiB 的块是 semaphores（4 B × grid.x，315 个是 1260 B），没有单独确认。`tests/check_norm_reduce.py` 打印这些属性，并用上面的配置模型逐个预测。
+
+**3. 哪些调用会触发（规则代入，target 按 320 估）**
+
+* **Wan 2.1（`qwen_image_vae`）：任何路径都不触发**——通道最多 384（每线程值数 96 < 256），与位置数无关；第一层、第二层、原生、自检都一样。warp 64 的设备上也不触发（192 < 256）。
+* **Wan 2.2 第一层：** 前缀 `middle` 的 RMS_norm（含注意力块的 norm）1024 通道、H/16 整图：1344 4032 位置 126 MiB、2688 16128 → 504 MiB、4K 32400 → 1012.5 MiB；条带里 `upsamples.0 / 1` 的 1024 通道 norm 和 `upsamples.2` 的第一个 norm（1024 → 512 块的输入）在位置数 ≤ ~41k 时触发，`upsamples.3`（512 / 256 通道）不触发。触发的那次分配落在 arena 外，开出新段并一直缓存到解码结束（reserved 多出 1–3 GiB）。
+* **Wan 2.2 第二层和原生（整图）：** H/16 的 1024 通道 norm 在 1344 / 2688 / 4K 都触发（126 / 504 / 1012.5 MiB），H/8 只在 1344（16128 位置，504 MiB）；H/4 以上的位置数太多，不触发。这些都发生在低分辨率的几级，那时活着的激活很小，峰值在全分辨率，所以实测的第二层 4.04 / 11.49 / 20.94、原生 GiB 都不受影响（与之前的读数一致）。小图（例如 512²，H/4 16384 位置 512 MiB）上它可能成为第二层的峰值：第二层估算里 2 × 工作区（默认 1 GiB）盖得住最大的 1.25 GiB；工作区更小（预算模式）时没有验证过。
+* **Wan 2.2 自检**（fp32 副本，24 × 24 的 decoder 输入，参照解码在第二层分块下）：H/16 576 位置 18 MiB、H/8 2304 → 72 MiB、H/4 9216 → 288 MiB；实测自检峰值（1.51 GiB）没有超过上界 1.61，被别的阶段盖住。
+
+**4. 修法的方案（避开这次分配；用户不要 B / C，也不要算进模型）**
+
+* **方案 G（推荐）：分组求范数。** 托管解码期间（`vae_ops.OpChunking` 进入时，退出时恢复——第一层的前缀和条带、自检的参照解码和条带、第二层都在它里面），把通道数大于 510 的 `wan.RMS_norm` 实例的 `forward` 换成：把通道分成 G 组、每组 `Cg` = C 的不超过 510 的最大约数（1024 → 4 × 256，512 → 2 × 256），`part = vector_norm(x.view(B, G, Cg, …), dim=2, dtype=float32)`（`[B, G, …]` fp32，输入还是 bf16 / fp32，内核在 fp32 里累加），`denom = vector_norm(part, dim=1, keepdim=True).to(x.dtype)`，然后与原来逐字相同：`x / denom.clamp_min(1e-12).expand_as(x) * scale * gamma.to(x) + bias`。
+  * **为什么不再触发：** 全局归约要每线程值数 ≥ 256；`block_height ≥ 2`（`max_num_threads ≥ 128`、`block_width ≤ 64`），所以每组 ≤ 510 通道时每线程值数 ≤ 255，任何 warp 大小、任何 vec 都不会跨块拆；合并的那一步只有 G 个值。临时量变成 `4G + 4 + e` B / 位置（1024 通道 bf16 22 B，40320 位置 0.85 MiB），是线性的、确定的，算进 `res_peak` / 注意力的计数。
+  * **每块的上限：** 不按位置分块（位置数不影响是否触发——分组后它总不触发），只按通道分组；上限 510 来自上面的条件，不依赖设备。也可以只对这台机器会触发的（C ≥ 1021）换，512 通道保持原生——要用户定（见「要用户定的」）。
+  * **前缀 / 条带 / 第二层：** 同一个替换，都在 `OpChunking` 里，不分别处理；原生解码（`mode native`、`MONOLOAD=0`、视频走原生）不替换。结构识别（`hooked_module` 会把实例级 forward 当成钩子）在 `OpChunking` 进入之前做；实现时要确认解码期间没有再做识别（OOM 重试、自检的 fp32 副本），必要时让识别认得 Monoload 自己的替换。
+  * **精度：** 数学上相同；差别只在 fp32 里的求和顺序（原生是一个内核里 64 块的树形归约，分组是先组内、再组间）。fp32：相对 1e-7 量级（CPU 上 C = 1024：与 `F.normalize` max|Δ| 8.9e-8，对 fp64 的相对误差 7.2e-8，原生 2.2e-7）。bf16：分母先在 fp32 里算、最后取整到 bf16，只有 fp32 值恰好落在 bf16 舍入边界附近时差 1 个 ulp（CPU 上 384 / 512 / 1024 通道逐位相同）；GPU 上差多少由 `check_norm_reduce.py` 量（差异比例、max|Δ|、对 fp64 的误差，和原生并排）。都在已接受的「bf16 下对 fp32 真值与原生同一水平」以内。
+  * **对 Wan 2.1：** 没有影响——384 通道不替换，逐位不变。
+  * **耗时：** 一次归约变成两次（一次读整个张量、一次只读 G 个 fp32）加一次转换；原生那条路有 64 块 / 输出加一次 memset。预计与原生同量级，`check_norm_reduce.py` 逐个比 ms；Wan 2.2 4K 第一层每次解码几百次 norm，相对 9.7 s 可以忽略。
+  * **预期效果：** Wan 2.2 第一层回到模拟（`check_l1_units --sim`）：4K 默认 alloc ≈ 0.95、reserved ≈ 1.34 ≤ 估算 1.35 GiB；r64 0.80 / 1.12；2688 0.63 / 0.92；前缀不再开 1 GiB 的段。要真机复测（XW / YW / D1）。
+* **不推荐的：**
+  * 按位置分块调原生 norm：每块还是触发（只是变小，块越小启动越多：4K 前缀 32400 位置要几十次才压到几十 MiB），且块大小改变每个输出的归约配置，同样不逐位一致。
+  * 把通道换到最后一维（让归约在最快的维上，不走「沿输出向量化」）：要一份连续的转置拷贝，多一整份激活。
+  * 用矩阵乘求平方和（`ones @ x²`）：要一份 x² 的临时量，bf16 下平方先取整，精度变差。
+  * `F.rms_norm`：eps 的语义不同（`x / max(‖x‖, eps)` 对 `x / sqrt(mean(x²) + eps)`），而且是融合内核，与原生的逐步 bf16 取整不同。
+
+**测试（CT 700，README §9.19）：** `tests/check_norm_reduce.py`（纯 PyTorch，不碰插件）：bf16 / fp32 × 384 / 512 / 1024 通道 × 5D T=1 / 4D × 连续 / 行切片 × 7680–80640 位置（加 Wan 2.2 的实际尺寸、位置数不是 4 的倍数的一例），每次 `F.normalize` 的额外分配、新开的段、配置模型的预测；同样的输入跑方案 G，量它的临时量、与原生的差、对 fp64 的误差、耗时。
+
+**要用户定的：** ① 方案 G 做不做；② 分组的范围：通道 > 510 都换（与设备无关，512 通道也换，数值差 1e-7 / 偶尔 1 ulp），还是只换这台机器会触发的 ≥ 1021 通道（512 通道保持原生）。
 
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
