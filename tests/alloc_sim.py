@@ -325,8 +325,9 @@ WAN22 = dict(dim=160, z_dim=48, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_sc
 # the HunyuanImage 2.1 VAE as comfy.sd.VAE builds it (AutoencodingEngine with hunyuan_video.vae.Decoder, z 64, 32x)
 HY21 = {"block_out_channels": [128, 256, 512, 512, 1024, 1024], "in_channels": 3, "out_channels": 3, "num_res_blocks": 2,
         "ffactor_spatial": 32, "downsample_match_channel": True, "upsample_match_channel": True, "z_channels": 64}
-# the HunyuanImage 2.1 Refiner VAE as comfy.sd.VAE builds it (AutoencodingEngine with vae_refiner.Decoder,
-# refiner_vae=False: plain Conv3d and GroupNorm; z 32, 16x, an image decoded as 4 frames)
+# sd.py's refiner_vae=False branch (a 5D decoder.conv_in.weight with 32 input channels, ComfyUI #10150): AutoencodingEngine
+# with vae_refiner.Decoder, plain Conv3d and GroupNorm; z 32, 16x, an image decoded as 4 frames. NOT the official HunyuanImage
+# 2.1 Refiner file (DESIGN §9.31), which is "hv15"
 HYR = {"block_out_channels": [128, 256, 512, 1024, 1024], "in_channels": 3, "out_channels": 3, "num_res_blocks": 2, "ffactor_spatial": 16,
        "ffactor_temporal": 4, "downsample_match_channel": True, "upsample_match_channel": True, "refiner_vae": False, "z_channels": 32}
 # the LDM ddconfig comfy.sd.VAE builds for SDXL / SD1.5 (z 4, AutoencoderKL with post_quant_conv) and Flux ae /
@@ -335,7 +336,7 @@ LDM_DDCONFIG = {'double_z': True, 'z_channels': 4, 'resolution': 256, 'in_channe
                 'ch_mult': [1, 2, 4, 4], 'num_res_blocks': 2, 'attn_resolutions': [], 'dropout': 0.0}
 # model name -> (latent channels, latent dims[, spatial ratio (default 8)])
 LATENT = {"qwen": (16, 5), "sdxl": (4, 4), "flux": (16, 4), "flux2": (128, 4, 16), "wan22": (48, 5, 16), "hy21": (64, 4, 32),
-          "hyr": (32, 5, 16)}
+          "hyr": (32, 5, 16), "hv15": (32, 5, 16)}
 
 
 class _MetaVAE:
@@ -374,6 +375,13 @@ def _build(model):
         return AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
                                   encoder_config={'target': "comfy.ldm.hunyuan_video.vae.Encoder", 'params': HY21},
                                   decoder_config={'target': "comfy.ldm.hunyuan_video.vae.Decoder", 'params': HY21})
+    if model == "hv15":
+        # the HunyuanImage 2.1 Refiner file (hunyuan_image_refiner_vae_fp16) and the HunyuanVideo 1.5 VAE: decoder.conv_in.conv.weight,
+        # vae_refiner.Decoder with refiner_vae=True (CarriedConv3d, RMS norm), EmptyRegularizer
+        dd = {k: v for k, v in HYR.items() if k != "refiner_vae"}
+        return AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.EmptyRegularizer"},
+                                  encoder_config={'target': "comfy.ldm.hunyuan_video.vae_refiner.Encoder", 'params': dd},
+                                  decoder_config={'target': "comfy.ldm.hunyuan_video.vae_refiner.Decoder", 'params': dd})
     if model == "hyr":
         return AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
                                   encoder_config={'target': "comfy.ldm.hunyuan_video.vae_refiner.Encoder", 'params': HYR},
@@ -440,7 +448,8 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     model   "qwen" (Wan 2.1, qwen_image_vae), "sdxl" (LDM AutoencoderKL, z 4), "flux" (LDM AutoencodingEngine, z 16),
             "flux2" (LDM AutoencoderKL with a batch-norm latent, z 32, latent 128 x H/16), "wan22" (Wan 2.2 VAE, z 48, H/16),
             "hy21" (HunyuanImage 2.1 VAE, z 64, H/32: heights / widths multiples of 32, e.g. 3840x2176),
-            "hyr" (HunyuanImage 2.1 Refiner VAE, z 32, H/16, 5D latent with one frame decoded as 4)
+            "hyr" (sd.py's vae_refiner refiner_vae=False branch, z 32, H/16, 5D latent with one frame decoded as 4),
+            "hv15" (the HunyuanImage 2.1 Refiner file and the HunyuanVideo 1.5 VAE: vae_refiner refiner_vae=True, z 32, H/16)
     scheme  GroupNorm scheme of an LDM layer-1 decode (None: the current setting)
     units   tag every allocation with the layer-1 unit / prefix module that made it (for --peak)
     output_in_arena  the layer-1 layout up to 6324592 (vae_engine.OUTPUT_IN_ARENA): no cache emptied before / after the
@@ -767,7 +776,7 @@ def main():
     ap.add_argument("--rows", default=None)
     ap.add_argument("--dtype", default="bf16")
     ap.add_argument("--version", default="current", help="current / v1 / v2 / v3 / w128")
-    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux / flux2 / wan22 / hy21 / hyr")
+    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux / flux2 / wan22 / hy21 / hyr / hv15")
     ap.add_argument("--scheme", default=None, help="GroupNorm scheme of an LDM layer-1 decode: A / B / C / D")
     ap.add_argument("--layer", type=int, default=1)
     ap.add_argument("--ws", default=None, help="workspace MiB (layer 2: default 1024; layer 1: the layer-1 default)")
