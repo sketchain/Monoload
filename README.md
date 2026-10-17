@@ -1187,7 +1187,7 @@ docker exec -e TORCH_BLAS_PREFER_HIPBLASLT=0 -w /opt/ComfyUI/custom_nodes/monolo
 
 ### 9.19 `F.normalize` 的归约临时缓冲：触发范围（命令 N）
 
-**状态：待 CT 700 跑（分析见 DESIGN §9.28；结果出来、用户定了之前不改插件）。** 纯 PyTorch，不加载 ComfyUI / Monoload，不用 `/free`（几分钟，最大的张量约 0.6 GiB）：
+**状态：已跑（dev 2c24452，结果见 §10.12；用户定了做方案 G，DESIGN §9.29）。** 纯 PyTorch，不加载 ComfyUI / Monoload，不用 `/free`（几分钟，最大的张量约 0.6 GiB）：
 
 ```bash
 # N. bf16 / fp32 × 384 / 512 / 1024 通道 × 5D / 4D × 连续 / 行切片 × 7680–80640 位置 + Wan 2.2 的实际尺寸；同样的输入跑分组的方案 G
@@ -1605,6 +1605,18 @@ DESIGN §9.26 之后的第 3–7 项（test_entry 的适配器列表、check_vae
   以前 Wan 2.2 第一行 reserved 3.98（含权重 1.31）、HunyuanImage 3.26（含 0.755）。Wan 2.2 第一行的 GTT 比估算多 0.07，reserved 在估算内：是进程第一批 GPU 计算（DESIGN §9.19，接受的事项）。
 * **解码日志：** Wan 2.2 的设置里已经没有 GroupNorm 方案这一项（`check_vae_node.py` 自己打印的那行当时仍写 `gn_scheme B [default]`，是测试脚本的输出，已改成只对有 GroupNorm 方案的 decoder 打印这一项）。
 * **bench 汇总表：** HunyuanImage 1344 的 `monoload` 一行是 `1.47 / 1.49 [cold: incl. the first-use self-test]`（峰值和估算取自同一次）。
+
+### 10.12 `F.normalize` 的归约临时缓冲：触发范围（命令 N，`norm_reduce`，2026-10，2c24452）
+
+§9.19 的命令 N，1048 行逐行核过，**与 DESIGN §9.28 的模型完全一致**。
+
+* **设备：** AMD Radeon 8060S（gfx1151），`multiProcessorCount` 20、`maxThreadsPerMultiProcessor` 2048、warp 32；torch 2.14.0a0+rocm7.15.0a20260721，hip 7.15.0。target_grid = 320：**1024 通道、位置数是 4 的倍数且 ≤ 40960 时触发**，缓冲 32768 B / 位置。
+* **原生 `F.normalize`：** 预测触发的 192 行（只有 C = 1024，bf16 和 fp32 都有，最大 40320 位置），实测峰值与预测的缓冲差 ≤ 2 MiB；预测不触发的行，多出来的最多 1.31 MiB。384 / 512 通道在 7680–80640 位置都不触发。5D 和 4D、连续和行切片相同。9799 位置（不是 4 的倍数，vec 1）不触发。
+* **方案 G（分组求范数）：** 输入和输出之外的临时量最大 2.85 MiB（fp32，1024 通道，80640 位置），286 行超过 1 MiB，每位置约 20–35 B，小尺寸上有约 1 MiB 的固定部分（fp32 512 通道 7680 位置 1.12 MiB）。
+* **G 的精度：** bf16 384 通道逐位相同（不替换）；512 / 1024 通道 max|Δ| 0.000977（1 ulp），有差别的比例最多 6.1e-5 / 2.7e-5，对 fp64 的相对误差与原生相同（0.0023–0.0025）。fp32 max|Δ| ≤ 4.5e-8，对 fp64 的误差比原生略大（512 通道最多 1.15 倍、1024 通道最多 1.07 倍，都在 5e-8 以下）。
+* **G 的耗时：** bf16 1024 通道合计 233.9 对原生 237.7 ms，512 通道 106.7 对 104.2 ms，384 通道相同；全部合计 1231.7 对 1235.3 ms。
+* **脚本：** 当时汇总里 bf16 384 / 512 和 fp32 384 / 512 / 1024 标的「PREDICTION DIFFERS」是 1–3 MiB 的零碎分配越过了 > 1 MiB 的门槛，不是模型错；extra 列又不含输出（缓冲在输出之前释放，触发的行 extra = 缓冲 − 输出）。已改成 peak+（含输出）、按 16 MiB 判断；按新判断重算这次的数据，24 组全部一致，峰值与预测差 ≤ 0.16 MiB。
+* **决定：** 做方案 G，范围是通道 > 510 的 Wan `RMS_norm`（DESIGN §9.28 / §9.29）。
 
 ## 11. 仓库结构
 
