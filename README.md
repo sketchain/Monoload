@@ -1205,6 +1205,78 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_nor
 
 **发回：** `norm_reduce.txt` 和 `norm_reduce.json`。
 
+### 9.20 方案 G（分组求范数）的真机复测（命令 GA–GK）
+
+**状态：待 CT 700 跑（实现 DESIGN §9.29，dev f1f3fc1 之后）。** 拉新代码、重启容器后（每条 bench 前先 `/free`）。预测都是 `tests/alloc_sim.py` 的模拟（跟踪器已加上 ROCm 的归约缓冲；**不用方案 G 时它复现了 §10.10 的每个 Wan 2.2 读数**，含第二层 4.04 / 11.49 / 20.94），GiB，GTT ≈ reserved。
+
+```bash
+# GA = XW. Wan 2.2 三档，带 fp32 参照
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae wan2.2_vae.safetensors --modes native,monoload,monoload-l2 --warm 1 --fp32-ref \
+  --json /opt/ComfyUI/output/bench_vae_wan22_g.json 2>&1 | tee bench_vae_wan22_g.txt
+# GB = YW. 4K 条带高度扫参
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae wan2.2_vae.safetensors --res 3840x2160 --modes monoload --stripe-rows 32,64,256,512 --warm 1 \
+  --json /opt/ComfyUI/output/bench_vae_wan22_rows_g.json 2>&1 | tee bench_vae_wan22_rows_g.txt
+# GC = ZW. 预算 3G / 2G
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae wan2.2_vae.safetensors --modes native --budgets 3,2 --warm 1 \
+  --json /opt/ComfyUI/output/bench_vae_wan22_budget_g.json 2>&1 | tee bench_vae_wan22_budget_g.txt
+# GD / GE. VAE 设置节点（4K 预算 3G）：Wan 2.2、HunyuanImage 2.1
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae_node.py \
+  --vae wan2.2_vae.safetensors --res 3840x2160 --budget 3 2>&1 | tee check_vae_node_wan22_g.txt
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_vae_node.py \
+  --vae hunyuan_image_2.1_vae_fp16.safetensors --res 3840x2176 --budget 3 2>&1 | tee check_vae_node_hy21_g.txt
+# GF–GH = D1. 逐单元（4K 64 / 默认 / 256；2688 默认；4K fp32 默认）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_l1_units.py \
+  --vae wan2.2_vae.safetensors --res 3840x2160 --rows 64,0,256 --json /opt/ComfyUI/output/l1_units_wan22_4k_g.json 2>&1 | tee l1_units_wan22_4k_g.txt
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_l1_units.py \
+  --vae wan2.2_vae.safetensors --res 2688x1536 --rows 0 --json /opt/ComfyUI/output/l1_units_wan22_2688_g.json 2>&1 | tee l1_units_wan22_2688_g.txt
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_l1_units.py \
+  --vae wan2.2_vae.safetensors --res 3840x2160 --rows 0 --fp32 --json /opt/ComfyUI/output/l1_units_wan22_4k_fp32_g.json 2>&1 | tee l1_units_wan22_4k_fp32_g.txt
+# GI. 回归：Wan 2.1（qwen_image_vae）三档
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae qwen_image_vae.safetensors --modes native,monoload,monoload-l2 --warm 1 \
+  --json /opt/ComfyUI/output/bench_vae_qwen_g.json 2>&1 | tee bench_vae_qwen_g.txt
+# GJ. 回归：HunyuanImage 2.1 4K 默认
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --vae hunyuan_image_2.1_vae_fp16.safetensors --res 3840x2176 --modes monoload --warm 1 2>&1 | tee bench_vae_hy21_g.txt
+# GK. 回归：SDXL 4K 默认
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py \
+  --checkpoint waiIllustriousSDXL_v170.safetensors --res 3840x2160 --modes monoload --warm 1 2>&1 | tee bench_vae_sdxl_g.txt
+# 最后：tests/run_all.sh（同 §8）
+```
+
+**GA（XW）的逐行预期**（热启动 alloc / reserved，估算；括号里是方案 G 之前的实测）：
+
+| 行 | 1344×768 | 2688×1536 | 3840×2160 |
+|---|---|---|---|
+| `native` | 不变（4.44 / 17.02 / 34.91 reserved） | | |
+| `monoload`（第一层） | 0.45 / 0.45，估算 0.59（0.60 / 0.98） | 0.72 / 0.92，0.94（1.25 / 1.99） | 1.04 / 1.34，1.35（1.49 / 3.27） |
+| `monoload-fp32` | 0.67 / 0.87，0.89（0.67 / 1.41） | 1.32 / 1.74，1.75（1.38 / 2.80） | 1.93 / 2.52，2.53（不变） |
+| `monoload-l2` | 3.39 / 4.01，估算 4.67（3.39 / 4.04） | 9.91 / 11.66，12.69（9.90 / 11.49） | 18.66 / 19.78，23.48（18.66 / 20.94） |
+
+* 第一层的 alloc 是 `reserve_arena` 那一刻的「输出 + arena」（4K 0.095 + 0.95 = 1.04）；**每一行（含 fp32）reserved ≤ 估算**。1344 冷启动那次含自检：峰值约 1.51（模拟 1546 MiB，上界 1.61）。
+* 日志：`settings` 里没有 GroupNorm 方案；`last_decode()["stats"]["norm_grouped"]`：第一层 / 第二层 Wan 2.2 是 37（> 510 通道的 RMS_norm：decoder 24 个 + encoder 13 个——`OpChunking` 装在整个 first-stage model 上，encoder 的在解码里不会被调用；自检的 fp32 副本只有 decoder，24 个）。
+* 精度：第一层对原生的 PSNR 应与 §10.10 同一水平（57–59 dB）；对 fp32 与原生相同（53.1–53.3 dB）。方案 G 的分母与原生偶尔差 1 个 bf16 ulp（命令 N：有差别的元素 ≤ 2.7e-5），看不出来。
+* 耗时：与 §10.10 相同（第一层 1.07 / 4.54 / 9.69 s，±3%）。
+
+**GB（YW，4K，alloc / reserved / 估算）：** 32 行 0.80 / 1.01 / 1.03（以前 1.21 / 1.80）；64 行 0.88 / 1.12 / 1.13（1.36 / 4.02）；默认 1.04 / 1.34 / 1.35；256 行 1.33 / 1.73 / 1.75（不变）；512 行 1.97 / 2.54 / 2.56（不变）。
+
+**GC（ZW）：** 与以前相同（12 个配置都 ≤ 估算，以前就没超）：3G 1 × 768 1.37 / 1.76、2 × 768 2.68 / 2.73、5 × 432 2.57 / 2.69；2G 1 × 768 1.19 / 1.46、4 × 384 1.37 / 1.75、8 × 270 1.94 / 1.95。
+
+**GD（Wan 2.2 节点）：** 节点副本 5 × 432：第一次 reserved 2.65 / GTT 约 2.76（含第一批 GPU 计算，与 §10.11 同），再次 2.58，估算 2.69；**原 VAE 17 × 128：1.34 / 1.35（以前 3.27）**。**GE（HunyuanImage 节点）：** 与 §10.11 相同（不受影响）：第一次 2.50 reserved，原 VAE 2.13 / 2.41，再次 2.43 / 2.94。
+
+**GF–GH（D1，与 `check_l1_units --sim wan22` 的表比）：** 带 1024 通道 RMS_norm 的调用（`middle.0 / 1 / 2`、`upsamples.0 / 1 / 2`）excess ≈ 0（以前 +300…+775 MiB）；其余单元与以前相同（≤ 10 MiB，`upsamples.3`、`head.2` 的几 MiB 以前就有）；调用里的 alloc 峰值 4K 64 行 815、默认 972、256 行 1261 MiB，2688 649，fp32 4K 1849；reserved 1146 / 1368 / 1772 / 944 / 2578 MiB，**都 ≤ 估算**；开新段的只有 `upsamples.1`（`DupUp3D` 落在 arena 外的那份，在估算的 largest 里），前缀不再开 1 GiB 的段。
+
+**GI（Wan 2.1 回归）：** 第一层 6 × 128 / 12 × 128 / 14 × 155，GTT 0.36 / 0.56 / 0.87（估算 0.50 / 0.71 / 1.16），第二层 reserved 2.10 / 5.05 / 9.59，原生不变——与 §10.4 相同（384 通道不替换，`norm_grouped` 0，逐位不变）。
+
+**GJ（HunyuanImage 4K）：** B 13 × 168，2.13 / 2.41，约 44.5 s，与 §10.9 相同。**GK（SDXL 4K）：** B 17 × 128，2.17 / 2.68，约 42 s，与 §10.8 相同。
+
+**`run_all.sh`：** 43 组，比 §10.11 多 11 项（`test_vae_wan22` 55 → 66），0 失败 0 跳过。
+
+**发回：** GA–GK 的 txt 和 JSON、`run_all` 的汇总。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
