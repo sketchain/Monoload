@@ -205,7 +205,6 @@ def main():
     print(hdr.format("case", "C", "rows", "cols", "nd", "layout", "positions", "predicted", "extra", "resv+", "segs",
                      "grouped", "max|Δ|", "rel fp64", "ms n/g", "config (vec, block, values/thread, grid / target, ctas)"))
     for dtype in (torch.bfloat16, torch.float32):
-        e = torch.empty((), dtype=dtype).element_size()
         for label, rows, cols, c in cases(a.quick):
             for nd in (5, 4):
                 for sliced in (False, True):
