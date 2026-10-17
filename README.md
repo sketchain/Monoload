@@ -1393,6 +1393,34 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 * SVD：原生按 `free / memory_used` 分子批、每个子批当一段独立的视频解码（结果随空闲内存变），bench 的数字是当时那种分法的。
 * 1280×720 的 LTX 宽高要是 32 的倍数，用 1280×704。
 
+### 9.23 Flux 2 dev 整套文生图：Monoload 默认对 MONOLOAD=0（`tests/run_flux2_dev.py`）
+
+**状态：待 CT 700 跑（DESIGN §9.33）。** 用 CT 700 上已有的三个文件（`diffusion_models/flux2_dev_fp8mixed.safetensors` 35,455,599,592 字节、`text_encoders/mistral_3_small_flux2_fp8.safetensors` 18,034,640,095 字节、`vae/flux2-vae.safetensors` 336,213,556 字节；Comfy-Org/flux2-dev 的 `split_files/`）。工作流是 ComfyUI 自带的蓝图「Text to Image (Flux.2 Dev)」（62b3c94 `blueprints/`）：`CLIPLoader`（type flux2）→ `CLIPTextEncode` → `FluxGuidance` 4；`UNETLoader` → `EmptyFlux2LatentImage`、`Flux2Scheduler` 20 步、`RandomNoise`、`KSamplerSelect` euler、`BasicGuider` → `SamplerCustomAdvanced`；`VAELoader` → `VAEDecode`。蓝图里的 Turbo LoRA 开关是关的，不用。
+
+脚本在进程里按执行器的顺序直接调这些节点（插件由 ComfyUI 的 custom node 加载器装上，和服务器一样），1024² 和 2048² 各一张，两种模式各在一个子进程里：`monoload`（默认：总开关开、没有 Monoload 节点）和 `native`（`MONOLOAD=0`）。每个阶段（文本编码 / 采样 / VAE 解码）记：耗时（同步过）、GTT（amdgpu sysfs，整机所有进程）前 / 峰值 / 后、本进程分配器的 reserved 峰值；VAE 阶段另记是谁解的（Monoload 的记录：层、计划、估算；原生：是否 OOM 退 tiled）。最后父进程比两种模式：最终 latent 的 max|Δ|（Monoload 对没有 LoRA 的模型什么都不做，应当相同）和图像的 PSNR（差别只来自 VAE）。
+
+```bash
+# 先释放服务器的模型（它的进程也占 GTT），再在容器里跑（约 1 小时，见下）
+curl -X POST http://127.0.0.1:8188/free -d '{"unload_models":true,"free_memory":true}'
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/run_flux2_dev.py \
+  --json /opt/ComfyUI/output/flux2_dev.json 2>&1 | tee flux2_dev.txt
+```
+
+选项：`--res`（默认 `1024x1024,2048x2048`）、`--modes`（默认 `monoload,native`）、`--steps`（默认 20）、`--seed`（默认 42）、`--prompt`、`--unet` / `--clip` / `--vae`（文件名）、`--out`（默认 `/opt/ComfyUI/output/flux2_dev`，图像存 PNG 和 `.pt`）。只想先看能不能跑通：`--res 1024x1024 --steps 4`。
+
+**预期（不是模拟；`--gpu-only` 下文本编码器和 diffusion 模型都卸不出 GTT，`text_encoder_offload_device` / `unet_offload_device` 都是 GPU）：**
+
+* 常驻权重：diffusion 33.02 GiB + 文本编码器 16.80 GiB + VAE 0.31 GiB = **50.1 GiB**，离 GTT 上限 62.47 GiB 只剩约 12 GiB（再减去服务器进程和本进程的 HIP 上下文、各自的分配器缓存）。
+* **text**：GTT 增加约 16.8（权重）+ 不到 1 GiB；耗时主要是从磁盘读 18 GB（页缓存冷时几十秒）。第二张图只重新编码，几秒。
+* **sample**：GTT 再加 33.0（权重）+ 激活。激活多少取决于 ComfyUI 在 gfx1151 上用哪种注意力：split / sub-quadratic 按空闲内存切块，会用到剩下的大部分（1024² 预计 2–6 GiB，2048² 可能把剩下的 ~10 GiB 用满，但不该 OOM）；pytorch SDPA 如果走 math 内核，2048² 要 48 × 16896² × 2 B ≈ 27 GiB 的注意力矩阵，会 OOM。**哪种注意力看日志开头**（`Using ... attention`）。每步耗时粗估（32 B 参数、fp8 按层转成 bf16 算）：1024² 约 10–20 s，2048² 约 50–100 s；20 步约 4–7 / 17–33 分钟。两种模式应当一样（Monoload 不碰这个模型）。
+* **vae**（Flux 2 VAE 的数字来自 §10.5，1344×768 / 2688×1536 与 1024² / 2048² 面积相近）：
+  * `monoload`：第一层 B，1024² GTT 约 +0.63 GiB / 约 5 s（估算约 0.77），2048² 约 +1.35 / 约 20 s（估算约 1.65）；**两张都放得下**。
+  * `native`：1024² 原生约 +8.5 GiB / 约 1 s——加上常驻的 50.1 GiB 和采样留下的缓存，**可能放得下，也可能 OOM 退 tiled**；2048² 原生约 +43 GiB，**放不下**：`VAEDecode` 里 OOM → ComfyUI 自己退到 tiled 解码（日志 `Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.`，脚本记成 `native ran out of memory -> tiled`），慢一些，图像在 tile 接缝处与整图不同。
+* **对比**：latent max|Δ| 应为 0（两种模式的采样相同；如果 split 注意力按空闲内存切的块数不同，可能有极小的差别）。图像 PSNR：1024² 原生没有退 tiled 时约 64 dB（§10.5：Flux 2 第一层对原生 64.4–64.6 dB）；退了 tiled（2048² 一定）时更低（tiled 的接缝；这时 Monoload 的才是整图结果）。
+* 如果哪一步整个进程被杀（统一内存，GTT 用满时系统也会 OOM），把 `--res` 拆开单独跑，或者先只跑 `--modes monoload`。
+
+把 `flux2_dev.txt`、`flux2_dev.json` 和 `/opt/ComfyUI/output/flux2_dev/` 里的 PNG 发给我。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
