@@ -1797,6 +1797,22 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **4. 要用户定的：** 做哪几项、按什么顺序；方案 G 是否扩到 `vae_refiner.RMS_norm`；bench 要不要先加 `--frames`（README §9.22：现在 `bench_vae.py` 的随机 latent 只有 1 帧，不加就测不了视频的原生基线）。
 
+### 9.33 Flux 2 dev 整套真机跑（`tests/run_flux2_dev.py`）
+
+**要做什么：** CT 700（`--gpu-only`）上跑一遍标准的 Flux 2 dev 文生图（1024² 和 2048²，步数照官方工作流），分阶段记 GTT 峰值和耗时，Monoload 默认和 `MONOLOAD=0` 各一次，比较出图。
+
+**做法：**
+
+* 工作流照 ComfyUI 自带的蓝图「Text to Image (Flux.2 Dev)」（62b3c94 `blueprints/`）：`CLIPLoader`（flux2）→ `CLIPTextEncode` → `FluxGuidance` 4；`UNETLoader` → `EmptyFlux2LatentImage`、`Flux2Scheduler`（20 步）、`RandomNoise`、`KSamplerSelect`（euler）、`BasicGuider` → `SamplerCustomAdvanced`；`VAELoader` → `VAEDecode`。蓝图里的 Turbo LoRA 开关默认关，不用。
+* 在进程里按执行器的顺序直接调节点（V3 节点调 `execute`），不走 `/prompt`：每一阶段前后好同步、重置分配器的峰值、开关 GTT 采样线程（`bench_vae.Sampler`，sysfs `mem_info_gtt_used`，整机）。模型在两张图之间不卸载（和服务器一样）。
+* 两种模式各在一个子进程里：插件用 ComfyUI 的 custom node 加载器装上（和服务器一样；`MONOLOAD=0` 时钩子照装、直通）。插件的模块名是按路径起的，和测试工具 import 的顶层 `monoload` 不是同一份，所以脚本从 `comfy.sd.VAE.decode.__module__` 找插件自己的 `vae` / `settings` 来读解码记录。
+* VAE 阶段：原生 OOM → tiled 时，`VAE.decode_tiled_` 被数到（不拦，照常让它退），日志里的 OOM 警告也记下来。
+* 输出：每张图的最终 latent 和图像存成 `.pt` 和 PNG；父进程比较两种模式的 latent（max|Δ|）和图像（PSNR）。
+
+**CPU 冒烟测试（云端，加载器 / 文本编码 / 采样换成假的，VAE 用合成的小 LDM VAE）：** 两种模式的子进程、插件模块的查找、Monoload 解码记录（`layer1 (LDM stripes, GroupNorm scheme B, …)` / `native`）、父进程的汇总和比较都跑通。没有在真模型上跑过。
+
+**预期**（README §9.23）：常驻权重 50.1 GiB（`--gpu-only` 下文本编码器和 diffusion 模型都卸不出 GTT），离 62.47 GiB 的上限约 12 GiB；Monoload 的 VAE 解码两张都放得下（第一层 B，约 +0.6 / +1.35 GiB）；原生 1024² 约 +8.5 GiB，可能放得下也可能退 tiled，2048² 约 +43 GiB 一定退 tiled；采样阶段的激活取决于注意力实现，没有模拟。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
