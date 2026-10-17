@@ -1727,14 +1727,75 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **第一层：能做，比 §9.25 的设想简单得多（只做了分析，没有实现）。**
 
-* 和 Wan 2.2 单帧同类：没有整图统计（RMS 逐位置），没有统计遍、没有方案，只有条带高度；时间维始终 1，不需要「每行平面数」的引擎改动（§9.34 的那个改动只对 `refiner_vae=False` 有用）。
+* 和 Wan 2.2 单帧同类：没有整图统计（RMS 逐位置），没有统计遍、没有方案，只有条带高度；时间维始终 1，不需要「每行平面数」的引擎改动（分支上 §9.34 的那个改动只对 `refiner_vae=False` 有用）。
 * 前缀：`conv_in + repeat`、mid（含全局注意力，tokens = latent 像素）、`up[0]` 的三个块；单元：`UpSmpl`（第一帧那条路，×2，halo 2：输出第 2h + i 行只依赖卷积输出第 h 行）、每级的 `ResnetBlock`（halo 2）、`norm_out`、silu、`conv_out`。`CarriedConv3d` 在条带切口按复制补边：切口旁的行本来就在 halo 里、被丢掉；真正的上下边缘由模块自己复制补边，与整图相同。
 * **要先定的：**
   1. **方案 G 扩到 `vae_refiner.RMS_norm`**（通道 > 510：mid、s0、s1 的 1024 通道 17 个，s2 的 512 通道 6 个）。不扩的话，条带里 1024 通道的 norm 会像 Wan 2.2 当初那样申请 32 KiB / 位置的临时缓冲（落在 arena 外，估算不是上界）；用户以前定的范围是「Wan 的 RMS_norm」，这个类要另外定。实现：同一个 `_GroupedRMSNorm` 的变体（这个类没有 `channel_first` / `bias`：`F.normalize(x, dim=1) * scale * cast(gamma)`）。
   2. 自检的 fp32 副本：单帧时 `CarriedConv3d` 的输入是同一帧复制 3 份，输出 = (w₀ + w₁ + w₂) ∗ x，副本可以存三片之和的 1×3×3 核（数学上相同，舍入不同，fp32 下 ~1e-7）：872 M 参数 → 约 0.3 G，fp32 副本约 1.1 GiB，自检预计 1.5 GiB 左右（整核要 3.25 GiB + 参照解码）。
-  3. （可选，精度取舍）托管解码里单帧的 `CarriedConv3d` 改走 `F.conv2d`（三片之和的核）：vol2col 的列少 2/3，也去掉 SlowDilated3d 逐通道的 `fill_`（§9.13.9、§9.34）；但改变舍入（bf16 下权重先相加），所以不在已接受的精度取舍里。
+  3. （可选，精度取舍）托管解码里单帧的 `CarriedConv3d` 改走 `F.conv2d`（三片之和的核）：vol2col 的列少 2/3，也去掉 SlowDilated3d 逐通道的 `fill_`（§9.13.9；分支上的 §9.34）；但改变舍入（bf16 下权重先相加），所以不在已接受的精度取舍里。
 * **预期（粗估，没有模拟）：** 每级的通道和 Wan 2.2 相近（H/16 1024 … H/2 256），全分辨率只有 128 通道、没有 unpatchify：2048² 第一层约 0.7–1.0 GiB（Wan 2.2 4K 是 1.34，面积是它的一半），重算只有 halo（约 1.2–1.5 倍），耗时约第二层的 1.2–1.5 倍。与第二层（10.46 GiB）比降一个数量级。
 * 这个 decoder 也是 HunyuanVideo 1.5 的（多帧见 §9.32）：单帧第一层做了，多帧的第一层可以复用大部分。
+
+### 9.32 视频（多帧）：分析（先分析，等用户定；插件没有改）
+
+范围：§9.16 第四阶段盘点里的「视频」——多帧第二层（Wan 2.1 / 2.2、HunyuanVideo 1.0 / 1.5、CogVideoX、Cosmos；SVD 的整批第二层）、LTX（`output_buffer`）、视频第一层（Mochi 只有这一条路）。现在这些都走原生（`vae._native_reason`：T > 1 的 5D latent、`comfy_has_chunked_io`、SVD 的 batch 当时间轴）。
+
+**方法：** 读 62b3c94 的解码代码（下面的「解码路径」）；`tests/vae_inventory.py` 在 meta 上建出每种 VAE（交给 `comfy.sd.VAE` 自己识别），用 alloc_sim 的分配器模型追踪原生（`VAE.decode` 里那次 `first_stage_model.decode`，输出 fp32 也在设备上，`--gpu-only`）和第二层（同一个 decode 在 `OpChunking` 下，工作区 1 GiB）的 reserved 峰值，60 GiB 设备上限（超过记 OOM，原生在 CT 700 上就会退 tiled）；跟踪器同时模拟 ROCm 上 `vector_norm` 的归约临时缓冲（§9.28）。另外用现有的 `vae.estimate`（8×8 形状探测保留 T）算一下：如果现在就放开多帧，估算是不是上界。
+
+**1. 每种 VAE 的解码路径、原生峰值从哪来、第二层怎么套**
+
+| VAE（sd.py 识别） | 解码路径（62b3c94） | 原生峰值主要来自 | 第二层怎么套 |
+|---|---|---|---|
+| Wan 2.1（`wan/vae.py`；CT 700 的 `qwen_image_vae` 同结构）| `WanVAE.decode` 逐块：第一块 1 个 latent 帧、之后每块 2 帧，`feat_cache` 存每个 `CausalConv3d` 输入的最后 2 帧（视图，钉住整块输入），时间因果、前面补零；`Resample` 的时间上采样第一块跳过；输出各块进 Python 列表，最后 `torch.cat`（2 × 输出） | 全分辨率 2 帧的卷积（SlowDilated3d 的 vol2col 每输出 96 × 27 列）+ 各级缓存（约 4.8 KB / 输出像素）+ 输出列表和 cat | 卷积 / 注意力的替换原样适用（`CausalConv3d` 最后都是标准的 `_conv_forward`）；第一块 T=1 走 conv2d；RMS 最多 384 通道，不用分组 |
+| Wan 2.2（`vae2_2.py`）| 每块 1 个 latent 帧（第一块特殊：不做时间卷积、`DupUp3D` 丢掉多出的帧），缓存是 `clone()`、总是补成 2 帧（32 个，含两个 1024 通道的 `time_conv` 缓存）；输出每块 `torch.cat([out, out_])`（O(T²) 的拷贝），最后 `unpatchify` | i3 第一个块（8r、512 通道、4 帧）的卷积和 vol2col（约 28 KB / 像素）+ 缓存（约 3.6 KB / 像素）+ 2 × 输出 | 原样适用；1024 / 512 通道的 RMS 是 Wan 的类，方案 G 覆盖 |
+| HunyuanVideo 1.0（LDM `AutoencoderKL`，`conv3d`，`CarriedConv3d`）| `conv_in` 和 mid（含**跨全部帧的全局注意力**，tokens = T·h·w）在全部 latent 帧上，再 `torch.split(h, 2)` 逐块跑上采样路径；`CarriedConv3d` 复制补边、把补好的输入最后 2 帧 `clone()` 传给下一块；输出列表 + cat | 8r 的 `Upsample`（插值输出 + 复制补边的拷贝 + 卷积输出，约 14 KB / 像素）+ vol2col（约 110 KB / 像素）| 卷积 / 注意力原样适用；GroupNorm 不动（原生的语义本来就是每块各自统计） |
+| HunyuanVideo 1.5（`vae_refiner.py`，`refiner_vae=True`；官方 Refiner 文件同一个 decoder）| mid（全局注意力，T·h·w tokens）在全部帧上，`torch.split(x, 2)` 逐块；`UpSmpl` 首帧特例；`CarriedConv3d` 复制补边 + 2 帧 carry；输出列表 + cat | s3 / s4 的 `UpSmpl` 和块（约 10 KB / 像素）+ vol2col（约 55 KB / 像素）| 卷积 / 注意力原样适用；**`vae_refiner.RMS_norm`（1024 通道 17 个、512 通道 6 个）不是 Wan 的类，方案 G 不覆盖**（这个类也没有 `channel_first` / `bias`，要一个变体） |
+| CogVideoX（`cogvideo/vae.py`）| 第一段**整段视频**一起过 `conv_in`、mid、前两级上采样（时间 ×2），第二段每 4 帧一块过后两级，`conv_caches`；各块 `.cpu()` 存主机，最后整段 `torch.cat(...).to(device)`；第一段的输出一直活到最后 | 第一段整段视频的张量（4r、256 通道、全部帧：81 帧时约 31 KB / 像素）| 原样适用（T=1 的捷径 `F.conv3d` 绕过 `_conv_forward`，多帧不走它）；但第一段是整段视频，一行就带着全部帧 |
+| Cosmos（CV8x8x8）| **整段视频一次**过 decoder（没有分块、没有缓存）；因式分解卷积（1×3×3 + 3×1×1）、每帧的 1 组 GroupNorm、每帧空间注意力 + 每像素时间注意力；最后 haar 反变换 | 2r 整段视频的 4–6 份激活 | 卷积 / 空间注意力原样适用；时间注意力（内联 bmm）和 haar 的 `conv_transpose3d` 不分块 |
+| Mochi（`genmo`）| **整段视频一次**，没有分块；`PConv3d` 时间复制补边、空间 replicate；每帧 GroupNorm（每次 8 帧）；`DepthToSpaceTime` | 全分辨率、全部帧的最后几个块（每体素 128 通道，约 5 份）+ vol2col：720p 79 帧原生约 760 GiB | 原样适用（非 zeros 补边那条路），但一行就是全部帧（720p 一行约 1 GB），第二层不够 |
+| LTX-Video（0.9.x，`comfy_has_chunked_io`）| `sd.py` 预分配输出（`output_device`，fp32），传 `output_buffer`；decoder 每级之后按 `get_max_chunk_size`（按**总**显存 32–128 MiB）沿 T 切块递归，每块直接写进输出；非因果、首尾帧复制、reflect 空间补边；PixelNorm（1024 / 512 通道，`mean(x²)`）| 一块乘上那一级的膨胀；模拟的原生 reserved（30–59 GiB）远大于 alloc（6–10 GiB），是缓存碎片——**要真机确认** | `_run` 要改成把 `output_buffer` 传进去（现在会让它在 `intermediate_device` 上自己分配）；卷积原样适用；PixelNorm 的 1024 通道 `mean` 没有覆盖 |
+| SVD（`temporal_ae.VideoDecoder`，4D，batch 是时间轴）| `VAE.decode` 按 `free / memory_used` 把帧分成子批，每个子批当一段独立的视频（`timesteps=None` → 子批大小）：**原生的结果随空闲内存变** | 子批大小 × SD VAE 的激活 | 要整批（或与原生同样的子批）一次进 `OpChunking`；逐样本会改变结果（这就是现在走原生的原因） |
+
+**模拟（GiB，reserved；原生 > 60 记 OOM，CT 700 上会退 tiled；第二层工作区 1 GiB）：**
+
+| VAE | 832×480×81 原生 → 第二层 | 1280×720×81 原生 → 第二层 | 现有估算（若放开）| ROCm 归约缓冲（最大一次，原生 / 第二层）|
+|---|---|---|---|---|
+| Wan 2.1 | 8.72 → 4.96 | 20.29 → 8.99 | 3.51 / 5.48：**不是上界** | 0 / 0 |
+| Wan 2.2 | 17.90 → 5.20 | 40.49 → 9.47 | 4.54 / 7.85：**不是上界** | 0.76 · 0.88 / 0（分组） |
+| HunyuanVideo 1.0 | 74.1（OOM）→ 14.98 | 171（OOM）→ 37.88 | 10.47 / 21.54：**不是上界** | 0 / 0 |
+| HunyuanVideo 1.5 | 50.01 → 9.14 | 110（OOM）→ 22.95 | 6.29 / 11.90：**不是上界** | 1.00 · 0.88 / 1.00 · 0.88 |
+| CogVideoX | 53.12 → 19.28 | 121（OOM）→ 45.41 | 探测失败（读 meta 张量的值） | 0 / 0 |
+| Cosmos | 11.63 → 4.15 | 21.27 → 11.05 | 4.89（上界）/ 8.68：**不是上界** | 0 / 0 |
+| Mochi（848×480 / 1280×720 × 79 帧）| 337（OOM）→ 54.36 | 762（OOM）→ 106（OOM）| 33.0 / 72.3：**不是上界** | 0 / 0 |
+| LTX 0.9.0（1280×704）| 30.63 → 5.43 | 51.35 → 6.40 | 探测要先改（`output_buffer`） | 0 / 0 |
+| LTX 0.9.5+（`ltxv2`，1280×704）| 39.71 → 5.66 | 59.33 → 6.94 | 同上 | 0 / 0 |
+| SVD 1024×576（14 / 25 帧，整批）| 25.71 → 20.62 | 48.89 → 38.39 | 3.22 / 3.29（按单帧算）：**不是上界** | 0 / 0 |
+
+* 第二层在多帧上数值精确（§9.16 的小解码，相对误差 ≤ 2.3e-6），省下来的是：Wan 2.1 / 2.2 2–4 倍，两个 Hunyuan 5 倍左右（原生 OOM 的也能放下：1.0 的 720p 仍要 38 GiB），CogVideoX 2.7 倍（720p 仍 45 GiB），Cosmos 2–3 倍，LTX 5–9 倍（如果原生的碎片在真机上成立），SVD 只省 20%（GroupNorm 跨整批帧，活着的激活本来就按帧数乘）。Mochi 第二层不够（720p 仍 > 60 GiB）。
+* **现有估算对多帧基本都不是上界**：8×8 的形状探测保留了 T，但看不到缓存（Wan / Hunyuan 的每卷积缓存、carry）、输出列表和 `torch.cat`（2 × 输出，vae dtype，在设备上）、CogVideoX 一直活着的第一段整段视频、SVD 的整批。放开多帧时每种 decoder 都要补估算项（像 §9.27 那样按类型取：`retained`、`copies`，外加「输出列表 + cat」这一项），再用 alloc_sim 扫尺寸确认。
+* 1280×720 的 Wan 2.2：16 倍、720 / 16 = 45，宽高都可以；LTX 32 倍，用 1280×704。
+
+**2. 方案 G（ROCm 归约临时缓冲）对视频的影响**
+
+规则（§9.28，CT 700）：`vector_norm` 沿通道、通道 ≥ 1021、位置数是 4 的倍数且 ≤ 40960 时申请 32 KiB / 位置。多帧时位置数 = 这次调用的 T × H × W：
+
+* **Wan 2.1：** 最多 384 通道，任何路径都不触发。
+* **Wan 2.2：** 每块 1 个 latent 帧。1024 通道的 norm：r 级（middle、upsamples.0）位置 = h·w（832×480 1560 → 48.75 MiB，720p 3600 → 112.5 MiB）；2r（upsamples.1，2 帧）12480 → 390 MiB / 28800 → 900 MiB；第一块只有 1 帧，4r 的第一个 norm 24960 → 780 MiB（832×480）；4r 的其他块是 512 通道，不触发。**原生**模拟里最大一次 0.76 / 0.88 GiB（在低分辨率的几级，不是峰值，原生峰值 17.9 / 40.5 GiB 在 8r）。**第二层里 `OpChunking` 已经把它们换成分组求范数**，不会触发；分组的临时量是 1 MiB + 每位置约 30 B，多帧第二层的峰值不受影响。
+* **HunyuanVideo 1.5（和官方 Refiner 文件）：** `vae_refiner.RMS_norm` 不在方案 G 里。mid 在全部帧上：832×480 21 × 1560 = 32760 → **1 GiB**；720p 75600 位置不触发；逐块的 s0（2 帧）3120 / 7200 → 97.5 / 225 MiB，s1（4 帧）24960 → 780 MiB / 57600 不触发。模拟的第二层里最大一次 1.00 / 0.88 GiB，同样在低分辨率、不是峰值，但它落在缓存外面、开新段；做这个 VAE 的第二层或第一层时应该把方案 G 扩到这个类（要用户定）。
+* **LTX：** PixelNorm 是 `mean(x²)`（同一个归约内核框架，1024 通道），按道理也会触发，跟踪器没有模拟，**没有核实**；LTX 现在走原生。
+* HunyuanVideo 1.0、CogVideoX、Cosmos、Mochi、SVD 用 GroupNorm，不走这个内核。
+
+**3. 建议的顺序（收益 / 工作量）**
+
+1. **Wan 2.1 / 2.2 多帧第二层**：工作量小（替换都已适用，方案 G 已覆盖；要补的是缓存和输出列表的估算项、`_native_reason` 放开、alloc_sim 扫尺寸），收益 2–4 倍；用户手上已有这两个 VAE。
+2. **HunyuanVideo 1.5 多帧第二层**（顺带：官方 Refiner 单帧的第一层，§9.31）：原生 720p 放不下 → 23 GiB；要先定方案 G 扩到 `vae_refiner.RMS_norm`。
+3. **HunyuanVideo 1.0 / CogVideoX**：原生 OOM → 15–45 GiB；CogVideoX 第一段是整段视频，720p 还是 45 GiB，以后要第一层才行。
+4. **Cosmos**：2–3 倍，整段一次，工作量小。
+5. **LTX**：先用真机确认原生的碎片（模拟 30–59 GiB 对 alloc 6–10 GiB）；再把 `output_buffer` 接进第二层。
+6. **SVD 整批第二层**：只省 20%，而且要先决定按什么分批（原生的结果随空闲内存变）。
+7. **视频第一层**（Mochi 的唯一出路；HunyuanVideo / CogVideoX 要再降的话）：时间分块 + 缓存 + 条带一起做，工作量最大，等前面的做完、有需要再说。
+
+**4. 要用户定的：** 做哪几项、按什么顺序；方案 G 是否扩到 `vae_refiner.RMS_norm`；bench 要不要先加 `--frames`（README §9.22：现在 `bench_vae.py` 的随机 latent 只有 1 帧，不加就测不了视频的原生基线）。
 
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 

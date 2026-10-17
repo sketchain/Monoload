@@ -1328,6 +1328,71 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 
 把 W / RA / RB 的输出和 JSON 发给我。
 
+### 9.22 视频（多帧）：要下的文件和 bench 命令（DESIGN §9.32，先分析）
+
+**状态：只有分析，插件没有改，视频照旧走原生。** 下面的命令要先给 `tests/bench_vae.py` 加一个 `--frames N`（随机 latent 的帧数；现在只生成 1 帧，测不了视频）。这是测试工具的改动，**还没做**，等你定（DESIGN §9.32 第 4 点）。
+
+**文件**（字节数、sha256 来自 HF API；都不用登录，`resolve` 链接直接 302；放到 `/models/comfy/vae/`，LTX 和 SVD 是 checkpoint，放 `/models/comfy/checkpoints/`）：
+
+| VAE | 仓库 / 路径 | 字节 | sha256 | 登录 | 链接 |
+|---|---|---|---|---|---|
+| Wan 2.1（可选：CT 700 的 `qwen_image_vae` 是同一结构） | Comfy-Org/Wan_2.1_ComfyUI_repackaged `split_files/vae/wan_2.1_vae.safetensors` | 253,815,318 | `2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b` | 不用 | https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors |
+| Wan 2.2（CT 700 已有 `wan2.2_vae.safetensors`） | Comfy-Org/Wan_2.2_ComfyUI_Repackaged `split_files/vae/wan2.2_vae.safetensors` | 1,409,400,960 | `e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156` | 不用 | https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/vae/wan2.2_vae.safetensors |
+| HunyuanVideo 1.0 | Comfy-Org/HunyuanVideo_repackaged `split_files/vae/hunyuan_video_vae_bf16.safetensors` | 492,984,198 | `e8f8553275406d84ccf22e7a47601650d8f98bdb8aa9ccfdd6506b57a9701aed` | 不用 | https://huggingface.co/Comfy-Org/HunyuanVideo_repackaged/resolve/main/split_files/vae/hunyuan_video_vae_bf16.safetensors |
+| HunyuanVideo 1.5（可选：§9.21 的 Refiner 文件是同一个 decoder） | Comfy-Org/HunyuanVideo_1.5_repackaged `split_files/vae/hunyuanvideo15_vae_fp16.safetensors` | 2,521,292,758 | `e7c3091949c27e2d55ae6d5df917b99dadfebbf308e5a50d0ade0d16c90297ae` | 不用 | https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged/resolve/main/split_files/vae/hunyuanvideo15_vae_fp16.safetensors |
+| CogVideoX（diffusers 格式，ComfyUI 的 VAELoader 直接认） | zai-org/CogVideoX-5b `vae/diffusion_pytorch_model.safetensors` | 862,388,596 | `a410e48d988c8224cef392b68db0654485cfd41f345f4a3a81d3e6b765bb995e` | 不用 | https://huggingface.co/zai-org/CogVideoX-5b/resolve/main/vae/diffusion_pytorch_model.safetensors |
+| Cosmos 1.0（CV8x8x8） | comfyanonymous/cosmos_1.0_text_encoder_and_VAE_ComfyUI `vae/cosmos_cv8x8x8_1.0.safetensors` | 211,344,924 | `e4478fa8629160d16262276e52bdea91ecef636b005a2a29e93a3d7764e0863b` | 不用 | https://huggingface.co/comfyanonymous/cosmos_1.0_text_encoder_and_VAE_ComfyUI/resolve/main/vae/cosmos_cv8x8x8_1.0.safetensors |
+| Mochi | Comfy-Org/mochi_preview_repackaged `split_files/vae/mochi_vae.safetensors` | 919,544,702 | `1be451cec94b911980406169286babc5269e7cf6a94bbbbdf45e8d3f2c961083` | 不用 | https://huggingface.co/Comfy-Org/mochi_preview_repackaged/resolve/main/split_files/vae/mochi_vae.safetensors |
+| LTX-Video 0.9.8 2B（checkpoint，VAE 在里面，是 0.9.5 以后那一版） | Lightricks/LTX-Video `ltxv-2b-0.9.8-distilled-fp8.safetensors` | 4,461,695,684 | `d6d8fa8ed3a98346787c2503ac80fb5d7cebcf80e356b79a2ba361fbadf97e15` | 不用 | https://huggingface.co/Lightricks/LTX-Video/resolve/main/ltxv-2b-0.9.8-distilled-fp8.safetensors |
+| SVD-XT（checkpoint，VAE 在里面） | stabilityai/stable-video-diffusion-img2vid-xt `svd_xt.safetensors` | 9,559,625,980 | `b2652c23d64a1da5f14d55011b9b6dce55f2e72e395719f1cd1f8a079b00a451` | 不用 | https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt/resolve/main/svd_xt.safetensors |
+
+```bash
+cd /models/comfy/vae && wget -O hunyuan_video_vae_bf16.safetensors https://huggingface.co/Comfy-Org/HunyuanVideo_repackaged/resolve/main/split_files/vae/hunyuan_video_vae_bf16.safetensors && sha256sum hunyuan_video_vae_bf16.safetensors   # e8f8553275406d84ccf22e7a47601650d8f98bdb8aa9ccfdd6506b57a9701aed
+cd /models/comfy/vae && wget -O hunyuanvideo15_vae_fp16.safetensors https://huggingface.co/Comfy-Org/HunyuanVideo_1.5_repackaged/resolve/main/split_files/vae/hunyuanvideo15_vae_fp16.safetensors && sha256sum hunyuanvideo15_vae_fp16.safetensors   # e7c3091949c27e2d55ae6d5df917b99dadfebbf308e5a50d0ade0d16c90297ae
+cd /models/comfy/vae && wget -O cogvideox_5b_vae.safetensors https://huggingface.co/zai-org/CogVideoX-5b/resolve/main/vae/diffusion_pytorch_model.safetensors && sha256sum cogvideox_5b_vae.safetensors   # a410e48d988c8224cef392b68db0654485cfd41f345f4a3a81d3e6b765bb995e
+cd /models/comfy/vae && wget -O cosmos_cv8x8x8_1.0.safetensors https://huggingface.co/comfyanonymous/cosmos_1.0_text_encoder_and_VAE_ComfyUI/resolve/main/vae/cosmos_cv8x8x8_1.0.safetensors && sha256sum cosmos_cv8x8x8_1.0.safetensors   # e4478fa8629160d16262276e52bdea91ecef636b005a2a29e93a3d7764e0863b
+cd /models/comfy/vae && wget -O mochi_vae.safetensors https://huggingface.co/Comfy-Org/mochi_preview_repackaged/resolve/main/split_files/vae/mochi_vae.safetensors && sha256sum mochi_vae.safetensors   # 1be451cec94b911980406169286babc5269e7cf6a94bbbbdf45e8d3f2c961083
+cd /models/comfy/checkpoints && wget -O ltxv-2b-0.9.8-distilled-fp8.safetensors https://huggingface.co/Lightricks/LTX-Video/resolve/main/ltxv-2b-0.9.8-distilled-fp8.safetensors && sha256sum ltxv-2b-0.9.8-distilled-fp8.safetensors   # d6d8fa8ed3a98346787c2503ac80fb5d7cebcf80e356b79a2ba361fbadf97e15
+cd /models/comfy/checkpoints && wget -O svd_xt.safetensors https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt/resolve/main/svd_xt.safetensors && sha256sum svd_xt.safetensors   # b2652c23d64a1da5f14d55011b9b6dce55f2e72e395719f1cd1f8a079b00a451
+```
+
+**bench（加了 `--frames` 之后）：** 现在 Monoload 对多帧走原生，所以先测原生的基线（`--modes native`）；做了第二层以后再加 `monoload-l2`。每个 VAE 一条：
+
+```bash
+# V1–V7（832x480 和 1280x720，81 帧；Mochi 79 帧 / 848x480，LTX 1280x704）
+for v in qwen_image_vae.safetensors wan2.2_vae.safetensors hunyuan_video_vae_bf16.safetensors hunyuanvideo15_vae_fp16.safetensors \
+         cogvideox_5b_vae.safetensors cosmos_cv8x8x8_1.0.safetensors; do
+  docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py --vae $v --res 832x480,1280x720 --frames 81 \
+    --modes native --warm 0 --json /opt/ComfyUI/output/bench_video_${v%.safetensors}.json 2>&1 | tee bench_video_${v%.safetensors}.txt
+done
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py --vae mochi_vae.safetensors --res 848x480 --frames 79 \
+  --modes native --warm 0 2>&1 | tee bench_video_mochi.txt
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py --checkpoint ltxv-2b-0.9.8-distilled-fp8.safetensors \
+  --res 832x480,1280x704 --frames 81 --modes native --warm 0 2>&1 | tee bench_video_ltxv.txt
+# V8. SVD：batch 当时间轴（14 / 25 帧 = batch 14 / 25，--frames 对 2D latent 是 batch）
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae.py --checkpoint svd_xt.safetensors \
+  --res 1024x576 --frames 25 --modes native --warm 0 2>&1 | tee bench_video_svd.txt
+```
+
+**逐行预测**（GiB，GTT ≈ reserved；`tests/alloc_sim.py` 的模拟，DESIGN §9.32；「第二层」一列是做了之后的，现在测不到）：
+
+| VAE | 832×480×81 原生 | 第二层 | 1280×720×81 原生 | 第二层 |
+|---|---|---|---|---|
+| Wan 2.1（`qwen_image_vae`）| 8.72 | 4.96 | 20.29 | 8.99 |
+| Wan 2.2 | 17.90 | 5.20 | 40.49 | 9.47 |
+| HunyuanVideo 1.0 | **OOM**（模拟 74）→ tiled | 14.98 | **OOM**（171）| 37.88 |
+| HunyuanVideo 1.5 | 50.01（接近上限）| 9.14 | **OOM**（110）| 22.95 |
+| CogVideoX | 53.12（接近上限）| 19.28 | **OOM**（121）| 45.41 |
+| Cosmos | 11.63 | 4.15 | 21.27 | 11.05 |
+| Mochi（848×480×79）| **OOM**（337）| 54.36 | — | — |
+| LTX 0.9.8（1280×704）| 39.71（alloc 只有 6.64：模拟的碎片，要看实测）| 5.66 | 59.33（alloc 9.57）| 6.94 |
+| SVD-XT 1024×576（25 帧整批）| 48.89 | 38.39 | — | — |
+
+* 「OOM」：原生放不下，ComfyUI 退到 tiled；bench 记「native ran out of memory」并跳过（不算原生的结果）。
+* 耗时这次不预测：CT 700 上没有任何多帧解码的实测，5D 卷积走 SlowDilated3d（逐通道 `fill_`，分支 vae-refiner-layer1 的 DESIGN §9.34 里估过它在 `refiner_vae=False` 的第一层里占多少），换算误差太大。原生的这批实测正好拿来校准。
+* SVD：原生按 `free / memory_used` 分子批、每个子批当一段独立的视频解码（结果随空闲内存变），bench 的数字是当时那种分法的。
+* 1280×720 的 LTX 宽高要是 32 的倍数，用 1280×704。
+
 ## 10. 真机验收结果（CT 700，2026-10）
 
 * **9.1 第一轮**（WAI v17 SDXL，1344×768，20 步，CFG 6）。当时插件只有逐位一致路径，这一条里的 Monoload 数字都是逐位一致路径，也就是现在的 `MONOLOAD_EXACT=1`，不是现在的默认路径：
