@@ -1501,6 +1501,8 @@ c = { 前缀（H/8，整图一次）: 1.35, H/4: 0.113, H/2: 0.129, H: 0.269 }
 
 ### 9.25 HunyuanImage 2.1 Refiner 的第一层：分析（先分析，等用户定）
 
+**更正（2026-10，§9.31）：这一节分析的是 sd.py 的 `refiner_vae=False` 那一支（5D `decoder.conv_in.weight`、GroupNorm），不是官方 Refiner 文件。** 官方的 `hunyuan_image_refiner_vae_fp16.safetensors` 是 `decoder.conv_in.conv.weight`、RMS norm，建出 `refiner_vae=True` 的 decoder（与 HunyuanVideo 1.5 相同），单张图在里面始终是 1 帧。下面的结构、代理模拟、耗时和自检都只对 `refiner_vae=False` 成立。
+
 **结构（62b3c94，`comfy/ldm/hunyuan_video/vae_refiner.py`、`comfy/sd.py`，meta 上建出来核对）：** `comfy.sd.VAE` 看到 5D 的 `decoder.conv_in.weight`、输入 32 通道，建 `AutoencodingEngine` + `vae_refiner.Decoder(refiner_vae=False)`，`latent_dim` 3、`not_video` True、空间 16 倍、`ffactor_temporal` 4。`refiner_vae=False` 时卷积是普通的 `ops.Conv3d`（3×3×3，padding 1：**时间上两边补零，非因果**），归一化是 `Normalize` = GroupNorm 32 组（5D 上统计 C/32 × T × H × W：**跨帧**），中间的注意力是 `AttnBlock`（3D）。decoder 872 M 参数（encoder 390 M）。单张图（latent T=1）的解码：
 
     x = conv_in(z) + z.repeat_interleave(32, 1)                    H/16, 1024 ch, T=1
@@ -1678,9 +1680,11 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **测试（`tests/test_vae_wan22.py` 第 7、8 节，66 项）：** 1024 通道的 RMS_norm 只在 `OpChunking` 里被换、384 通道不换；与模块自己的 forward 比 fp32 ≤ 1e-6（相对）、bf16 ≤ 1 ulp，384 通道逐位相同；替换期间 `hooked_module` 返回 None；退出后没有残留；`norm_groups` / `grouped_norm_bytes`；把阈值降到 16 通道让小模型的 47 个 norm 都换：第一层（7 行 / 默认）、第二层、自检都与原生一致（≤ 1e-5），条带里 OOM 时替换已装上、重试后一致且恢复；替换生效期间一次识别都没有（间谍记录 5 次识别，全在替换之外）；alloc_sim：不用 G 复现 CT 700 的 4K 默认，用 G 时 7 个第一层配置 reserved ≤ 估算、自检 ≤ 上界、第二层 ≤ 估算。
 
-### 9.30 HunyuanImage 2.1 Refiner 的第二层估算（vae-refiner-l2-estimate）
+### 9.30 `vae_refiner.Decoder(refiner_vae=False)` 的第二层估算（vae-refiner-l2-estimate）
 
-**问题（已确认）：** `tests/alloc_sim.py` 加了 Refiner 的真实结构（`--model hyr`：`AutoencodingEngine` + `vae_refiner.Decoder(refiner_vae=False)`，z 32、16 倍，5D latent T=1；§9.25 用的是代理），第二层（默认工作区 1 GiB，bf16）：
+**更正（docs-refiner-file，§9.31）：** 这一节写的时候以为它是官方 Refiner 文件的 decoder，其实是 sd.py 的 `refiner_vae=False` 那一支。下面的问题和修正对这一支成立（代码按类型、只对 `refiner_vae is False` 生效，不影响别的 decoder）；**官方 Refiner 文件（`refiner_vae=True`）的第二层估算本来就是上界**，没有这个问题（§9.31）。
+
+**问题（已确认，对 `refiner_vae=False`）：** `tests/alloc_sim.py` 加了这一支的结构（`--model hyr`：`AutoencodingEngine` + `vae_refiner.Decoder(refiner_vae=False)`，z 32、16 倍，5D latent T=1；§9.25 用的是代理），第二层（默认工作区 1 GiB，bf16）：
 
 | 输出 | 模拟 reserved / alloc | 以前的估算（4 份） | 需要的份数 |
 |---|---|---|---|
@@ -1697,6 +1701,40 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 **估算变化：** 1344 7.92（以前 5.95）、2048² 26.05（18.05）。第二层的预算比较、`load_models_gpu` 的 `memory_required` 都用它。第一层（§9.31）的自检上界也读适配器的 `activation_copies`。
 
 **测试（`tests/test_vae_refiner.py` 第 1、2 节）：** `comfy.sd.VAE` 从小的 state dict 建出 Refiner（`refiner_vae` False、`latent_dim` 3）；第二层估算 = 4 份 + 2 份激活，什么都不留；挂 forward hook 后仍是 6 份；托管解码走第二层、与原生相同；`refiner_vae=True` 的 decoder 是通用的 4 份；alloc_sim（全尺寸，meta）：1344 / 1536² / 2048² 模拟 ≤ 估算，2048² 时 4 份不是上界。
+
+### 9.31 官方 HunyuanImage 2.1 Refiner 文件：它是 `refiner_vae=True` 的 decoder（更正；第一层只做分析）
+
+**怎么发现的：** 实现 `refiner_vae=False` 的第一层之后（§9.34，分支 vae-refiner-layer1，未合并），用下载的真实文件在 CPU 上核对，适配器不认它：`hunyuan_image_refiner_vae_fp16.safetensors`（Comfy-Org/HunyuanImage_2.1_ComfyUI，2025-09-12 上传，2,521,292,694 字节，sha256 e1b74e85…db769）有 218 个键，`decoder.conv_in.conv.weight` [1024, 32, 3, 3, 3]、`decoder.mid.block_1.norm1.gamma` [1024, 1, 1, 1]，没有 `decoder.conv_in.weight`。sd.py（62b3c94）按键名：
+
+* 第 599 行：`decoder.conv_in.weight` 是 5D、32 通道 → `refiner_vae=False`（`ops.Conv3d`、GroupNorm、一张图解成 4 帧取最后一帧、`not_video` True）。这一支是 ComfyUI #10150「Support the new hunyuan vae」（2025-10-01）加的，我没找到用它的公开 ComfyUI 文件（也许是 HunyuanImage 3.0 的 VAE，没有核实）。
+* 第 713 行：`decoder.conv_in.conv.weight`、32 通道 → `vae_refiner.Decoder` 用默认的 `refiner_vae=True`（`CarriedConv3d`、`vae_refiner.RMS_norm`、`EmptyRegularizer`、`not_video` False）。Refiner 本来的支持（#9817，2025-09-11）就是这个键名；后来 HunyuanVideo 1.5 也用这一支（`hunyuanvideo15_vae_fp16.safetensors` 2,521,292,758 字节，同一个 decoder）。**官方 Refiner 文件走这一支。**
+
+§9.25 的分析和 `tests/vae_inventory.py` 的标签把两支对错了（`hy_refiner` 其实是 `refiner_vae=False`），这一轮的第一、二项照它做的。已改正：vae_inventory 的标签、alloc_sim 加了 `--model hv15`（真实结构），§9.25 / §9.30 加了更正。
+
+**官方文件的单帧解码（62b3c94 `vae_refiner.py`）：** `x = conv_in(z) + z.repeat_interleave(32, 1)` → mid（`ResnetBlock` ×2、`AttnBlock`，norm 是 RMS）→ `torch.split(x, 2, dim=2)`（T=1：一块）→ 5 级（1024 / 1024 / 512 / 256 / 128 通道，前 4 级末尾 `UpSmpl`）→ `norm_out`（RMS）→ silu → `conv_out`。`CarriedConv3d` 先 `F.pad(x, (1, 1, 1, 1, 2, 0), mode="replicate")`（宽高各补 1 行 / 列复制，时间前面补 2 帧复制），内层 `ops.Conv3d` 不补边；`UpSmpl` 在 `refiner_vae` 且没有 carry 时第一帧单独处理（只做空间的 2×2 重排、取一半通道），**单张图的 T 始终是 1**（不是 §9.25 说的 4 帧）。归一化是逐位置的 RMS（`F.normalize` 沿通道），**没有 GroupNorm、没有整图统计**。
+
+**模拟（`tests/alloc_sim.py --model hv15` / `vae_inventory` 的 `hy_video15`，bf16，GiB）：**
+
+| 输出 | 原生 | 第二层（估算，4 份激活） | 整图卷积乘加 |
+|---|---|---|---|
+| 1344×768 | 13.33 | 3.70（5.06） | 16.7 万亿 |
+| 1536×1536 | 30.43 | 5.65（8.99） | — |
+| 2048×2048 | 52.59 | 10.46（14.43） | 67.8 万亿 |
+| 2560×1536 | 49.28 | 9.05（13.65） | 63.6 万亿 |
+
+* **第二层估算是上界**（需要的份数最多 2.72），不用改；`decoder_terms` 对 `refiner_vae=True` 返回 None（通用的 4 份），测试检查（`test_vae_refiner`）。
+* ROCm 的归约临时缓冲（§9.28）：`vae_refiner.RMS_norm` 不是 Wan 的类，方案 G 不替换它；1024 通道的那 17 个（mid、s0、s1）在位置数 ≤ 40960 时触发。模拟里第二层的最大一次 504 / 1152 / 512 / 480 MiB（1344 / 1536² / 2048² / 2560×1536），都在低分辨率的几级、被 2 × 工作区盖住，所以第二层估算仍是上界。
+
+**第一层：能做，比 §9.25 的设想简单得多（只做了分析，没有实现）。**
+
+* 和 Wan 2.2 单帧同类：没有整图统计（RMS 逐位置），没有统计遍、没有方案，只有条带高度；时间维始终 1，不需要「每行平面数」的引擎改动（§9.34 的那个改动只对 `refiner_vae=False` 有用）。
+* 前缀：`conv_in + repeat`、mid（含全局注意力，tokens = latent 像素）、`up[0]` 的三个块；单元：`UpSmpl`（第一帧那条路，×2，halo 2：输出第 2h + i 行只依赖卷积输出第 h 行）、每级的 `ResnetBlock`（halo 2）、`norm_out`、silu、`conv_out`。`CarriedConv3d` 在条带切口按复制补边：切口旁的行本来就在 halo 里、被丢掉；真正的上下边缘由模块自己复制补边，与整图相同。
+* **要先定的：**
+  1. **方案 G 扩到 `vae_refiner.RMS_norm`**（通道 > 510：mid、s0、s1 的 1024 通道 17 个，s2 的 512 通道 6 个）。不扩的话，条带里 1024 通道的 norm 会像 Wan 2.2 当初那样申请 32 KiB / 位置的临时缓冲（落在 arena 外，估算不是上界）；用户以前定的范围是「Wan 的 RMS_norm」，这个类要另外定。实现：同一个 `_GroupedRMSNorm` 的变体（这个类没有 `channel_first` / `bias`：`F.normalize(x, dim=1) * scale * cast(gamma)`）。
+  2. 自检的 fp32 副本：单帧时 `CarriedConv3d` 的输入是同一帧复制 3 份，输出 = (w₀ + w₁ + w₂) ∗ x，副本可以存三片之和的 1×3×3 核（数学上相同，舍入不同，fp32 下 ~1e-7）：872 M 参数 → 约 0.3 G，fp32 副本约 1.1 GiB，自检预计 1.5 GiB 左右（整核要 3.25 GiB + 参照解码）。
+  3. （可选，精度取舍）托管解码里单帧的 `CarriedConv3d` 改走 `F.conv2d`（三片之和的核）：vol2col 的列少 2/3，也去掉 SlowDilated3d 逐通道的 `fill_`（§9.13.9、§9.34）；但改变舍入（bf16 下权重先相加），所以不在已接受的精度取舍里。
+* **预期（粗估，没有模拟）：** 每级的通道和 Wan 2.2 相近（H/16 1024 … H/2 256），全分辨率只有 128 通道、没有 unpatchify：2048² 第一层约 0.7–1.0 GiB（Wan 2.2 4K 是 1.34，面积是它的一半），重算只有 halo（约 1.2–1.5 倍），耗时约第二层的 1.2–1.5 倍。与第二层（10.46 GiB）比降一个数量级。
+* 这个 decoder 也是 HunyuanVideo 1.5 的（多帧见 §9.32）：单帧第一层做了，多帧的第一层可以复用大部分。
 
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 

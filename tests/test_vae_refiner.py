@@ -1,5 +1,5 @@
-"""The HunyuanImage 2.1 Refiner VAE (comfy.ldm.hunyuan_video.vae_refiner.Decoder, refiner_vae=False;
-DESIGN §9.25 / §9.30).
+"""sd.py's vae_refiner.Decoder with refiner_vae=False (DESIGN §9.30), and the official HunyuanImage 2.1 Refiner file's
+decoder (refiner_vae=True, the same as HunyuanVideo 1.5's: DESIGN §9.31).
 
 No model files needed: ComfyUI's own AutoencodingEngine with vae_refiner.Decoder / Encoder with small channels and
 random weights, through comfy.sd.VAE (it detects the kind from the 5D decoder.conv_in with 32 input channels; its
@@ -8,9 +8,10 @@ on the CPU unless noted.
 
   1. layer-2 estimate: 6 activation copies for this decoder, by its class (a forward hook does not change it);
      HunyuanVideo 1.5 (the same class with refiner_vae=True) keeps the generic 4; the managed decode == native;
-  2. caching allocator (tests/alloc_sim.py / vae_inventory.py, full-size Refiner on the meta device): layer 2's
-     simulated reserved peak <= the layer-2 estimate (1344x768, 1536x1536, 2048x2048; the 4 generic copies are
-     not a bound at 2048x2048).
+  2. caching allocator (tests/alloc_sim.py / vae_inventory.py, full size on the meta device): layer 2's simulated
+     reserved peak <= the layer-2 estimate (1344x768, 1536x1536, 2048x2048; for refiner_vae=False the 4 generic copies
+     are not a bound at 2048x2048); the official Refiner file's decoder (refiner_vae=True, single frame) keeps the
+     generic 4, an upper bound at the same sizes.
 
     python tests/test_vae_refiner.py
 """
@@ -42,7 +43,7 @@ def refiner_model(**kw):
 
 
 def refiner_vae(dtype=None, model=None):
-    """comfy.sd.VAE on a small Refiner state dict (sd.py's block_out_channels swapped for BOC while it builds)."""
+    """comfy.sd.VAE on a small refiner_vae=False state dict (sd.py's block_out_channels swapped for BOC while it builds)."""
     m = model if model is not None else refiner_model()
     hyr.Decoder = lambda **kw: _DEC(**dict(kw, block_out_channels=BOC))
     hyr.Encoder = lambda **kw: _ENC(**dict(kw, block_out_channels=BOC))
@@ -59,7 +60,7 @@ def lat_(h, w, b=1, seed=4):
 def estimate_tests():
     v = refiner_vae()
     dec = v.first_stage_model.decoder
-    check("comfy.sd.VAE builds the Refiner: vae_refiner.Decoder, refiner_vae False, latent_dim 3",
+    check("comfy.sd.VAE builds the refiner_vae=False decoder (a 5D decoder.conv_in.weight): vae_refiner.Decoder, latent_dim 3",
           type(dec) is _DEC and not dec.refiner_vae and v.latent_dim == 3)
     lat = lat_(5, 6)
     est, probe = mvae._layer2_estimate(v, lat, {}, mvae.workspace())
@@ -100,11 +101,25 @@ def allocator_tests():
             p = mvae._probe(v, lat, {})
         est = mvae.estimate(v, lat, mvae.DEFAULT_WORKSPACE, p, **mvae._decoder_terms(v, lat))
         four = mvae.estimate(v, lat, mvae.DEFAULT_WORKSPACE, p)
-        check("Refiner {}x{} layer 2: simulated reserved {:.2f} GiB <= estimate {:.2f} GiB (6 activation copies; 4 would give {:.2f})".format(
+        check("refiner_vae=False {}x{} layer 2: simulated reserved {:.2f} GiB <= estimate {:.2f} GiB (6 activation copies; 4 would give {:.2f})".format(
             w, h, t["reserved"] / G, est["total"] / G, four["total"] / G), t["reserved"] <= est["total"])
         if (w, h) == (2048, 2048):
             check("... at 2048x2048 the generic 4 copies are not a bound ({:.2f} > {:.2f} GiB)".format(t["reserved"] / G, four["total"] / G),
                   t["reserved"] > four["total"])
+    kind = next(k for k in vi.KINDS if k[0] == "hy_video15")
+    v = vi.build(kind)
+    for w, h in ((1344, 768), (1536, 1536), (2048, 2048)):
+        shape = vi.latent_shape(v, w, h, 1)
+        t = vi.trace(v, shape, 2)
+        lat = torch.empty(shape, device="meta", dtype=v.vae_dtype)
+        with alloc_sim._patched(mvae.mm, "get_free_memory", lambda dev=None, torch_free_too=False: (48 << 30, 48 << 30) if torch_free_too else 48 << 30):
+            mvae._PROBES.clear()
+            p = mvae._probe(v, lat, {})
+        terms = mvae._decoder_terms(v, lat)
+        est = mvae.estimate(v, lat, mvae.DEFAULT_WORKSPACE, p, **terms)
+        check("official Refiner file's decoder (refiner_vae=True) {}x{} layer 2: {} activation copies, simulated reserved {:.2f} GiB <= estimate "
+              "{:.2f} GiB".format(w, h, terms["copies"], t["reserved"] / G, est["total"] / G),
+              terms["copies"] == mvae.ACTIVATION_COPIES and t["reserved"] <= est["total"])
 
 
 def main():
