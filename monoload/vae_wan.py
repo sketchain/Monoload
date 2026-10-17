@@ -22,6 +22,7 @@ from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
 from . import vae_engine as eng
 from .vae_engine import CONV, POINT, RES, UP, Unit, conv_extra, conv_io
+from .vae_ops import grouped_norm_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +181,9 @@ def signature(fsm, units):
 # slice), A / B one plane of input / output channels on the rows the module
 # runs on, e = element size.
 #   RMS_norm       F.normalize(x) * scale * gamma + 0: two temporaries at a time   S + 2A
+#                  (more than vae_ops.GROUP_NORM_MAX channels, Wan 2.2: the grouped norm's
+#                  temporaries on top, vae_ops.grouped_norm_bytes; the same in the norms of the
+#                  blocks below)
 #   ResidualBlock  RMS 2A | SiLU out + conv1 out + conv1 extra | RMS on conv1 out 3B
 #                  | conv2 in + out + extra | x + shortcut(old_x) 2B (3B and the
 #                  1x1 conv's input copy + columns with a shortcut conv)        S + max(...)
@@ -193,9 +197,9 @@ def signature(fsm, units):
 
 def res_peak(cin, cout, shortcut, r, w, e, ws, s):
     a, b = r * w * cin * e, r * w * cout * e
-    phases = [2 * a,
+    phases = [2 * a + grouped_norm_bytes(cin, r * w, e),
               a + b + conv_extra(cin, cout, 3, r, r, w, w, e, ws),
-              3 * b,
+              3 * b + grouped_norm_bytes(cout, r * w, e),
               2 * b + conv_extra(cout, cout, 3, r, r, w, w, e, ws),
               2 * b]
     if shortcut:
@@ -216,7 +220,7 @@ def unit_peak(u, r, w, e, ws, s):
         return up_peak(u.cin, u.cout, r, w, e, ws, s)
     if u.kind == CONV:
         return s + r * w * u.cout * e + conv_extra(u.cin, u.cout, 3, r, r, w, w, e, ws, contiguous=False)
-    return s + 2 * r * w * u.cin * e
+    return s + 2 * r * w * u.cin * e + (grouped_norm_bytes(u.cin, r * w, e) if isinstance(u.module, wan.RMS_norm) else 0)
 
 
 def unit_largest(u, r, w, e, ws):
@@ -252,7 +256,7 @@ def attention_peak(c, h, w, e, ws, s, split):
     p, n = h * w * c * e, h * w
     rows = min(n, max(1, ws // (2 * n * e)))
     scores = 2 * rows * n * e + 2 * rows * c * e
-    return s + (5 if split else 8) * p + scores
+    return s + (5 if split else 8) * p + scores + grouped_norm_bytes(c, n, e)
 
 
 def prefix_peak(m, h, w, e, ws, s):
