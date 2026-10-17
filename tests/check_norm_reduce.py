@@ -40,6 +40,8 @@ import torch
 import torch.nn.functional as F
 
 MIB = 1 << 20
+NOISE = 16 * MIB   # small allocations (norm results, clamp, small-pool rounding: <= 3 MiB measured) are below this; the
+                   # smallest scratch the sweep can trigger is 7680 positions x 32 KiB = 240 MiB
 ROWS_SWEEP = list(range(8, 86, 2))          # x 960 columns: 7680 .. 80640 positions
 WAN22 = [  # (label, rows, cols, channels) of the Wan 2.2 calls in check_l1_units (4K / 2688, layer 1, prefix)
     ("4K prefix middle", 135, 240, 1024), ("4K r128 upsamples.2", 42, 960, 1024), ("4K r128 upsamples.2 last", 53, 960, 1024),
@@ -146,10 +148,10 @@ def measure(fn, x):
     torch.cuda.reset_peak_memory_stats()
     y = fn(x)
     torch.cuda.synchronize()
-    extra = torch.cuda.max_memory_allocated() - a0 - y.untyped_storage().nbytes()
+    peak = torch.cuda.max_memory_allocated() - a0     # above the inputs, the output included
     res = torch.cuda.memory_reserved() - r0
     segs = torch.cuda.memory_stats().get("segment.all.current", 0) - s0
-    return y, extra, res, segs
+    return y, peak, res, segs
 
 
 def timed(fn, x, n=5):
@@ -201,9 +203,12 @@ def main():
             tpm, warp = tpm or 2048, warp or 32
 
     rows_out = []
-    hdr = "{:38s} {:>5s} {:>6s} {:>5s} {:>2s} {:>6s} {:>8s} | {:>9s} {:>9s} {:>9s} {:>4s} | {:>9s} {:>9s} {:>9s} {:>9s} | {}"
-    print(hdr.format("case", "C", "rows", "cols", "nd", "layout", "positions", "predicted", "extra", "resv+", "segs",
-                     "grouped", "max|Δ|", "rel fp64", "ms n/g", "config (vec, block, values/thread, grid / target, ctas)"))
+    print("predicted = the scratch the launch configuration allocates; peak+ = max_memory_allocated above the inputs during the "
+          "call, the output included (the scratch is freed before the output is allocated, so a call with a scratch has "
+          "peak+ = scratch + its small results); out = the output; g scratch = the grouped candidate's peak+ minus its output")
+    hdr = "{:38s} {:>5s} {:>6s} {:>5s} {:>2s} {:>6s} {:>8s} | {:>9s} {:>9s} {:>8s} {:>9s} {:>4s} | {:>9s} {:>9s} {:>9s} {:>11s} | {}"
+    print(hdr.format("case", "C", "rows", "cols", "nd", "layout", "positions", "predicted", "peak+", "out", "resv+", "segs",
+                     "g scratch", "max|Δ|", "rel fp64", "ms n/g", "config (vec, block, values/thread, grid / target, ctas)"))
     for dtype in (torch.bfloat16, torch.float32):
         for label, rows, cols, c in cases(a.quick):
             for nd in (5, 4):
@@ -215,22 +220,25 @@ def main():
                            "positions": n, "predicted": pred, "config": cfg}
                     if gpu:
                         x, base = make(c, rows, cols, dtype, nd, sliced, rows * 7 + c)
-                        y, extra, res, segs = measure(lambda t: F.normalize(t, dim=1), x)
-                        yg, gextra, _, _ = measure(grouped_normalize, x)
+                        y, peak, res, segs = measure(lambda t: F.normalize(t, dim=1), x)
+                        out_b = y.untyped_storage().nbytes()
+                        yg, gpeak, _, _ = measure(grouped_normalize, x)
                         ref = F.normalize(x.double(), dim=1)
                         d = float((yg.float() - y.float()).abs().max())
                         rel = float(((yg.double() - ref).norm() / ref.norm()))
                         rel_native = float(((y.double() - ref).norm() / ref.norm()))
                         tn, tg = timed(lambda t: F.normalize(t, dim=1), x), timed(grouped_normalize, x)
-                        row.update(extra=extra, reserved=res, segments=segs, grouped_extra=gextra, max_diff=d, rel_fp64=rel,
+                        row.update(peak=peak, out=out_b, triggered=peak > out_b + NOISE, reserved=res, segments=segs,
+                                   grouped_scratch=gpeak - out_b, max_diff=d, rel_fp64=rel,
                                    rel_fp64_native=rel_native, ms_native=tn, ms_grouped=tg,
                                    differing=float((yg != y).float().mean()))
                         del x, base, y, yg, ref
-                    print("{:38s} {:5d} {:6d} {:5d} {:2d} {:>6s} {:8d} | {:>9s} {:>9s} {:>9s} {:>4s} | {:>9s} {:>9s} {:>9s} {:>9s} | {}".format(
+                    print("{:38s} {:5d} {:6d} {:5d} {:2d} {:>6s} {:8d} | {:>9s} {:>9s} {:>8s} {:>9s} {:>4s} | {:>9s} {:>9s} {:>9s} {:>11s} | {}".format(
                         label[:38] + (" " + str(dtype).replace("torch.", "") if label == "sweep" else ""), c, rows, cols, nd,
                         "slice" if sliced else "contig", n, "{:.1f}".format(pred / MIB),
-                        "{:.1f}".format(row["extra"] / MIB) if gpu else "-", "{:.1f}".format(row["reserved"] / MIB) if gpu else "-",
-                        str(row["segments"]) if gpu else "-", "{:.1f}".format(row["grouped_extra"] / MIB) if gpu else "-",
+                        "{:.1f}".format(row["peak"] / MIB) if gpu else "-", "{:.1f}".format(row["out"] / MIB) if gpu else "-",
+                        "{:.1f}".format(row["reserved"] / MIB) if gpu else "-",
+                        str(row["segments"]) if gpu else "-", "{:.2f}".format(row["grouped_scratch"] / MIB) if gpu else "-",
                         "{:.2g}".format(row["max_diff"]) if gpu else "-", "{:.2g}".format(row["rel_fp64"]) if gpu else "-",
                         "{:.2f}/{:.2f}".format(row["ms_native"], row["ms_grouped"]) if gpu else "-",
                         "{} {}x{} {} {}/{} {}".format(cfg["vec"], cfg["block"][0], cfg["block"][1], cfg["values_per_thread"], cfg["grid"],
@@ -239,27 +247,32 @@ def main():
         print()
 
     # the trigger range per (dtype, channels, layout): positions whose call allocated (or is predicted to allocate) a scratch
-    print("=== where the scratch appears (MiB above inputs + output > 1; predicted where not measured) ===")
-    key = "extra" if gpu else "predicted"
+    print("=== where the scratch appears (measured: peak+ more than {} MiB above the output; predicted where not measured) ===".format(NOISE // MIB))
     groups = {}
     for r in rows_out:
         if r["case"].startswith("sweep"):
             groups.setdefault((r["dtype"], r["C"], r["nd"], r["sliced"]), []).append(r)
     for (dt, c, nd, sl), rs in sorted(groups.items()):
-        hit = [r["positions"] for r in rs if r[key] > MIB]
-        miss = [r["positions"] for r in rs if r[key] <= MIB]
-        agree = all((r["extra"] > MIB) == (r["predicted"] > 0) for r in rs) if gpu else None
+        trig = (lambda r: r["triggered"]) if gpu else (lambda r: r["predicted"] > 0)
+        size = (lambda r: r["peak"]) if gpu else (lambda r: r["predicted"])
+        hit = [r for r in rs if trig(r)]
+        miss = [r["positions"] for r in rs if not trig(r)]
+        agree = None
+        if gpu:   # the same rows trigger, and where they do the peak is the predicted scratch (plus results of a few MiB)
+            off = max((abs(r["peak"] - r["predicted"]) for r in hit), default=0)
+            agree = all(trig(r) == (r["predicted"] > 0) for r in rs) and off <= NOISE
         print("{:15s} C {:4d} {}D {:6s}: scratch for {} positions{}; none for {} positions{}".format(
             dt.replace("torch.", ""), c, nd, "slice" if sl else "contig",
-            "{} .. {} ({} sizes)".format(min(hit), max(hit), len(hit)) if hit else "no",
-            ", {:.0f} B per position".format(statistics_mean([r[key] / r["positions"] for r in rs if r[key] > MIB])) if hit else "",
+            "{} .. {} ({} sizes)".format(min(r["positions"] for r in hit), max(r["positions"] for r in hit), len(hit)) if hit else "no",
+            ", {:.0f} B per position".format(statistics_mean([size(r) / r["positions"] for r in hit])) if hit else "",
             "{} .. {} ({} sizes)".format(min(miss), max(miss), len(miss)) if miss else "no",
-            "" if agree is None else ("; prediction agrees" if agree else "; PREDICTION DIFFERS")))
+            "" if agree is None else ("; prediction agrees (peak - predicted <= {:.1f} MiB)".format(off / MIB) if agree
+                                      else "; PREDICTION DIFFERS (peak - predicted up to {:.1f} MiB)".format(off / MIB))))
     if gpu:
-        worst = max(rows_out, key=lambda r: r["grouped_extra"])
+        worst = max(rows_out, key=lambda r: r["grouped_scratch"])
         print("grouped candidate: largest scratch {:.2f} MiB ({}); max|Δ| vs F.normalize {:.3g}; relative error vs fp64 {:.3g} "
               "(F.normalize {:.3g}); time {:.2f} vs {:.2f} ms summed over all rows".format(
-                  worst["grouped_extra"] / MIB, worst["case"], max(r["max_diff"] for r in rows_out),
+                  worst["grouped_scratch"] / MIB, worst["case"], max(r["max_diff"] for r in rows_out),
                   max(r["rel_fp64"] for r in rows_out), max(r["rel_fp64_native"] for r in rows_out),
                   sum(r["ms_grouped"] for r in rows_out), sum(r["ms_native"] for r in rows_out)))
     if a.json:
