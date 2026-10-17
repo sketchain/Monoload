@@ -1665,7 +1665,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 ### 9.29 方案 G 的实现：分组求范数（wan22-grouped-norm）
 
-**做了什么（`monoload/vae_ops.py`）：** `OpChunking` 进入时，`type(m) is comfy.ldm.wan.vae.RMS_norm`、`channel_first`、实例上没有自己的 `forward`、通道数 > `GROUP_NORM_MAX`（510）的模块，实例属性 `forward` 换成 `_GroupedRMSNorm`；退出时（包括异常、OOM）和其他替换一起恢复。它算 `grouped_normalize(x, dim, Cg) * scale * gamma.to(x) + bias`，后半句与 62b3c94 `vae.py:63` 逐字相同；`grouped_normalize` 是 `vector_norm(vector_norm(x.view(…, G, Cg, …), dim + 1, dtype=float32), dim, keepdim=True).to(x.dtype)`，再 `x / denom.clamp_min(1e-12).expand_as(x)`（= `F.normalize` 的后半句）。组大小 `norm_groups(C)` = C 的不超过 510 的最大约数（1024 → 256、512 → 256）。`OpStats.norm_grouped` 记换了几个（进 `last_decode()["stats"]`）。
+**做了什么（`monoload/vae_ops.py`）：** `OpChunking` 进入时，`type(m) is comfy.ldm.wan.vae.RMS_norm`、`channel_first`、实例上没有自己的 `forward`、通道数 > `GROUP_NORM_MAX`（510）的模块，实例属性 `forward` 换成 `_GroupedRMSNorm`；退出时（包括异常、OOM）和其他替换一起恢复。它算 `grouped_normalize(x, dim, Cg) * scale * gamma.to(x) + bias`，后半句与 62b3c94 `vae.py:63` 逐字相同；`grouped_normalize` 是 `vector_norm(vector_norm(x.view(…, G, Cg, …), dim + 1, dtype=float32), dim, keepdim=True).to(x.dtype)`，再 `x / denom.clamp_min(1e-12).expand_as(x)`（= `F.normalize` 的后半句）。组大小 `norm_groups(C)` = C 的不超过 510 的最大约数（1024 → 256、512 → 256）。`OpStats.norm_grouped` 记换了几个（进 `last_decode()["stats"]`；全尺寸 Wan 2.2 是 37 个：decoder 24 个（30 个 RMS_norm 里头部和最后一级的 256 通道不换）+ encoder 13 个，`OpChunking` 装在整个 first-stage model 上，encoder 的在解码里不会被调用；Wan 2.1 0 个）。
 
 * **覆盖：** `OpChunking` 是所有托管解码的入口——第一层 `StripeAdapter.run`（前缀和条带都在里面）、自检（fp32 副本的参照解码和条带两次）、第二层 `vae._run`。原生解码（`mode native`、`MONOLOAD=0`、视频 / 音频走原生、`VAEDecodeTiled`）不经过它，不替换。
 * **Wan 2.1：** 通道最多 384，不替换，逐位不变；其他 decoder 没有 `wan.RMS_norm`。Wan 2.2 头部的 256 通道 RMS_norm 也不替换。
