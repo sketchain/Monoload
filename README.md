@@ -1577,7 +1577,7 @@ DESIGN §9.26 之后的第 3–7 项（test_entry 的适配器列表、check_vae
 | HunyuanImage 2.1 | 节点副本再次 | 2.43 | 2.43 | 2.94 |
 
   以前 Wan 2.2 第一行 reserved 3.98（含权重 1.31）、HunyuanImage 3.26（含 0.755）。Wan 2.2 第一行的 GTT 比估算多 0.07，reserved 在估算内：是进程第一批 GPU 计算（DESIGN §9.19，接受的事项）。
-* **解码日志：** Wan 2.2 的设置里已经没有 GroupNorm 方案这一项（`check_vae_node.py` 自己打印的那行当时仍写 `gn_scheme B [default]`，是测试脚本的输出，之后改成只对有方案的 decoder 打印）。
+* **解码日志：** Wan 2.2 的设置里已经没有 GroupNorm 方案这一项（`check_vae_node.py` 自己打印的那行当时仍写 `gn_scheme B [default]`，是测试脚本的输出，已改成只对有 GroupNorm 方案的 decoder 打印这一项）。
 * **bench 汇总表：** HunyuanImage 1344 的 `monoload` 一行是 `1.47 / 1.49 [cold: incl. the first-use self-test]`（峰值和估算取自同一次）。
 
 ## 11. 仓库结构

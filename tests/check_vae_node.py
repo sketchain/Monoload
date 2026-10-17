@@ -27,7 +27,7 @@ from bench_vae import gib, mvae, torch  # noqa: E402
 from monoload.nodes import NODE_CLASS_MAPPINGS  # noqa: E402
 
 
-def describe(m):
+def describe(m, schemes=True):
     if m.get("strategy") == "layer1":
         what = "layer 1, {}, {} stripes of {} rows, workspace {}".format(m.get("adapter"), m.get("stripes"), m.get("rows"),
                                                                        B.vae_ops.fmt_bytes(m.get("workspace")))
@@ -38,7 +38,8 @@ def describe(m):
     src = m.get("settings_source") or {}
     eff = m.get("settings") or {}
     shown = dict(eff, budget=B.vae_ops.fmt_bytes(eff["budget"]) if eff.get("budget") else None)
-    sett = "settings: " + ", ".join("{} {} [{}]".format(k, shown.get(k), src.get(k)) for k in ("budget", "gn_scheme", "stripe_rows", "mode"))
+    items = ("budget", "gn_scheme", "stripe_rows", "mode") if schemes else ("budget", "stripe_rows", "mode")   # no GroupNorm: no scheme
+    sett = "settings: " + ", ".join("{} {} [{}]".format(k, shown.get(k), src.get(k)) for k in items)
     est = (m.get("estimate") or {}).get("total")
     return what, sett, est
 
@@ -73,7 +74,7 @@ def main():
         torch.cuda.empty_cache() if B.is_cuda() else None
         row, _, _ = B.decode_once(v, lat, False, 0.02)
         m = mvae.last_decode()
-        what_, sett, est = describe(m)
+        what_, sett, est = describe(m, mvae.gn_schemes_apply(v))
         rows.append((label, row, what_, sett, est))
         print("{:16s} {:10s} {:7.2f} s | GTT +{} reserved +{} estimate {} GiB | {} | {}".format(
             label, row["status"], row["seconds"], gib(row.get("gtt_delta")).strip(), gib(row.get("res_delta")).strip(), gib(est).strip(), what_, sett),
