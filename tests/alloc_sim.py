@@ -23,7 +23,11 @@ reproduces that without a GPU:
                   Slow2d (4D conv without cuDNN) and SlowDilated3d (5D) copy a
                   non-contiguous input / weight, allocate the output, then the
                   im2col / vol2col columns (Slow2d skips them for 1x1 / stride 1 /
-                  unpadded); upsampling copies a non-contiguous input.
+                  unpadded); upsampling copies a non-contiguous input; a
+                  vector_norm over a channel dim allocates the reduction scratch
+                  of gpu_reduce_kernel when its launch configuration splits each
+                  output over blocks (DESIGN §9.28: tests/check_norm_reduce.py's
+                  model with the CT 700 device, ROCM_DEVICE).
   * decode_trace  builds the Wan 2.1 decoder (qwen_image_vae dimensions) on the
                   meta device and runs Monoload's layer 1 or layer 2 on it, with
                   the switches the earlier versions had (cache emptied between
@@ -216,6 +220,27 @@ def _tensors(x):
 
 
 CONV_OPS = ("aten::convolution", "aten::_convolution", "aten::conv2d", "aten::conv3d")
+# the CT 700 GPU for the reduction scratch (command N, README §10.12): multiProcessorCount, maxThreadsPerMultiProcessor,
+# warp size, ROCm (ctas_per_output >= 64)
+ROCM_DEVICE = dict(mp=20, threads_per_mp=2048, warp=32, rocm=True)
+
+
+def norm_scratch(x, dims):
+    """Bytes of gpu_reduce_kernel's global-reduce buffer + semaphores for torch.linalg.vector_norm(x, dim=dims): a
+    reduction over one dim that is not the fastest-moving one (channels of NC[T]HW, contiguous or a row slice -- the
+    remaining dims coalesce into one output dim). Other layouts are not modelled (0)."""
+    from check_norm_reduce import predict
+    dims = [d % x.dim() for d in (dims if isinstance(dims, (list, tuple)) else [dims])]
+    if len(dims) != 1 or x.shape[dims[0]] <= 1:
+        return 0
+    d = dims[0]
+    others = [i for i in range(x.dim()) if i != d and x.shape[i] > 1]
+    if not others or x.stride(d) <= min(x.stride(i) for i in others):
+        return 0
+    c = int(x.shape[d])
+    n = x.numel() // c
+    size, cfg = predict(n, c, int(x.stride(d)), int(x.storage_offset()), **ROCM_DEVICE)
+    return size + (4 * cfg["grid"] if size else 0)
 
 
 def _ints(v):
@@ -270,10 +295,18 @@ def make_tracer(sim):
                 after.append(("cols", x.dim() == 5 or not one, w))
             elif "upsample_nearest" in name and not args[0].is_contiguous():
                 temps.append(sim.malloc(args[0].numel() * args[0].element_size()))
+            elif name == "aten::linalg_vector_norm":
+                dim = args[2] if len(args) > 2 else kwargs.get("dim")
+                if dim is not None:
+                    after.append(("norm", norm_scratch(args[0], dim), None))
             out = func(*args, **kwargs)
             for t in _tensors(out):
                 self._track(t)
             for kind, need, w in after:
+                if kind == "norm":       # allocated after the result, freed when the kernel is launched
+                    if need:
+                        temps.append(sim.malloc(need))
+                    continue
                 if need:
                     o = next(_tensors(out))
                     cols = w.shape[1] * w[0, 0].numel() * o[0, 0].numel() * o.element_size()

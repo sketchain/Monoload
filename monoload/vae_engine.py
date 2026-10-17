@@ -66,6 +66,7 @@ import comfy.model_management as mm
 import comfy.ops
 
 from .errors import MonoloadError, MonoloadVAEOOMError
+from . import vae_ops
 from .vae_ops import MIB, OpChunking, OpStats, fmt_bytes
 
 POINT, CONV, RES, UP = "point", "conv", "res", "up"
@@ -147,9 +148,11 @@ def split_rows(h, rows):
 def hooked_module(model):
     """Name of a module whose call would not be its class' forward (forward
     hooks, instance-level forward replacements such as bypass injections),
-    or None."""
+    or None. OpChunking's own replacements (vae_ops.is_replacement) are not
+    hooks: they compute the class' forward (DESIGN §9.29)."""
     for name, m in model.named_modules():
-        if "forward" in m.__dict__ or m._forward_hooks or m._forward_pre_hooks:
+        fwd = m.__dict__.get("forward")
+        if (fwd is not None and not vae_ops.is_replacement(fwd)) or m._forward_hooks or m._forward_pre_hooks:
             return name or "<root>"
     if torch.nn.modules.module._global_forward_hooks or torch.nn.modules.module._global_forward_pre_hooks:
         return "<global module hooks>"

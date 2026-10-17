@@ -26,10 +26,20 @@ CPU unless noted.
      keeps (decode_retained); MONOLOAD_VAE_BUDGET: layer 2 when its estimate
      fits, else layer 1, else an error naming both;
   6. the Monoload VAE Settings node (forced rows, layer 2 only) and the Info node;
-  7. caching allocator (tests/alloc_sim.py, full-size Wan 2.2 on the meta
-     device): layer 1 reserved <= estimate (1344x768, 2688x1536, 4K default;
-     4K 32 / 512 rows; fp32 4K), the self-test's peak <= its bound, layer 2's
-     simulated peak <= the layer-2 estimate (1344x768, 4K).
+  7. the grouped RMS norm (vae_ops, DESIGN §9.29): an RMS_norm over more than
+     510 channels gets it inside OpChunking only (384 channels never), it
+     computes the module's forward (fp32 <= 1e-6, bf16 <= 1 ulp), it is
+     restored on exit (also after an OOM), recognition does not count it as a
+     hook, and no recognition runs while it is installed during a decode;
+     with the threshold lowered to 16 channels (so the small model's norms
+     are grouped) layer 1, layer 2 and the self-test == native;
+  8. caching allocator (tests/alloc_sim.py, full-size Wan 2.2 on the meta
+     device; the tracer adds the ROCm reduction scratch of vector_norm,
+     DESIGN §9.28): without the grouped norm it reproduces the CT 700
+     readings (4K default alloc 1.49 / reserved 3.27 GiB, over the
+     estimate); with it, layer 1 reserved <= estimate (1344x768, 2688x1536,
+     4K default; 4K 32 / 64 / 512 rows; fp32 4K), the self-test's peak <= its
+     bound, layer 2's simulated peak <= the layer-2 estimate (1344x768, 4K).
 
     python tests/test_vae_wan22.py
 """
@@ -418,11 +428,119 @@ def node_tests(v, lat):
 # 7. caching allocator
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 7. the grouped RMS norm
+# ---------------------------------------------------------------------------
+
+def grouped_norm_tests(v, lat):
+    torch.manual_seed(11)
+    holder = torch.nn.Module()
+    holder.big = wan.RMS_norm(1024, images=False)
+    holder.small = wan.RMS_norm(384, images=False)
+    with torch.no_grad():
+        holder.big.gamma.uniform_(0.5, 1.5)
+        holder.small.gamma.uniform_(0.5, 1.5)
+    for dt, tol in ((torch.float32, 1e-6), (torch.bfloat16, None)):
+        hm = holder.to(dt)
+        x = torch.randn(1, 1024, 1, 13, 24).to(dt).narrow(3, 2, 9)   # a row slice, as in the stripes
+        y = torch.randn(1, 384, 1, 9, 24).to(dt)
+        ref_big, ref_small = hm.big(x), hm.small(y)
+        with vae_ops.OpChunking(hm, 1 << 20) as st:
+            installed = vae_ops.is_replacement(hm.big.__dict__.get("forward")) and "forward" not in hm.small.__dict__
+            hooked = eng.hooked_module(hm)
+            got_big, got_small = hm.big(x), hm.small(y)
+        if tol is None:   # bf16: at most one ulp of the result
+            ulp = (ref_big.float().abs() * 2 ** -7).clamp_min(2 ** -133)
+            ok_big = bool(((got_big.float() - ref_big.float()).abs() <= ulp).all())
+        else:
+            ok_big = float((got_big - ref_big).abs().max()) <= tol * float(ref_big.abs().max())
+        check("{}: RMS_norm 1024 ch grouped (4 x 256) only inside OpChunking ({} replaced), 384 ch left alone; == the module's "
+              "forward (max|Δ| {:.2g}); 384 ch bit-identical; not a hook for recognition; restored".format(
+                  str(dt).replace("torch.", ""), st.norm_grouped, float((got_big.float() - ref_big.float()).abs().max())),
+              installed and st.norm_grouped == 1 and ok_big and torch.equal(got_small, ref_small) and hooked is None
+              and no_overrides(hm))
+    holder.float()
+    check("norm groups: 1024 -> 256, 512 -> 256, 544 -> 272, 510 / 384 not grouped; bytes 0 below the threshold",
+          [vae_ops.norm_groups(c) for c in (1024, 512, 544, 510, 384)] == [256, 256, 272, 510, 384]
+          and vae_ops.grouped_norm_bytes(384, 1000, 2) == 0 and vae_ops.grouped_norm_bytes(1024, 1000, 2) == (1 << 20) + 1000 * 24)
+
+    # the small model's norms are <= 128 channels: lower the threshold so that every one of them is grouped
+    orig_max = vae_ops.GROUP_NORM_MAX
+    seen = []
+    orig_hooked = eng.hooked_module
+
+    def spy(model):
+        seen.append(any(vae_ops.is_replacement(m.__dict__.get("forward")) for _, m in model.named_modules()))
+        return orig_hooked(model)
+    vae_ops.GROUP_NORM_MAX = 16
+    eng.hooked_module = spy
+    eng._SELFTEST.clear()
+    try:
+        for rows in (7, None):
+            mvae.set_stripe_rows(rows)
+            out = managed_decode(v, lat, raw=True)
+            last = mvae.last_decode()
+            ref = native_decode(v, lat, raw=True)
+            check("grouped norm on every RMS_norm (threshold 16 ch): layer 1 rows {}: {} RMS norms grouped, == native "
+                  "(max|Δ| {:.2g}), nothing left installed".format(rows or "default", last["stats"]["norm_grouped"], err(out, ref)),
+                  last.get("strategy") == "layer1" and last["stats"]["norm_grouped"] > 0 and err(out, ref) <= 1e-5
+                  and no_overrides(v.first_stage_model))
+        mvae.set_stripe_rows(None)
+        mvae.set_stripe(False)
+        try:
+            l2 = managed_decode(v, lat, raw=True)
+        finally:
+            mvae.set_stripe(True)
+        last = mvae.last_decode()
+        check("... layer 2: {} RMS norms grouped, == native (max|Δ| {:.2g})".format(last["stats"]["norm_grouped"], err(l2, native_decode(v, lat, raw=True))),
+              last.get("strategy") == "layer2" and last["stats"]["norm_grouped"] > 0 and err(l2, native_decode(v, lat, raw=True)) <= 1e-5)
+        ok, detail = eng._SELFTEST.get(w22.match(v, lat, {})[0].key, (None, ""))
+        check("... the self-test ran with it and passed: {}".format(detail), ok is True)
+        # an OOM inside the stripes: the replacement is restored before the retry
+        orig_stripes = eng.run_stripes
+        calls = [0]
+
+        def oom_once(*a, **kw):
+            calls[0] += 1
+            if calls[0] == 1:
+                left[0] = any(vae_ops.is_replacement(m.__dict__.get("forward")) for m in v.first_stage_model.modules())
+                raise torch.cuda.OutOfMemoryError("simulated OOM")
+            return orig_stripes(*a, **kw)
+        left = [False]
+        eng.run_stripes = oom_once
+        try:
+            out = managed_decode(v, lat, raw=True)
+        finally:
+            eng.run_stripes = orig_stripes
+        check("... OOM inside the stripes (with the grouped norm installed: {}): retried, == native, restored".format(left[0]),
+              left[0] and calls[0] >= 2 and err(out, native_decode(v, lat, raw=True)) <= 1e-5 and no_overrides(v.first_stage_model))
+    finally:
+        vae_ops.GROUP_NORM_MAX = orig_max
+        eng.hooked_module = orig_hooked
+        eng._SELFTEST.clear()
+        mvae.set_stripe_rows(None)
+    check("recognition never ran while a grouped norm was installed ({} structure checks during those decodes)".format(len(seen)),
+          seen and not any(seen))
+
+
+# ---------------------------------------------------------------------------
+# 8. caching allocator
+# ---------------------------------------------------------------------------
+
 def allocator_tests():
     import alloc_sim
     G = float(1 << 30)
+    orig_max = vae_ops.GROUP_NORM_MAX
+    vae_ops.GROUP_NORM_MAX = 1 << 30   # no grouped norm: the code up to this change
+    try:
+        i = alloc_sim.decode_trace(3840, 2160, "bf16", None, model="wan22")
+    finally:
+        vae_ops.GROUP_NORM_MAX = orig_max
+    check("without the grouped norm the simulation reproduces CT 700 (4K default 17 x 128: alloc 1.49, reserved 3.27, estimate "
+          "1.35 GiB): alloc {:.2f}, reserved {:.2f}, estimate {:.2f} GiB".format(i["alloc"] / G, i["reserved"] / G, i["estimate"] / G),
+          abs(i["alloc"] / G - 1.49) <= 0.03 and abs(i["reserved"] / G - 3.27) <= 0.05)
     for w, h, rows, dt in ((1344, 768, None, "bf16"), (2688, 1536, None, "bf16"), (3840, 2160, None, "bf16"), (3840, 2160, 32, "bf16"),
-                           (3840, 2160, 512, "bf16"), (3840, 2160, None, "fp32")):
+                           (3840, 2160, 64, "bf16"), (3840, 2160, 512, "bf16"), (3840, 2160, None, "fp32")):
         i = alloc_sim.decode_trace(w, h, dt, rows, model="wan22")
         check("Wan 2.2 {}x{} {} rows {}: {} x {} rows, simulated reserved {:.3f} GiB <= estimate {:.3f} GiB, {:.3f} stays (output)".format(
             w, h, dt, rows or "default", i["stripes"], i["rows"], i["reserved"] / G, i["estimate"] / G, i["stays"] / G),
@@ -458,6 +576,7 @@ def main():
     selftest_tests(v, lat)
     oom_budget_tests(v, lat)
     node_tests(v, lat)
+    grouped_norm_tests(v, lat)
     allocator_tests()
     finish()
 
