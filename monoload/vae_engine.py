@@ -32,6 +32,13 @@ The adapter interface (StripeAdapter):
   ckpt_channels        channels of the checkpoint
   hdim                 the row dimension of the tensors (5D Wan: 3, 4D: 2)
   scale                output rows per checkpoint row (per row of the decoder's input)
+  tdim, ckpt_planes    the planes (frames) dimension of the tensors and the checkpoint's
+                       planes, for a decoder whose rows carry several planes (the
+                       HunyuanImage 2.1 Refiner decodes one image as 4 frames: its stripes
+                       carry them all); None / 1 for the others. A unit's Unit.tscale
+                       multiplies the planes (time upsampling 2, taking the last frame
+                       1/4): the elements of a row are width x planes, which the memory
+                       and work counts use; the row intervals do not depend on it
   decoder_hw(samples)  rows / cols the decoder works at below the prefix (the plan's
                        h8 x w8): the latent's, unless the first prefix step changes the
                        resolution (Flux 2's 2x2 un-patchify of the latent)
@@ -91,15 +98,18 @@ class StripeError(MonoloadError):
 class Unit:
     """One step of the stripe part: kind, halo (rows on each side a unit
     needs, at its output level), scale (output rows per input row), channels."""
-    __slots__ = ("kind", "module", "halo", "scale", "cin", "cout", "name", "macs_row", "shortcut", "norms", "contiguous", "extra")
+    __slots__ = ("kind", "module", "halo", "scale", "cin", "cout", "name", "macs_row", "shortcut", "norms", "contiguous", "extra",
+                 "tscale")
 
-    def __init__(self, kind, module, halo, scale, cin, cout, name, macs_row=0, shortcut=False, norms=(), contiguous=False, extra=None):
+    def __init__(self, kind, module, halo, scale, cin, cout, name, macs_row=0, shortcut=False, norms=(), contiguous=False, extra=None,
+                 tscale=1):
         self.kind, self.module, self.halo, self.scale = kind, module, halo, scale
         self.cin, self.cout, self.name, self.macs_row = cin, cout, name, macs_row
         self.shortcut = shortcut   # residual block with a 1x1 conv shortcut
         self.norms = tuple(norms)  # NormRef: norms in this unit that need whole-image statistics, in call order
         self.contiguous = contiguous   # its row slice is made contiguous before the call (as for the CONTIGUOUS_INPUT kinds)
         self.extra = extra         # what the adapter's cost model needs besides the above (e.g. the blocks of a compound unit)
+        self.tscale = tscale       # output planes per input plane (int, or a Fraction: the module docstring's tdim)
 
 
 def need_in(unit, a, b, h_in, h_out):
@@ -319,18 +329,19 @@ class Pass:
     unit `unit`) on stripes of rows at the norm's input level, and accumulate
     the norm's statistics over each stripe's core rows. On the way, the saves
     in `builds` (positions start < p <= unit) are filled with the core rows."""
-    __slots__ = ("start", "unit", "norm", "chain", "heights", "widths", "rows", "stripes", "needs", "order", "builds",
+    __slots__ = ("start", "unit", "norm", "chain", "heights", "widths", "planes", "rows", "stripes", "needs", "order", "builds",
                  "alive", "live", "largest", "work", "work_levels")
 
 
-def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
+def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None, planes=None):
     """(needs, order, live, largest, work) of running `chain` on `stripes` (rows at
     the chain's output level). live: the largest unit peak (the first unit reads a
     slice of a save, counted on its own); tail(rows, s) -> the peak after the chain
     (the statistics of a pass). The peaks depend only on the rows each unit runs
     on, so each distinct pattern of rows is evaluated once. work: conv MACs by
     output width (identifies the resolution level), and under the key CALLS the
-    number of conv GEMM calls (row blocks under the workspace; bound.unit_calls)."""
+    number of conv GEMM calls (row blocks under the workspace; bound.unit_calls). planes: the planes of each level
+    (None: 1): the cost model gets the elements of a row (width x planes) as its width."""
     needs_all = [stripe_needs(chain, heights, a, b) for a, b in stripes]
     # the stripe with the largest slices runs first: the blocks it leaves in the allocator's cache fit every later stripe
     size = [sum(n[1] - n[0] for n in needs) for needs in needs_all]
@@ -343,17 +354,18 @@ def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
     live = largest = 0
     work = {CALLS: 0}
     unit_calls = getattr(bound, "unit_calls", None)
+    ew = widths if planes is None else [w * p for w, p in zip(widths, planes)]
     for rows, count in patterns.items():
         s = 0
         for i, u in enumerate(chain):
             r = rows[i]
-            live = max(live, bound.unit_peak(u, r, widths[i], elem, ws, s))
-            largest = max(largest, bound.unit_largest(u, r, widths[i], elem, ws))
-            s = r * u.scale * widths[i + 1] * u.cout * elem
+            live = max(live, bound.unit_peak(u, r, ew[i], elem, ws, s))
+            largest = max(largest, bound.unit_largest(u, r, ew[i], elem, ws))
+            s = r * u.scale * ew[i + 1] * u.cout * elem
             w_out = widths[i + 1]
-            work[w_out] = work.get(w_out, 0) + count * r * u.scale * w_out * u.macs_row
+            work[w_out] = work.get(w_out, 0) + count * r * u.scale * ew[i + 1] * u.macs_row
             if unit_calls is not None:
-                work[CALLS] += count * unit_calls(u, r, widths[i], elem, ws)
+                work[CALLS] += count * unit_calls(u, r, ew[i], elem, ws)
         if tail is not None:
             live = max(live, tail(rows[-1], s))
     return needs_all, order, live, largest, work
@@ -388,12 +400,18 @@ class Plan:
         units = bound.units
         heights = [h8]
         widths = [w8]
+        planes = [getattr(bound, "ckpt_planes", 1)]
         for u in units:
             heights.append(heights[-1] * u.scale)
             widths.append(widths[-1] * u.scale)
-        self.heights, self.widths = heights, widths
+            p = planes[-1] * u.tscale
+            if p != int(p) or p < 1:
+                raise StripeError("[Monoload] internal error: {} gives {} planes".format(u.name, p))
+            planes.append(int(p))
+        self.heights, self.widths, self.planes = heights, widths, planes
+        self.tdim = getattr(bound, "tdim", None)
         self.h_out, self.w_out = heights[-1], widths[-1]
-        self.ckpt_bytes = bound.ckpt_channels * h8 * w8 * elem
+        self.ckpt_bytes = bound.ckpt_channels * h8 * w8 * planes[0] * elem
         self.channels = [bound.ckpt_channels] + [u.cout for u in units]
         targets = [(i, nr) for i, u in enumerate(units) for nr in u.norms]
         if len(split_rows(self.h_out, rows)) == 1:
@@ -402,7 +420,7 @@ class Plan:
         self.saves = saves
 
         def save_bytes(p):
-            return self.ckpt_bytes if p == 0 else units[p - 1].cout * heights[p] * widths[p] * elem
+            return self.ckpt_bytes if p == 0 else units[p - 1].cout * heights[p] * widths[p] * planes[p] * elem
         self.save_bytes = {p: save_bytes(p) for p in [0] + saves}
 
         # the final pass: output stripes from the last save
@@ -416,12 +434,14 @@ class Plan:
         self.out_segment = 0 if OUTPUT_IN_ARENA else out_segment(out_bytes)
         prefix_live = s = 0
         largest = max(out_arena, lat_bytes)
+        # the prefix runs at the checkpoint's planes (its cost model gets width x planes as the width)
+        pw = w8 * planes[0]
         for _, m in bound.prefix:
-            prefix_live = max(prefix_live, bound.prefix_peak(m, h8, w8, elem, ws, s))
-            largest = max(largest, bound.prefix_largest(m, h8, w8, elem, ws))
-            s = bound.prefix_out_channels(m) * h8 * w8 * elem
+            prefix_live = max(prefix_live, bound.prefix_peak(m, h8, pw, elem, ws, s))
+            largest = max(largest, bound.prefix_largest(m, h8, pw, elem, ws))
+            s = bound.prefix_out_channels(m) * h8 * pw * elem
         self.needs, self.order, strip_live, lg, final_levels = _chain_cost(
-            bound, self.final_units, self.final_heights, widths[sf:], self.stripes, elem, ws)
+            bound, self.final_units, self.final_heights, widths[sf:], self.stripes, elem, ws, planes=planes[sf:])
         largest = max(largest, lg)
         # with saves, the checkpoint is a buffer allocated before the prefix (the front of the arena) and the
         # prefix's output is copied into it, so that the saves' places are known (saves_fit): the prefix holds it too
@@ -441,6 +461,7 @@ class Plan:
             ps.chain = units[cur:i] + ([nr.partial] if nr.partial is not None else [])
             ps.heights = heights[cur:i + 1] + ([heights[i] * nr.partial.scale] if nr.partial is not None else [])
             ps.widths = widths[cur:i + 1] + ([widths[i] * nr.partial.scale] if nr.partial is not None else [])
+            ps.planes = planes[cur:i + 1] + ([int(planes[i] * nr.partial.tscale)] if nr.partial is not None else [])
             self.passes.append(ps)
             built.update(ps.builds)
             if ps.builds:
@@ -485,9 +506,9 @@ class Plan:
             hit = cache.get(key)
             if hit is None:
                 st = split_rows(ps.heights[-1], r)
-                c_t, w_t = ps.norm.channels, ps.widths[-1]
+                c_t, w_t = ps.norm.channels, ps.widths[-1] * ps.planes[-1]
                 hit = cache[key] = (st, _chain_cost(bound, ps.chain, ps.heights, ps.widths, st, elem, ws,
-                                                    tail=lambda rr, s_: s_ + norm_temp(c_t, rr, w_t, ws)))
+                                                    tail=lambda rr, s_: s_ + norm_temp(c_t, rr, w_t, ws), planes=ps.planes))
             return hit
 
         def layout(alive, final_bytes):
@@ -528,7 +549,7 @@ class Plan:
         for ps, a, (r, (st, (needs, order, live, plg, work))) in zip(self.passes, alive, rows):
             ps.alive, ps.rows, ps.stripes, ps.needs, ps.order, ps.live, ps.largest = a, r, st, needs, order, live, plg
             ps.work_levels, ps.work = work, _macs(work)
-            largest = max(largest, plg, norm_temp(ps.norm.channels, max(b - a_ for a_, b in st), ps.widths[-1], ws))
+            largest = max(largest, plg, norm_temp(ps.norm.channels, max(b - a_ for a_, b in st), ps.widths[-1] * ps.planes[-1], ws))
         self.persistent = persistent
         self.front_arena = 0
         if saves:
@@ -556,8 +577,8 @@ class Plan:
         # reserved = the output's segment and the arena, unless fragmentation strands one request outside it (then
         # that request's own segment); the saves are not among the candidates when saves_fit guarantees their place
         self.estimate = self.out_segment + self.arena + self.largest + ESTIMATE_PAD
-        work_prefix = sum(bound.prefix_macs(m) for _, m in bound.prefix) * h8 * w8
-        work_whole = work_prefix + sum(heights[i + 1] * widths[i + 1] * u.macs_row for i, u in enumerate(units))
+        work_prefix = sum(bound.prefix_macs(m) for _, m in bound.prefix) * h8 * pw
+        work_whole = work_prefix + sum(heights[i + 1] * widths[i + 1] * planes[i + 1] * u.macs_row for i, u in enumerate(units))
         work_stripes = _macs(final_levels)
         self.work_passes = sum(ps.work for ps in self.passes)
         self.recompute = (work_prefix + work_stripes + self.work_passes) / max(1, work_whole)
@@ -821,6 +842,8 @@ def run_passes(plan, saves, hdim, ws, norms):
             shape = list(src.shape)
             shape[1] = plan.channels[p]
             shape[hdim], shape[hdim + 1] = plan.heights[p], plan.widths[p]
+            if plan.tdim is not None:
+                shape[plan.tdim] = plan.planes[p]
             if pool is None:
                 saves[p] = torch.empty(shape, dtype=src.dtype, device=src.device)
                 continue
@@ -919,6 +942,8 @@ class StripeAdapter:
 
     name = "?"
     hdim = 2
+    tdim = None      # the planes dimension (the module docstring), None: one plane per row
+    ckpt_planes = 1
     scale = 8
     schemes = ()     # GroupNorm schemes the variants differ by (LDM); empty: one variant
     selftest_size = SELFTEST_LATENT   # the self-test's decoder input rows / cols
@@ -1087,8 +1112,8 @@ class StripeAdapter:
             return hit
         n = self.selftest_size
         plan = Plan(self, n, n, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0)
-        act = max(c * h * w for c, h, w in zip(plan.channels, plan.heights, plan.widths))
-        act = max(act, max(self.prefix_out_channels(m) for _, m in self.prefix) * n * n) * 4
+        act = max(c * h * w * p for c, h, w, p in zip(plan.channels, plan.heights, plan.widths, plan.planes))
+        act = max(act, max(self.prefix_out_channels(m) for _, m in self.prefix) * n * n * plan.planes[0]) * 4
         out = self.out_channels * plan.h_out * plan.w_out * 4
         ref = self.activation_copies * act + 2 * SELFTEST_REF_WORKSPACE + out + self.decode_retained(n, n, 4)
         need = int(self.selftest_params() * 4 + max(ref, plan.estimate + out) + out + SELFTEST_MARGIN)

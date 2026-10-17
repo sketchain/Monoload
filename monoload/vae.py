@@ -36,7 +36,9 @@ decoder structure (monoload/vae_wan.py: the Wan 2.1 VAE single frame;
 monoload/vae_wan22.py: the Wan 2.2 VAE single frame; monoload/vae_ldm.py:
 the LDM Decoder of SD1.5 / SDXL / SD3 / Flux ae / Flux 2, with GroupNorm
 statistics gathered across stripes; monoload/vae_hunyuan.py: the HunyuanImage
-2.1 decoder, the same with depth-to-space upsampling). A recognized, self-tested decoder is
+2.1 decoder, the same with depth-to-space upsampling; monoload/vae_refiner.py:
+the HunyuanImage 2.1 Refiner decoder, an image decoded as 4 frames that the
+stripes carry). A recognized, self-tested decoder is
 decoded in stripes of output rows from a low-resolution checkpoint instead of the
 whole-image activations; everything else keeps layer 2. Default stripe height:
 the lowest peak that does not cost speed (DEFAULT_POLICY_ROWS, DESIGN
@@ -72,7 +74,7 @@ import comfy.ops
 import comfy.sd
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
-from . import settings, vae_engine, vae_hunyuan, vae_ldm, vae_ops, vae_overrides, vae_wan, vae_wan22
+from . import settings, vae_engine, vae_hunyuan, vae_ldm, vae_ops, vae_overrides, vae_refiner, vae_wan, vae_wan22
 from .errors import MonoloadError, MonoloadVAEOOMError
 from .messages import label, msg
 from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
@@ -461,7 +463,7 @@ class _MemProbe:
 #   bound.plan(vae, samples, budget, workspace, rows=None, out_bytes=0) -> plan (estimate, stripes, recompute,
 #                                       ckpt_bytes, describe()) or None when the budget cannot be met
 #   bound.run(vae, samples, plan, workspace, stats) -> pixel_samples (process_output applied), native layout
-STRIPE_ADAPTERS = [vae_wan, vae_wan22, vae_ldm, vae_hunyuan]
+STRIPE_ADAPTERS = [vae_wan, vae_wan22, vae_ldm, vae_hunyuan, vae_refiner]
 
 _L1_NOTED = weakref.WeakKeyDictionary()   # first_stage_model -> last logged layer-1 reason
 

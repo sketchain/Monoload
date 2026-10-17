@@ -188,9 +188,11 @@ def vae_section(v):
     elif eff["mode"] != "native" and eff["mode"] != "layer2" and schemes and (eff["gn_forced"] or not eff["budget"]):
         shown = eff["gn_scheme"]
     if shown in ("A", "B", "C", "D"):
-        from . import vae_hunyuan
-        hy = vae_hunyuan.is_hunyuan(getattr(v, "first_stage_model", None))   # its levels are not the LDM decoder's
-        lines.append(msg("info.scheme_hint", scheme=shown, hint=msg(("scheme_hy." if hy else "scheme.") + shown)))
+        from . import vae_hunyuan, vae_refiner
+        fsm = getattr(v, "first_stage_model", None)
+        # their levels are not the LDM decoder's
+        family = "scheme_hy." if vae_hunyuan.is_hunyuan(fsm) else "scheme_hyr." if vae_refiner.is_refiner(fsm) else "scheme."
+        lines.append(msg("info.scheme_hint", scheme=shown, hint=msg(family + shown)))
     return lines
 
 
