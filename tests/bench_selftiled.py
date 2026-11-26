@@ -155,7 +155,9 @@ class Sampler(bv.Sampler):
 
 
 def digest(t):
-    return hashlib.sha256(t.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()).hexdigest()[:16]
+    # VAE.decode returns pixel_samples.movedim(1, -1) (not contiguous): copy to the host first, a device-side
+    # .contiguous() would add an output-sized allocation to the measured peak
+    return hashlib.sha256(t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()[:16]
 
 
 def one(vae, lat, opts, mode, sample_ms):
@@ -179,6 +181,8 @@ def one(vae, lat, opts, mode, sample_ms):
         row["shape"] = list(out.shape)
         row["out_bytes"] = out.numel() * out.element_size()
         row["out_device"] = str(out.device)
+        row["alloc_peak"] = torch.cuda.max_memory_allocated()
+        row["res_peak"] = torch.cuda.max_memory_reserved()
         row["sha"] = digest(out)
         del out
     except bv.TiledFallback as e:
@@ -187,8 +191,8 @@ def one(vae, lat, opts, mode, sample_ms):
     except torch.OutOfMemoryError as e:
         row["error"] = "OOM " + str(e).splitlines()[0][:160]
         smp = plan = uc = None
-    row["alloc_peak"] = torch.cuda.max_memory_allocated()
-    row["res_peak"] = torch.cuda.max_memory_reserved()
+    row.setdefault("alloc_peak", torch.cuda.max_memory_allocated())
+    row.setdefault("res_peak", torch.cuda.max_memory_reserved())
     row["alloc_inc"] = row["alloc_peak"] - alloc0
     row["res_inc"] = row["res_peak"] - res0
     if smp is not None:
