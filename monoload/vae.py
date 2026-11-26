@@ -89,7 +89,7 @@ PROBE_SIZE = 8             # latent rows/cols of the shape probe
 MF_PROBE_SIZES = (16, 32)  # latent rows/cols of the two multi-frame memory probes (DESIGN §9.35)
 MF_PROBE_WORKSPACE = 64 * MIB  # their OpChunking workspace (= MIN_WORKSPACE): capped at both sizes, so in the intercept, not the
                                # slope (an overcount of <= 2 x 64 MiB); 1 MiB made the probe ~85 s on CT 700 (Wan 2.1 81 frames)
-MF_MARGIN = 1.25           # the measured slope (allocated bytes per latent pixel) times this: reserved vs allocated, tests/test_vae_multiframe.py
+MF_MARGIN = 1.25           # the measured slope (bytes per latent pixel, _CudaPeak) times this: headroom over the two-point line, DESIGN §9.35
 
 
 def parse_size(s):
@@ -633,19 +633,25 @@ def _measured(vae, samples):
 
 
 class _CudaPeak:
-    """Peak allocated bytes on a CUDA / ROCm device since start(), above what was allocated then. Resets the
-    device's peak statistics: _MemProbe's reserved peak of the decode in progress then starts at the probe (which
-    comes before any decode work, after loading the weights)."""
+    """Peak bytes on a CUDA / ROCm device since start(), above what was there then: the larger of the allocated and the
+    reserved peak, the allocator's cache emptied first (so the reserved peak counts the segments the decode makes,
+    its fragmentation included: LTX 0.9's decoder reserves 1.7x what it allocates, DESIGN §9.35). Resets the device's
+    peak statistics: _MemProbe's reserved peak of the decode in progress then starts at the probe (which comes before
+    any decode work, after loading the weights)."""
 
     def __init__(self, dev):
         self.dev = dev
 
     def start(self):
+        torch.cuda.synchronize(self.dev)
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.dev)
         self.base = torch.cuda.memory_allocated(self.dev)
+        self.base_res = torch.cuda.memory_reserved(self.dev)
 
     def peak(self):
-        return torch.cuda.max_memory_allocated(self.dev) - self.base
+        torch.cuda.synchronize(self.dev)
+        return max(torch.cuda.max_memory_allocated(self.dev) - self.base, torch.cuda.max_memory_reserved(self.dev) - self.base_res)
 
 
 def _cuda_peak_meter(dev):
