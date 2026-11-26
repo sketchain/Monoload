@@ -33,6 +33,7 @@ import time
 _ap = argparse.ArgumentParser()
 _ap.add_argument("--wan21", help="Wan 2.1 VAE file (real-model section)")
 _ap.add_argument("--wan22", help="Wan 2.2 VAE file (real-model section)")
+_ap.add_argument("--no-fp32", action="store_true", help="skip the real-model fp32 self-test / exactness section")
 _ap.add_argument("--sizes", default="832x480,1280x720", help="WxH list of the bf16 sweep")
 _ap.add_argument("--frames", default="5,9,17,33,49,81", help="pixel frame counts of the bf16 sweep (1 + 4 k)")
 _ap.add_argument("--no-native", action="store_true", help="skip native decodes in the sweep (no diff, no native peak)")
@@ -400,7 +401,8 @@ if __name__ == "__main__":
             table = []
             for label, path in (("Wan 2.1", OPTS.wan21), ("Wan 2.2", OPTS.wan22)):
                 if path:
-                    real_fp32(label, path)
+                    if not OPTS.no_fp32:
+                        real_fp32(label, path)
                     real_sweep(label, path, table)
             print_table(table)
     finish()
