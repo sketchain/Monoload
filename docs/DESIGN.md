@@ -1813,6 +1813,24 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **预期**（README §9.23）：常驻权重 50.1 GiB（`--gpu-only` 下文本编码器和 diffusion 模型都卸不出 GTT），离 62.47 GiB 的上限约 12 GiB；Monoload 的 VAE 解码两张都放得下（第一层 B，约 +0.6 / +1.35 GiB）；原生 1024² 约 +8.5 GiB，可能放得下也可能退 tiled，2048² 约 +43 GiB 一定退 tiled；采样阶段的激活取决于注意力实现，没有模拟。
 
+### 9.36 引擎的时间轴（钩子 H2 + H5，分支 video-engine-time）
+
+**要做什么：** PLAN-video.md §1 的 H2（`vae_engine` 认得帧：平面数、按时间分块）和 H5（视频的自检）。这一步只改引擎，**没有任何适配器用上**：现有的图片适配器都不定义 `time_chunks`，走原来的路径，行为不变（真机回归见下）。各组（A Wan、B Hunyuan、C CogVideoX…）写第一层时接上。
+
+**平面数（取自未合的 vae-refiner-layer1 f51a6bc 的引擎部分）：** 适配器给 `tdim`（张量里帧的那一维）和 `ckpt_planes`（存档的帧数），每个单元有 `Unit.tscale`（时间上采样 2、只取最后一帧 1/4 等）。一行的元素数 = 宽 × 平面数，内存和计算量的模型都按这个算；行区间与平面数无关。HunyuanImage 2.1 Refiner 一张图解成 4 帧，条带里带着全部 4 帧，就是这个。
+
+**按时间分块（stripe-major）：**
+
+* 适配器的 `time_chunks(shape)` 返回 `[TimeChunk(ct0, ct1, ot0, ot1)]`：第 k 块读存档的第 [ct0, ct1) 帧，产出输出的第 [ot0, ot1) 帧，按因果顺序。图片返回 None。
+* 存档（前缀的输出，全部帧）整份留着；每个输出条带**依次跑完所有时间块**，块与块之间带着这一条带自己的状态（`stripe_state()` 新建，`call_unit(u, x, state, k)` 调单元：每个因果卷积缓存它这几行（含 halo 行）的输入尾帧）。峰值 ≈ 存档 + 一条带 × 一块 + 这条带的缓存 + 输出，**几乎与帧数无关**。另一种顺序（每块跑完所有条带）要同时留所有条带的缓存，等于整帧的缓存，峰值高，不用。
+* 计数：`chunk_planes(chunk)` 给每级的平面数（默认 ct1 − ct0 乘各单元的 `tscale`），计划按各块里最大的取；`unit_cache(u, r, w, e)` 是单元在条带状态里跨块留的字节，在整条带期间都活着，加到每个单元的峰值上（`_chain_cost(caches=True)`）。前缀按块跑、边跑边填存档，所以 `prefix_bytes` 里总是带着存档。
+* 统计遍（整幅 GroupNorm，方案 A–D）不能和时间块一起用：`Plan` 直接报内部错误。HunyuanVideo 1.0 这种每块统计的情况由 B 组按块实现（PLAN-video §2）。
+* `run_stripes` 把每块的输出写到输出的 [ot0, ot1) 帧（`write(o0, o1, rows, t0, t1)`），交出的帧数不对就报内部错误。
+
+**H5（视频自检）：** 自检 latent 至少要跑 `SELFTEST_MIN_CHUNKS`（3）个时间块，状态才真跨过块边界（第一块常常特殊处理，至少再有两块）；不够就报内部错误，让适配器把自检 latent 的帧数给够。自检内存的上界里输出算上帧数。
+
+**真机回归（CT 700，`comfyui-latest`，图片适配器不变）：** 见下（随测随补）。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
