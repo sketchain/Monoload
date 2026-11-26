@@ -50,6 +50,7 @@ from .messages import msg
 _ORIG = {}
 _ORIG_DYNAMIC = {}
 _WARNED = set()
+_ADAPTED_PWTD = set()   # subclass patch_weight_to_device replacements that hand keys to Monoload (monoload/gguf.py)
 
 
 def set_exact(on):
@@ -88,6 +89,21 @@ except Exception:  # pragma: no cover
 
 def _is_quantized(t):
     return bool(_QuantizedTensor) and isinstance(t, _QuantizedTensor)
+
+
+def _ggml_kind(t):
+    """ComfyUI-GGUF parameter: "quantized" (Q4_K, Q8_0, ...), "plain" (F16 / F32 GGMLTensor), else None."""
+    if getattr(t, "tensor_type", None) is None or not hasattr(t, "tensor_shape"):
+        return None
+    from . import gguf
+    return "quantized" if gguf.is_ggml_quantized(t) else "plain"
+
+
+def _plain(t):
+    """Drop a GGMLTensor subclass from a temporary (its shape / dtype overrides)."""
+    if type(t) is not torch.Tensor and hasattr(t, "tensor_type"):
+        return t.as_subclass(torch.Tensor)
+    return t
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +293,13 @@ class MonoloadRuntimePatch(LowVramPatch):
         if not base and not hooks:
             return weight
         param = getattr(self._module(), self.attr)
-        if not (settings.exact() if b.exact is None else b.exact):
+        exact = settings.exact() if b.exact is None else b.exact
+        ggml = _ggml_kind(param)
+        if ggml is not None:
+            weight = _plain(weight)
+            if ggml == "quantized":
+                return self._call_ggml(weight, param, base, hooks, base_all, exact)
+        if not exact:
             return self._call_fast(weight, param, base, hooks, base_all)
         device = weight.device
         pdt = param.dtype  # for a QuantizedTensor: its dequantized dtype
@@ -286,13 +308,14 @@ class MonoloadRuntimePatch(LowVramPatch):
 
         w = None
         if base:
-            ldt = comfy.model_management.lora_compute_dtype(device)
+            # an F16 / F32 GGUF layer: ComfyUI-GGUF bakes it in fp32 and rounds with seed 0
+            ldt = torch.float32 if ggml else comfy.model_management.lora_compute_dtype(device)
             if src is not None:
                 temp = src if src.dtype == ldt else src.to(ldt)
             else:
-                temp = comfy.model_management.cast_to_device(param, device, ldt, copy=True)
+                temp = _plain(comfy.model_management.cast_to_device(param, device, ldt, copy=True))
             out = comfy.lora.calculate_weight(self._base_on(base, device, param.numel()), temp, key)
-            w = comfy.float.stochastic_rounding(out, pdt, seed=self.seed)
+            w = comfy.float.stochastic_rounding(out, pdt, seed=0 if ggml else self.seed)
             del temp, out
 
         if hooks:
@@ -301,7 +324,7 @@ class MonoloadRuntimePatch(LowVramPatch):
             elif src is not None:
                 temp = src.to(torch.float32)
             else:
-                temp = comfy.model_management.cast_to_device(param, device, torch.float32, copy=True)
+                temp = _plain(comfy.model_management.cast_to_device(param, device, torch.float32, copy=True))
             orig_param = param.dequantize() if _is_quantized(param) else param
             original = {key: [(orig_param, _identity)] + list(base_all or [])}
             moved_hooks = _to_device(hooks, device, self.binding.device_cache, param.numel(), {"transient": False})
@@ -310,6 +333,37 @@ class MonoloadRuntimePatch(LowVramPatch):
             del temp, out
 
         return w.to(dtype=cdt)
+
+    def _call_ggml(self, weight, param, base, hooks, base_all, exact):
+        """A quantized ComfyUI-GGUF layer: `weight` is the private dequantized temporary in the compute dtype
+        (GGMLLayer.cast_bias_weight -> dequantize_tensor). Merged into it and used as is, never re-quantized.
+        exact: native ComfyUI-GGUF's own merge (GGMLLayer.get_weight: calculate_weight on the dequantized
+        temporary, fp32 intermediate or the layer's patch_dtype), bit for bit; hook LoRAs (which native GGUF
+        does not apply to quantized layers) the same way after it. Default: the fused path (_merge_fast)."""
+        key = self.key
+        device = weight.device
+        cdt = weight.dtype
+        module = self._module()
+        w = weight if weight.dtype in _MATH_DTYPES else weight.to(torch.float32)
+        if base:
+            moved = self._base_on(base, device, param.numel())
+            if exact:
+                pdt = getattr(module, "patch_dtype", None)
+                if pdt is None:
+                    w = comfy.lora.calculate_weight(moved, w, key)
+                else:
+                    w = comfy.lora.calculate_weight(moved, w, key, cdt if pdt == "target" else pdt)
+            else:
+                w = _merge_fast(moved, w, key)
+        if hooks:
+            orig_param = _plain(module.get_weight(param, cdt))
+            original = {key: [(orig_param, _identity)] + list((base if base_all is None else base_all) or [])}
+            moved_hooks = _to_device(hooks, device, self.binding.device_cache, param.numel(), {"transient": False})
+            if exact:
+                w = comfy.lora.calculate_weight(moved_hooks, w, key, original_weights=original)
+            else:
+                w = _merge_fast(moved_hooks, w, key, original_weights=original)
+        return _plain(w).to(dtype=cdt)
 
     def _call_fast(self, weight, param, base, hooks, base_all=None):
         """Default path. The temporary is the one cast_bias_weight made, in the
@@ -394,7 +448,7 @@ def _active(patcher):
     if not _enabled(patcher):
         return False
     cls = type(patcher)
-    if cls.patch_weight_to_device is _patch_weight_to_device:
+    if cls.patch_weight_to_device is _patch_weight_to_device or cls.patch_weight_to_device in _ADAPTED_PWTD:
         return True
     if cls not in _WARNED:
         _WARNED.add(cls)
@@ -494,7 +548,8 @@ def _load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=Fals
     _check_dynamic(self)
     # No caller in ComfyUI 0.31 passes force_patch_weights=True (saving goes through model_state_dict_for_saving,
     # below); a custom node that asks for the patches to be baked in gets an error instead of base weights.
-    if force_patch_weights and len(self.patches) > 0:
+    # ComfyUI-GGUF's load always forces it (monoload/gguf.py): there it only means lowvram layers get a runtime patch.
+    if force_patch_weights and len(self.patches) > 0 and not self.__dict__.get("_monoload_gguf_forced", False):
         raise MonoloadUnsupportedError("force_patch_weights", msg("lora.force_patch"), key=_first_key(self))
     # Native load() wipes weight_function on every fully-loaded comfy.ops
     # module but skips modules already flagged comfy_patched_weights (natively
@@ -615,7 +670,11 @@ def _model_state_dict_for_saving(self, model=None, prefix=""):
     every module flagged comfy_patched_weights (natively the patches are baked into it) and a LazyCastingParam
     (patch_weight_to_device(return_weight=True): the merged weight, computed while saving) for the others. Under
     Monoload the stored tensors of a patched module are the base, so for the call the modules of this patcher's
-    patched keys are not flagged: they go through LazyCastingParam, which native merges exactly."""
+    patched keys are not flagged: they go through LazyCastingParam, which native merges exactly.
+    A ComfyUI-GGUF model cannot be saved at all (natively its quantized layers give meta placeholders or fail):
+    a clear error instead of a broken file (docs/GGUF-QUANT.md §3)."""
+    if _active(self) and _ggml_model(self.model):
+        raise MonoloadUnsupportedError("gguf_save", msg("lora.gguf_save"), key=_first_key(self))
     if not _active(self) or not self.patches:
         return _ORIG["model_state_dict_for_saving"](self, model=model, prefix=prefix)
     unflagged = []
@@ -632,6 +691,11 @@ def _model_state_dict_for_saving(self, model=None, prefix=""):
     finally:
         for m in unflagged:
             m.comfy_patched_weights = True
+
+
+def _ggml_model(model):
+    from . import gguf
+    return gguf.model_has_ggml_quantized(model)
 
 
 def _dynamic_load(self, *args, **kwargs):
@@ -668,13 +732,25 @@ def install():
     if dyn is not None and "load" in dyn.__dict__:
         _ORIG_DYNAMIC["load"] = dyn.__dict__["load"]
         dyn.load = _dynamic_load
+    find_subclass_adapters()
     return True
+
+
+def find_subclass_adapters():
+    """Adapt ModelPatcher subclasses with their own weight patching that Monoload knows (ComfyUI-GGUF), among the
+    modules loaded so far; also called at the start of every prompt (custom nodes may load after Monoload)."""
+    if not _ORIG:
+        return 0
+    from . import gguf
+    return gguf.find_and_install()
 
 
 def uninstall():
     """Restore native ModelPatcher. Unload all models first."""
     if not _ORIG:
         return False
+    from . import gguf
+    gguf.uninstall()
     for name, fn in _ORIG.items():
         setattr(ModelPatcher, name, fn)
     _ORIG.clear()
