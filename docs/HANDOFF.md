@@ -27,6 +27,7 @@
   * K-quant 等云端造不出的 GGUF 类型：`tests/check_gguf_kquant.py`（真机逐层对原生），计划见 `docs/GGUF-QUANT.md` §6.2。GGUF VAE 没有加载器（H3 和核心都没有），H7 已取消。
   * `bench_lora.py` 加了 `--unet-gguf` / `--clip-gguf` / `--latent C,T,H,W` / `--batch`，每个组合报 GTT 峰值（20 ms 采样）。
 * **H1 / H3 / H6：多帧第二层入口（video-l2-entry，合并见 §7）**——Wan 2.1 / 2.2 和 LTX（0.9.x 卷积 VAE 的 chunked io、LTX 2.5 扩散 decoder `CausalDiffusionVAE`）的 5D latent 走第二层，峰值靠实测探测 `vae._probe_mf` 定上界（16、32 两个 latent 尺寸在 64 MiB 工作区上的 allocated 连线 × `MF_MARGIN` 1.25，加上在解码自己工作区上再跑一次量到的碎片），输出块直接写进预分配的输出缓冲；F 组的扩展点 `vae_ops.EXTRA_CHUNKERS`；`bench_vae --frames N`。真机：Wan 2.1 720p×81 原生 reserved 18.90 → 9.84 GiB，估算 13.77，像素 max 0.0166（PSNR 60.8），热解码慢 9%。最终探测的真机读数在排队（DESIGN §9.35 表）。
+* **H2 / H5：引擎的时间轴（video-engine-time，合并见 §7）**——`vae_engine` 认帧：单元的 `tscale`、适配器的 `tdim` / `ckpt_planes` 决定每行平面数；适配器给 `time_chunks` 就按「条带为主」跑时间块，每条带带着自己的因果卷积缓存跨块；统计遍不能和时间块同用（B 组的 HunyuanVideo 1.0 按块统计自己实现）；视频自检至少 3 个时间块。现有图片适配器不受影响，CPU 回归全过。各组第一层接上（DESIGN §9.36）。
 * **阶段 B**：**`docs/PLAN-video.md` 已写（合并见 §7）**——共用钩子 H1–H7、各 VAE 的第一层方案和 A–H 分组、模型清单与单次峰值（> 55 只有 MiniMax H3 完整版 bf16 DiT）、开工顺序。还没做：`vae_inventory` 扩到 v0.46.3 的全部 VAE；README / DESIGN / HANDOFF 更新；`docs/PLAN-video.md`（每种视频 VAE + 新图像 VAE 的第一层方案，分组可并行，含 safetensors / GGUF；覆盖 v0.46.3 里量化能跑的全部视频模型，扩散模型和文本编码器分开算；单次峰值 ≤ 55G 为主线，> 55G 单列「等宿主机调 ttm 后再验」；超大模型不分批会 OOM 时才把 TE 和视频模型分开加载；不做 MAGI-2）。
 * **视频第一层 A 组：Wan 2.1 / 2.2 多帧（video-wan-l1，合并见 §7；DESIGN §9.39）**——`monoload/vae_wan_video.py`：T > 1 的 Wan 2.1 VAE（16 ch、8×）和 Wan 2.2 VAE（48 ch、16×）走第一层，条带为主：`conv2` 和前缀按时间块整段算进存档 `[1, C, T, h, w]`，每个输出行条带带着自己的 `feat_cache` 依次跑全部时间块（原生的模块实例和调用方式，Wan 2.1 的 2 帧切片照做），每块直接写进预分配的 5D 输出。单元 / halo / 条带划分沿用单帧适配器；内存模型和执行在适配器里（`VideoPlan`），不依赖 H2（H2 的 `run_chain` 表达不了 Wan 2.1 的切片）。自检跑真正的视频路径（fp32、3 个时间块）。小测试全过（对原生相对误差 ≤ 2e-6，自检、注入错误、未注册时逐位一致）；CPU 上接到 video-l2-entry：整条托管路径选第一层、与原生相对误差 ≤ 8e-7。真机：REALMACHINE_PLACEHOLDER
   * **还没注册**：`vae.STRIPE_ADAPTERS` 加 `vae_wan_video`（顺序无所谓，只接 T > 1）并在 `vae.py` 顶上 import；没注册时 Wan 多帧走 H1 的第二层。
@@ -264,7 +265,8 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | **video 分支**：适配 ComfyUI v0.46.3（阶段 A） | 8d89069 |
 | video：PLAN-video.md | d58707f |
 | **video 分支**：LoRA 量化 safetensors 测试 / GGUF / 视频小参数 | 见 `git log --first-parent video`（Merge lora-quant-formats / lora-gguf / lora-video-models） |
-| **video 分支**：H1 / H3 / H6 多帧第二层入口、LTX 进第二层、`EXTRA_CHUNKERS` | Merge video-l2-entry（`git log --first-parent video`） |
+| **video 分支**：H1 / H3 / H6 多帧第二层入口、LTX 进第二层、`EXTRA_CHUNKERS` | 5fddc22 |
+| **video 分支**：H2 / H5 引擎时间轴 | Merge video-engine-time（`git log --first-parent video`） |
 | video：视频第一层 A 组 Wan 2.1 / 2.2 多帧（`vae_wan_video`） | 见 `git log --first-parent video`（Merge video-wan-l1） |
 | 本文件 | 本文件所在的提交（`git log --first-parent video` 最上面几条） |
 
