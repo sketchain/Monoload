@@ -56,9 +56,12 @@
 |---|---|---|---|---|
 | `cogvideo/vae.py`（GroupNorm、`conv_caches`）| CogVideoX 2B / 5B、I2V、Inpaint | — | 53.12 → 19.28 | 121（OOM）→ 45.41 |
 
-* 原生：第一段**整段视频**一起过 `conv_in`、mid、前两级上采样（时间 ×2），第二段每 4 帧一块过后两级（`conv_caches`）；各块 `.cpu()` 存主机最后 `cat`——**这违反「不经过内存」**，Monoload 接管时第二段的输出要直接写设备上的输出（H3）。
-* L1：第一段的 GroupNorm 统计量跨整段视频 → 统计遍按「每行全部帧」（H2 平面数 = T）；第一段的低分辨率部分进存档；第二段条带为主、按 4 帧块推进、条带自己的 `conv_caches`。
-* L2 的探测现在会失败（读 meta 张量的值），H1 里要修。
+* 原生：第一段**整段视频**一起过 `conv_in`、mid、前两级上采样（时间 ×2 两次），第二段每 4 帧一块过后两级（`conv_caches`）；各块 `.cpu()` 存主机最后 `cat`。峰值由 up_blocks[1] 的 Upsample3D 输出（整段、H/2、256 通道）主导。
+* **实际做法（`monoload/vae_cogvideo.py`，DESIGN §9.38）**：
+  * L2：`chunks()` 流式——第一段停在 up_blocks[1] 的上采样之前，上采样按块只算该块要的源帧，第二段照原生循环逐块产出（经 `vae_video._CHUNKS`，H3 直接写设备上的输出，不经主机）。数值和原生同一套调用。
+  * L1：`match()` 接到 `vae.STRIPE_ADAPTERS`（05abc20）。各 resnet 按输出行切片、GroupNorm 用整张量统计（fp32 Moments），SpatialNorm→SiLU 现算、`conv_caches` 逐行填；第一段整段视频、第二段沿用原生 4 帧块；自检走 `self_test_run`（fp32 拷贝，对 `chunks()` 参考 ≤1e-4）。
+  * 帧数：latent t 奇数 → 4t−3，偶数 → 4t（sd.py 的 upscale_ratio 只对奇数对），`output_frames()` 先问本模块。
+  * 待真机：720p×81 第一层对第二层、一个偶数帧档、自检、MONOLOAD=0 逐位；据此定第一层去留。
 
 ### D 组：Cosmos 1.0、Mochi（整段一次、没有时间块）
 
