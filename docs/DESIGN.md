@@ -507,7 +507,7 @@ loop:
 | 多帧视频（5D、T>1） | **暂时**交给原生，打日志。这是第一阶段暂时不做，不是永远不做：多帧需要按时空分别规划（时间 cache、首帧特例），留到第一层之后 |
 | 1D / 音频 latent、`comfy_has_chunked_io` 的 VAE（LTX、MiniMax：自己往预分配输出里写） | 原生，打日志 |
 | 2D latent 的音频 VAE（ACE-Step、LTX 2 音频、MiniMax H3 音频；`extra_1d_channel` 已设，或放大倍数大于 64，图像 VAE 是 1 / 4 / 8 / 16 / 32） | 原生，打日志（第四阶段 4b-0 起，§9.17） |
-| decoder 在 batch 的各帧之间混合（SVD 的 `VideoDecoder`：batch 就是时间轴，逐样本解码会改变结果） | 原生，打日志（4b-0 起；以后做视频第二层时改成整批一次） |
+| decoder 在 batch 的各帧之间混合（SVD 的 `VideoDecoder`：batch 就是时间轴，逐样本解码会改变结果） | 第二层整批一次解码（§9.38）；设备没有分配器统计时原生，打日志 |
 | first-stage model 里没有卷积也没有 ComfyUI 的 VAE 注意力（像素空间「VAE」） | 原生，打日志（4b-0 起：第二层没有可做的） |
 | 用户显式用 `VAEDecodeTiled` 节点或 `VAE.decode_tiled` | 不经过 `VAE.decode`，保持原生（用户自己选择了 tiled 的语义） |
 | 直接调用 `first_stage_model.decode` 的第三方代码 | 不经过 `VAE.decode`，原生 |
@@ -1888,6 +1888,22 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 **测试：** `tests/test_vae_norm_g.py`（真机 GPU 上跑，没有 GPU 时 CPU）：两种模块只在 `OpChunking` 里被换、小通道逐位相同、fp32 / bf16 精度、替换期间不当钩子、退出后无残留；整个 LTX 2 `VideoVAE(version=2)` decoder（随机权重，全宽）和 `vae_refiner.Decoder(refiner_vae=True)`（阈值降到 16 通道让小模型的 norm 都换）在 `OpChunking` 下与原生一致。`tests/check_norm_reduce.py --pixelnorm`：真机量原生 PixelNorm 的峰值（含 x²）、归约是否另开临时缓冲，与分组版对比峰值、误差、耗时。
 
 **回归（CT 700 的 `comfyui-latest` 里 `--cpu` 跑）：** `test_vae_norm_g` 7 项、`test_vae_stripe` 79 项全过；`test_vae_refiner` 13 项全过。真机 GPU 上的 `test_vae_norm_g` 和 `check_norm_reduce --pixelnorm` 在排队，测完补在这里。
+
+### 9.38 SVD 的整批第二层（E 组，分支 video-svd-l2）
+
+**问题：** SVD 的 `temporal_ae.VideoDecoder` 把 batch 当时间轴（`timesteps` 默认等于 batch 大小），在帧之间做时间卷积和时间注意力。逐样本解码等于每帧单独解码，结果会变（§9.17 缺口 1），所以 4b-0 起它一直走原生。原生自己也按 `free / memory_used_decode` 把 batch 切成子批，每个子批当一段独立的视频：**原生的结果随空闲内存变**，通常一次装得下才是整批。
+
+**替用户定的：** 第二层**整批一次**进 `OpChunking`，不按空闲内存切。整批是模型本来的用法（img2vid 的帧数就是它训练时的时间长度），也是原生在显存够时的结果。
+
+* `vae._whole_batch(vae)`：`_model_traits` 认出 `temporal_ae` 的时间模块（`VideoResBlock` / `AE3DConv` / `AttnVideoBlock`）就是整批 decoder。
+* `_native_reason`：这类 decoder 只在设备没有分配器统计时原生（信息改成「整批解码要用分配器统计定上界」）。
+* 估算用 H1 的实测探测（`_probe_mf`，§9.35）：探测的零 latent 用**整批**的帧数，在 16、32 两个 latent 尺寸上测峰值；估算的 latent 项算整批。探测缓存的键加上 batch 大小（帧数不同、时间注意力的大小不同）。
+* `_run` 按 `step = batch` 走一次；输出缓冲在解码前按 4D 形状分配，`_decode_sample` 整段解码后拷进去。
+* 与原生的差别：只有原生自己切了子批时（空闲内存不够整批）结果不同，那时原生的结果本来就是「几段独立视频」。
+
+**验证：** `tests/test_vae_svd.py`（真机 GPU，随机权重、SVD 全宽）：14 帧 40×48 latent 走第二层、与原生整批解码相对差 ≤ 1e-4、与逐帧解码明显不同、调用的实测峰值 ≤ 记录的估算、不走分块；同形状第二次复用探测、7 帧另有自己的探测；没有分配器统计时走原生。`tests/test_vae.py` 第 5 部分（`--cpu`，没有分配器统计）照旧走原生。
+
+**真机（CT 700，`comfyui-latest`）：** 见下面的结果表（随测随补）。
 
 ### 9.39 v0.46.3 的全部 VAE 盘点（分支 video-inventory）
 

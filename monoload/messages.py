@@ -188,8 +188,10 @@ M = {
                            "not available on {dev}",
                            "多帧视频 latent（T={t}）：给它的内存定上界要用设备分配器的统计，{dev} 上没有"),
     "vae.nr_batch_time": ("{model}'s decoder mixes frames across the batch (the batch is its time axis, e.g. SVD's VideoDecoder): "
-                          "a sample-by-sample decode would change the result",
-                          "{model} 的 decoder 把整个 batch 当时间轴、在帧之间混合（例如 SVD 的 VideoDecoder）：逐样本解码会改变结果"),
+                          "Monoload decodes the whole batch at once, and bounding its memory needs the device's allocator "
+                          "statistics, not available on {dev}",
+                          "{model} 的 decoder 把整个 batch 当时间轴、在帧之间混合（例如 SVD 的 VideoDecoder）：Monoload 整批一起解码，"
+                          "给它的内存定上界要用设备分配器的统计，{dev} 上没有"),
     "vae.nr_no_ops": ("{model} has no convolution or VAE attention to chunk (e.g. the pixel-space VAE): nothing to manage",
                       "{model} 没有可分块的卷积或 VAE 注意力（例如像素空间 VAE）：没有可管理的"),
     "vae.cand_selftest": (" (first use: the self-test before it reserves up to {st}; the decode {plan})",

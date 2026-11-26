@@ -599,8 +599,8 @@ def _native_reason(vae, samples):
         if (samples.shape[2] != 1 or vae_video.measured(fsm)) and _PEAK_METER[0](getattr(vae, "device", None)) is None:
             return msg("vae.nr_mf_no_meter", t=samples.shape[2], dev=getattr(vae, "device", None))
     mixes, ops = _model_traits(fsm)
-    if mixes:
-        return msg("vae.nr_batch_time", model=model)
+    if mixes and _PEAK_METER[0](getattr(vae, "device", None)) is None:
+        return msg("vae.nr_batch_time", model=model, dev=getattr(vae, "device", None))
     if not ops:
         return msg("vae.nr_no_ops", model=model)
     return None
@@ -634,10 +634,24 @@ def _multiframe(samples):
     return samples.ndim == 5 and int(samples.shape[2]) > 1
 
 
-def _measured(vae, samples):
-    """Whether layer 2's estimate is the measured probe (_probe_mf): a multi-frame latent, or a model vae_video always
-    measures (LTX, a single frame included)."""
+def _whole_batch(vae):
+    """SVD's VideoDecoder (and anything else that mixes frames across the batch, _batch_time_modules): the batch is its
+    time axis, so layer 2 decodes the whole batch in one go, as native does when its free memory allows it (native
+    splits the batch by free memory and only mixes the frames inside each part: its result depends on the free memory;
+    the whole batch is what the model was made for). DESIGN §9.38."""
+    return _model_traits(vae.first_stage_model)[0]
+
+
+def _timed(vae, samples):
+    """A 5D latent whose frame count keys the measured probe: a multi-frame latent, or a model vae_video always measures
+    (LTX, a single frame included)."""
     return _multiframe(samples) or (samples.ndim == 5 and vae_video.measured(vae.first_stage_model))
+
+
+def _measured(vae, samples):
+    """Whether layer 2's estimate is the measured probe (_probe_mf): a multi-frame latent, a model vae_video always
+    measures, or a whole-batch decoder."""
+    return _timed(vae, samples) or _whole_batch(vae)
 
 
 class _CudaPeak:
@@ -686,7 +700,11 @@ def _probe_key(vae, samples):
     first-stage model in another dtype, and the probe's bytes per pixel are in the decode's dtype. Multi-frame: and the
     number of latent frames (the probe measures the whole decode)."""
     key = (int(samples.shape[1]), samples.ndim, str(vae.vae_dtype))
-    return key + (int(samples.shape[2]),) if _measured(vae, samples) else key
+    if _timed(vae, samples):
+        key += (int(samples.shape[2]),)
+    if _whole_batch(vae):
+        key += ("batch", int(samples.shape[0]))
+    return key
 
 
 def _probe(vae, samples, vae_options):
@@ -764,7 +782,7 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
     runs = [(s, MF_PROBE_WORKSPACE) for s in MF_PROBE_SIZES] + ([(MF_PROBE_SIZES[-1], ws)] if ws > MF_PROBE_WORKSPACE else [])
     for s, run_ws in runs:
         shape = list(samples.shape)
-        shape[0] = 1
+        shape[0] = int(samples.shape[0]) if _whole_batch(vae) else 1   # a whole-batch decoder: every frame
         shape[-2] = shape[-1] = s
         with torch.inference_mode(), torch.random.fork_rng(devices=devs):
             z = torch.zeros(shape, device=vae.device, dtype=vae.vae_dtype)
@@ -781,7 +799,7 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
     slope = max(0.0, (peaks[1] - peaks[0]) / (b - a))
     intercept = max(0.0, peaks[1] - slope * b)
     r = vae.spacial_compression_decode()
-    out_numel = getattr(vae, "output_channels", 3) * r * r * (vae_video.output_frames(vae, int(samples.shape[2])) or 1)
+    out_numel = getattr(vae, "output_channels", 3) * r * r * ((vae_video.output_frames(vae, int(samples.shape[2])) if samples.ndim == 5 else None) or 1)
     p = _Probe(slope, out_numel, time.perf_counter() - t0, mf_slope=slope, mf_intercept=intercept, mf_frag=max(frags))
     per_model[key] = p
     return p
@@ -828,7 +846,7 @@ def estimate(vae, samples, budget, probe=None, retained=0, copies=ACTIVATION_COP
     out_bytes = 0
     if _same_device(vae.output_device, vae.device):
         out_bytes = out_numel * samples.shape[0] * mm.dtype_size(vae.vae_output_dtype())
-    lat = (samples[0:1].numel()) * mm.dtype_size(vae.vae_dtype)
+    lat = (samples.numel() if _whole_batch(vae) else samples[0:1].numel()) * mm.dtype_size(vae.vae_dtype)
     total = copies * act + 2 * budget + out_bytes + lat + retained
     return {"total": int(total), "activation": int(act), "workspace": int(budget), "output": int(out_bytes), "latent": int(lat),
             "retained": int(retained)}
@@ -865,6 +883,9 @@ def _output_shape(vae, z):
         r = vae.spacial_compression_decode()
         return (int(z.shape[0]), getattr(vae, "output_channels", 3), vae_video.output_frames(vae, int(z.shape[2])),
                 int(z.shape[-2]) * r, int(z.shape[-1]) * r)
+    if z.ndim == 4 and _whole_batch(vae):
+        r = vae.spacial_compression_decode()
+        return (int(z.shape[0]), getattr(vae, "output_channels", 3), int(z.shape[-2]) * r, int(z.shape[-1]) * r)
     return None
 
 
@@ -894,28 +915,30 @@ def _decode_sample(vae, z, vae_options, dest):
 
 def _run(vae, samples_in, vae_options, budget, stats):
     """Layer 2: the original decoder forward under OpChunking, one sample at a
-    time, written into the output buffer like native decode (_decode_sample)."""
+    time (a whole-batch decoder: the whole batch at once, _whole_batch), written
+    into the output buffer like native decode (_decode_sample)."""
     fsm = vae.first_stage_model
     pixel_samples = None
     n = samples_in.shape[0]
+    step = n if _whole_batch(vae) else 1
     shape = _output_shape(vae, samples_in)
     if shape is not None:
         with vae_ops.malloc_graph_paused():
             pixel_samples = torch.empty(shape, device=vae.output_device, dtype=vae.vae_output_dtype())
     with OpChunking(fsm, budget, stats):
-        for i in range(n):
-            samples = samples_in[i:i + 1].to(device=vae.device, dtype=vae.vae_dtype)
+        for i in range(0, n, step):
+            samples = samples_in[i:i + step].to(device=vae.device, dtype=vae.vae_dtype)
             if pixel_samples is not None:
-                _decode_sample(vae, samples, vae_options, pixel_samples[i:i + 1])
+                _decode_sample(vae, samples, vae_options, pixel_samples[i:i + step])
                 del samples
             else:
                 out = fsm.decode(samples, **vae_options)
                 del samples
                 with vae_ops.malloc_graph_paused():
                     pixel_samples = torch.empty((n,) + tuple(out.shape[1:]), device=vae.output_device, dtype=vae.vae_output_dtype())
-                pixel_samples[i:i + 1].copy_(out)   # = native's .to(output_device, output dtype, copy=True) + copy_
+                pixel_samples[i:i + step].copy_(out)   # = native's .to(output_device, output dtype, copy=True) + copy_
                 del out
-            vae.process_output(pixel_samples[i:i + 1])
+            vae.process_output(pixel_samples[i:i + step])
     return pixel_samples
 
 
@@ -1344,7 +1367,7 @@ def _layer2_estimate(vae, samples_in, vae_options, ws):
     shape probe (first decode of this model and latent layout) loads the weights."""
     probe = _PROBES.get(vae.first_stage_model, {}).get(_probe_key(vae, samples_in))
     if probe is None and _measured(vae, samples_in):
-        big = samples_in[0:1, ..., :MF_PROBE_SIZES[-1], :MF_PROBE_SIZES[-1]]
+        big = samples_in[(slice(None) if _whole_batch(vae) else slice(0, 1)), ..., :MF_PROBE_SIZES[-1], :MF_PROBE_SIZES[-1]]
         _load_models(vae, estimate(vae, big, ws, copies=8)["total"])
         try:
             probe = _probe_mf(vae, samples_in, vae_options, ws)
