@@ -98,10 +98,10 @@
 | VAE（类） | 自己怎么分块 | 原生峰值（CT 700 实测，reserved） | 结论 |
 |---|---|---|---|
 | MiniMax H3 视频，原版 decoder（`MiniMaxH3VideoVAE` + `ViT3DDecoder`） | 时间上 5 + 2 个 latent 一块，空间 256 px tile（一次最多 4 块），边解边写输出 | 见下表：1080p 107 帧总共 11.8 GiB（权重 4.85 + 输出 2.5 + 工作量 < 2.5）| 原生已够，只透传 |
-| MiniMax H3 视频，Sol decoder（`NonCausalViT3DDecoder`） | 整段的残差流 + 5 个 latent 一块的 q/k/v 环（ring 2）| 待测（batch3） | 待定 |
+| MiniMax H3 视频，Sol decoder（`NonCausalViT3DDecoder`） | 整段的残差流 + 5 个 latent 一块的 q/k/v 环（ring 2）| 待测（已排队）。按代码算：残差流每输出像素·帧 4 B（2048 维 bf16 ÷ 16×16×4 像素），只有 fp32 输出（12 B）的三分之一；q/k/v/注意力输出的环 1080p 约 1.3 GiB、单块 qkv / MLP 临时量约 1 GiB，与帧数无关。1080p 107 帧估 ≈ 权重 + 输出 2.5 + 残差 1.1 + 2.5 | 只透传：随帧数涨的部分以 ComfyUI 预分配的输出为主，第一层省不掉它；残差流整段在显存里是这个 decoder 的设计（不重算时间重叠），拆开就不是同一个结果 |
 | MiniMax H3 Image / P-H3 Image（`H3ImageVAE` 子类） | 同原版的 256 px tile | 没有单独的 Image 模型文件（Comfy-Org/MiniMax-H3 只有 fl2va / ref2va），按原版的数推 | 只透传 |
-| SeedVR2（`VideoAutoencoderKLWrapper`） | 按空闲显存定每片几个 latent 帧；卷积 / GroupNorm 0.5 GiB 一块；放不下时把因果缓存放到锁页内存（`CausalMemoryCache(offload=True)`，每输出像素 6200 B）| 待测（batch3） | 待定 |
-| RelayVSR Flash（`RelayFlash`） | 逐帧解码，窗口注意力 48×48 / 24×24，`HostWriter` 直接写输出 | 待测（batch3） | 待定 |
+| SeedVR2（`VideoAutoencoderKLWrapper`） | 按空闲显存定每片几个 latent 帧；卷积 / GroupNorm 0.5 GiB 一块；放不下时把因果缓存放到锁页内存（`CausalMemoryCache(offload=True)`，每输出像素 6200 B）| 待测（已排队）。它自己的估算（`comfy_memory_used_decode`，按实测拟合，`comfy_decode_estimate_is_reliable`）：每输出像素 3150 B，**bf16 再 ×5**（只有 fp16 channels-last 走拟合的快路径）——1080p 一帧约 32 GiB、4K 约 120 GiB，4K 直接走它自己的空间分块（`preferred_decode_tile`，最大 768 px） | 只透传：峰值由它自己按空闲显存规划、估算可靠、放不下自动分块，第一层要重写它的因果缓存机制（4a 盘点就不建议）。能省的是精度：SeedVR2 VAE 用 fp16 比 bf16 少约 5 倍，这是用户侧的选择，不是 Monoload 的事 |
+| RelayVSR Flash（`RelayFlash`） | 逐帧解码，窗口注意力 48×48 / 24×24，`HostWriter` 直接写输出 | 待测（已排队）。按代码：一帧的工作量，和帧数无关 | 只透传 |
 
 **MiniMax H3 原版 decoder 实测**（`minimax_h3_video_vae_fp16.safetensors`，`--gpu-only --bf16-vae`，权重 4.85 GiB；随机 latent；`tests/bench_selftiled.py`；原生和装了 Monoload 的输出逐位相同）：
 
