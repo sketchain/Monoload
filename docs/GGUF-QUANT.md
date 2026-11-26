@@ -23,6 +23,11 @@
 * 底模跨工作流常驻，LoRA 每个 prompt 结束释放（现有 release 机制）。默认融合 fp16 `addmm_`，留逐位一致开关（fused / exact）。
 * 运行时任何东西都不许走 CPU。
 
+## 1.1 用户的机器（2026-11-26）
+
+* CT 只给 48 GB 内存（因为定了运行时不经过内存）；GPU 稳定可用 55 GiB，估峰值以此为准。
+* 用户说的「分批跑」只针对超大模型防 OOM，不是必须；怎么做由线程自己定。
+
 ## 2. 新版 ComfyUI / ComfyUI-GGUF 的相关事实
 
 ### 2.1 ComfyUI v0.46.3
@@ -101,7 +106,7 @@ LoRA key 映射是 ComfyUI 自己的（`comfy/lora.py` `model_lora_keys_unet` + 
 * 视频 LoRA 改到 modulation / scale_shift_table / `.diff` / `.diff_b` 这类非 comfy.ops 小参数：按 §5 的 hook 方案支持（模块 forward 期间临时换上合并好的参数，不留备份），目标所有视频模型都能用，不等 LXC 上的 LoRA key 扫描结果。
 * Dynamic VRAM：新容器继续 `--gpu-only`；Monoload 在 Dynamic VRAM 下报清楚的错即可，暂不兼容。
 * 分支：阶段 A 合进 `video` 后从 `video` 拉 feature 分支，`--no-ff` 合回 `video`；本文件一起带进 `video`。
-* LXC 检查结果（2026-11-26，底座线程跑，原文在 LXC `/srv/comfy-latest/logs/gguf_checks.out`）：`--gpu-only` 在 compose 和运行中容器里都有。int8 = `int8_tensorwise`。fp8 那几份（flux2_dev_fp8mixed、wai_v17_fp8_test、mistral_3_small_flux2_fp8、oldt5 / umt5 fp8 scaled）文件里都没有 `comfy_quant` 张量，靠 scale 键，属于头部元数据或旧 `scaled_fp8` 标记那两种来源，具体哪种待第 3 条检查。LoRA 小参数扫描为空，是因为视频 LoRA 还没下完，下完让验证线程再查。
+* LXC 检查结果（2026-11-26，底座线程跑，原文在 LXC `/srv/comfy-latest/logs/gguf_checks.out`）：`--gpu-only` 在 compose 和运行中容器里都有。int8 = `int8_tensorwise`。fp8 那几份（flux2_dev_fp8mixed、wai_v17_fp8_test、mistral_3_small_flux2_fp8、oldt5 / umt5 fp8 scaled）文件里都没有 `comfy_quant` 张量，靠 scale 键，属于头部元数据或旧 `scaled_fp8` 标记那两种来源，第 3 条检查（原文 LXC `/srv/comfy-latest/logs/gguf_checks2.out`）：只有头部 `_quantization_metadata`：flux2_dev_fp8mixed；只有 `scaled_fp8` 标记：wai_v17_fp8_test、oldt5、umt5；两样都有：mistral_3_small_flux2_fp8（`convert_old_quants` 见到元数据就不走标记分支）。三条路径都要 CPU 测试锁住。LoRA 小参数扫描为空，是因为视频 LoRA 还没下完，下完让验证线程再查。
 
 ## 8. 进度日志
 
