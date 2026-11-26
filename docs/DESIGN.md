@@ -1889,6 +1889,14 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **回归（CT 700 的 `comfyui-latest` 里 `--cpu` 跑）：** `test_vae_norm_g` 7 项、`test_vae_stripe` 79 项全过；`test_vae_refiner` 13 项全过。真机 GPU 上的 `test_vae_norm_g` 和 `check_norm_reduce --pixelnorm` 在排队，测完补在这里。
 
+### 9.38 SVD：整批第二层不合，保持原生（E 组，分支 video-svd-l2 留着不合）
+
+**问题：** SVD 的 `temporal_ae.VideoDecoder` 把 batch 当时间轴（`timesteps` 默认等于 batch 大小），帧之间做时间卷积和时间注意力，逐样本解码会改结果（§9.16 缺口 1），所以现在走原生（§9.17）。
+
+**试过的：** 第二层**整批一次**进 `OpChunking`，估算用 H1 的实测探测（零 latent 用整批的帧数）。代码和 GPU 测试 `tests/test_vae_svd.py` 在分支 video-svd-l2（`_whole_batch`、`bench_vae --batch`）。
+
+**为什么不合（盘点模拟，1024×576×14，bf16，GiB）：** 原生 reserved 25.71；整批第二层 20.72，只省 20%（GroupNorm 和时间模块跨整批帧，活着的激活本来就按帧数乘，§9.32 的预言）；探测给的估算 20.03（碎片项 1.21）**不是上界**：整批时 reserved 比 allocated 多 6.7，碎片随尺寸涨，在 32×32 latent 上量不出来。按尺寸放大碎片项又会到 30 左右，比原生还高。省得少、上界给不出，替用户定了：SVD 照旧原生（原生在显存不够时自己按空闲内存切子批）。要降 SVD 的峰值只能走第一层（按时间段的条带，整批统计），收益和工作量见 PLAN-video §2 的 E 组，暂不做。
+
 ### 9.39 v0.46.3 的全部 VAE 盘点（分支 video-inventory）
 
 **做了什么：** `tests/vae_inventory.py` 跟到 v0.46.3：新加 MiniMax-H3-Image、p-h3-image（单帧 2D ViT decoder）、LTX 扩散 decoder（`na_diffusion_decoder.CausalDiffusionVAE`）、RelayVSR Flash（`wan.model_vsr.RelayFlash`）；MiniMax Music3 DAV、Trellis2 形状 / 纹理（1D / 稀疏 3D，走原生）只列不追踪。托管的多帧（`vae._measured`）走 Monoload 自己的路：`vae._decode_sample` 逐块写进输出缓冲，估算由 `vae._probe_mf` 在模拟器上量（模拟器的计量和 `_CudaPeak` 一样：先清缓存、记 allocated 和 reserved 的峰值、碎片项）。没托管的多帧（Mochi、CogVideoX、Cosmos、HunyuanVideo 1.0 / 1.5）照旧给「假设走第二层」的模拟值，不跑 H1 的探测（原来会因为没有输出形状而追踪失败，已改）。
