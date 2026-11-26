@@ -26,6 +26,7 @@ Real models (--wan21 / --wan22 PATH to the VAE safetensors; GPU):
 
 import argparse
 import gc
+import os
 import sys
 import time
 
@@ -35,6 +36,8 @@ _ap.add_argument("--wan22", help="Wan 2.2 VAE file (real-model section)")
 _ap.add_argument("--sizes", default="832x480,1280x720", help="WxH list of the bf16 sweep")
 _ap.add_argument("--frames", default="5,9,17,33,49,81", help="pixel frame counts of the bf16 sweep (1 + 4 k)")
 _ap.add_argument("--no-native", action="store_true", help="skip native decodes in the sweep (no diff, no native peak)")
+_ap.add_argument("--native-dir", help="shared directory of native results, one file per model / size / frames: an existing file is "
+                 "read instead of running native again, a new native run is written there")
 _ap.add_argument("--no-small", action="store_true", help="skip the small-model sections")
 _ap.add_argument("--workspace", default="64M", help="layer-2 workspace inside the stripes on the GPU")
 _ap.add_argument("--rows", type=int, default=None, help="force a stripe height in the sweep (default: the plan for the free memory)")
@@ -301,7 +304,11 @@ def real_sweep(label, path, table):
             check("{} {}x{} x{} frames: L1 {} stripes x {} rows, reserved +{} <= estimate {} ({:.1f}s)".format(
                 label, W, H, nf, len(plan.stripes), plan.rows, fmt_bytes(dres), fmt_bytes(plan.estimate), dt),
                 dres <= plan.estimate and bool(torch.isfinite(out).all()))
-            if not OPTS.no_native:
+            known = native_file(label, size, nf)
+            if known is not None and os.path.exists(known):
+                row.update(read_native(known))
+                print("  native from {}: reserved +{}".format(known, fmt_bytes(row.get("native_res") or 0)))
+            elif not OPTS.no_native:
                 def run_nat():
                     with torch.inference_mode():
                         return raw_native(v, lat)
@@ -316,12 +323,42 @@ def real_sweep(label, path, table):
                     check("{} {}x{} x{}: L1 vs native bf16 max abs diff {:.3g} (native reserved +{}, {:.1f}s)".format(
                         label, W, H, nf, d, fmt_bytes(nres), ndt), out.shape == ref.shape and d <= 0.25)
                     del ref
+                if known is not None:
+                    write_native(known, label, size, nf, nres if not isinstance(ref, Exception) else None, ndt, nalloc)
             table.append(row)
             del out
             gc.collect()
     del v
     gc.collect()
     mm.soft_empty_cache(True)
+
+
+def native_file(label, size, nf):
+    if not OPTS.native_dir:
+        return None
+    return os.path.join(OPTS.native_dir, "{}_{}_{}f.txt".format(label.lower().replace(" ", "").replace(".", ""), size, nf))
+
+
+def read_native(path):
+    d = {}
+    for line in open(path):
+        k, _, v = line.strip().partition("=")
+        if k == "native_reserved_bytes":
+            d["native_res"] = int(v)
+        elif k == "native_seconds":
+            d["native_s"] = float(v)
+    return d
+
+
+def write_native(path, label, size, nf, res, secs, alloc):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("model={}\nsize={}\nframes={}\nbf16=1\n".format(label, size, nf))
+        f.write("native_reserved_bytes={}\nnative_reserved_gib={}\n".format(res if res is not None else "OOM",
+                                                                           "{:.2f}".format(res / GIB) if res is not None else "OOM"))
+        f.write("native_alloc_bytes={}\nnative_seconds={:.1f}\n".format(alloc, secs))
+        f.write("how=WanVAE.decode itself (first_stage_model.decode, no comfy VAE.decode wrapper), weights loaded, latent on CPU, "
+                "max_memory_reserved growth after empty_cache; tests/test_vae_wan_video.py (wan-video-l1)\n")
 
 
 def print_table(table):
