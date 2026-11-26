@@ -467,6 +467,11 @@ class _MemProbe:
 #                                       ckpt_bytes, describe()) or None when the budget cannot be met
 #   bound.run(vae, samples, plan, workspace, stats) -> pixel_samples (process_output applied), native layout
 STRIPE_ADAPTERS = [vae_wan, vae_wan22, vae_ldm, vae_hunyuan]
+try:   # group C's CogVideoX layer 1 (its match() takes CogVideoX latents of 2+ frames); absent until merged
+    from . import vae_cogvideo
+    STRIPE_ADAPTERS.append(vae_cogvideo)
+except ImportError:
+    pass
 
 _L1_NOTED = weakref.WeakKeyDictionary()   # first_stage_model -> last logged layer-1 reason
 
