@@ -27,6 +27,7 @@
   * K-quant 等云端造不出的 GGUF 类型：`tests/check_gguf_kquant.py`（真机逐层对原生），计划见 `docs/GGUF-QUANT.md` §6.2。GGUF VAE 没有加载器（H3 和核心都没有），H7 已取消。
   * `bench_lora.py` 加了 `--unet-gguf` / `--clip-gguf` / `--latent C,T,H,W` / `--batch`，每个组合报 GTT 峰值（20 ms 采样）。
 * **阶段 B**：**`docs/PLAN-video.md` 已写（合并见 §7）**——共用钩子 H1–H7、各 VAE 的第一层方案和 A–H 分组、模型清单与单次峰值（> 55 只有 MiniMax H3 完整版 bf16 DiT）、开工顺序。还没做：`vae_inventory` 扩到 v0.46.3 的全部 VAE；README / DESIGN / HANDOFF 更新；`docs/PLAN-video.md`（每种视频 VAE + 新图像 VAE 的第一层方案，分组可并行，含 safetensors / GGUF；覆盖 v0.46.3 里量化能跑的全部视频模型，扩散模型和文本编码器分开算；单次峰值 ≤ 55G 为主线，> 55G 单列「等宿主机调 ttm 后再验」；超大模型不分批会 OOM 时才把 TE 和视频模型分开加载；不做 MAGI-2）。
+* **G 组：自带分块的 transformer VAE（video-g-selftiled）**——MiniMax H3（视频原版 `ViT3DDecoder`、Sol `NonCausalViT3DDecoder`、MiniMax-H3-Image / P-H3-Image）、SeedVR2、RelayVSR Flash 都声明 `comfy_has_chunked_io`，`_native_reason` 先判这一条，一律原生，Monoload 只透传，**不做第一层 / 第二层**。理由和真机数据在 `docs/PLAN-video.md` G 组：MiniMax 原版 1080p×107 帧总 reserved 11.77 GiB（权重 4.85、输出 2.50，块内工作量 <1 GiB 且不随帧数涨），开/关 Monoload 逐位相同。新增 `tests/test_vae_selftiled.py`（锁路由，含 H1 放开 5D 以后；真机 19 项全过）、`tests/bench_selftiled.py`（原生峰值、RSS/GTT、SeedVR2 的缓存放哪、`--gguf` 反量化加载 GGUF VAE、`--relay`）。**给 H1 的约束**：`chunked_io` 的判断必须排在多帧白名单之前。
 * **阶段 C（未开始）**：多帧第二层（放开 `_native_reason` 的多帧、探测和估算认 5D、alloc_sim 验上界，DESIGN §9.32）；feat_cache 和因果时间卷积；SVD 整批第二层；LTX 分块 IO 的输出缓冲（音频仍原生）；`bench_vae --frames`；共用的第一层视频钩子（参考 vae-refiner-layer1 f51a6bc）。每项一个功能分支。
 
 **待办（视频这一轮之后）**：形状变化的 LoRA 的运行时支持——协调者替用户定：这次冲刺先保持报错（原生 v0.46.3 会烤进权重），视频做完再考虑。
@@ -163,9 +164,9 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | Wan 2.2 单帧（`vae2_2.WanVAE`，5D，T=1） | 第一层（`vae_wan22`） |
 | HunyuanImage 2.1（`AutoencodingEngine` + `hunyuan_video.vae.Decoder`，4D，32x） | 第一层（`vae_hunyuan`） |
 | 其他 2D 图像 VAE（带注意力的 up 级、TAESD、Stable Cascade Stage A / C、Mage-VAE 等） | 第二层（逐算子分块），或第一层识别不通过时第二层 |
-| 3D VAE 的单帧 latent（5D，T=1）：Hunyuan 系（含 HunyuanImage 2.1 Refiner）、Mochi、Cosmos、CogVideoX、TAEHV、SeedVR2（`latent_dim` 3）等，Wan 2.1 / 2.2 以外 | 第二层（SeedVR2 的注意力在 `optimized_vae_attention`，审查 2026-10 第 12 项起也分块） |
-| 多帧视频 latent（T>1）：Wan 2.1 / 2.2、Hunyuan 系（3D 卷积 `AutoencoderKL` / `AutoencodingEngine`）、Mochi、Cosmos、CogVideoX、MiniMax H3、TAEHV 等 | **原生**（`_native_reason`：multi-frame video latent，第一阶段暂不做） |
-| 自己往预分配输出写的（`comfy_has_chunked_io`，如 LTX） | 原生 |
+| 3D VAE 的单帧 latent（5D，T=1）：Hunyuan 系（含 HunyuanImage 2.1 Refiner）、Mochi、Cosmos、CogVideoX、TAEHV 等，Wan 2.1 / 2.2 以外 | 第二层（SeedVR2 在 v0.46.3 声明了 `comfy_has_chunked_io`，单帧也走原生，见下面一行） |
+| 多帧视频 latent（T>1）：Wan 2.1 / 2.2、Hunyuan 系（3D 卷积 `AutoencoderKL` / `AutoencodingEngine`）、Mochi、Cosmos、CogVideoX、TAEHV 等 | **原生**（`_native_reason`：multi-frame video latent，第一阶段暂不做） |
+| 自己往预分配输出写的（`comfy_has_chunked_io`）：LTX 卷积 VAE、MiniMax H3 视频 / Sol / 图像、SeedVR2（`VideoAutoencoderKLWrapper`）、RelayVSR Flash | 原生，单帧也不管（`tests/test_vae_selftiled.py`；G 组，PLAN-video） |
 | 1D / 音频（Stable Audio、ACE、MMAudio、LTX Audio 等） | 原生 |
 
 **入口和做法：**
@@ -258,6 +259,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | **video 分支**：适配 ComfyUI v0.46.3（阶段 A） | 8d89069 |
 | video：PLAN-video.md | d58707f |
 | **video 分支**：LoRA 量化 safetensors 测试 / GGUF / 视频小参数 | 见 `git log --first-parent video`（Merge lora-quant-formats / lora-gguf / lora-video-models） |
+| video：G 组（自带分块的 transformer VAE）保持原生、路由测试、bench_selftiled | 见 `git log --first-parent video`（Merge video-g-selftiled） |
 | 本文件 | 本文件所在的提交（`git log --first-parent video` 最上面几条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。
