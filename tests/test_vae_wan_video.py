@@ -1,0 +1,359 @@
+"""Layer 1 for the Wan 2.1 / 2.2 VAEs decoding video (monoload/vae_wan_video.py, docs/PLAN-video.md group A).
+
+The adapter is called directly (vae.py sends a multi-frame latent to native until hook H1 opens it), so this
+tests the adapter itself: recognition, exactness against WanVAE.decode, the self-test, the memory bound.
+
+Small models (default; ComfyUI's own WanVAE / vae2_2.WanVAE with small channels and random weights, fp32):
+  1. recognition: Wan 2.1 / 2.2 with T > 1 -> the video adapter (key apart from the single-frame one); T = 1,
+     vae_options, a wrong channel count -> not taken, with the reason; the image adapters still refuse T > 1;
+  2. whole decode vs native WanVAE.decode, fp32: several frame counts (odd / even: Wan 2.1's last chunk of 1),
+     stripe heights (7 / 16 / 40 / whole), batch 2, a small workspace (layer-2 row blocks inside the stripes);
+     rel err <= 1e-4;
+  3. the self-test (vae_engine.self_test with the video prefix / stripes): passes; an injected bug (the stripe
+     caches shared across stripes) -> fails;
+  4. with Monoload's VAE switch off (MONOLOAD=0) or the adapter not registered, comfy.sd.VAE.decode of a
+     multi-frame latent is bit-identical to native.
+
+Real models (--wan21 / --wan22 PATH to the VAE safetensors; GPU):
+  5. fp32 at a small geometry: L1 == native fp32 (rel err <= 1e-4);
+  6. bf16 sweep over sizes x frame counts: L1 output vs native bf16 (max abs diff), reserved growth during the
+     L1 decode <= the plan's estimate, native's reserved growth for comparison (skipped with --no-native),
+     seconds; a table at the end (frame count effect on the peak).
+
+    python tests/test_vae_wan_video.py
+    python tests/test_vae_wan_video.py --wan21 /opt/ComfyUI/models/vae/wan_2.1_vae.safetensors --wan22 /opt/ComfyUI/models/vae/wan2.2_vae.safetensors
+"""
+
+import argparse
+import gc
+import sys
+import time
+
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--wan21", help="Wan 2.1 VAE file (real-model section)")
+_ap.add_argument("--wan22", help="Wan 2.2 VAE file (real-model section)")
+_ap.add_argument("--sizes", default="832x480,1280x720", help="WxH list of the bf16 sweep")
+_ap.add_argument("--frames", default="5,9,17,33,49,81", help="pixel frame counts of the bf16 sweep (1 + 4 k)")
+_ap.add_argument("--no-native", action="store_true", help="skip native decodes in the sweep (no diff, no native peak)")
+_ap.add_argument("--no-small", action="store_true", help="skip the small-model sections")
+_ap.add_argument("--workspace", default="64M", help="layer-2 workspace inside the stripes on the GPU")
+_ap.add_argument("--rows", type=int, default=None, help="force a stripe height in the sweep (default: the plan for the free memory)")
+OPTS, _rest = _ap.parse_known_args()
+sys.argv = [sys.argv[0]] + _rest
+
+import torch  # noqa: E402
+
+from common import check, finish  # noqa: E402
+import comfy.model_management as mm  # noqa: E402
+import comfy.sd  # noqa: E402
+import comfy.utils  # noqa: E402
+import comfy.ldm.wan.vae as wan  # noqa: E402
+import comfy.ldm.wan.vae2_2 as wan22  # noqa: E402
+from monoload import vae as mvae  # noqa: E402
+from monoload import vae_engine as eng  # noqa: E402
+from monoload import vae_wan, vae_wan22, vae_wan_video as wv  # noqa: E402
+from monoload.vae_ops import MIB, OpStats, fmt_bytes  # noqa: E402
+
+torch.manual_seed(0)
+GIB = 1024 ** 3
+
+
+def err(a, b):
+    return float((a.float().cpu() - b.float().cpu()).abs().max())
+
+
+def rel(a, b):
+    return err(a, b) / max(1.0, float(b.float().abs().max()))
+
+
+def raw_native(v, lat):
+    """The model's own WanVAE.decode on the VAE's device and dtype (what comfy's native VAE.decode calls), moved
+    to the CPU: [B, C, T, H, W]."""
+    mm.load_models_gpu([v.patcher])
+    with torch.inference_mode():
+        out = v.first_stage_model.decode(lat.to(device=v.device, dtype=v.vae_dtype))
+        return out.to("cpu")
+
+
+def l1_decode(v, lat, rows=None, ws=MIB, budget=None):
+    """The video adapter's run() with a plan (forced rows, or the largest under budget); process_output off.
+    Returns (pixels [B, C, T, H, W] like WanVAE.decode, plan)."""
+    bound, why = wv.match(v, lat, {})
+    if bound is None:
+        raise AssertionError("not taken: " + why)
+    mm.load_models_gpu([v.patcher])
+    out_b = bound.output_bytes(v, lat)
+    if rows is None and budget is None:
+        rows = 10 ** 6
+    plan = bound.plan(v, lat, budget if budget is not None else 0, ws, rows=rows, out_bytes=out_b)
+    po = v.process_output
+    v.process_output = lambda image: image
+    try:
+        with torch.inference_mode():
+            out = bound.run(v, lat, plan, ws, OpStats())
+    finally:
+        v.process_output = po
+    return out, plan
+
+
+# ---------------------------------------------------------------------------
+# small models
+# ---------------------------------------------------------------------------
+
+def wan21_small(dtype=None):
+    from test_vae import wan_vae_model
+    return wan_vae_model(dtype)
+
+
+def wan22_small(dtype=None):
+    from test_vae_wan22 import wan22_vae
+    return wan22_vae(dtype)
+
+
+def lat21(t, h, w, b=1, seed=3):
+    return torch.randn(b, 16, t, h, w, generator=torch.Generator().manual_seed(seed))
+
+
+def lat22(t, h, w, b=1, seed=3):
+    return torch.randn(b, 48, t, h, w, generator=torch.Generator().manual_seed(seed))
+
+
+def recognition_tests(v21, v22):
+    for label, v, lat_fn, cls, img in (("Wan 2.1", v21, lat21, wv.Wan21Video, vae_wan), ("Wan 2.2", v22, lat22, wv.Wan22Video, vae_wan22)):
+        b, why = wv.match(v, lat_fn(5, 6, 5), {})
+        check("{} T=5 -> '{}' ({} units, kt {})".format(label, b.name if b else why, len(b.units) if b else 0, b.kt if b else "-"),
+              b is not None and type(b) is cls and b.key[0] == "video")
+        b1, why1 = wv.match(v, lat_fn(1, 6, 5), {})
+        check("{} T=1 not taken by the video adapter ({})".format(label, why1), b1 is None)
+        bi, whyi = img.match(v, lat_fn(5, 6, 5), {})
+        check("{} T=5 not taken by the single-frame adapter ({})".format(label, whyi), bi is None)
+        bo, whyo = wv.match(v, lat_fn(5, 6, 5), {"tile": 1})
+        check("{} vae_options -> not taken ({})".format(label, whyo), bo is None)
+        wrong = torch.zeros(1, 7, 5, 6, 5)
+        bw, whyw = wv.match(v, wrong, {})
+        check("{} wrong channel count -> not taken ({})".format(label, whyw), bw is None)
+        if b is not None:
+            img_b, _ = img.match(v, lat_fn(1, 6, 5), {})
+            check("{} video key differs from the single-frame key".format(label), img_b is not None and img_b.key != b.key)
+            t = 5
+            shape = b.output_shape(lat_fn(t, 6, 5))
+            check("{} output shape {} (frames 1 + 4 (T - 1) = {})".format(label, list(shape), 1 + 4 * (t - 1)), shape[2] == 1 + 4 * (t - 1))
+
+
+def exactness_tests(v21, v22):
+    cases = [
+        ("Wan 2.1", v21, lat21, [(2, 6, 5), (3, 6, 5), (4, 7, 6), (5, 6, 5), (9, 5, 4)]),
+        ("Wan 2.2", v22, lat22, [(2, 6, 5), (3, 5, 6), (5, 4, 4)]),
+    ]
+    for label, v, lat_fn, geos in cases:
+        for t, h, w in geos:
+            lat = lat_fn(t, h, w)
+            ref = raw_native(v, lat)
+            for rows in (7, 16, 40, None):
+                out, plan = l1_decode(v, lat, rows=rows)
+                e = rel(out, ref)
+                check("{} T={} {}x{} rows {}: {} stripes, rel err {:.2g}, shape {}".format(
+                    label, t, h, w, rows or "whole", len(plan.stripes), e, list(out.shape)),
+                    out.shape == ref.shape and e <= 1e-4)
+        lat = lat_fn(3, 6, 5, b=2, seed=9)
+        ref = raw_native(v, lat)
+        out, plan = l1_decode(v, lat, rows=16)
+        check("{} batch 2: rel err {:.2g}".format(label, rel(out, ref)), out.shape == ref.shape and rel(out, ref) <= 1e-4)
+        lat = lat_fn(4, 6, 6, seed=5)
+        ref = raw_native(v, lat)
+        out, plan = l1_decode(v, lat, rows=12, ws=16 * 1024)
+        check("{} 16 KiB workspace (row blocks inside the stripes): rel err {:.2g}".format(label, rel(out, ref)), rel(out, ref) <= 1e-4)
+
+
+def selftest_tests(v21, v22):
+    for label, v, lat_fn in (("Wan 2.1", v21, lat21), ("Wan 2.2", v22, lat22)):
+        b, _ = wv.match(v, lat_fn(5, 6, 5), {})
+        eng._SELFTEST.pop(b.key, None)
+        ok, detail = eng.self_test(b, v)
+        check("{} self-test: {} ({}), bound {}".format(label, "pass" if ok else "FAIL", detail, fmt_bytes(b.selftest_memory())), ok)
+        # injected bug: one cache list for every stripe (the caches of the previous stripe's rows leak in)
+        orig = wv.WanVideoStripe.stripe
+        shared = {}
+
+        def bad_stripe(self, ckpt, needs, heights, emit, label_):
+            cache = shared.setdefault(id(self), [None] * self.ncache)
+            tpos = [0]
+
+            def out(x):
+                emit(tpos[0], x)
+                tpos[0] += int(x.shape[2])
+            xa, xb = needs[0]
+            for c0, k in self.chunks(int(ckpt.shape[2])):
+                x = ckpt.narrow(2, c0, k).narrow(self.hdim, xa, xb - xa)
+                try:
+                    self.run_units(0, x, needs, heights, cache, [0], c0 == 0, out, label_)
+                except RuntimeError:
+                    raise eng.StripeError("shape mismatch from a shared cache")
+        wv.WanVideoStripe.stripe = bad_stripe
+        try:
+            eng._SELFTEST.pop(b.key, None)
+            ok2, detail2 = eng.self_test(b, v)
+        finally:
+            wv.WanVideoStripe.stripe = orig
+            eng._SELFTEST.pop(b.key, None)
+        check("{} self-test with the caches shared across stripes -> fails ({})".format(label, detail2), not ok2)
+
+
+def native_identity_tests(v21, v22):
+    for label, v, lat_fn in (("Wan 2.1", v21, lat21), ("Wan 2.2", v22, lat22)):
+        lat = lat_fn(3, 6, 5, seed=11)
+        a = comfy.sd.VAE.decode(v, lat)
+        bnat = mvae._ORIG["decode"](v, lat)
+        check("{} comfy.sd.VAE.decode of T=3 bit-identical to native (adapter not registered: {})".format(
+            label, "vae_wan_video" not in [m.__name__.rsplit(".", 1)[-1] for m in mvae.STRIPE_ADAPTERS]), torch.equal(a, bnat))
+
+
+# ---------------------------------------------------------------------------
+# real models
+# ---------------------------------------------------------------------------
+
+def load_real(path, dtype):
+    sd = comfy.utils.load_torch_file(path)
+    return comfy.sd.VAE(sd=sd, dtype=dtype)
+
+
+def lat_real(v, t, h, w, seed=1):
+    c = v.latent_channels
+    return torch.randn(1, c, t, h, w, generator=torch.Generator().manual_seed(seed))
+
+
+def measure(fn):
+    """(result or exception, seconds, reserved growth, allocated growth)."""
+    gc.collect()
+    mm.soft_empty_cache(True)
+    torch.cuda.synchronize()
+    base_r, base_a = torch.cuda.memory_reserved(), torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    try:
+        res = fn()
+        torch.cuda.synchronize()
+    except Exception as e:
+        if not mm.is_oom(e):
+            raise
+        res = e
+    dt = time.perf_counter() - t0
+    return res, dt, torch.cuda.max_memory_reserved() - base_r, torch.cuda.max_memory_allocated() - base_a
+
+
+def real_fp32(label, path):
+    v = load_real(path, torch.float32)
+    sc = v.spacial_compression_decode()
+    lat = lat_real(v, 9, 192 // sc, 320 // sc)
+    mm.load_models_gpu([v.patcher])
+    b, why = wv.match(v, lat, {})
+    check("{} (real, fp32) recognized: {}".format(label, b.name if b else why), b is not None)
+    if b is None:
+        return
+    eng._SELFTEST.pop(b.key, None)
+    ok, detail = eng.self_test(b, v)
+    check("{} (real) self-test: {} ({}), bound {}".format(label, "pass" if ok else "FAIL", detail, fmt_bytes(b.selftest_memory())), ok)
+    with torch.inference_mode():
+        ref = raw_native(v, lat)
+    out, plan = l1_decode(v, lat, rows=48, ws=64 * MIB)
+    e = rel(out.cpu(), ref.cpu())
+    check("{} (real, fp32) 320x192 x {} frames, {} stripes: rel err vs native {:.2g}".format(label, out.shape[2], len(plan.stripes), e), e <= 1e-4)
+    del v, out, ref
+    gc.collect()
+    mm.soft_empty_cache(True)
+
+
+def real_sweep(label, path, table):
+    v = load_real(path, torch.bfloat16)
+    mm.load_models_gpu([v.patcher])
+    sc = v.spacial_compression_decode()
+    ws = mvae.parse_size(OPTS.workspace)
+    for size in OPTS.sizes.split(","):
+        W, H = [int(x) for x in size.split("x")]
+        for nf in [int(x) for x in OPTS.frames.split(",")]:
+            t = 1 + (nf - 1) // 4
+            lat = lat_real(v, t, H // sc, W // sc)
+            b, why = wv.match(v, lat, {})
+            if b is None:
+                check("{} {}x{}x{}: not taken ({})".format(label, W, H, nf, why), False)
+                continue
+            free = mm.get_free_memory(v.device)
+            if OPTS.rows:
+                plan = b.plan(v, lat, 0, ws, rows=OPTS.rows, out_bytes=b.output_bytes(v, lat))
+            else:
+                plan = b.plan(v, lat, free, ws, out_bytes=b.output_bytes(v, lat)) or b.smallest_plan(v, lat, ws, b.output_bytes(v, lat))
+            po = v.process_output
+            v.process_output = lambda image: image
+
+            def run_l1():
+                with torch.inference_mode():
+                    return b.run(v, lat, plan, ws, OpStats())
+            try:
+                out, dt, dres, dalloc = measure(run_l1)
+            finally:
+                v.process_output = po
+            row = {"model": label, "size": size, "frames": nf, "stripes": len(plan.stripes), "rows": plan.rows,
+                   "estimate": plan.estimate, "l1_res": dres, "l1_alloc": dalloc, "l1_s": dt, "ckpt": plan.ckpt_bytes}
+            if isinstance(out, Exception):
+                check("{} {}x{} x{}: L1 OOM: {}".format(label, W, H, nf, str(out).splitlines()[0][:160]), False)
+                table.append(row)
+                continue
+            check("{} {}x{} x{} frames: L1 {} stripes x {} rows, reserved +{} <= estimate {} ({:.1f}s)".format(
+                label, W, H, nf, len(plan.stripes), plan.rows, fmt_bytes(dres), fmt_bytes(plan.estimate), dt),
+                dres <= plan.estimate and bool(torch.isfinite(out).all()))
+            if not OPTS.no_native:
+                def run_nat():
+                    with torch.inference_mode():
+                        return raw_native(v, lat)
+                ref, ndt, nres, nalloc = measure(run_nat)
+                row.update(native_res=nres, native_s=ndt)
+                if isinstance(ref, Exception):
+                    row["diff"] = None
+                    print("  native OOM at {}x{} x{}".format(W, H, nf))
+                else:
+                    d = err(out, ref)
+                    row["diff"] = d
+                    check("{} {}x{} x{}: L1 vs native bf16 max abs diff {:.3g} (native reserved +{}, {:.1f}s)".format(
+                        label, W, H, nf, d, fmt_bytes(nres), ndt), out.shape == ref.shape and d <= 0.25)
+                    del ref
+            table.append(row)
+            del out
+            gc.collect()
+    del v
+    gc.collect()
+    mm.soft_empty_cache(True)
+
+
+def print_table(table):
+    if not table:
+        return
+    print("\nmodel    size       frames  stripes x rows   ckpt      estimate   L1 reserved  L1 s    native reserved  native s  max|diff|")
+    for r in table:
+        print("{:<8} {:<10} {:>6}  {:>4} x {:<6}  {:>9} {:>10} {:>12} {:>6} {:>16} {:>9} {:>10}".format(
+            r["model"], r["size"], r["frames"], r["stripes"], r["rows"], fmt_bytes(r["ckpt"]), fmt_bytes(r["estimate"]),
+            fmt_bytes(r["l1_res"]), "{:.1f}".format(r["l1_s"]),
+            fmt_bytes(r["native_res"]) if r.get("native_res") is not None else "-",
+            "{:.1f}".format(r["native_s"]) if r.get("native_s") is not None else "-",
+            "{:.3g}".format(r["diff"]) if r.get("diff") is not None else "-"))
+
+
+if __name__ == "__main__":
+    if not mvae.is_installed():
+        check("vae.install() on this ComfyUI", mvae.install())
+    if not OPTS.no_small:
+        v21, v22 = wan21_small(), wan22_small()
+        recognition_tests(v21, v22)
+        exactness_tests(v21, v22)
+        selftest_tests(v21, v22)
+        native_identity_tests(v21, v22)
+    if OPTS.wan21 or OPTS.wan22:
+        if not torch.cuda.is_available():
+            check("real-model section needs a GPU", False)
+        else:
+            table = []
+            for label, path in (("Wan 2.1", OPTS.wan21), ("Wan 2.2", OPTS.wan22)):
+                if path:
+                    real_fp32(label, path)
+                    real_sweep(label, path, table)
+            print_table(table)
+    finish()
