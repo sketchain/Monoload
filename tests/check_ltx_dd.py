@@ -53,7 +53,7 @@ def main():
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--vae")
     src.add_argument("--random", action="store_true")
-    p.add_argument("--sizes", default="256x256x25,384x256x49")
+    p.add_argument("--sizes", default="256x256x25,384x256x49,256x256x97")
     p.add_argument("--workspaces", default="1,64,0")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-fp32", action="store_true")

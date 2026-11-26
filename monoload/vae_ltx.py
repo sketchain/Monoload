@@ -14,14 +14,17 @@ to x and the context. It grows linearly with frames and resolution.
 What this module does, without changing results (up to GEMM row grouping):
 
 * NeighborhoodAttention3D.forward (per instance) runs in T slabs. A block of
-  query frames [a, b) uses the slab [a - (k_t - 1), b + (k_t - 1)) clipped to
-  [0, T): with NATTEN's window (exactly k_t frames, centred, shifted inward at
-  the grid borders) every query's window in the slab equals its window in the
-  whole volume when the halo is k_t - 1 (the window can sit up to k_t - 1
-  frames away from its query at a border; the slab then reaches that border
-  too). H and W are not split, so RoPE uses the global tables sliced in T.
-  The residual add writes back into x itself (add_to is x), so the result of a
-  block is kept pending until no later slab reads those frames of the old x.
+  query frames [a, b) uses a slab of n = (b - a) + 2 (k_t - 1) frames around
+  it, shifted inward at the borders: with NATTEN's window (exactly k_t frames,
+  centred, shifted inward at the grid borders) every query's window in the
+  slab equals its window in the whole volume when at least k_t - 1 frames, or
+  the border, lie on each side of the block. All slabs of a call have the same
+  length and share one q / k / v allocation. H and W are not split, so RoPE
+  uses the global tables sliced in T. The block is the largest whose slab fits
+  max(workspace, half the activation), but at least 2 (k_t - 1) frames: the
+  kernel attends for every slab frame, so the halo costs n / block times the
+  attention. The residual add writes back into x itself (add_to is x): frames
+  before the next slab's start land at once, the rest of a block waits.
 * SwiGLU.forward runs over token chunks bounded by the workspace (native
   chunks whole frames: 65536 tokens or one frame, whichever is more).
 * NADiffusionDecoder.forward (per instance): the same steps as native, but
@@ -33,7 +36,8 @@ What this module does, without changing results (up to GEMM row grouping):
   x_t is drawn whole from the same generator, so the noise is the same.
 
 Peak of stage 5 then is x + context + one slab's q/k/v/output + the pending
-results + the pixel tensors, about 2.2 x S plus the workspace.
+results + the pixel tensors, about 3 x S at 193 frames (2 S + a slab of
+at least 4 (2 k_t - 2) frames). The cache is emptied once before stage 5.
 
 The conv VAE (causal_video_autoencoder.VideoVAE) is not handled here.
 
@@ -104,15 +108,31 @@ def na_modules(dec):
 # ---------------------------------------------------------------------------
 
 def t_blocks(t, kt, block):
-    """[(a, b, s, e)]: query frames [a, b) and the slab [s, e) they need; one block (0, t, 0, t) if no split."""
+    """[(a, b, s, e)]: query frames [a, b) and the slab [s, e) they need; one block (0, t, 0, t) if no split.
+    Every slab has the same length n = block + 2 (k_t - 1) (so the allocator reuses the same blocks): a slab at a
+    border is shifted inward instead of clipped, which keeps at least k_t - 1 frames, or the border, on each side
+    of its query block."""
     halo = kt - 1
-    if block >= t or kt >= t:
+    n = block + 2 * halo
+    if n >= t or kt >= t:
         return [(0, t, 0, t)]
     out = []
     for a in range(0, t, block):
         b = min(a + block, t)
-        out.append((a, b, max(0, a - halo), min(t, b + halo)))
+        s = min(max(0, a - halo), t - n)
+        out.append((a, b, s, s + n))
     return out
+
+
+def pending_frames(blocks, t):
+    """Most frames of block results waiting at once when the residual writes into x: once slab i has read its
+    frames, every waiting result before the next slab's start lands (_flush), so what waits lies in
+    [next start, b_i)."""
+    worst = 0
+    for i, (a, b, s, e) in enumerate(blocks):
+        nxt = blocks[i + 1][2] if i + 1 < len(blocks) else t
+        worst = max(worst, b - nxt)
+    return worst
 
 
 def na_frame_bytes(h, w, dim, elem):
@@ -121,13 +141,14 @@ def na_frame_bytes(h, w, dim, elem):
 
 def na_slab_bytes(block, kt, t, h, w, dim, elem):
     """Workspace of one NA call at query block `block`: q, k, v and the attention output over the slab, plus the
-    pending block results (only when the residual writes back into x; counted always): a result waits until no later
-    slab reads its frames, so the pending frames stay below halo + 2 x block."""
-    split = block < t and kt < t
-    n = min(t, block + 2 * (kt - 1)) if split else t
-    pend = min(t, (kt - 1) + 2 * block) if split else t
+    pending block results (only when the residual writes back into x; counted always: pending_frames) and one
+    qkv chunk's temporaries."""
+    blocks = t_blocks(t, kt, block)
     f = na_frame_bytes(h, w, dim, elem)
-    return 4 * n * f + pend * f + qkv_temp_bytes(h, w, dim, elem)
+    if len(blocks) == 1:
+        return 4 * t * f + t * f + qkv_temp_bytes(h, w, dim, elem)
+    n = blocks[0][3] - blocks[0][2]
+    return 4 * n * f + pending_frames(blocks, t) * f + qkv_temp_bytes(h, w, dim, elem)
 
 
 def qkv_temp_bytes(h, w, dim, elem):
@@ -140,21 +161,33 @@ def qkv_temp_bytes(h, w, dim, elem):
 
 
 def na_block_frames(t, kt, h, w, dim, elem, workspace):
-    """Largest query block (frames) whose slab workspace fits `workspace` and whose slab stays inside the HIP
-    kernel's grid; 1 if none fits (the estimate then says what it costs). t when no split is needed."""
+    """Query block (frames) of one NA call; t when no split is needed.
+
+    The slab's q, k, v and output (4 n frames) may use max(workspace, half the whole activation): a slab costs
+    n / block times the attention of its query block (the halo frames are attended to and thrown away), so a block
+    sized by the small conv workspace alone (one frame, 2 k_t - 1 frames of slab) made stage 5 about 20 times
+    slower. The block is the largest that fits that budget and HIP's grid (n x H <= 65535), but at least 2 (k_t - 1)
+    frames (at most twice the native attention work); t when the slab would reach the whole volume anyway."""
     if kt >= t:
         return t
-    if na_slab_bytes(t, kt, t, h, w, dim, elem) <= workspace and t * h <= HIP_GRID_MAX:
+    halo = kt - 1
+    grid = HIP_GRID_MAX // max(h, 1)
+    budget = max(workspace, t * na_frame_bytes(h, w, dim, elem) // 2)
+    if t <= grid and (na_slab_bytes(t, kt, t, h, w, dim, elem) <= budget or 4 * halo >= t):
         return t
-    best = 1
-    lo, hi = 1, t - 1
+    floor = max(1, 2 * halo)
+    best = floor
+    lo, hi = floor + 1, t - 1
     while lo <= hi:
         mid = (lo + hi) // 2
-        n = min(t, mid + 2 * (kt - 1))
-        if na_slab_bytes(mid, kt, t, h, w, dim, elem) <= workspace and n * h <= HIP_GRID_MAX:
+        if na_slab_bytes(mid, kt, t, h, w, dim, elem) <= budget and mid + 2 * halo <= grid:
             best, lo = mid, mid + 1
         else:
             hi = mid - 1
+    if best + 2 * halo > grid:
+        best = max(1, grid - 2 * halo)
+    if best + 2 * halo >= t and t <= grid:
+        return t
     return best
 
 
@@ -189,13 +222,13 @@ class _NASlabs:
         # the residual writes into x itself: a block's result may only land once no later slab reads those frames
         hazard = add_to is not None and add_to.untyped_storage().data_ptr() == x.untyped_storage().data_ptr()
         pending = []
+        n = blocks[0][3] - blocks[0][2]
+        shape = (batch, n, h, w, nh, hd)
+        q = torch.empty(shape, dtype=x.dtype, device=x.device)
+        k = torch.empty(shape, dtype=x.dtype, device=x.device)
+        v = torch.empty(shape, dtype=x.dtype, device=x.device)
 
         for i, (a, b, s, e) in enumerate(blocks):
-            n = e - s
-            shape = (batch, n, h, w, nh, hd)
-            q = torch.empty(shape, dtype=x.dtype, device=x.device)
-            k = torch.empty(shape, dtype=x.dtype, device=x.device)
-            v = torch.empty(shape, dtype=x.dtype, device=x.device)
             for t0 in range(s, e, sub):
                 t1 = min(t0 + sub, e)
                 sl = x[:, t0:t1] if pre is None else pre(x[:, t0:t1])
@@ -214,43 +247,43 @@ class _NASlabs:
                         k[bi, t0 - s:t1 - s].view(1, nt, nh, hd),
                         freqs, q_weight, k_weight)
                 del freqs
-            # this slab has read x[s:e]: earlier results no later slab reads can land now
+            # this slab has read x[s:e]; slabs start in increasing order, so frames before the next slab's start
+            # are never read again: earlier results there can land now, and so can this block's
             nxt = blocks[i + 1][2] if i + 1 < len(blocks) else t
             pending = _flush(res, pending, nxt, add_to is not None)
             out = comfy_kitchen.na3d(q, k, v, list(attn.kernel_size), None, 1.0)
-            del q, k, v
             out = out.reshape(batch, n, h, w, dim)
-            if hazard:
-                y = torch.empty((batch, b - a, h, w, dim), dtype=x.dtype, device=x.device)
-                for t0 in range(a, b, sub):
+            cut = min(b, max(a, nxt)) if hazard else b
+            for t0 in range(a, cut, sub):
+                t1 = min(t0 + sub, cut)
+                if add_to is not None:
+                    res[:, t0:t1] += attn.proj(out[:, t0 - s:t1 - s])
+                else:
+                    res[:, t0:t1] = attn.proj(out[:, t0 - s:t1 - s])
+            if cut < b:
+                y = torch.empty((batch, b - cut, h, w, dim), dtype=x.dtype, device=x.device)
+                for t0 in range(cut, b, sub):
                     t1 = min(t0 + sub, b)
-                    y[:, t0 - a:t1 - a] = attn.proj(out[:, t0 - s:t1 - s])
-                del out
-                pending.append((a, b, y))
-                pending = _flush(res, pending, nxt, True)
-            else:
-                for t0 in range(a, b, sub):
-                    t1 = min(t0 + sub, b)
-                    if add_to is not None:
-                        res[:, t0:t1] += attn.proj(out[:, t0 - s:t1 - s])
-                    else:
-                        res[:, t0:t1] = attn.proj(out[:, t0 - s:t1 - s])
-                del out
+                    y[:, t0 - cut:t1 - cut] = attn.proj(out[:, t0 - s:t1 - s])
+                pending.append((cut, b, y))
+            del out
+        del q, k, v
         _flush(res, pending, t, add_to is not None)
         return res
 
 
 def _flush(res, pending, first_read, add):
-    """Write the pending results whose frames end at or before `first_read` (no later slab reads them)."""
+    """Write the pending results' frames before `first_read` (no later slab reads them); keep the rest."""
     keep = []
     for (a, b, y) in pending:
-        if b <= first_read:
+        c = min(b, first_read)
+        if c > a:
             if add:
-                res[:, a:b] += y
+                res[:, a:c] += y[:, :c - a]
             else:
-                res[:, a:b] = y
-        else:
-            keep.append((a, b, y))
+                res[:, a:c] = y[:, :c - a]
+        if b > c:
+            keep.append((max(a, c), b, y[:, max(a, c) - a:]))
     return keep
 
 
@@ -391,6 +424,10 @@ class _DecoderForward:
         dec = self.dec
         _note(self.stats, "ltx_decodes")
         holder = [_pre_diffusion(dec, z, drop_leading_frame, pad_trailing)]
+        if z.device.type == "cuda":
+            # stages 1-4 leave cached blocks of their own sizes; stage 5's tensors are S-sized (DESIGN: reserved
+            # 59 GiB over 19 allocated at 1920x1088x97 without this and with variable slabs)
+            torch.cuda.empty_cache()
         batch, t5, h5, w5, _ = holder[0].shape
         pixel_shape = (batch, dec.out_channels, t5, h5 * dec.patch_size, w5 * dec.patch_size)
         x_t = torch.randn(pixel_shape, dtype=z.dtype, device=z.device, generator=generator)
