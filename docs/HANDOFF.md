@@ -20,10 +20,12 @@
   * v0.46.3 的 `pytorch_attention_enabled_vae` 在 AMD 上读 `gcnArchName`，gfx11 返回 False：**CT 700 上原生 VAE 注意力是 split**（Monoload 三种都分块，不受影响）；`vae_inventory` / `check_models` 模拟 gfx1151。
   * 测试桩跟着改：CLIP 的 `tokenizer_metadata`、SeedVR 新的 `Attention(query_dim, norm_num_groups, eps)`。
   * 核对过不用改的：`LowVramPatch` 新的 `prepare` / `memory_required`（`MonoloadRuntimePatch` 早已覆盖）；`load()` 现在会把形状变化的 key 烤进权重，Monoload 照旧报 `lora_shape_change`（没改）；"config" patch 变成 object patch；前端 1.59.6 仍不翻译 combo 选项，`monoload_i18n.js` 还需要。
-* **阶段 B（未开始）**：`vae_inventory` 扩到 v0.46.3 的全部 VAE；README / DESIGN / HANDOFF 更新；`docs/PLAN-video.md`（每种视频 VAE + 新图像 VAE 的第一层方案，分组可并行，含 safetensors / GGUF；覆盖 v0.46.3 里量化能跑的全部视频模型，扩散模型和文本编码器分开算；单次峰值 ≤ 55G 为主线，> 55G 单列「等宿主机调 ttm 后再验」；超大模型不分批会 OOM 时才把 TE 和视频模型分开加载；不做 MAGI-2）。
+* **阶段 B**：**`docs/PLAN-video.md` 已写（合并见 §7）**——共用钩子 H1–H7、各 VAE 的第一层方案和 A–H 分组、模型清单与单次峰值（> 55 只有 MiniMax H3 完整版 bf16 DiT）、开工顺序。还没做：`vae_inventory` 扩到 v0.46.3 的全部 VAE；README / DESIGN / HANDOFF 更新；`docs/PLAN-video.md`（每种视频 VAE + 新图像 VAE 的第一层方案，分组可并行，含 safetensors / GGUF；覆盖 v0.46.3 里量化能跑的全部视频模型，扩散模型和文本编码器分开算；单次峰值 ≤ 55G 为主线，> 55G 单列「等宿主机调 ttm 后再验」；超大模型不分批会 OOM 时才把 TE 和视频模型分开加载；不做 MAGI-2）。
 * **阶段 C（未开始）**：多帧第二层（放开 `_native_reason` 的多帧、探测和估算认 5D、alloc_sim 验上界，DESIGN §9.32）；feat_cache 和因果时间卷积；SVD 整批第二层；LTX 分块 IO 的输出缓冲（音频仍原生）；`bench_vae --frames`；共用的第一层视频钩子（参考 vae-refiner-layer1 f51a6bc）。每项一个功能分支。
 
-**未决（等用户定）**：形状变化的 LoRA 要不要在运行时支持（现在报错，原生 v0.46.3 会烤进权重）；Refiner 第一层分支 vae-refiner-layer1；polish-after-ui-test 的复测（换底座后一起测）。
+**待办（视频这一轮之后）**：形状变化的 LoRA 的运行时支持——协调者替用户定：这次冲刺先保持报错（原生 v0.46.3 会烤进权重），视频做完再考虑。
+
+**未决（等用户定）**：Refiner 第一层分支 vae-refiner-layer1；polish-after-ui-test 的复测（换底座后一起测）。
 
 ## 1. 当前状态
 
