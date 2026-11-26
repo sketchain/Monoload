@@ -8,7 +8,7 @@
 |---|---|---|
 | 调研 + 设计（本文件） | `gguf-quant-design`（基于 dev 339b754 的本地草稿） | 进行中 |
 | 1 GGUF（ComfyUI-GGUF 的 Unet / CLIP 加载器） | `lora-gguf` | 设计完成，等 `video` 阶段 A 合并后实现 |
-| 2 safetensors 各量化格式 | `lora-quant-formats` | 设计中 |
+| 2 safetensors 各量化格式 | `lora-quant-formats` | 合成测试 `tests/test_quant_formats.py` 草稿 66 项全过（现有 hotpatch 不改），等阶段 A 后在 `video` 上复跑 |
 | 3 视频模型（Wan / HunyuanVideo / LTX，含 GGUF） | `lora-video-models` | 设计定了（§5 hook 方案），等阶段 A |
 | 4 合成小模型测试 + 真机命令 | 各分支各自带 | 未开始 |
 
@@ -113,3 +113,4 @@ LoRA key 映射是 ComfyUI 自己的（`comfy/lora.py` `model_lora_keys_unet` + 
 * 2026-11-26：读完 HANDOFF / DESIGN / hotpatch / release / lora_overrides；读 ComfyUI v0.46.3 的 quant_ops / ops / model_patcher / lora 和 ComfyUI-GGUF 全部源码；写本文件。云端 venv 在装（download.pytorch.org 被代理挡，改用 PyPI 的 torch）。
 * 2026-11-26：基准定为 ComfyUI v0.46.3 + ComfyUI-GGUF-H3 6d33de2，§2.2 按 H3 重写（`.dtype` 返回计算 dtype、Q8_CR 走原生 int8、Dynamic VRAM 版不在范围）。venv 装好（torch 2.15.0，`/home/user/venv`）。CPU 实测：8 种 `QuantizedTensor` 格式都能反量化；原生 GGUF 前向在反量化结果上合并 LoRA 与「反量化 + BA」逐位一致；原生 GGUF 保存失败（§3.6）。实验脚本在会话临时目录，没进仓库。
 * 2026-11-26：现有小测试在 v0.46.3 + CPU venv 上试跑：`test_dtype_paths` 198 项全过；`test_lora_save` 缺合成 checkpoint（要先跑 make_synthetic_checkpoint）；`test_release` 加载插件失败（`PromptServer.instance` 为空、`nodes_replacements` 导入失败），属于阶段 A 适配新版 ComfyUI 的范围，这里不改。
+* 2026-11-26：写 `tests/test_quant_formats.py`（草稿分支）：4 种来源（文件内 comfy_quant / 头部元数据 / 旧 scaled_fp8 标记 / 两者都有）× fp8，加 comfy_quant × e5m2、int8_tensorwise、nvfp4、mxfp8、convrot_w4a4、asym_w4a8_int8、w6a8_int8；经 `convert_old_quants` → `mixed_precision_ops` 真加载，一层量化一层普通。fused / exact 都与「先反量化 + LoRA」逐位一致，无备份、量化字节不变、unpatch 干净：66 项全过，dev 的 hotpatch 不用改。与原生（合并后量化回去）的差值只报告；mxfp8 / convrot / w4a8 / w6a8 的原生前向在 CPU 上没有 kernel，标 n/a。
