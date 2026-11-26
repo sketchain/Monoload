@@ -648,7 +648,7 @@ def _cuda_peak_meter(dev):
     return None
 
 
-_PEAK_METER = [_cuda_peak_meter]   # device -> meter or None; tests/test_vae_multiframe.py puts alloc_sim's in
+_PEAK_METER = [_cuda_peak_meter]   # device -> meter or None; tests/vae_inventory.py puts the simulator's in
 
 
 _PROBES = weakref.WeakKeyDictionary()   # first_stage_model -> {(latent channels, ndim, dtype): _Probe}
