@@ -407,8 +407,8 @@ def structure(fsm):
 
 
 class _SimMeter:
-    """vae._PEAK_METER's meter on the simulator, as vae._CudaPeak: the cache emptied at start(), then the larger of the
-    allocated and the reserved peak above what was there."""
+    """vae._PEAK_METER's meter on the simulator, as vae._CudaPeak: the cache emptied at start(), the allocated peak
+    above what was allocated then, and frag(): how much more was reserved at the peak."""
 
     def __init__(self, sim, tracer):
         self.sim, self.tracer, self.base, self.base_res = sim, tracer, 0, 0
@@ -421,7 +421,10 @@ class _SimMeter:
 
     def peak(self):
         self.tracer.poll()
-        return max(self.sim.peak_allocated - self.base, self.sim.peak_reserved - self.base_res)
+        return self.sim.peak_allocated - self.base
+
+    def frag(self):
+        return max(0, self.sim.peak_reserved - self.base_res - self.peak())
 
 
 def path(v, shape):
@@ -506,7 +509,7 @@ def trace(v, shape, layer, ws=GIB):
                 probe = mvae._probe_mf(v, lat, {}, ws)
             mf_parts = mvae.estimate(v, lat, ws, probe)
             mf_est = mf_parts["total"]
-            mf_parts = dict(mf_parts, slope=probe.mf_slope, intercept=probe.mf_intercept)
+            mf_parts = dict(mf_parts, slope=probe.mf_slope, intercept=probe.mf_intercept, frag=probe.mf_frag)
             soft_empty_cache()
             sim.reset_peak()
         if layer == 2:
@@ -624,9 +627,9 @@ def main():
                         if layer == 2 else "", time.time() - t0))
                     if t.get("mf_estimate") is not None:
                         mp = t.get("mf_parts") or {}
-                        print("      layer2  multi-frame estimate {} GiB (probe on the simulator: slope {:.0f} B/px, intercept {} GiB; "
+                        print("      layer2  multi-frame estimate {} GiB (probe on the simulator: slope {:.0f} B/px, intercept {} GiB, frag {} GiB; "
                               "activation {}, workspace {}, output {} GiB){}".format(
-                                  gib(t["mf_estimate"]), mp.get("slope") or 0, gib(mp.get("intercept") or 0), gib(mp.get("activation", 0)),
+                                  gib(t["mf_estimate"]), mp.get("slope") or 0, gib(mp.get("intercept") or 0), gib(mp.get("frag") or 0), gib(mp.get("activation", 0)),
                                   gib(mp.get("workspace", 0)), gib(mp.get("output", 0)),
                                   "" if t["mf_estimate"] >= t["reserved"] else "  ** NOT AN UPPER BOUND **"))
                 except Exception as e:
