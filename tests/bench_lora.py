@@ -323,6 +323,12 @@ def layer_probe(model, clip, loras, reps=3):
         moved = _to_device(list(m.patches[key]), dev, cache, param.numel(), {"transient": False})
         items.append((key, param, f, moved, all(fused_factors(p) is not None for p in moved)))
 
+    def temporary(param):
+        # what cast_bias_weight hands the weight function: a private copy in the compute dtype, a quantized
+        # parameter (fp8 scaled, int8, ...: QuantizedTensor) dequantized into it
+        w = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
+        return w.dequantize() if hotpatch._is_quantized(w) else w
+
     def variant(kind, key, f, moved, w):
         if kind in ("exact", "default"):
             hotpatch.set_exact(kind == "exact")
@@ -345,8 +351,7 @@ def layer_probe(model, clip, loras, reps=3):
         t0 = time.perf_counter()
         for _ in range(reps):
             for key, param, f, moved, _fused in items:
-                w = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
-                w = variant(kind, key, f, moved, w)
+                w = variant(kind, key, f, moved, temporary(param))
                 del w
         _sync()
         return (time.perf_counter() - t0) / reps
@@ -361,7 +366,7 @@ def layer_probe(model, clip, loras, reps=3):
         err = {k: {"d_sq": 0.0, "max": 0.0} for k in ("default", "relaxed", "mm-add")}
         lora_sq = w_sq = bound_sq = 0.0
         for key, param, f, moved, _fused in items:
-            base = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
+            base = temporary(param)
             exact = variant("exact", key, f, moved, base.clone()).to(cmp).double()
             ch = float(((exact - base.to(cmp).double()) ** 2).sum())
             wn = float(exact.norm())
