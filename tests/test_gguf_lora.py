@@ -11,6 +11,9 @@ Checked, for compute dtype fp32 and bf16, full load and lowvram load:
   * default (fused) merge: close to native (reported, bounded);
   * native GGUF backs up the F16 / F32 keys; Monoload never does: no backup,
     the GGML bytes never change, nothing left on GGMLTensor.patches;
+  * an F32 `modulation` on the model itself (non-leaf, like Wan's): native
+    load drops its LoRA; Monoload's parameter swap == native GGUF arithmetic
+    (fp32, seed 0) bit for bit, no backup;
   * after unpatch no runtime patch is left and the output is the base model's;
   * saving a GGUF model raises a clear error (native cannot save one either).
 
@@ -29,6 +32,7 @@ from common import ROOT, check, expect_raises, finish  # noqa: E402
 import torch  # noqa: E402
 
 import comfy.lora  # noqa: E402
+import comfy.model_management  # noqa: E402
 from monoload import gguf as mgguf  # noqa: E402
 from monoload import hotpatch  # noqa: E402
 from monoload.errors import MonoloadUnsupportedError  # noqa: E402
@@ -75,6 +79,7 @@ def make_state_dict(gguf, GGMLTensor):
     for name, qtype in (("q8", Q.Q8_0), ("q4", Q.Q4_0), ("q5", Q.Q5_1), ("f16", Q.F16)):
         sd[name + ".weight"] = ggml(torch.randn(OUT, IN, generator=g) * 0.05, qtype)
         sd[name + ".bias"] = ggml(torch.randn(OUT, generator=g) * 0.01, Q.F32)
+    sd["modulation"] = ggml(torch.randn(2, OUT, generator=g) * 0.1, Q.F32)   # like Wan's: F32, on a non-leaf module
     return sd
 
 
@@ -86,7 +91,9 @@ def make_lora():
         lora[n + ".lora_down.weight"] = (torch.randn(RANK, IN, generator=g) * 0.1).half()
         lora[n + ".alpha"] = torch.tensor(4.0)
     lora["q8.diff_b"] = torch.randn(OUT, generator=g) * 0.01      # a diff on the F32 bias of a quantized layer
+    lora["modulation.diff"] = torch.randn(2, OUT, generator=g) * 0.05
     keys = {n: n + ".weight" for n in ("q8", "q4", "q5", "f16")}
+    keys["modulation"] = "modulation"
     return comfy.lora.load_lora(lora, keys, log_missing=False)
 
 
@@ -95,10 +102,12 @@ class Net(torch.nn.Module):
         super().__init__()
         for n in ("q8", "q4", "q5", "f16"):
             setattr(self, n, ops.Linear(IN, OUT))
+        self.modulation = torch.nn.Parameter(sd["modulation"], requires_grad=False)
         self.load_state_dict(sd, strict=False)
 
     def forward(self, x):
-        return self.q8(x) + self.q4(x) + self.q5(x) + self.f16(x)
+        m = comfy.model_management.cast_to(self.modulation, dtype=x.dtype, device=x.device)
+        return (self.q8(x) + self.q4(x) + self.q5(x) + self.f16(x)) * (1 + m[0]) + m[1]
 
 
 def raw_digest(net):
@@ -111,7 +120,7 @@ def same_raw(a, b):
                for (n1, t1), (n2, t2) in zip(a, b))
 
 
-def run(pack, sd, loaded, x, lowvram, with_lora=True):
+def run(pack, sd, loaded, x, lowvram, with_lora=True, native_fill=False):
     net = Net(pack.ops.GGMLOps, sd)
     p = pack.nodes.GGUFModelPatcher(net, load_device=CPU, offload_device=CPU)
     if with_lora:
@@ -121,11 +130,13 @@ def run(pack, sd, loaded, x, lowvram, with_lora=True):
         p.load(CPU, lowvram_model_memory=1)
     else:
         p.load(CPU, full_load=True)
+    if native_fill:   # native load never patches a parameter of a non-leaf module: native's arithmetic on it
+        p.patch_weight_to_device("modulation", device_to=CPU)
     y = net(x)
     info = {"backup": sorted(p.backup)}
     p.unpatch_model(CPU)
     info["leftover"] = sum(len(m.__dict__.get("weight_function", [])) + len(m.__dict__.get("bias_function", []))
-                           for m in net.modules())
+                           + len(m.__dict__.get("_monoload_param_swaps") or {}) for m in net.modules())
     info["ggml_patches"] = sum(len(getattr(q, "patches", []) or []) for q in net.parameters())
     info["raw_same"] = same_raw(before, raw_digest(net))
     info["after"] = net(x)
@@ -155,10 +166,12 @@ def main():
 
             hotpatch.uninstall()
             mgguf.uninstall()
-            y_nat, info_nat, _ = run(pack, sd, loaded, x, lowvram)
+            y_drop, _, _ = run(pack, sd, {k: v for k, v in loaded.items() if k == "modulation"}, x, lowvram)
+            check(tag + ": native load drops the LoRA on the non-leaf modulation", torch.equal(y_drop, base))
+            y_nat, info_nat, _ = run(pack, sd, loaded, x, lowvram, native_fill=True)
             hotpatch.install()
             check(tag + ": native GGUF backs up the F16 / F32 keys",
-                  "f16.weight" in info_nat["backup"] and "q8.bias" in info_nat["backup"], str(info_nat["backup"]))
+                  {"f16.weight", "q8.bias", "modulation"} <= set(info_nat["backup"]), str(info_nat["backup"]))
 
             for exact in (True, False):
                 hotpatch.set_exact(exact)

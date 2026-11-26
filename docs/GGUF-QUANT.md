@@ -7,9 +7,9 @@
 | 项 | 分支 | 状态 |
 |---|---|---|
 | 调研 + 设计（本文件） | `gguf-quant-design`（基于 dev 339b754 的本地草稿） | 进行中 |
-| 1 GGUF（ComfyUI-GGUF 的 Unet / CLIP 加载器） | `lora-gguf` | 草稿已写（`monoload/gguf.py` + hotpatch 小改），`tests/test_gguf_lora.py` 31 项全过；还差 hook LoRA 测试、Info 一行；等阶段 A 后搬到 `video` |
+| 1 GGUF（ComfyUI-GGUF 的 Unet / CLIP 加载器） | `lora-gguf` | 草稿已写（`monoload/gguf.py` + hotpatch 小改），`tests/test_gguf_lora.py` 35 项全过（含非叶子 F32 modulation）；还差 hook LoRA 测试、Info 一行；等阶段 A 后搬到 `video` |
 | 2 safetensors 各量化格式 | `lora-quant-formats` | 合成测试 `tests/test_quant_formats.py` 草稿 66 项全过（现有 hotpatch 不改），等阶段 A 后在 `video` 上复跑 |
-| 3 视频模型（Wan / HunyuanVideo / LTX，含 GGUF） | `lora-video-models` | 设计定了（§5 hook 方案），等阶段 A |
+| 3 视频模型（Wan / HunyuanVideo / LTX，含 GGUF） | `lora-video-models` | 小参数运行时换参数已写（§5），`tests/test_lora_param_swap.py` 44 项全过；发现原生 0.46.3 静默丢弃这类 key；等阶段 A 后搬到 `video`，视频 LoRA 下完后真机复核 |
 | 4 合成小模型测试 + 真机命令 | 各分支各自带 | 未开始 |
 
 **基准**（协调者定）：ComfyUI **v0.46.3（cab5f4e）**，前端 1.59.6；GGUF 节点用 **kyuz0/ComfyUI-GGUF-H3 6d33de2**（city96 版加 H3 / Krea2 的 fork，city96 上游 1 月起没更新）。本文的源码引用都按这两份核过；版本再变要重核 §2。
@@ -93,7 +93,18 @@
 
 LoRA key 映射是 ComfyUI 自己的（`comfy/lora.py` `model_lora_keys_unet` + `lora_convert`），对 GGUF 和 safetensors 一样，Monoload 拿到的已经是模型 key。Monoload 这边要保证的是：被改到的参数都能运行时合并。
 
-已知缺口：不是 comfy.ops 层 weight / bias 的参数（Wan 的 `blocks.N.modulation`、`head.modulation`，LTX 的 `scale_shift_table` 之类）。`model_lora_keys_unet` 的通用规则把非 `.weight` 的 key 也映射（`diff` 形式），Monoload 现在对这种 key 报 `lora_non_comfy_ops_param`。**方案（已定，§7）**：对这种参数在所属模块上挂 forward pre-hook / always-call 的 forward hook，进模块时把参数换成合并后的临时张量、出来换回，合并结果只在这个模块的 forward 期间存在（这些参数都很小，比如 Wan 14B 的 modulation 6×5120），等于「当前那一层短暂多一份」，不备份。
+不是 comfy.ops 层 weight / bias 的参数（Wan 的 `blocks.N.modulation`、`head.modulation`，LTX 的 `scale_shift_table` / `audio_scale_shift_table` / `prompt_scale_shift_table`，以及纯 torch 层的权重）：`model_lora_keys_unet` 的通用规则把非 `.weight` 的 key 也映射（`diff` 形式）。
+
+**发现（2026-11-26，CPU 实测）：原生 ComfyUI v0.46.3 加载时根本不应用这些 key。** `ModelPatcher._load_list` 跳过「自己有参数、又有子模块」的模块（注释 "default random weights in non leaf modules"），所以 Wan 的 block / head、LTX 的 block 和顶层模型上的这些参数从不走 `patch_weight_to_device`，LoRA 在这些 key 上被静默丢掉（保存时 `model_state_dict_for_saving` 也直接输出原值）。lowvram 加载时纯 torch 叶子层（如 `nn.LayerNorm`）放不下也不会被打补丁。只有 hook LoRA（`patch_hooks`）会改到它们。
+
+**实现（`monoload/hotpatch.py` `MonoloadParamSwap`，按已定方案）**：
+- 在参数所属模块上挂 forward pre-hook + `always_call=True` 的 forward hook：进模块时把 `module._parameters[attr]` 换成合并后的临时张量，出来换回原参数对象；合并结果只在这个模块的 forward 期间存在（Wan 14B 每个 block 的 modulation 6×5120），不备份，原参数从不被写。
+- 合并一律用原生自己的算法，逐位一致（lora 计算 dtype → `calculate_weight` → 按 key 种子随机舍入回参数 dtype；GGUF 的 F16 / F32 张量用 ComfyUI-GGUF 的 fp32 + 种子 0），fused / exact 两种模式下都一样（参数小，不用快路径）。量化参数先反量化，结果不量化回去。
+- 参数留在 offload 设备（CPU）时，临时张量放到 patcher 的 load device 上合并，不在 CPU 上算。
+- 原生 load 不调用的 key 在 Monoload 的 `_load` 结束后统一装上（`_install_param_swaps`）；叶子层（纯 torch 层）走原来的 `patch_weight_to_device` 入口。卸载 / 换 hook 时和其它运行时补丁一起拆掉。
+- **与原生的差别**：带这类 key 的 LoRA，Monoload 会真正应用它们，原生不会，所以「和原生的 max|Δ|」在这类 LoRA 上不为 0（这是原生的缺陷，Monoload 的结果是 LoRA 作者的本意；对照基准用「原生加载 + 对这些 key 手动调原生 `patch_weight_to_device`」）。没有这类 key 的 LoRA 与原生行为不变。
+- 已核对 v0.46.3 源码：Wan（model / ar_model / animate2）、LTX（model / av_model）读这些参数都在所属模块自己的 forward 里，hook 时机覆盖得到。
+- 测试：`tests/test_lora_param_swap.py`（44 项），`tests/test_gguf_lora.py` 加了 F32 modulation。
 
 ## 6. 测试计划
 
@@ -115,3 +126,4 @@ LoRA key 映射是 ComfyUI 自己的（`comfy/lora.py` `model_lora_keys_unet` + 
 * 2026-11-26：现有小测试在 v0.46.3 + CPU venv 上试跑：`test_dtype_paths` 198 项全过；`test_lora_save` 缺合成 checkpoint（要先跑 make_synthetic_checkpoint）；`test_release` 加载插件失败（`PromptServer.instance` 为空、`nodes_replacements` 导入失败），属于阶段 A 适配新版 ComfyUI 的范围，这里不改。
 * 2026-11-26：写 `tests/test_quant_formats.py`（草稿分支）：4 种来源（文件内 comfy_quant / 头部元数据 / 旧 scaled_fp8 标记 / 两者都有）× fp8，加 comfy_quant × e5m2、int8_tensorwise、nvfp4、mxfp8、convrot_w4a4、asym_w4a8_int8、w6a8_int8；经 `convert_old_quants` → `mixed_precision_ops` 真加载，一层量化一层普通。fused / exact 都与「先反量化 + LoRA」逐位一致，无备份、量化字节不变、unpatch 干净：66 项全过，dev 的 hotpatch 不用改。与原生（合并后量化回去）的差值只报告；mxfp8 / convrot / w4a8 / w6a8 的原生前向在 CPU 上没有 kernel，标 n/a。
 * 2026-11-26：GGUF 适配器草稿（草稿分支，基于 dev）：`monoload/gguf.py`（按结构找 GGUFModelPatcher / GGMLLayer / dequant.is_quantized；替换 patch_weight_to_device、包 load 打「GGUF 强制」标记、包 GGMLLayer.cast_bias_weight 只调 Monoload 的运行时 patch）；hotpatch：`_ADAPTED_PWTD` 让 `_active` 认适配后的子类、`_load` 认 GGUF 强制标记、`MonoloadRuntimePatch._call_ggml`（量化层：exact = 原生 GGUF 的 calculate_weight，fused = addmm_）、F16/F32 GGML 参数 exact 用 fp32 + seed 0（与原生 GGUF 烘焙一致）、保存含 GGML 量化层的模型报 `gguf_save`；`install()` 和每个 prompt 开始（release 的 execute_async 包装）调 `find_subclass_adapters()`。CLIPLoaderGGUF 也用 GGUFModelPatcher，一并覆盖。`tests/test_gguf_lora.py`：Q8_0 / Q4_0 / Q5_1 / F16 权重 + F32 bias（带 diff），fp32 / bf16 × 全量 / lowvram：exact 与原生 GGUF 逐位一致，fused 在界内，无备份、GGML 字节不变、unpatch 干净、保存报错：31 项全过。回归：test_dtype_paths 198、test_quant_formats 66、test_lora_lowvram_hook 14、test_master_switch 19、test_messages 15 全过。CPU venv 里 H3 用软链 `ComfyUI/custom_nodes/ComfyUI-GGUF` 挂上。gguf-py 不支持 K-quant 量化（Q4_K 等），合成测试用 Q4_0 / Q5_1 代替；K-quant 留给真机。
+* 2026-11-26：视频小参数（§5）：发现原生 v0.46.3 的 `_load_list` 跳过非叶子模块，Wan modulation / LTX scale_shift_table 上的 LoRA 被原生静默丢弃（CPU 实测，见 §5）。实现 `MonoloadParamSwap`（所属模块 forward 前后换参数，原生算法逐位一致，无备份），`_load` 后对原生不调用的 key 统一装上；根模型自己的参数（无点号 key）也支持；`gguf.dequantize` 给量化 GGML 参数用。`tests/test_lora_param_swap.py` 44 项全过（fp32 / bf16 × 全量 / lowvram × exact / fused + hook LoRA）；`test_gguf_lora` 加非叶子 F32 modulation，35 项全过；`test_lora_hot` 里「纯 torch 层报错」改成「装上换参数、卸载后拆掉」（真机测试，云端没跑）。回归 test_dtype_paths 198、test_quant_formats 66、test_lora_lowvram_hook 14、test_master_switch 19、test_messages 15 全过。
