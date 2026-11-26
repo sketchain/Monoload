@@ -18,10 +18,16 @@ docs/DESIGN.md §9.35).
   output_frames()  frames of the decoded output, from sd.py's own upscale_ratio.
 """
 
+import comfy.ldm.cogvideo.vae as cogvideo
 import comfy.ldm.lightricks.vae.causal_video_autoencoder as ltx
 import comfy.ldm.lightricks.vae.na_diffusion_decoder as ltx_diffusion
 import comfy.ldm.wan.vae as wan
 import comfy.ldm.wan.vae2_2 as wan22
+
+try:   # group C's module (CogVideoX); until it is merged CogVideoX stays native at T > 1
+    from . import vae_cogvideo
+except ImportError:
+    vae_cogvideo = None
 
 
 def _wan21_chunks(fsm, z):
@@ -60,6 +66,8 @@ _CHUNKS = {
     wan.WanVAE: _wan21_chunks,
     wan22.WanVAE: _wan22_chunks,
 }
+if vae_cogvideo is not None:
+    _CHUNKS[cogvideo.AutoencoderKLCogVideoX] = vae_cogvideo.chunks   # group C: up_blocks[1]'s time upsampling per chunk
 
 WHOLE = frozenset((ltx.VideoVAE, ltx_diffusion.CausalDiffusionVAE))
 
@@ -91,7 +99,12 @@ def chunks(fsm, z, vae_options):
 
 
 def output_frames(vae, t):
-    """Frames out of t latent frames (sd.py's upscale_ratio[0]), None if the VAE has no such rule."""
+    """Frames out of t latent frames (sd.py's upscale_ratio[0]), None if the VAE has no such rule. CogVideoX: its
+    decoder's own rule (sd.py's 4t - 3 holds for odd t only; an even t decodes to 4t frames)."""
+    if vae_cogvideo is not None:
+        n = vae_cogvideo.output_frames(getattr(vae, "first_stage_model", None), t)
+        if n is not None:
+            return n
     r = getattr(vae, "upscale_ratio", None)
     if isinstance(r, tuple) and r and callable(r[0]):
         return int(r[0](t))

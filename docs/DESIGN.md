@@ -1841,6 +1841,8 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 * 按类判断而不按 state dict 的 key：解码时手里只有模块。
 * 随机数：卷积 VAE 解码时用全局 RNG 加 `randn_like` 噪声，探测在 `fork_rng` 里跑，真解码的噪声与原生相同；batch > 1 时原生整批一次抽、Monoload 按样本抽，结果不逐位相同（原生自己按空闲内存切子批时也一样）。扩散 decoder 用固定种子 0 的生成器，没有这个差别。
 
+**CogVideoX 的登记（给 C 组，取自 C 组的 9a3d534）：** `vae_video._CHUNKS` 加 `cogvideo.AutoencoderKLCogVideoX → vae_cogvideo.chunks`，`output_frames` 先问 `vae_cogvideo.output_frames`（sd.py 的 4t − 3 只在 t 为奇数时对，t 为偶数时实际出 4t 帧）。`vae_cogvideo` 是 C 组的模块，按可选导入写：它合进来之前 CogVideoX 的多帧照旧走原生。
+
 **扩展点 `vae_ops.EXTRA_CHUNKERS`（给 F 组）：** 模块级列表，每项是 `(model, workspace, stats) -> 上下文管理器或 None`。`OpChunking.__enter__` 装好自己的替换之后按顺序进入（`contextlib.ExitStack`），`__exit__` 在恢复替换之前倒序退出；块里出异常、进入时出错也一样退出。返回 None 表示不管这个模型。它在模型上装的东西自己恢复；装成实例属性的替换请带 `monoload_replacement = True`，不然识别会把它当成用户的钩子。
 
 **H6：** `bench_vae.py --frames N`：随机 latent 的输出帧数（视频 VAE），latent 帧数取解码后 ≥ N 的最少帧数；标签加 `x{N}f`。
