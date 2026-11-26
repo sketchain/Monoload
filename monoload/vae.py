@@ -87,8 +87,9 @@ MIN_WORKSPACE = 64 * MIB
 ACTIVATION_COPIES = 4      # live full-size activations bounded by 4x the largest one (DESIGN §9.4)
 PROBE_SIZE = 8             # latent rows/cols of the shape probe
 MF_PROBE_SIZES = (16, 32)  # latent rows/cols of the two multi-frame memory probes (DESIGN §9.35)
-MF_PROBE_WORKSPACE = 64 * MIB  # their OpChunking workspace (= MIN_WORKSPACE): capped at both sizes, so in the intercept, not the
-                               # slope (an overcount of <= 2 x 64 MiB); 1 MiB made the probe ~85 s on CT 700 (Wan 2.1 81 frames)
+MF_PROBE_WORKSPACE = 64 * MIB  # their OpChunking workspace (= MIN_WORKSPACE): capped at both sizes, so in the intercept, not the slope;
+                               # 1 MiB made the probe ~85 s on CT 700 (Wan 2.1 81 frames). Fragmentation: one more run at the decode's own
+                               # workspace (_probe_mf, DESIGN §9.35)
 MF_MARGIN = 1.25           # the measured slope (bytes per latent pixel, _CudaPeak) times this: headroom over the two-point line, DESIGN §9.35
 
 
@@ -607,15 +608,17 @@ def _native_reason(vae, samples):
 class _Probe:
     """act_bytes_per_px: the largest single activation per latent pixel (the shape probe). A multi-frame probe
     (_probe_mf) has mf_slope / mf_intercept instead: the peak allocated by one sample's layer-2 decode, bytes per
-    latent pixel and the constant part, from two measured sizes (act_bytes_per_px is the slope then)."""
-    __slots__ = ("act_bytes_per_px", "out_numel_per_px", "seconds", "mf_slope", "mf_intercept")
+    latent pixel and the constant part, from two measured sizes (act_bytes_per_px is the slope then), and mf_frag: the
+    most the allocator reserved beyond that peak (fragmentation) at either size."""
+    __slots__ = ("act_bytes_per_px", "out_numel_per_px", "seconds", "mf_slope", "mf_intercept", "mf_frag")
 
-    def __init__(self, act, out, seconds, mf_slope=None, mf_intercept=0):
+    def __init__(self, act, out, seconds, mf_slope=None, mf_intercept=0, mf_frag=0):
         self.act_bytes_per_px = act
         self.out_numel_per_px = out
         self.seconds = seconds
         self.mf_slope = mf_slope
         self.mf_intercept = mf_intercept
+        self.mf_frag = mf_frag
 
 
 class _UnboundedDecode(Exception):
@@ -633,11 +636,11 @@ def _measured(vae, samples):
 
 
 class _CudaPeak:
-    """Peak bytes on a CUDA / ROCm device since start(), above what was there then: the larger of the allocated and the
-    reserved peak, the allocator's cache emptied first (so the reserved peak counts the segments the decode makes,
-    its fragmentation included: LTX 0.9's decoder reserves 1.7x what it allocates, DESIGN §9.35). Resets the device's
-    peak statistics: _MemProbe's reserved peak of the decode in progress then starts at the probe (which comes before
-    any decode work, after loading the weights)."""
+    """Peak allocated bytes on a CUDA / ROCm device since start(), above what was allocated then, and frag(): how much
+    more the allocator reserved at its peak than that (fragmentation; the cache is emptied at start(), so the reserved
+    peak counts the segments the decode makes: LTX 0.9.0's decoder reserves 1.7x what it allocates, DESIGN §9.35).
+    Resets the device's peak statistics: _MemProbe's reserved peak of the decode in progress then starts at the probe
+    (which comes before any decode work, after loading the weights)."""
 
     def __init__(self, dev):
         self.dev = dev
@@ -651,7 +654,10 @@ class _CudaPeak:
 
     def peak(self):
         torch.cuda.synchronize(self.dev)
-        return max(torch.cuda.max_memory_allocated(self.dev) - self.base, torch.cuda.max_memory_reserved(self.dev) - self.base_res)
+        return torch.cuda.max_memory_allocated(self.dev) - self.base
+
+    def frag(self):
+        return max(0, torch.cuda.max_memory_reserved(self.dev) - self.base_res - self.peak())
 
 
 def _cuda_peak_meter(dev):
@@ -725,10 +731,12 @@ def _probe(vae, samples, vae_options):
     return p
 
 
-def _probe_mf(vae, samples, vae_options):
+def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
     """The multi-frame memory probe (DESIGN §9.35): one sample's layer-2 decode (_decode_sample, under OpChunking with
     MF_PROBE_WORKSPACE) of a zeros latent with all of samples' frames, at the MF_PROBE_SIZES latent sizes, measuring the
-    peak allocated above the start (the output buffer, allocated before, not counted: it is its own term). Video
+    peak allocated above the start (_CudaPeak; the output buffer, allocated before, not counted: it is its own term),
+    and the larger size once more at the decode's workspace for the fragmentation (the reserved peak beyond the
+    allocated one; the largest of all runs). Video
     decoders keep per-conv caches, carries and output pieces besides the activations; a single largest tensor (_probe)
     does not see them, the measured peak does. Linear in the latent area: slope and intercept from the two sizes.
     Cached per model and _probe_key; the global RNG state is preserved. Raises when it cannot measure."""
@@ -742,19 +750,26 @@ def _probe_mf(vae, samples, vae_options):
     if meter is None:
         raise MonoloadError("no allocator statistics on {}".format(vae.device))
     t0 = time.perf_counter()
-    peaks = []
+    peaks, frags = [], []
     devs = [vae.device.index or 0] if vae.device.type == "cuda" else []
-    for s in MF_PROBE_SIZES:
+    ws = max(MF_PROBE_WORKSPACE, int(workspace))
+    # the two sizes at MF_PROBE_WORKSPACE (the line: allocated bytes, the workspace capped at both sizes, so in the
+    # intercept), then the larger size again at the decode's own workspace when it is larger: its block sizes are what
+    # fragment the allocator (LTX 0.9.0), and only the fragmentation (frag) is taken from that run
+    runs = [(s, MF_PROBE_WORKSPACE) for s in MF_PROBE_SIZES] + ([(MF_PROBE_SIZES[-1], ws)] if ws > MF_PROBE_WORKSPACE else [])
+    for s, run_ws in runs:
         shape = list(samples.shape)
         shape[0] = 1
         shape[-2] = shape[-1] = s
         with torch.inference_mode(), torch.random.fork_rng(devices=devs):
             z = torch.zeros(shape, device=vae.device, dtype=vae.vae_dtype)
             buf = torch.empty(_output_shape(vae, z), device=vae.output_device, dtype=vae.vae_output_dtype())
-            with OpChunking(fsm, MF_PROBE_WORKSPACE, OpStats()):
+            with OpChunking(fsm, run_ws, OpStats()):
                 meter.start()
                 _decode_sample(vae, z, vae_options, buf)
-                peaks.append(meter.peak())
+                if len(peaks) < len(MF_PROBE_SIZES):
+                    peaks.append(meter.peak())
+                frags.append(meter.frag())
             del z, buf
         mm.soft_empty_cache(True)
     a, b = MF_PROBE_SIZES[0] ** 2, MF_PROBE_SIZES[1] ** 2
@@ -762,7 +777,7 @@ def _probe_mf(vae, samples, vae_options):
     intercept = max(0.0, peaks[1] - slope * b)
     r = vae.spacial_compression_decode()
     out_numel = getattr(vae, "output_channels", 3) * r * r * (vae_video.output_frames(vae, int(samples.shape[2])) or 1)
-    p = _Probe(slope, out_numel, time.perf_counter() - t0, mf_slope=slope, mf_intercept=intercept)
+    p = _Probe(slope, out_numel, time.perf_counter() - t0, mf_slope=slope, mf_intercept=intercept, mf_frag=max(frags))
     per_model[key] = p
     return p
 
@@ -795,7 +810,7 @@ def estimate(vae, samples, budget, probe=None, retained=0, copies=ACTIVATION_COP
     px = _latent_px(samples)
     if probe is not None and probe.mf_slope is not None:
         # multi-frame (DESIGN §9.35): the measured peak of one sample's decode, everything it keeps alive included
-        act = MF_MARGIN * probe.mf_slope * px + probe.mf_intercept
+        act = MF_MARGIN * probe.mf_slope * px + probe.mf_intercept + probe.mf_frag
         out_numel = probe.out_numel_per_px * px
         copies, retained = 1, 0
     elif probe is not None:
@@ -1325,9 +1340,9 @@ def _layer2_estimate(vae, samples_in, vae_options, ws):
     probe = _PROBES.get(vae.first_stage_model, {}).get(_probe_key(vae, samples_in))
     if probe is None and _measured(vae, samples_in):
         big = samples_in[0:1, ..., :MF_PROBE_SIZES[-1], :MF_PROBE_SIZES[-1]]
-        _load_models(vae, estimate(vae, big, 0, copies=8)["total"])
+        _load_models(vae, estimate(vae, big, ws, copies=8)["total"])
         try:
-            probe = _probe_mf(vae, samples_in, vae_options)
+            probe = _probe_mf(vae, samples_in, vae_options, ws)
         except Exception as e:
             mm.soft_empty_cache(True)
             raise _UnboundedDecode("{}: {}".format(type(e).__name__, e))
