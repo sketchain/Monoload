@@ -1230,7 +1230,8 @@ def self_test(bound, vae):
         return hit
     oom = False
     try:
-        ok, detail = _self_test_run(bound, vae)
+        run = getattr(bound, "self_test_run", None)   # an adapter outside the engine's stripe units (CogVideoX) tests itself
+        ok, detail = run(vae) if run else _self_test_run(bound, vae)
     except Exception as e:
         if not mm.is_oom(e):
             ok, detail = False, "{}: {}".format(type(e).__name__, str(e).splitlines()[0] if str(e) else "")
