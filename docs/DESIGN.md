@@ -1887,6 +1887,22 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **回归（CT 700 的 `comfyui-latest` 里 `--cpu` 跑）：** `test_vae_norm_g` 7 项、`test_vae_stripe` 79 项全过；`test_vae_refiner` 13 项全过。真机 GPU 上的 `test_vae_norm_g` 和 `check_norm_reduce --pixelnorm` 在排队，测完补在这里。
 
+### 9.38 B 组：HunyuanVideo 1.0 / 1.5 多帧第二层、HunyuanVideo 1.5 / Refiner 第一层（分支 claude/project-thread-glsomb）
+
+**第二层的多帧入口（`vae_video.py`，c8f481e）：** HunyuanVideo 1.0（Kandinsky 5 用同一个）和 1.5 的 first-stage 是通用类 `AutoencoderKL` / `AutoencodingEngine`，图片 VAE 也用，所以不按类、按 decoder 结构认：1.0 = `ldm.Decoder` 且 `carried`、`conv_in` 是 `CarriedConv3d`、没有 bn / `max_batch_size` / `tanh_out` / `fused_norm`；1.5 = `vae_refiner.Decoder` 且 `refiner_vae=True`。`multiframe()` 对这两种返回真（H1 放行 T > 1），`chunks()` 按 decoder 自己的 2 帧一块逐块交出（v0.46.3 的 forward 原样搬过来，只是把列表 + `torch.cat` 换成生成器：少一份整段输出），估算走实测探针（`_probe_mf`）。`refiner_vae=False`（sd.py 的 5D `decoder.conv_in.weight`）整段解，不在这里。`vae.py` 的 `nr_multiframe` 提示只列 `MULTIFRAME` 里的类，名字在 `vae_video.MULTIFRAME_NAMES`，要不要加进提示由适配线程定。
+
+**第一层：`monoload/vae_hunyuan15.py`（4e348fa；还没进 `vae.STRIPE_ADAPTERS`，注册归适配线程）。** 1.5 的 decoder 和 Refiner 官方文件同一个（§9.31），一个适配器两种绑定：T = 1（Refiner、单帧）没有时间块；T > 1 用 H2 的时间轴。
+
+* **前缀**（整段视频一次）：`conv_in + repeat`、mid（`block_1`、全局注意力 tokens = T·h·w、`block_2`）、`up[0]` 的三个块；存档 = `up[0]` 的输出（1024 通道、latent 分辨率、全部帧）。原生的 `up[0]` 块是按 2 帧一块带 carry 跑的；carry 正是块前面的 2 帧（已补边的卷积输入），所以对整段一次跑 = 按块跑，数学上相同（`conv_carry_causal_3d`：没有 carry 时前面复制补 2 帧，有 carry 时拼上一块的末 2 帧）。
+* **单元**：`up[0].upsample`、`up[1..4]` 各自的块和 `UpSmpl`、`norm_out`、silu、`conv_out`。`UpSmpl` 是 3×3×3 卷积到 fct × C 通道再做 2×2（和 2 帧）的深度到空间，输出第 2h + i 行只依赖卷积输出第 h 行：在输出级 halo 2；`ResnetBlock` halo 2；`conv_out` halo 1。条带切口的复制补边只影响 halo 行（包括 carry 里的补边行）。
+* **时间块** = 原生的 2 帧一块（T 奇数时最后一块 1 帧）；第一块没有 carry，`UpSmpl`（第 0、1 级的 `tus`）把第一帧只做空间：2 → 3 → 5 帧，其后的块 2 → 4 → 8，总 4T − 3。`chunk_planes` 按这个给每级平面数。
+* **carry**：每个带 carry 的单元在条带状态里有自己的列表（`call_unit`：第 k > 0 块把上一块的列表传进去，弹出顺序与原生共用列表时相同）。`unit_cache` = 每个带 carry 的卷积 2 帧 ×（r + 2）×（W + 2）× C_in。
+* **内存模型**按 v0.46.3 的代码逐阶段数活张量（模块里注释）：`conv_carry_causal_3d` 的补边 / 拼接（Ap，含时间前 2 帧）、卷积的列或第二层行块（`conv3_extra`）、`ResnetBlock` 各阶段、`UpSmpl` 的重排和重复输入（≤ 4H）、RMS norm 的两个临时量加方案 G 的分组临时量（`grouped_norm_bytes`，> 510 通道：H4）。引擎给前缀的宽是「宽 × 一块的存档平面数」，这个前缀实际在全部帧上跑，`_prefix_geom` 换算回去。
+* **自检**：fp32 副本按配置重建 `vae_refiner.Decoder`（整核，多帧要读每个时间片；单帧没有用三片之和的 1×3×3 核，省事优先）；单帧 latent 1 帧，多帧 5 帧（块 2、2、1：满足 H5 的 ≥ 3 块，最后一块只有 1 帧也覆盖到）；两者的结构键不同，分开缓存。
+* **测试**：`tests/test_vae_hunyuan15.py`（测试里临时注册适配器）：认结构 / 拒绝的原因；单帧托管解码 == 原生（多种条带高度、奇数、1×1、batch 2、16 KiB 工作区）；多帧直接 `bound.plan` / `bound.run`（CPU 上 `vae._native_reason` 没有峰值计、T > 1 保持原生）== 原生 decode（T = 2、3、5、6、9，块内首帧特殊处理、carry）；自检通过、注入 halo 太小 / 丢 carry 时自检失败并回第二层；`alloc_sim`（加了 `frames` / `latent_frames` 参数）全尺寸 meta：第一层模拟 reserved ≤ 估算（Refiner 1344×768 … 3072²，HunyuanVideo 1.5 832×480×81、1280×720×121），自检峰值 ≤ `selftest_memory`。**真机还没跑**（DC 从 11-26 17:40 起连不上），结果出来补在这里。
+
+**HunyuanVideo 1.0 / Kandinsky 5 的第一层：** 原生 GroupNorm 是每个时间块各自统计（块内 2 帧 × 整幅），条带为主的引擎要每块一个统计遍，H2 不支持统计遍和时间块同时用。先用第二层的真机数据（832×480×81 模拟 14.98 GiB）看够不够，再定做不做。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
