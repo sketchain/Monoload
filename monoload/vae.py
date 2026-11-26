@@ -87,7 +87,8 @@ MIN_WORKSPACE = 64 * MIB
 ACTIVATION_COPIES = 4      # live full-size activations bounded by 4x the largest one (DESIGN §9.4)
 PROBE_SIZE = 8             # latent rows/cols of the shape probe
 MF_PROBE_SIZES = (16, 32)  # latent rows/cols of the two multi-frame memory probes (DESIGN §9.35)
-MF_PROBE_WORKSPACE = 1 * MIB   # their OpChunking workspace: the workspace is its own term of the estimate, kept out of the slope
+MF_PROBE_WORKSPACE = 64 * MIB  # their OpChunking workspace (= MIN_WORKSPACE): capped at both sizes, so in the intercept, not the
+                               # slope (an overcount of <= 2 x 64 MiB); 1 MiB made the probe ~85 s on CT 700 (Wan 2.1 81 frames)
 MF_MARGIN = 1.25           # the measured slope (allocated bytes per latent pixel) times this: reserved vs allocated, tests/test_vae_multiframe.py
 
 

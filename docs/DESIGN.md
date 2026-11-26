@@ -1906,7 +1906,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 **H1：哪些放开、怎么给上界**
 
 * `_native_reason`：T > 1 的 5D latent，第一阶段模型的类（精确类型）在 `vae_video.MULTIFRAME` 里才托管，否则仍原生（信息里列出已托管的类）；设备没有分配器统计（不是 CUDA / ROCm）也原生。
-* **估算换成实测**：§9.32 说过，8×8 的形状探测只看「最大的单个张量」，看不到每卷积缓存、carry、输出块列表和 `torch.cat`，多帧时不是上界；按类型一项项补（像 §9.27）每种 decoder 都要单独建模，而且 Wan 2.1 刚改过结构。所以多帧改成**实测峰值**（`vae._probe_mf`）：用同样的帧数、零 latent，在 `MF_PROBE_SIZES`（16、32）两个 latent 尺寸上各跑一次**和真解码同一条路**（`_decode_sample`，`OpChunking` 工作区 `MF_PROBE_WORKSPACE` = 1 MiB），记分配器的 allocated 峰值（输出缓冲在开始前分配、不算在内）；两点连线得每 latent 像素的斜率和截距。工作区单独是估算里的 2 × 工作区一项，探测用 1 MiB 让它不混进斜率。
+* **估算换成实测**：§9.32 说过，8×8 的形状探测只看「最大的单个张量」，看不到每卷积缓存、carry、输出块列表和 `torch.cat`，多帧时不是上界；按类型一项项补（像 §9.27）每种 decoder 都要单独建模，而且 Wan 2.1 刚改过结构。所以多帧改成**实测峰值**（`vae._probe_mf`）：用同样的帧数、零 latent，在 `MF_PROBE_SIZES`（16、32）两个 latent 尺寸上各跑一次**和真解码同一条路**（`_decode_sample`，`OpChunking` 工作区 `MF_PROBE_WORKSPACE` = 64 MiB），记分配器的 allocated 峰值（输出缓冲在开始前分配、不算在内）；两点连线得每 latent 像素的斜率和截距。探测的卷积列在两个尺寸上都顶到 64 MiB，落在截距里、不进斜率（多算 ≤ 2 × 64 MiB，偏保守）。最早用 1 MiB（想让工作区完全不进测量），真机上 Wan 2.1 81 帧第一次解码多花约 85 s（行块太碎），改成 64 MiB。
 * 估算 = `MF_MARGIN`（1.25）× 斜率 × 像素 + 截距 + 2 × 工作区 + 输出缓冲（整批，`--gpu-only` 时）+ 一个 latent 样本。1.25 盖住 reserved 比 allocated 多出的碎片（模拟里 reserved / allocated 1.2–1.3）。缓存按（通道、维数、dtype、帧数）。
 * 探测失败（任何异常）：没有上界就交给 ComfyUI 原生解码（`_UnboundedDecode`，记录 strategy native、原因写探测失败），不报错。
 * `_CudaPeak` 会重置设备的峰值统计：`_MemProbe` 记的这次解码的 reserved 峰值从探测开始算（探测在加载权重之后、任何解码工作之前）。
