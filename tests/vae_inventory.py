@@ -503,7 +503,7 @@ def trace(v, shape, layer, ws=GIB):
             # H1: Monoload's own estimate (multi-frame, or a decoder vae_video always measures: LTX), its probe measured on this simulator (before the decode's OpChunking)
             mvae._PROBES.pop(fsm, None)
             with _patched(mvae, "_PEAK_METER", [lambda dev: _SimMeter(sim, tracer)]):
-                probe = mvae._probe_mf(v, lat, {})
+                probe = mvae._probe_mf(v, lat, {}, ws)
             mf_parts = mvae.estimate(v, lat, ws, probe)
             mf_est = mf_parts["total"]
             mf_parts = dict(mf_parts, slope=probe.mf_slope, intercept=probe.mf_intercept)
