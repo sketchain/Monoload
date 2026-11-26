@@ -26,6 +26,13 @@ from F.normalize and from an fp64 reference, and the time of both.
     docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_norm_reduce.py \\
         --json /opt/ComfyUI/output/norm_reduce.json 2>&1 | tee norm_reduce.txt
 
+--pixelnorm measures LTX's PixelNorm instead (x / sqrt(mean(x^2, dim=1) + eps), DESIGN §9.37): the native call's peak
+above its input (its full-size x^2 included) and whether the mean's reduction adds a scratch, against the grouped
+candidate (the sum of squares as fp32 norms of channel groups of <= 510, Monoload's vae_ops.grouped_pixel_norm):
+its peak, its difference from native and from fp64, and the time of both.
+
+    docker exec -w /tmp/mono-x comfyui-latest python tests/check_norm_reduce.py --pixelnorm
+
 --predict prints the model's table without a GPU (--mp / --threads-per-mp / --warp
 for the device). Plain PyTorch, no ComfyUI, no Monoload.
 """
@@ -127,6 +134,74 @@ def grouped_normalize(x, dim=1, eps=1e-12):
     return x / denom.clamp_min(eps).expand_as(x)
 
 
+def pixel_norm(x, eps=1e-8):
+    """cab5f4e comfy/ldm/lightricks/vae/pixel_norm.py:12 with dim 1."""
+    return x / torch.sqrt(torch.mean(x ** 2, dim=1, keepdim=True) + eps)
+
+
+def grouped_pixel_norm(x, eps=1e-8):
+    """monoload.vae_ops.grouped_pixel_norm (copied: this script has no Monoload)."""
+    c = x.shape[1]
+    g = group_size(c)
+    if g == c:
+        return pixel_norm(x, eps)
+    shape = list(x.shape)
+    shape[1:2] = [c // g, g]
+    ss = torch.linalg.vector_norm(torch.linalg.vector_norm(x.view(shape), 2, 2, dtype=torch.float32), 2, 1, keepdim=True)
+    return x / ss.square_().div_(c).add_(eps).sqrt_().to(x.dtype)
+
+
+# (label, frames, rows, cols, channels): LTX 2's decoder levels (latent 1/32 spatially, 1/8 in time; 1024 channels at
+# the latent, 512 after the first compress_all, then 256, 128) for 768x512x97 and 1280x704x121, whole frames as layer 2
+# decodes them, and a sweep of single-frame sizes
+PIXELNORM = [("LTX2 768x512x97 L0", 13, 16, 24, 1024), ("LTX2 1280x704x121 L0", 16, 22, 40, 1024),
+             ("LTX2 768x512x97 L1", 25, 32, 48, 512), ("LTX2 1280x704x121 L1", 31, 44, 80, 512),
+             ("LTX2 768x512x97 L2", 49, 64, 96, 256)]
+
+
+def pixelnorm_main(quick):
+    rows_out = []
+    print("peak+ = max_memory_allocated above the input during the call (the output and native's full-size x^2 included); "
+          "sq = the size of x^2; scratch? = peak+ more than {} MiB above max(sq, out); g peak+ = the grouped candidate's".format(NOISE // MIB))
+    hdr = "{:24s} {:>9s} {:>5s} {:>4s} {:>4s} {:>5s} {:>8s} | {:>9s} {:>8s} {:>8s} {:>8s} | {:>9s} {:>9s} {:>9s} {:>9s} {:>11s}"
+    print(hdr.format("case", "dtype", "C", "T", "rows", "cols", "pos", "peak+", "sq", "out", "scratch?", "g peak+",
+                     "max|Δ|", "g fp64", "n fp64", "ms n/g"))
+    cases_ = list(PIXELNORM)
+    for c in (1024, 512, 384):
+        for r in ROWS_SWEEP[::4] if quick else ROWS_SWEEP[::2]:
+            cases_.append(("sweep", 1, r, 960, c))
+    for dtype in (torch.bfloat16, torch.float32):
+        for label, t, rows, cols, c in cases_:
+            g = torch.Generator(device="cuda").manual_seed(rows * 7 + c + t)
+            x = (torch.randn((1, c, t, rows, cols), generator=g, device="cuda", dtype=torch.float32) * 2).to(dtype)
+            y, peak, _, _ = measure(pixel_norm, x)
+            yg, gpeak, _, _ = measure(grouped_pixel_norm, x)
+            out_b = y.untyped_storage().nbytes()
+            sq = x.numel() * x.element_size()
+            ref = pixel_norm(x.double())
+            row = {"case": label, "dtype": str(dtype), "C": c, "T": t, "rows": rows, "cols": cols, "positions": t * rows * cols,
+                   "peak": peak, "sq": sq, "out": out_b, "scratch": peak > max(sq, out_b) + NOISE, "grouped_peak": gpeak,
+                   "max_diff": float((yg.float() - y.float()).abs().max()),
+                   "rel_fp64": float((yg.double() - ref).norm() / ref.norm()),
+                   "rel_fp64_native": float((y.double() - ref).norm() / ref.norm()),
+                   "ms_native": timed(pixel_norm, x), "ms_grouped": timed(grouped_pixel_norm, x)}
+            del x, y, yg, ref
+            print("{:24s} {:>9s} {:5d} {:4d} {:4d} {:5d} {:8d} | {:9.1f} {:8.1f} {:8.1f} {:>8s} | {:9.1f} {:9.2g} {:9.2g} {:9.2g} {:>11s}".format(
+                label[:24], str(dtype).replace("torch.", ""), c, t, rows, cols, row["positions"], peak / MIB, sq / MIB,
+                out_b / MIB, "YES" if row["scratch"] else "no", gpeak / MIB, row["max_diff"], row["rel_fp64"],
+                row["rel_fp64_native"], "{:.2f}/{:.2f}".format(row["ms_native"], row["ms_grouped"])), flush=True)
+            rows_out.append(row)
+    hits = [r for r in rows_out if r["scratch"]]
+    print("=== native PixelNorm: scratch in {} of {} calls{}; grouped: largest peak above its output {:.1f} MiB, "
+          "max|Δ| vs native {:.3g}, relative error vs fp64 {:.3g} (native {:.3g}) ===".format(
+              len(hits), len(rows_out),
+              " ({} .. {} positions, C {})".format(min(r["positions"] for r in hits), max(r["positions"] for r in hits),
+                                                   sorted({r["C"] for r in hits})) if hits else "",
+              max(r["grouped_peak"] - r["out"] for r in rows_out) / MIB, max(r["max_diff"] for r in rows_out),
+              max(r["rel_fp64"] for r in rows_out), max(r["rel_fp64_native"] for r in rows_out)))
+    return rows_out
+
+
 # ---------------------------------------------------------------------------
 # measuring
 # ---------------------------------------------------------------------------
@@ -183,7 +258,19 @@ def main():
     p.add_argument("--mp", type=int, default=None, help="--predict: multiProcessorCount")
     p.add_argument("--threads-per-mp", type=int, default=2048, help="--predict: maxThreadsPerMultiProcessor")
     p.add_argument("--warp", type=int, default=32, help="--predict: warp size")
+    p.add_argument("--pixelnorm", action="store_true", help="LTX's PixelNorm instead of F.normalize (needs a GPU)")
     a = p.parse_args()
+
+    if a.pixelnorm:
+        if not torch.cuda.is_available():
+            raise SystemExit("--pixelnorm needs a CUDA / HIP device")
+        pr = torch.cuda.get_device_properties(0)
+        print("device {} ({}); torch {} hip {}".format(pr.name, getattr(pr, "gcnArchName", "?"), torch.__version__, torch.version.hip))
+        rows_out = pixelnorm_main(a.quick)
+        if a.json:
+            with open(a.json, "w") as f:
+                json.dump(rows_out, f)
+        return 0
 
     if a.predict:
         mp, tpm, warp, rocm, gpu = a.mp or 20, a.threads_per_mp, a.warp, True, False

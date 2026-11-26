@@ -169,5 +169,4 @@ TAESD / TAEF1 / TAEF2、**Qwen Image 2.1 TAESD（64 ch，16×，RGBA，v0.46.3 �
 ## 5. GGUF
 
 * DiT / TE：GGUF 线程（量化 LoRA 运行时合并）。
-* VAE：ComfyUI-GGUF（kyuz0/ComfyUI-GGUF-H3）能把 VAE 也放成 GGUF 时，权重在每次 `forward` 里反量化（`GGMLOps` 的 cast）。Monoload 的第二层 / 第一层把卷积按行分块、条带重算，**同一个卷积会被调用很多次 → 每次都反量化一遍**，又慢、又多一份反量化的临时量。共用钩子（阶段 C 加，记作 H7）：托管解码期间，对每个模块只反量化一次、缓存到解码结束（算进估算：反量化后的权重大小），fp32 自检照常。识别时按 `weight` 的类型（GGML 张量）判断，不靠类名；没有 GGUF VAE 文件时这条不生效。
-* 先确认 kyuz0/ComfyUI-GGUF-H3 6d33de2 有没有 VAE 的 GGUF 加载节点、各视频 VAE 有没有现成的 GGUF 文件（交给 GGUF 线程 / 下载线程核实，结果补进本节）。
+* VAE：**不做（原计划的钩子 H7 已取消，2026-11-26）。** ComfyUI v0.46.3 核心和 kyuz0/ComfyUI-GGUF-H3 6d33de2 都没有 GGUF VAE 的加载器（GGUF 线程核实，见 `docs/GGUF-QUANT.md`）；现成的视频 VAE GGUF 文件只有 MiniMax-H3 Q8_0、SeedVR2 F16（社区），加载不了。另外原设想的「每模块反量化一次、缓存到解码结束」等于同时多留一份权重，违反「权重只留一份」，也不该做。以后真有 GGUF VAE 加载器再议。
