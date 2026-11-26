@@ -417,6 +417,10 @@ M = {
     "info.model_head": ("MODEL ({model}):", "MODEL（{model}）："),
     "info.lora_list": ("  LoRA: {items}", "  LoRA：{items}"),
     "info.lora_other": ("  LoRA: none from the LoRA loader nodes (other patches present)", "  LoRA：没有来自 LoRA 加载节点的（有其他 patch）"),
+    "info.gguf": ("  GGUF model: {q} patched keys on quantized tensors (merged into the dequantized temporary, never "
+                  "re-quantized), {plain} on F16 / F32 tensors (merged at run time, no backup)",
+                  "  GGUF 模型：被改到的 key 中 {q} 个在量化张量上（合并进反量化的临时权重，不量化回去），{plain} 个在 F16 / F32 "
+                  "张量上（运行时合并，不备份）"),
     "info.lora_none": ("  LoRA: none", "  LoRA：无"),
     "info.patched": ("  patched weights: {n}{hooks}", "  被改动的权重：{n}{hooks}"),
     "info.hooks": (", hook-LoRA groups: {n}", "，hook LoRA 组：{n}"),

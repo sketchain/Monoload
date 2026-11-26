@@ -389,6 +389,94 @@ class MonoloadRuntimePatch(LowVramPatch):
         return w.to(dtype=cdt)
 
 
+class MonoloadParamSwap:
+    """Runtime merge for a patched parameter that is not a comfy.ops layer's weight / bias (Wan's
+    blocks.N.modulation / head.modulation, LTX's scale_shift_table, ...): the module reads it directly in its own
+    forward, so there is no weight function to hook. A forward pre-hook on the owning module puts a merged
+    temporary in its place for the duration of that module's forward and a forward hook (always_call) puts the
+    stored parameter back; the stored parameter is never written and never backed up. These parameters are small
+    (Wan 14B: 6 x 5120 per block), so the merge always uses native's own arithmetic, bit for bit (lora compute dtype
+    -> calculate_weight -> stochastic rounding to the parameter's dtype; for an F16 / F32 GGUF tensor ComfyUI-GGUF's:
+    fp32, seed 0), in either merge mode. A quantized parameter is dequantized and the result kept dequantized."""
+
+    is_monoload_patch = True
+
+    def __init__(self, key, patches, module, attr, binding, device):
+        self.key = key
+        self.attr = attr
+        self.binding = binding
+        if binding.patches is not patches and not binding.patches:
+            binding.patches = patches
+        self.device = device     # the patcher's load device: a parameter left on the offload device merges there
+        self.seed = comfy.utils.string_to_seed(key)
+        self._module = weakref.ref(module)
+        self._saved = []
+        self._handles = (module.register_forward_pre_hook(self._pre), module.register_forward_hook(self._post, always_call=True))
+
+    def remove(self):
+        for h in self._handles:
+            h.remove()
+        module = self._module()
+        if module is not None and self._saved:
+            module._parameters[self.attr] = self._saved[0]
+        self._saved = []
+
+    def merged(self, param):
+        """The merged tensor for the stored parameter `param` (on its device), or None when nothing applies."""
+        b = self.binding
+        key = self.key
+        base = b.patches.get(key)
+        hooks = b.hook_patches.get(key)
+        if not base and not hooks:
+            return None
+        ggml = _ggml_kind(param)
+        if _is_quantized(param):
+            src = param.dequantize()
+        elif ggml == "quantized":
+            from . import gguf
+            src = gguf.dequantize(param, torch.float32)
+        else:
+            src = _plain(param.data)
+        if src.device.type == "cpu" and self.device is not None and torch.device(self.device).type != "cpu":
+            src = src.to(self.device)   # never merge on the CPU: a temporary copy on the load device
+        device = src.device
+        pdt = src.dtype
+        limit = src.numel() + 1
+        w = None
+        if base:
+            ldt = torch.float32 if ggml else comfy.model_management.lora_compute_dtype(device)
+            temp = src.to(dtype=ldt, copy=True)
+            out = comfy.lora.calculate_weight(_to_device(base, device, b.device_cache, limit, {"transient": False}), temp, key)
+            w = comfy.float.stochastic_rounding(out, pdt, seed=0 if ggml else self.seed)
+        if hooks:
+            temp = (w if w is not None else src).to(torch.float32, copy=True)
+            original = {key: [(src, _identity)] + list(base or [])}   # no native LowVramPatch here: base is all of it
+            out = comfy.lora.calculate_weight(_to_device(hooks, device, b.device_cache, limit, {"transient": False}), temp, key,
+                                              original_weights=original)
+            w = comfy.float.stochastic_rounding(out, pdt, seed=self.seed)
+        return _plain(w)
+
+    def _pre(self, module, args):
+        param = module._parameters.get(self.attr)
+        if param is None or self._saved:
+            return None
+        w = self.merged(param)
+        if w is None:
+            return None
+        self._saved.append(param)
+        module._parameters[self.attr] = torch.nn.Parameter(w, requires_grad=False)
+        return None
+
+    def _post(self, module, args, output):
+        if self._saved:
+            module._parameters[self.attr] = self._saved.pop()
+        return None
+
+
+def _param_swaps(module):
+    return module.__dict__.get("_monoload_param_swaps")
+
+
 def fused_factors(patch):
     """(up, down, scale) when `patch` is a plain LoRA / LoCon (LoRAAdapter
     without Tucker mid, DoRA or reshape; no offset, custom function or
@@ -474,16 +562,23 @@ def _check_dynamic(patcher):
 def _module_for_key(patcher, key):
     parts = key.rsplit(".", 1)
     if len(parts) != 2:
-        raise MonoloadUnsupportedError("lora_non_comfy_ops_param", msg("lora.not_layer_param"), key=key)
+        return patcher.model, key     # a parameter of the model itself
     return comfy.utils.get_attr(patcher.model, parts[0]), parts[1]
+
+
+def _is_layer_param(module, attr):
+    """A comfy.ops layer's weight / bias: patched through its weight / bias functions. Anything else (Wan's
+    modulation, LTX's scale_shift_table, a plain torch layer's weight) gets a MonoloadParamSwap."""
+    return hasattr(module, "comfy_cast_weights") and attr in ("weight", "bias")
 
 
 def _install_runtime_patch(patcher, key):
     st = _binding(patcher)
     patcher.model.__dict__["_monoload_runtime"] = True   # runtime patches may live on this model's modules
     module, attr = _module_for_key(patcher, key)
-    if not hasattr(module, "comfy_cast_weights") or attr not in ("weight", "bias"):
-        raise MonoloadUnsupportedError("lora_non_comfy_ops_param", msg("lora.non_comfy_ops", module=type(module).__name__), key=key)
+    if not _is_layer_param(module, attr):
+        _install_param_swap(patcher, st, key, module, attr)
+        return
     # Quantized weights (mixed-precision ops, set_/convert_ functions) are
     # handled in relaxed mode: merged on the dequantized temporary and never
     # re-quantized (see MonoloadRuntimePatch._source).
@@ -500,8 +595,40 @@ def _install_runtime_patch(patcher, key):
     setattr(module, fn_attr, funcs)
 
 
+def _install_param_swap(patcher, st, key, module, attr):
+    param = module._parameters.get(attr) if isinstance(module, torch.nn.Module) else None
+    if param is None:
+        raise MonoloadUnsupportedError("lora_non_comfy_ops_param", msg("lora.not_layer_param"), key=key)
+    patches = list(patcher.patches.get(key, [])) + list(st.hook_patches.get(key, []))
+    new_shape = comfy.lora.calculate_shape(patches, param, key)
+    if tuple(new_shape) != tuple(param.shape):
+        raise MonoloadUnsupportedError("lora_shape_change", msg("lora.shape_change", old=list(param.shape), new=list(new_shape)), key=key)
+    swaps = module.__dict__.setdefault("_monoload_param_swaps", {})
+    old = swaps.pop(attr, None)
+    if old is not None:
+        old.remove()
+    swaps[attr] = MonoloadParamSwap(key, patcher.patches, module, attr, st, patcher.load_device)
+
+
+def _install_param_swaps(patcher):
+    """Native load never calls patch_weight_to_device for a parameter of a module that also has child modules (Wan's
+    blocks.N.modulation, LTX's scale_shift_table: ModelPatcher._load_list skips non-leaf modules), so natively a LoRA's
+    diff on them is silently dropped (docs/GGUF-QUANT.md §5). Under Monoload every patched key of that kind gets its
+    MonoloadParamSwap here, after native load."""
+    for key in patcher.patches:
+        try:
+            module, attr = _module_for_key(patcher, key)
+        except (AttributeError, MonoloadUnsupportedError):
+            continue
+        if not _is_layer_param(module, attr) and not _has_runtime_patch(patcher, key):
+            _install_runtime_patch(patcher, key)
+
+
 def _has_runtime_patch(patcher, key):
     module, attr = _module_for_key(patcher, key)
+    if not _is_layer_param(module, attr):
+        swap = (_param_swaps(module) or {}).get(attr)
+        return swap is not None and swap.key == key
     return any(_is_runtime_patch(f) and f.key == key for f in module.__dict__.get(attr + "_function", []))
 
 
@@ -510,6 +637,12 @@ def _remove_runtime_patches(patcher, keep=None):
     # exactly "loaded" (native partially_unload only offloads flagged modules); native unpatch_model drops the flags
     # itself when the model is really unloaded.
     for m in patcher.model.modules():
+        swaps = _param_swaps(m)
+        if swaps:
+            for attr in [a for a, sw in swaps.items() if keep is None or sw.key not in keep]:
+                swaps.pop(attr).remove()
+            if not swaps:
+                del m.__dict__["_monoload_param_swaps"]
         for fn_attr in ("weight_function", "bias_function"):
             funcs = m.__dict__.get(fn_attr, None)
             if not funcs:
@@ -568,6 +701,7 @@ def _load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=Fals
                 del m.comfy_patched_weights
     _state(self)
     r = _ORIG["load"](self, device_to, lowvram_model_memory=lowvram_model_memory, force_patch_weights=force_patch_weights, full_load=full_load)
+    _install_param_swaps(self)
     _assert_no_backup(self)
     return r
 

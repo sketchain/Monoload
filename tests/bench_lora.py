@@ -15,7 +15,8 @@ Reports per combination:
   patch  : load_models_gpu of the diffusion model (native: restore previous
            backups + bake the new combination; Monoload: attach weight functions)
   step   : median seconds per sampling step (steps 2..N; step 1 reported separately)
-plus GTT / RSS after the combination and the max difference of the final latent
+plus GTT / RSS after the combination, the GTT peak over the combination (lora + encode
++ patch + sampling, sampled every 20 ms) and the max difference of the final latent
 between the two modes.
 
 Examples (inside the ComfyUI container; free the server's models first):
@@ -27,6 +28,10 @@ Examples (inside the ComfyUI container; free the server's models first):
   # Krea 2 (UNET + CLIP loaded separately)
   python tests/bench_lora.py --unet krea2_turbo_bf16.safetensors --clip qwen3vl_4b_bf16.safetensors --clip-type krea2 \
       --width 1024 --height 1024 --steps 8 --cfg 1 --sampler euler --scheduler simple --combo x.safetensors --combo none
+
+  # GGUF diffusion model + GGUF / fp8 text encoder, video latent (Wan 2.1 T2V, 33 frames 832x480)
+  python tests/bench_lora.py --unet-gguf wan2.1-t2v-14b-Q4_K_M.gguf --clip-gguf umt5-xxl-encoder-Q8_0.gguf --clip-type wan \
+      --latent 16,9,60,104 --steps 4 --cfg 1 --combo some_wan_lora.safetensors --combo none --modes native,monoload,monoload-exact
 
 ComfyUI launch args: $COMFY_ARGS if set, otherwise those of the container's
 main process (PID 1), otherwise "--cpu".
@@ -191,10 +196,48 @@ def apply_mode_loras(model, clip, loras, mode):
     return m, c
 
 
+class _GttPeak:
+    """Highest GTT reading while active (sampled every 20 ms in a thread); None where the GPU exposes no GTT counter."""
+
+    def __init__(self):
+        import threading
+        self.peak = _gtt_gib()
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        while not self._stop.wait(0.02):
+            g = _gtt_gib()
+            if g is not None and (self.peak is None or g > self.peak):
+                self.peak = g
+
+    def __enter__(self):
+        if self.peak is not None:
+            self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._t.is_alive():
+            self._t.join()
+        g = _gtt_gib()
+        if g is not None and (self.peak is None or g > self.peak):
+            self.peak = g
+
+
+def _empty_latent(a):
+    """--latent C,H,W (image) or C,T,H,W (video, e.g. Wan 2.1 81 frames 832x480: 16,21,60,104); else SD-style 4 x H/8 x W/8."""
+    if a.latent:
+        dims = [int(v) for v in a.latent.split(",")]
+        return torch.zeros([a.batch] + dims)
+    return torch.zeros(a.batch, 4, a.height // 8, a.width // 8)
+
+
 def run_sequence(model, clip, combos, a, results, mode):
-    latent0 = torch.zeros(1, 4, a.height // 8, a.width // 8)
+    latent0 = _empty_latent(a)
     for rep in range(a.repeat):
         for label, loras in combos:
+            peak = _GttPeak().__enter__()
             _sync()
             t0 = time.perf_counter()
             m, c = apply_mode_loras(model, clip, loras, mode)
@@ -228,6 +271,7 @@ def run_sequence(model, clip, combos, a, results, mode):
                                       denoise=1.0, callback=cb, disable_pbar=True, seed=a.seed)
             _sync()
             t_total = time.perf_counter() - t0
+            peak.__exit__(None, None, None)
             steps = [stamps[0] - t0] + [b - x for x, b in zip(stamps, stamps[1:])]
             row = {
                 "mode": mode, "rep": rep, "combo": label,
@@ -235,12 +279,13 @@ def run_sequence(model, clip, combos, a, results, mode):
                 "backups": len(m.backup) + len(c.patcher.backup),
                 "lora": t_lora, "encode": t_encode, "patch": t_patch,
                 "step1": steps[0], "step": statistics.median(steps[1:]) if len(steps) > 1 else steps[0],
-                "sample": t_total, "gtt": _gtt_gib(), "rss": _rss_gib(),
+                "sample": t_total, "gtt": _gtt_gib(), "gtt_peak": peak.peak, "rss": _rss_gib(),
             }
             results.append((row, out.float().cpu()))
             print("{mode:8s} rep{rep} {combo:28s} keys {unet_keys:4d}/{te_keys:4d} backups {backups:4d} | lora {lora:6.2f}s encode {encode:6.2f}s "
-                  "patch {patch:6.2f}s | step1 {step1:6.3f}s step {step:6.3f}s total {sample:7.2f}s | GTT {g} RSS {rss:5.2f} GiB".format(
-                      g="{:6.2f}".format(row["gtt"]) if row["gtt"] is not None else "   n/a", **row), flush=True)
+                  "patch {patch:6.2f}s | step1 {step1:6.3f}s step {step:6.3f}s total {sample:7.2f}s | GTT {g} (peak {gp}) RSS {rss:5.2f} GiB".format(
+                      g="{:6.2f}".format(row["gtt"]) if row["gtt"] is not None else "   n/a",
+                      gp="{:6.2f}".format(row["gtt_peak"]) if row["gtt_peak"] is not None else "n/a", **row), flush=True)
             del m, c, pos, neg
 
 
@@ -356,6 +401,15 @@ def layer_probe(model, clip, loras, reps=3):
     free_all()
 
 
+def _gguf_pack():
+    """The ComfyUI-GGUF node pack under custom_nodes (any folder whose nodes.py defines GGUFModelPatcher)."""
+    from test_gguf_lora import find_pack, import_pack
+    path = find_pack()
+    if path is None:
+        raise SystemExit("ComfyUI-GGUF not found under custom_nodes (or $GGUF_NODE_PATH)")
+    return import_pack(path)
+
+
 def _mode_desc(mode):
     if mode.startswith("monoload-relaxed"):
         return "Monoload, default path with fusion off: relaxed merge only (diagnostic)"
@@ -372,8 +426,12 @@ def main():
     p = argparse.ArgumentParser(description="native vs Monoload LoRA benchmark")
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--checkpoint", help="CheckpointLoaderSimple file (e.g. SDXL)")
-    src.add_argument("--unet", help="UNETLoader file (use with --clip)")
+    src.add_argument("--unet", help="UNETLoader file (use with --clip / --clip-gguf)")
+    src.add_argument("--unet-gguf", help="ComfyUI-GGUF UnetLoaderGGUF file (use with --clip / --clip-gguf)")
     p.add_argument("--clip", help="CLIPLoader file")
+    p.add_argument("--clip-gguf", help="ComfyUI-GGUF CLIPLoaderGGUF file")
+    p.add_argument("--latent", help="empty latent shape without the batch: C,H,W or C,T,H,W (video); overrides --width/--height")
+    p.add_argument("--batch", type=int, default=1)
     p.add_argument("--clip-type", default="stable_diffusion")
     p.add_argument("--combo", action="append", required=True,
                    help="LoRA combination: 'none' or 'a.safetensors[:model[:clip]]+b.safetensors...'; repeatable, run in order")
@@ -403,9 +461,12 @@ def main():
     if a.checkpoint:
         model, clip = load_checkpoint(a.checkpoint)
     else:
-        if not a.clip:
-            p.error("--unet needs --clip")
-        model, clip = load_unet(a.unet), load_clip(a.clip, a.clip_type)
+        if not a.clip and not a.clip_gguf:
+            p.error("--unet / --unet-gguf need --clip or --clip-gguf")
+        pack = _gguf_pack() if (a.unet_gguf or a.clip_gguf) else None
+        model = pack.nodes.UnetLoaderGGUF().load_unet(a.unet_gguf)[0] if a.unet_gguf else load_unet(a.unet)
+        clip = pack.nodes.CLIPLoaderGGUF().load_clip(a.clip_gguf, a.clip_type)[0] if a.clip_gguf else load_clip(a.clip, a.clip_type)
+        hotpatch.find_subclass_adapters()
     print("model dtype {}  manual_cast {}".format(model.model.get_dtype(), model.model.manual_cast_dtype))
 
     results = []
@@ -471,10 +532,21 @@ def main():
                 ratio = r[0]["step"] / r0[0]["step"] if r0 and r0[0]["step"] else float("nan")
                 cells.append("{:>9.3f}s {:5.2f}x".format(r[0]["step"], ratio))
         print("{:28s} | ".format(label[:28]) + " | ".join(cells))
+    print("\n=== GTT peak / after, RSS (repetition {}) ===".format(last + 1))
+    print("{:28s} | ".format("combo") + " | ".join("{:>23s}".format(m_[:23]) for m_ in modes))
+    fg = lambda v: "n/a" if v is None else "{:.2f}".format(v)
+    for label, _ in combos:
+        cells = []
+        for m_ in modes:
+            r = by.get((m_, label))
+            cells.append("{:>23s}".format("n/a" if r is None else "{}/{} {:.2f}".format(fg(r[0]["gtt_peak"]), fg(r[0]["gtt"]), r[0]["rss"])))
+        print("{:28s} | ".format(label[:28]) + " | ".join(cells))
     print("\nmax|Δ| / mean|Δ| = difference of the final latent between the two modes (0 = bit-identical).")
     print("effect = what the LoRA changes in that mode (combo vs the same mode's 'none'); compare mean|Δ| with it.")
     print("Add native2 to --modes (e.g. native,monoload,monoload-exact,native2) to see how much native differs from itself on this GPU.")
     print("bypass is not bit-identical to merging by design (it adds up(down(x)) to the layer output).")
+    print("A LoRA with diffs on modulation / scale_shift_table (Wan, LTX): native ComfyUI v0.46.3 drops those keys, Monoload "
+          "applies them, so max|Δ| vs native is not 0 (docs/GGUF-QUANT.md §5).")
     if BYPASS_NOISE["suppressed"]:
         print("({} '[BypassLoRA] Adapter key not in model state_dict' warnings suppressed: text-encoder keys seen while "
               "attaching to the UNet; they are attached to the CLIP separately)".format(BYPASS_NOISE["suppressed"]))
