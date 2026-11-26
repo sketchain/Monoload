@@ -34,6 +34,7 @@ _INSTALLED = {}       # GGUFModelPatcher class -> (orig patch_weight_to_device, 
 _LAYERS = {}          # GGMLLayer class -> orig cast_bias_weight
 _REJECTED = set()
 _QUANT_CHECKS = []    # the found packs' dequant.is_quantized(tensor)
+_DEQUANT = []         # the found packs' dequant.dequantize_tensor(tensor, dtype)
 
 
 def is_ggml(t):
@@ -45,6 +46,13 @@ def is_ggml_quantized(t):
     if getattr(t, "tensor_type", None) is None:
         return False
     return any(f(t) for f in _QUANT_CHECKS)
+
+
+def dequantize(t, dtype):
+    """A quantized GGMLTensor's values as a plain tensor of `dtype` (the pack's own dequantize_tensor)."""
+    for f in _DEQUANT:
+        return _private(f(t, dtype), t)
+    raise MonoloadUnsupportedError("gguf_unknown", msg("lora.gguf_unknown", cls=type(t).__name__))
 
 
 def model_has_ggml_quantized(model):
@@ -84,16 +92,18 @@ def find_and_install():
             continue
         layer_cls = getattr(_sibling(patcher_cls, "ops"), "GGMLLayer", None)
         quant_check = getattr(_sibling(patcher_cls, "dequant"), "is_quantized", None)
-        if not _looks_like_layer(layer_cls) or not callable(quant_check) or not _compatible(patcher_cls, layer_cls):
+        dequant = getattr(_sibling(patcher_cls, "dequant"), "dequantize_tensor", None)
+        if not _looks_like_layer(layer_cls) or not callable(quant_check) or not callable(dequant) \
+                or not _compatible(patcher_cls, layer_cls):
             _REJECTED.add(patcher_cls)
             logging.warning(msg("lora.gguf_unknown", cls="{}.{}".format(patcher_cls.__module__, patcher_cls.__qualname__)))
             continue
-        _install(patcher_cls, layer_cls, quant_check)
+        _install(patcher_cls, layer_cls, quant_check, dequant)
         n += 1
     return n
 
 
-def _install(patcher_cls, layer_cls, quant_check):
+def _install(patcher_cls, layer_cls, quant_check, dequant):
     orig_pwtd = patcher_cls.__dict__["patch_weight_to_device"]
     orig_load = patcher_cls.__dict__["load"]
 
@@ -132,6 +142,8 @@ def _install(patcher_cls, layer_cls, quant_check):
     _INSTALLED[patcher_cls] = (orig_pwtd, orig_load)
     if quant_check not in _QUANT_CHECKS:
         _QUANT_CHECKS.append(quant_check)
+    if dequant not in _DEQUANT:
+        _DEQUANT.append(dequant)
 
     if layer_cls not in _LAYERS:
         orig_cbw = layer_cls.__dict__["cast_bias_weight"]
@@ -176,6 +188,7 @@ def uninstall():
     _LAYERS.clear()
     _REJECTED.clear()
     _QUANT_CHECKS.clear()
+    _DEQUANT.clear()
 
 
 def summary(patcher):
