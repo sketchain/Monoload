@@ -182,29 +182,23 @@ def selftest_tests(v21, v22):
         ok, detail = eng.self_test(b, v)
         check("{} self-test: {} ({}), bound {}".format(label, "pass" if ok else "FAIL", detail, fmt_bytes(b.selftest_memory())), ok)
         # injected bug: one cache list for every stripe (the caches of the previous stripe's rows leak in)
-        orig = wv.WanVideoStripe.stripe
+        orig_state, orig_call = wv.WanVideoStripe.stripe_state, wv.WanVideoStripe.call_unit
         shared = {}
 
-        def bad_stripe(self, ckpt, needs, heights, emit, label_):
-            cache = shared.setdefault(id(self), [None] * self.ncache)
-            tpos = [0]
+        def bad_state(self):
+            return shared.setdefault(id(self), orig_state(self))
 
-            def out(x):
-                emit(tpos[0], x)
-                tpos[0] += int(x.shape[2])
-            xa, xb = needs[0]
-            for c0, k in self.chunks(int(ckpt.shape[2])):
-                x = ckpt.narrow(2, c0, k).narrow(self.hdim, xa, xb - xa)
-                try:
-                    self.run_units(0, x, needs, heights, cache, [0], c0 == 0, out, label_)
-                except RuntimeError:
-                    raise eng.StripeError("shape mismatch from a shared cache")
-        wv.WanVideoStripe.stripe = bad_stripe
+        def bad_call(self, u, x, state, k):
+            try:
+                return orig_call(self, u, x, state, k)
+            except RuntimeError:
+                raise eng.StripeError("shape mismatch from a shared cache")
+        wv.WanVideoStripe.stripe_state, wv.WanVideoStripe.call_unit = bad_state, bad_call
         try:
             eng._SELFTEST.pop(b.key, None)
             ok2, detail2 = eng.self_test(b, v)
         finally:
-            wv.WanVideoStripe.stripe = orig
+            wv.WanVideoStripe.stripe_state, wv.WanVideoStripe.call_unit = orig_state, orig_call
             eng._SELFTEST.pop(b.key, None)
         check("{} self-test with the caches shared across stripes -> fails ({})".format(label, detail2), not ok2)
 

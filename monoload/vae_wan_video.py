@@ -17,29 +17,30 @@ the first chunk. Every one of those cached tensors is local in the rows the way 
 conv's input rows, a 1x1 time_conv's input rows), and the per-frame attention sits in the middle, which the
 single-frame adapters already put into the whole-image prefix.
 
-So the decode runs stripe-major (docs/PLAN-video.md H2):
+So the decode runs stripe-major, on the engine's time axis (docs/PLAN-video.md H2, DESIGN §9.36 / §9.39):
 
-  1. prefix: conv2 on the whole latent, then for each time chunk the prefix modules of the single-frame adapter
-     (decoder.conv1, middle, Wan 2.1 also the ResidualBlocks before the first Resample) with the prefix's own
-     feat_cache, at latent resolution; each chunk's output goes straight into the checkpoint
-     [1, C, T, h, w] (T latent frames: ~100 MB at 832x480x81 for Wan 2.1, bf16).
-  2. stripes: for each output row stripe (the single-frame adapter's units, halos and stripe plan: the time
-     kernels do not change the spatial halo), a feat_cache list of the stripe's own; all time chunks run in order
-     through the units on exactly the stripe's needed rows of the checkpoint, the module instances called with
-     the cache exactly as the native decoder calls them (Wan 2.1's 2-frame split included). A unit always runs on
-     the same row range, so its cache entries cover the same rows in every chunk: the rows a stripe keeps are
-     exact for the same reason as in the single-frame case (valid_out checks every unit), the inexact halo rows
-     next to an inner stripe edge are dropped.
-  3. each output piece (frames x the stripe's core rows) is written straight into the preallocated 5D output
+  1. prefix (prefix_pass, the adapter's own): conv2 on the whole latent, then for each time chunk the prefix
+     modules of the single-frame adapter (decoder.conv1, middle, Wan 2.1 also the ResidualBlocks before the first
+     Resample) with the prefix's own feat_cache, at latent resolution; each chunk's output goes straight into the
+     checkpoint [1, C, T, h, w] (T latent frames: ~100 MB at 832x480x81 for Wan 2.1, bf16).
+  2. stripes (the engine's run_stripes with time_chunks): the single-frame adapter's units, halos and stripe plan
+     (the time kernels do not change the spatial halo); each output stripe gets a fresh feat_cache
+     (stripe_state) and runs every time chunk in order through the units on exactly its needed rows of the
+     checkpoint, each module called with the cache as the native decoder calls it (call_unit). A unit always runs
+     on the same row range, so its cache entries cover the same rows in every chunk: the rows a stripe keeps are
+     exact for the same reason as in the single-frame case (valid_out checks every unit).
+  3. each piece (a chunk's frames x the stripe's core rows) is written straight into the preallocated 5D output
      (H3: no list, no torch.cat).
+
+Wan 2.1's run_up splits the frames after a temporal Resample into pieces of 2; the engine's chain does not
+(numerically the same, the native comment says so and the self-test checks it): a chunk's last levels run on 8
+frames of the stripe's rows, which the plan counts (the stripes are as tall as the memory target allows).
 
 Peak = checkpoint + the largest unit of one stripe on one chunk + that stripe's caches (2 frames of every cached
 conv input at the stripe's rows) + the output (its own segment, as for images). Only the checkpoint and the
-output grow with the number of frames.
-
-The adapter subclasses the engine's StripeAdapter: the self-test (vae_engine.self_test) builds the engine's
-image Plan from the units for the geometry and calls prefix_pass / stripe_pass, which are the video ones here;
-plan() returns a VideoPlan (the video memory model), run() writes the 5D output directly.
+output grow with the number of frames. The engine's Plan does the accounting; the cost model here gets the
+frames of each level from the chunk shapes of the latent being planned (time_chunks), since the engine hands the
+unit costs width x planes.
 """
 
 import torch
@@ -264,185 +265,148 @@ def prefix_peak_v(m, kt, h, w, f, e, ws, s, clone):
 
 
 # ---------------------------------------------------------------------------
-# the plan
-# ---------------------------------------------------------------------------
-
-class VideoPlan:
-    """A stripe plan of a video decode: the output row stripes (engine.split_rows / stripe_needs on the units,
-    exactly as for one frame) and the memory model over the time chunks. Has what vae.py reads from a plan:
-    estimate, arena, stripes, h_out, recompute, ckpt_bytes, prefix_bytes, stripe_bytes, persistent, live_peak,
-    out_segment, passes, saves / save_bytes, describe()."""
-
-    def __init__(self, bound, t, h8, w8, rows, ws, elem, out_bytes):
-        self.bound, self.workspace, self.elem, self.hdim = bound, ws, elem, bound.hdim
-        units = bound.units
-        self.final_units = units
-        heights, widths = [h8], [w8]
-        for u in units:
-            heights.append(heights[-1] * u.scale)
-            widths.append(widths[-1] * u.scale)
-        self.final_heights, self.widths = heights, widths
-        self.h_out, self.w_out = heights[-1], widths[-1]
-        self.t = t
-        self.stripes = eng.split_rows(self.h_out, rows)
-        self.needs = [eng.stripe_needs(units, heights, a, b) for a, b in self.stripes]
-        self.order = list(range(len(self.stripes)))
-        self.rows = max(b - a for a, b in self.stripes)
-        e = elem
-        kt, clone = bound.kt, bound.clone_cache
-        frames = bound.unit_frames()
-        # the checkpoint: T latent frames at h8 x w8
-        self.ckpt_bytes = bound.ckpt_channels * t * h8 * w8 * e
-        # prefix: the latent and conv2's output (whole, all frames), the checkpoint, the prefix's caches, the
-        # largest prefix module on one chunk (its input counted as a whole chunk of its own on top)
-        zc = int(bound.fsm.conv2.weight.shape[0])
-        pf = bound.prefix_frames
-        pcache = sum(prefix_cache_channels(m) for _, m in bound.prefix) * CACHE_T * h8 * w8 * e
-        s = pf * h8 * w8 * zc * e
-        ppeak = plargest = 0
-        for _, m in bound.prefix:
-            ppeak = max(ppeak, prefix_peak_v(m, kt, h8, w8, pf, e, ws, s, clone))
-            plargest = max(plargest, bound.prefix_largest(m, h8, w8 * (pf + kt - 1), e, ws))
-            s = pf * h8 * w8 * bound.prefix_out_channels(m) * e
-        self.prefix_bytes = 2 * t * h8 * w8 * zc * e + self.ckpt_bytes + pcache + ppeak
-        # stripes: the largest over stripes of (caches of the stripe + the largest unit on one chunk)
-        live, largest, rows_total = 0, plargest, 0
-        for needs in self.needs:
-            cache = peak = 0
-            for i, u in enumerate(units):
-                ra, rb = needs[i]
-                r = rb - ra
-                w = widths[i]
-                cache += unit_cache_channels(u) * CACHE_T * r * w * e
-                for f, first, fs in frames[i]:
-                    if i == 0:
-                        s = 0       # a slice of the checkpoint (counted on its own)
-                    else:
-                        pa, pb = needs[i - 1]
-                        s = fs * (pb - pa) * units[i - 1].scale * w * units[i - 1].cout * e
-                    peak = max(peak, unit_peak_v(u, kt, r, w, f, e, ws, s, first, clone))
-                    largest = max(largest, unit_largest_v(u, kt, r, w, f, e, ws, first))
-            live = max(live, cache + peak)
-            rows_total += needs[0][1] - needs[0][0]
-        self.stripe_bytes = live
-        self.live = max(self.prefix_bytes, self.ckpt_bytes + live)
-        self.recompute = rows_total / float(h8) - 1.0
-        self.arena = eng.arena_bytes(self.live, stripes=len(self.stripes))
-        self.largest = largest
-        self.out_bytes = out_bytes
-        self.out_segment = eng.out_segment(out_bytes)
-        self.estimate = int(self.out_segment + self.arena + largest + eng.ESTIMATE_PAD)
-        # the rest of what vae._decode_layer1 records from an engine Plan: no statistics passes, no saves
-        self.passes = ()
-        self.saves, self.save_bytes = [], {}
-        self.persistent = 0
-        self.live_peak = self.live
-
-    def describe(self):
-        from .messages import msg
-        return msg("vae.plan", n=len(self.stripes), rows=self.rows, rec=self.recompute, ckpt=fmt_bytes(self.ckpt_bytes)) + \
-            " x {} latent frames".format(self.t)
-
-
-# ---------------------------------------------------------------------------
 # the adapter
 # ---------------------------------------------------------------------------
 
+def _video_units(units):
+    """The single-frame adapter's units with the time scale of the engine's time axis (Unit.tscale: a temporal
+    Resample / DupUp3D doubles the frames; the first chunk is the exception, chunk_planes)."""
+    return [eng.Unit(u.kind, u.module, u.halo, u.scale, u.cin, u.cout, u.name, macs_row=u.macs_row, shortcut=u.shortcut,
+                     norms=u.norms, contiguous=u.contiguous, extra=u.extra, tscale=2 if _temporal(u) else 1) for u in units]
+
+
 class WanVideoStripe(eng.StripeAdapter):
-    """Video layer-1 adapter bound to one WanVAE (2.1 or 2.2); `base` is the single-frame adapter (units, prefix,
-    the cost model the engine's image Plan uses in the self-test)."""
+    """Video layer-1 adapter bound to one WanVAE (2.1 or 2.2) on the engine's time axis (H2, DESIGN §9.36): the
+    single-frame adapter's units / halos / stripes (`base`), time_chunks = the native time loop, a stripe's state =
+    its feat_cache, call_unit = the module called with the cache exactly as the native decoder calls it; the cost
+    model below gets the frames of each level from the chunk shapes (the engine passes width x planes)."""
 
     hdim = 3
+    tdim = 2
 
     def __init__(self, base, fsm, module=None):
         self.base = base
         self.fsm = fsm
         self.module = fsm if module is None else module
-        self.prefix, self.units = base.prefix, base.units
+        self.prefix = base.prefix
+        self.units = _video_units(base.units)
+        self._uidx = {id(u): i for i, u in enumerate(self.units)}
         self.scale = base.scale
         self.ckpt_channels = base.ckpt_channels
         self.out_channels = base.out_channels
         self.kt = _time_kernel(fsm)
         self.ncache = 1 + sum(1 for m in fsm.decoder.modules() if isinstance(m, wan.CausalConv3d))
         self.key = ("video",) + tuple(base.key) + (self.kt,)
-        self.unit_peak = base.unit_peak
-        self.unit_largest = base.unit_largest
-        self.prefix_peak = base.prefix_peak
-        self.prefix_largest = base.prefix_largest
         self.prefix_out_channels = base.prefix_out_channels
         self.prefix_macs = base.prefix_macs
         self.activation_copies = base.activation_copies
         self.selftest_size = base.selftest_size
+        if getattr(base, "unit_calls", None) is not None:
+            self.unit_calls = base.unit_calls
+        self._shape = None
 
-    # --- time schedule
+    # --- time schedule (engine: time_chunks / chunk_planes)
 
     def chunks(self, t):
         """[(first latent frame, frames)] of the native time loop."""
         raise NotImplementedError
 
-    split_temporal = False   # Wan 2.1: Decoder3d.run_up splits the frames after a temporal Resample into pieces of 2
-
-    def unit_frames(self):
-        """Per unit, [(input frames, first chunk, frames of the storage the input is a slice of)]: a chunk after the
-        first at its largest, and the first chunk."""
-        out = []
-        cur = [(self.chunk_frames, False), (1, True)]
-        store = [self.chunk_frames, 1]
+    def levels(self, f, first):
+        """Frames at each level ([checkpoint] + one per unit) of a chunk of f latent frames."""
+        p = [f]
         for u in self.units:
-            out.append([(f, first, fs) for (f, first), fs in zip(cur, store)])
-            nxt = [unit_out_frames(u, f, first) for f, first in cur]
-            store = list(nxt)
-            if self.split_temporal and u.kind == UP and u.module.mode == "upsample3d":
-                nxt = [min(n, 2) for n in nxt]
-            cur = [(n, first) for n, (_, first) in zip(nxt, cur)]
+            p.append(unit_out_frames(u, p[-1], first))
+        return p
+
+    def time_chunks(self, shape):
+        if len(shape) != 5:
+            return None
+        t = int(shape[2])
+        out, o = [], 0
+        for c0, k in self.chunks(t):
+            n = self.levels(k, c0 == 0)[-1]
+            out.append(eng.TimeChunk(c0, c0 + k, o, o + n))
+            o += n
+        # the chunk shapes of this latent, for the cost model (the engine plans right after asking for the chunks)
+        self._shape = (t, sorted({(k, c0 == 0) for c0, k in self.chunks(t)}))
         return out
 
+    def chunk_planes(self, chunk):
+        return self.levels(chunk.ct1 - chunk.ct0, chunk.ct0 == 0)
+
     def out_frames(self, t):
-        n = 0
-        for c0, k in self.chunks(t):
-            f = k
-            for u in self.units:
-                f = unit_out_frames(u, f, c0 == 0)
-            n += f
-        return n
+        return self.time_chunks((1, 1, t, 1, 1))[-1].ot1
 
     def output_shape(self, samples):
         return (samples.shape[0], self.out_channels, self.out_frames(int(samples.shape[2])),
                 int(samples.shape[-2]) * self.scale, int(samples.shape[-1]) * self.scale)
 
-    # --- planning
+    def _kinds(self):
+        """[(frames per level, first chunk)] of the chunk shapes of the latent being planned."""
+        if self._shape is None:
+            return [(self.levels(1, True), True)]
+        return [(self.levels(k, first), first) for k, first in self._shape[1]]
 
-    def plan(self, vae, samples, budget, ws, rows=None, out_bytes=0, measure="estimate"):
-        h8, w8 = self.decoder_hw(samples)
-        t = int(samples.shape[2])
-        elem = mm.dtype_size(vae.vae_dtype)
-        if rows is not None:
-            return VideoPlan(self, t, h8, w8, rows, ws, elem, out_bytes)
-        h_out = h8 * self.scale
-        lo = min(eng.MIN_ROWS, h_out)
-        while True:
-            best = VideoPlan(self, t, h8, w8, lo, ws, elem, out_bytes)
-            if getattr(best, measure) <= budget:
-                break
-            if lo >= h_out:
-                return None
-            lo = min(h_out, lo * 2)
-        lo, hi = lo + 1, h_out
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            p = VideoPlan(self, t, h8, w8, mid, ws, elem, out_bytes)
-            if getattr(p, measure) <= budget:
-                best, lo = p, mid + 1
-            else:
-                hi = mid - 1
-        return best
+    # --- a stripe's state (engine: stripe_state / call_unit)
+
+    def stripe_state(self):
+        return {"cache": [None] * self.ncache, "idx": [0]}
+
+    def call_unit(self, u, x, state, k):
+        if u is self.units[0]:
+            state["idx"][0] = 0        # every chunk walks the cache slots from the first unit
+        return self.call(u, x, state["cache"], state["idx"], k == 0)
+
+    # --- cost model (the engine passes the elements of a row: width x planes of the level)
+
+    def unit_cache(self, u, r, w, elem):
+        return unit_cache_channels(u) * CACHE_T * r * w * elem
+
+    def _unit_frames(self, i, ew):
+        kinds = self._kinds()
+        fmax = max(lv[i] for lv, _ in kinds)
+        return ew // fmax, [(lv[i], first) for lv, first in kinds]
+
+    def unit_peak(self, u, r, ew, elem, ws, s):
+        i = self._uidx[id(u)]
+        w, fr = self._unit_frames(i, ew)
+        return max(unit_peak_v(u, self.kt, r, w, f, elem, ws, s, first, self.clone_cache) for f, first in fr)
+
+    def unit_largest(self, u, r, ew, elem, ws):
+        i = self._uidx[id(u)]
+        w, fr = self._unit_frames(i, ew)
+        return max(unit_largest_v(u, self.kt, r, w, f, elem, ws, first) for f, first in fr)
+
+    def _prefix_whole(self, h, w, elem):
+        """What the prefix holds for the whole loop: the latent and conv2's output (all frames), the prefix's caches."""
+        t = self._shape[0] if self._shape else 1
+        zc = int(self.fsm.conv2.weight.shape[0])
+        pcache = sum(prefix_cache_channels(m) for _, m in self.prefix) * CACHE_T * h * w * elem
+        return 2 * t * h * w * zc * elem + pcache
+
+    def prefix_peak(self, m, h, pw, elem, ws, s):
+        f = max(lv[0] for lv, _ in self._kinds())
+        w = pw // f
+        t = self._shape[0] if self._shape else 1
+        if m is self.prefix[0][1]:        # conv2 on the whole latent
+            zc = int(self.fsm.conv2.weight.shape[0])
+            return 2 * t * h * w * zc * elem + conv3_extra(zc, zc, 1, 1, h, w, t, elem, ws)
+        return self._prefix_whole(h, w, elem) + prefix_peak_v(m, self.kt, h, w, f, elem, ws, s, self.clone_cache)
+
+    def prefix_largest(self, m, h, pw, elem, ws):
+        f = max(lv[0] for lv, _ in self._kinds())
+        w = pw // f
+        if m is self.prefix[0][1]:
+            t = self._shape[0] if self._shape else 1
+            return self.base.prefix_largest(m, h, w * t, elem, ws)
+        return self.base.prefix_largest(m, h, w * (f + self.kt - 1), elem, ws)
 
     # --- running
 
     def prefix_pass(self, z):
         """conv2 on the whole latent, then the prefix chunk by chunk with its own feat_cache -> the checkpoint
         [1, C, T, h, w] (each chunk written into it)."""
-        x = self.module_conv2()(z)
+        x = self.fsm.conv2(z)
         t = int(z.shape[2])
         ckpt = torch.empty((z.shape[0], self.ckpt_channels, t) + tuple(z.shape[-2:]), dtype=x.dtype, device=x.device)
         cache = [None] * self.ncache
@@ -453,93 +417,8 @@ class WanVideoStripe(eng.StripeAdapter):
         del x, cache
         return ckpt
 
-    def module_conv2(self):
-        return self.fsm.conv2
-
-    def stripe_pass(self, saves, plan, write):
-        """The self-test's stripes (engine Plan): each stripe's frames into a buffer, then write(o0, o1, rows)."""
-        ckpt = saves.pop(0)
-        t = int(ckpt.shape[2])
-        tout = self.out_frames(t)
-        for k in plan.order:
-            (o0, o1), needs = plan.stripes[k], plan.needs[k]
-            buf = None
-
-            def emit(t0, x):
-                nonlocal buf
-                if buf is None:
-                    buf = torch.empty(x.shape[:2] + (tout,) + x.shape[3:], dtype=x.dtype, device=x.device)
-                buf.narrow(2, t0, x.shape[2]).copy_(x)
-            self.stripe(ckpt, needs, plan.final_heights, emit, "stripe [{}, {})".format(o0, o1))
-            write(o0, o1, buf)
-            del buf
-
-    def stripe(self, ckpt, needs, heights, emit, label):
-        """All time chunks of one stripe; emit(t0, x) gets each output piece (frames from t0, the stripe's core rows)."""
-        cache = [None] * self.ncache
-        tpos = [0]
-
-        def out(x):
-            emit(tpos[0], x)
-            tpos[0] += int(x.shape[2])
-        xa, xb = needs[0]
-        for c0, k in self.chunks(int(ckpt.shape[2])):
-            x = ckpt.narrow(2, c0, k).narrow(self.hdim, xa, xb - xa)
-            self.run_units(0, x, needs, heights, cache, [0], c0 == 0, out, label)
-            del x
-
-    def _step(self, i, y, needs, heights, xa, xb, label):
-        """Unit i's output rows -> the next needed rows (checked exact), contiguous before an upsampling unit."""
-        u = self.units[i]
-        hd = self.hdim
-        if y.shape[hd] != (xb - xa) * u.scale:
-            raise eng.StripeError("[Monoload] internal error: {} returned {} rows for {} input rows".format(u.name, y.shape[hd], xb - xa))
-        va, vb = eng.valid_out(u, xa, xb, heights[i + 1])
-        ta, tb = needs[i + 1]
-        if ta < va or tb > vb:
-            raise eng.StripeError("[Monoload] internal error: {} needs rows [{}, {}) of {} but only [{}, {}) are exact".format(
-                label, ta, tb, u.name, va, vb))
-        x = y.narrow(hd, ta - xa * u.scale, tb - ta)
-        if i + 1 < len(self.units) and (self.units[i + 1].kind in eng.CONTIGUOUS_INPUT or self.units[i + 1].contiguous) \
-                and not x.is_contiguous():
-            x = x.contiguous()
-        return x
-
-    def run_units(self, i, x, needs, heights, cache, idx, first, out, label):
+    def call(self, u, x, cache, idx, first):
         raise NotImplementedError
-
-    # --- the decode
-
-    def run(self, vae, samples_in, plan, budget_ws, stats):
-        """Decode every sample (the engine's memory layout: cache emptied, the output in its own segment, the arena);
-        the stripes write their pieces straight into the output."""
-        n = samples_in.shape[0]
-        hd = self.hdim
-        mm.soft_empty_cache()
-        with vae_ops.malloc_graph_paused():
-            pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
-        arena = bool(plan.arena) and eng.arena_supported(vae.device)
-        if arena:
-            eng.reserve_arena(vae.device, plan.arena)
-            stats.arena = plan.arena
-        with OpChunking(self.module, budget_ws, stats):
-            for i in range(n):
-                z = samples_in[i:i + 1].to(device=vae.device, dtype=vae.vae_dtype)
-                ckpt = self.prefix_pass(z)
-                del z
-                if arena and eng.CKPT_LOW:
-                    ckpt = eng.move_low(ckpt, vae.device)
-                dst = pixel_samples[i:i + 1]
-                for k in plan.order:
-                    (o0, o1), needs = plan.stripes[k], plan.needs[k]
-
-                    def emit(t0, x, o0=o0, o1=o1, dst=dst):
-                        dst.narrow(2, t0, x.shape[2]).narrow(hd, o0, o1 - o0).copy_(x)
-                    self.stripe(ckpt, needs, plan.final_heights, emit, "stripe [{}, {})".format(o0, o1))
-                del ckpt
-                vae.process_output(pixel_samples[i:i + 1])
-        mm.soft_empty_cache()
-        return pixel_samples
 
     # --- self-test
 
@@ -552,23 +431,22 @@ class WanVideoStripe(eng.StripeAdapter):
     def selftest_memory(self):
         """Upper bound of the self-test (fp32, small, SELFTEST_FRAMES latent frames): the weights in fp32, then the
         larger of the reference (the native video decode under layer-2 chunking: every cached conv input of the
-        whole image, activation_copies x the largest activation of a chunk, 2 x the workspace, the prefix, its
-        output 3 x: the pieces, torch.cat, Wan 2.2's unpatchify) and the stripes (the reference's output, the
-        stripes' output, one stripe's buffer, their plan's estimate), a margin."""
+        whole image, activation_copies x the largest activation of a chunk (Wan 2.1's 2-frame pieces counted
+        whole), 2 x the workspace, the prefix, its output 3 x: the pieces, torch.cat, Wan 2.2's unpatchify) and the
+        stripes (the reference's output, the stripes' output, their plan's estimate), a margin."""
         key = ("selftest_memory", self.key)
         hit = eng._PASS_COST.get(key)
         if hit is not None:
             return hit
         n = self.selftest_size
-        t = SELFTEST_FRAMES[self.version]
-        plan = VideoPlan(self, t, n, n, eng.SELFTEST_ROWS, eng.SELFTEST_WORKSPACE, 4, 0)
-        out = self.out_channels * self.out_frames(t) * plan.h_out * plan.w_out * 4
+        shape = self.selftest_latent(n)
+        plan = eng.Plan(self, n, n, eng.SELFTEST_ROWS, eng.SELFTEST_WORKSPACE, 4, 0, 0, self.time_chunks(shape))
+        out = self.out_channels * plan.chunks[-1].ot1 * plan.h_out * plan.w_out * 4
         cache = act = 0
-        for i, (u, fr) in enumerate(zip(self.units, self.unit_frames())):
+        for i, u in enumerate(self.units):
             h, w = plan.final_heights[i], plan.widths[i]
             cache += unit_cache_channels(u) * CACHE_T * h * w * 4
-            f = max(max(unit_out_frames(u, fi, first), fs) for fi, first, fs in fr)
-            act = max(act, 4 * f * h * w * max(u.cin, u.cout) * 4)
+            act = max(act, 4 * plan.planes[i + 1] * h * w * max(u.cin, u.cout) * 4)
         ref = self.activation_copies * act + cache + 3 * out + 2 * eng.SELFTEST_REF_WORKSPACE + plan.prefix_bytes
         stripes = 3 * out + plan.estimate
         need = int(self.selftest_params() * 4 + max(ref, stripes) + eng.SELFTEST_MARGIN)
@@ -586,9 +464,6 @@ class Wan21Video(WanVideoStripe):
     name = "Wan 2.1 video stripes"
     version = "2.1"
     clone_cache = False
-    split_temporal = True
-    chunk_frames = 2       # latent frames of a chunk after the first
-    prefix_frames = 2
 
     def chunks(self, t):
         return [(0, 1)] + [(c, min(2, t - c)) for c in range(1, t, 2)]
@@ -616,26 +491,6 @@ class Wan21Video(WanVideoStripe):
             idx[0] += 1
             return y
         return u.module(x)
-
-    def run_units(self, i, x, needs, heights, cache, idx, first, out, label):
-        while i < len(self.units):
-            u = self.units[i]
-            xa, xb = needs[i]
-            y = self.call(u, x, cache, idx, first)
-            del x
-            x = self._step(i, y, needs, heights, xa, xb, label)
-            del y
-            if u.kind == UP and u.module.mode == "upsample3d" and x.shape[2] > 2:
-                # Decoder3d.run_up: pieces of 2 frames, each with its own copy of feat_idx
-                for f0 in range(0, x.shape[2], 2):
-                    piece = x[:, :, f0:f0 + 2]
-                    if i + 1 < len(self.units) and self.units[i + 1].kind in eng.CONTIGUOUS_INPUT:
-                        piece = piece.contiguous()
-                    self.run_units(i + 1, piece, needs, heights, cache, list(idx), first, out, label)
-                    del piece
-                return
-            i += 1
-        out(x)
 
     def fp32_copy(self, device):
         """conv2 + decoder rebuilt in fp32 with the model's weights (full time kernels: video reads them all)."""
@@ -667,8 +522,6 @@ class Wan22Video(WanVideoStripe):
     name = "Wan 2.2 video stripes"
     version = "2.2"
     clone_cache = True
-    chunk_frames = 1
-    prefix_frames = 1
 
     def chunks(self, t):
         return [(c, 1) for c in range(t)]
@@ -701,15 +554,6 @@ class Wan22Video(WanVideoStripe):
         if u.kind == CONV:
             return self._cached_conv(u.module, x, cache, idx)
         return u.module(x)
-
-    def run_units(self, i, x, needs, heights, cache, idx, first, out, label):
-        for j in range(i, len(self.units)):
-            xa, xb = needs[j]
-            y = self.call(self.units[j], x, cache, idx, first)
-            del x
-            x = self._step(j, y, needs, heights, xa, xb, label)
-            del y
-        out(x)
 
     def fp32_copy(self, device):
         """conv2 + decoder rebuilt in fp32 with the model's weights (full time kernels)."""
@@ -770,4 +614,4 @@ def match(vae, samples, vae_options):
     return cls(base, fsm), None
 
 
-__all__ = ["match", "Wan21Video", "Wan22Video", "VideoPlan", "MIB"]
+__all__ = ["match", "Wan21Video", "Wan22Video", "MIB"]
