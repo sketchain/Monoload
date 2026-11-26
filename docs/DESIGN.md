@@ -1813,6 +1813,21 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **预期**（README §9.23）：常驻权重 50.1 GiB（`--gpu-only` 下文本编码器和 diffusion 模型都卸不出 GTT），离 62.47 GiB 的上限约 12 GiB；Monoload 的 VAE 解码两张都放得下（第一层 B，约 +0.6 / +1.35 GiB）；原生 1024² 约 +8.5 GiB，可能放得下也可能退 tiled，2048² 约 +43 GiB 一定退 tiled；采样阶段的激活取决于注意力实现，没有模拟。
 
+### 9.37 方案 G 扩到 Refiner 的 RMS_norm 和 LTX 的 PixelNorm（钩子 H4，分支 video-norm-g）
+
+**为什么：** §9.28 的 ROCm 归约临时缓冲（每个输出位置 32 KiB，与通道数无关，落在缓存之外、开新段）出在对超过 510 个通道的归约上。§9.29 只换了 Wan 的 `RMS_norm`；HunyuanVideo 1.5 / HunyuanImage Refiner 文件用的 `vae_refiner.RMS_norm`（mid、s0、s1 共 17 个 1024 通道）和 LTX 的 `PixelNorm`（`x / sqrt(mean(x², dim=1) + eps)`，1024 / 512 通道）也一样会碰到。PLAN-video 的 H4 替用户定了扩（理由同 Wan 2.2）。
+
+**做了什么（`monoload/vae_ops.py`，都在 `OpChunking` 里换实例 forward、退出时恢复，与 §9.29 同一套）：**
+
+* `vae_refiner.RMS_norm`（精确类型、实例上没有自己的 forward、通道 > 510）→ `_GroupedRefinerRMSNorm`：`grouped_normalize(x, 1, Cg) * scale * cast_to(gamma, x 的 dtype / 设备)`，后半句与 cab5f4e `vae_refiner.py:19` 相同（这个类没有 `channel_first`、没有 bias）。
+* `PixelNorm`：模块没有参数能看出通道数，所以**每个 PixelNorm 都换**成 `_GroupedPixelNorm`，按每次调用决定：维度不是 1、或通道 ≤ 510，直接调类自己的 forward（逐位相同）；否则 `grouped_pixel_norm`：平方和用分组的 fp32 范数合起来，`square_ / div_(C) / add_(eps) / sqrt_` 在 fp32 里原地做，最后转回 x 的 dtype 再除。原生的 mean 也是 fp32 累加，但平方、取整、加 eps 在 x 的 dtype 里，所以 bf16 下两者差在除数的 1 ulp 左右；fp32 下 ≤ 1e-6（相对）。附带的好处：不再有原生那个整份大小的 `x²` 临时量。
+* `OpStats.norm_grouped` 照旧计数（LTX 的每个 PixelNorm 都算一个）。`vae_engine.hooked_module` 照旧认得这些替换（`monoload_replacement`）。
+* **计数：** 现在只有第二层用得到（Refiner 第一层分支未合、LTX 第一层是 F 组的事）。第二层的估算是激活份数 × 最大激活 + 2 × 工作区；分组的临时量是每位置 4G + 4 + 2e 字节（§9.29 的 `grouped_norm_bytes`），对 1024 通道 bf16 是 24 B，而激活本身每位置 2048 B、至少算 4 份，盖得住，不单列。各组写第一层时照 Wan 2.2 把 `grouped_norm_bytes` 加进对应单元。
+
+**测试：** `tests/test_vae_norm_g.py`（真机 GPU 上跑，没有 GPU 时 CPU）：两种模块只在 `OpChunking` 里被换、小通道逐位相同、fp32 / bf16 精度、替换期间不当钩子、退出后无残留；整个 LTX 2 `VideoVAE(version=2)` decoder（随机权重，全宽）和 `vae_refiner.Decoder(refiner_vae=True)`（阈值降到 16 通道让小模型的 norm 都换）在 `OpChunking` 下与原生一致。`tests/check_norm_reduce.py --pixelnorm`：真机量原生 PixelNorm 的峰值（含 x²）、归约是否另开临时缓冲，与分组版对比峰值、误差、耗时。
+
+**真机（CT 700，`comfyui-latest`）：** 见下（随测随补）。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
