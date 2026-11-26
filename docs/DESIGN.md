@@ -1889,6 +1889,32 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **回归（CT 700 的 `comfyui-latest` 里 `--cpu` 跑）：** `test_vae_norm_g` 7 项、`test_vae_stripe` 79 项全过；`test_vae_refiner` 13 项全过。真机 GPU 上的 `test_vae_norm_g` 和 `check_norm_reduce --pixelnorm` 在排队，测完补在这里。
 
+### 9.39 v0.46.3 的全部 VAE 盘点（分支 video-inventory）
+
+**做了什么：** `tests/vae_inventory.py` 跟到 v0.46.3：新加 MiniMax-H3-Image、p-h3-image（单帧 2D ViT decoder）、LTX 扩散 decoder（`na_diffusion_decoder.CausalDiffusionVAE`）、RelayVSR Flash（`wan.model_vsr.RelayFlash`）；MiniMax Music3 DAV、Trellis2 形状 / 纹理（1D / 稀疏 3D，走原生）只列不追踪。托管的多帧（`vae._measured`）走 Monoload 自己的路：`vae._decode_sample` 逐块写进输出缓冲，估算由 `vae._probe_mf` 在模拟器上量（模拟器的计量和 `_CudaPeak` 一样：先清缓存、记 allocated 和 reserved 的峰值、碎片项）。没托管的多帧（Mochi、CogVideoX、Cosmos、HunyuanVideo 1.0 / 1.5）照旧给「假设走第二层」的模拟值，不跑 H1 的探测（原来会因为没有输出形状而追踪失败，已改）。
+
+**结果（模拟，bf16，GiB，reserved 增量；输出缓冲 fp32 在设备上）：** 图像 VAE 的数字和 §9.16 一样，没变。视频和新加的：
+
+| VAE、分辨率×帧数 | 现在的路 | 原生 | 第二层 | 第二层估算 | ComfyUI 估算 |
+|---|---|---|---|---|---|
+| Wan 2.1，832×480×81 | 第二层 | 8.72 | 5.32 | 5.99 | 5.2 |
+| Wan 2.2，1280×704×121 | 第二层 | 39.61 | 10.61 | 11.96 | 13.4 |
+| LTX 0.9.0，768×512×97 | 第二层 | 30.58 | 6.70 | 7.96 | 5.7 |
+| LTX 2，768×512×97 | 第二层 | 59.34 | 4.97 | 10.62（碎片项 5.09，偏保守） | 5.7 |
+| LTX 扩散 decoder，768×512×97 | 第二层 | meta 上追踪不了（要真机） | — | — | 8.1 |
+| HunyuanVideo 1.0，848×480×73 | 原生（B 组） | 62.24（超上限 → tiled） | 15.21 | — | 17.0 |
+| HunyuanVideo 1.5，1280×720×121 | 原生（B 组） | 113.35（OOM → tiled） | 21.64 | — | 24.7 |
+| CogVideoX，720×480×49 | 原生（C 组接入后托管） | 35.02 | 11.66 | — | 88.3 |
+| Cosmos 1.0，1280×704×121 | 原生（D 组） | 30.18 | 12.99 | — | 10.7 |
+| Mochi，848×480×85 | 原生（D 组） | 362（OOM → tiled） | 59.32 | — | 68.2 |
+| SVD，1024×576×14 | 原生（本分支）/ 整批第二层（§9.38） | 25.71 | 2.75（逐样本；整批的数字等 §9.38 合入后重跑） | — | 6.5 |
+| MiniMax-H3-Image / p-h3-image，3840×2160 | 原生 | 0.27 / 0.34 | — | — | 0.36 |
+| RelayVSR Flash，1280×704 | 原生（自己分块，要低清帧） | 追踪不了 | — | — | 0.26 |
+
+托管的四种估算都 ≥ 模拟的 reserved。音频、3D 都走原生（`latent_dim` 1 或音频 VAE）。
+
+**命令：** `python tests/vae_inventory.py [--only wan21,ltxv2] [--no-trace] [--json out.json]`（CPU、meta 设备，几分钟）。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。

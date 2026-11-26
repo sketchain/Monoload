@@ -502,7 +502,7 @@ def trace(v, shape, layer, ws=GIB):
         es.enter_context(_patched(torch.Tensor, "cpu", host_copy))
         es.enter_context(torch.inference_mode())
         es.enter_context(tracer)
-        if layer == 2 and mvae._measured(v, lat):
+        if layer == 2 and mvae._measured(v, lat) and path(v, shape)[0] != "native":   # a native multi-frame kind: hypothetical layer 2, no H1 estimate
             # H1: Monoload's own estimate (multi-frame, or a decoder vae_video always measures: LTX), its probe measured on this simulator (before the decode's OpChunking)
             mvae._PROBES.pop(fsm, None)
             with _patched(mvae, "_PEAK_METER", [lambda dev: _SimMeter(sim, tracer)]):
@@ -514,7 +514,8 @@ def trace(v, shape, layer, ws=GIB):
             sim.reset_peak()
         if layer == 2:
             es.enter_context(vae_ops.OpChunking(fsm, ws, stats))
-        n = shape[0] if layer == 0 else 1      # native decodes the batch at once (memory permitting), layer 2 one sample at a time
+        whole = getattr(mvae, "_whole_batch", lambda v: False)(v)   # E (SVD): layer 2 decodes the whole batch at once too
+        n = shape[0] if layer == 0 or whole else 1      # native decodes the batch at once (memory permitting), layer 2 one sample at a time
         for i in range(0, shape[0], n):
             z = torch.empty((n,) + tuple(shape[1:]), device="meta", dtype=v.vae_dtype)   # the latent copied to the device
             if getattr(fsm, "comfy_has_chunked_io", False):
