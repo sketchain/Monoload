@@ -182,8 +182,11 @@ M = {
     "vae.nr_audio": ("{model} is an audio VAE ({ndim}-dim latent, x{ratio} to samples): audio decodes are not managed",
                      "{model} 是音频 VAE（{ndim} 维 latent，放大 {ratio} 倍到采样点）：音频解码不管理"),
     "vae.nr_dims": ("latent with {ndim} dims for a {ld}D VAE", "{ld}D VAE 收到 {ndim} 维的 latent"),
-    "vae.nr_multiframe": ("multi-frame video latent (T={t}): not managed yet, phase 1 covers images (4D, and 5D with T=1)",
-                          "多帧视频 latent（T={t}）：暂不管理，目前只管图像（4D，以及 T=1 的 5D）"),
+    "vae.nr_multiframe": ("multi-frame video latent (T={t}): {model} is not managed with more than one frame yet (managed: {managed})",
+                          "多帧视频 latent（T={t}）：{model} 的多帧解码暂不管理（已管理：{managed}）"),
+    "vae.nr_mf_no_meter": ("multi-frame video latent (T={t}): bounding its memory needs the device's allocator statistics, "
+                           "not available on {dev}",
+                           "多帧视频 latent（T={t}）：给它的内存定上界要用设备分配器的统计，{dev} 上没有"),
     "vae.nr_batch_time": ("{model}'s decoder mixes frames across the batch (the batch is its time axis, e.g. SVD's VideoDecoder): "
                           "a sample-by-sample decode would change the result",
                           "{model} 的 decoder 把整个 batch 当时间轴、在帧之间混合（例如 SVD 的 VideoDecoder）：逐样本解码会改变结果"),
@@ -312,6 +315,9 @@ M = {
         "[Monoload] VAE 解码 {shape} -> 第一层（{name}）：{plan}；{policy}，工作区 {ws}{retries}；arena {arena}，内存估算 {est}"
         "（原生 {native}），{secs:.2f}s；{note}"),
     "vae.retries": (", {n} OOM retries", "，OOM 重试 {n} 次"),
+    "vae.mf_probe_failed": (
+        "[Monoload] multi-frame memory probe failed ({err}); without it the memory has no upper bound, this decode is native",
+        "[Monoload] 多帧内存探测失败（{err}）；没有它内存就没有上界，这次解码走原生"),
     "vae.probe_failed": (
         "[Monoload] VAE shape probe failed ({err}); memory estimate falls back to the widest conv at full resolution",
         "[Monoload] VAE 形状探测失败（{err}）；内存估算退回按全分辨率下最宽的卷积计算"),
