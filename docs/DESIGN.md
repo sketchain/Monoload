@@ -1813,6 +1813,65 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **预期**（README §9.23）：常驻权重 50.1 GiB（`--gpu-only` 下文本编码器和 diffusion 模型都卸不出 GTT），离 62.47 GiB 的上限约 12 GiB；Monoload 的 VAE 解码两张都放得下（第一层 B，约 +0.6 / +1.35 GiB）；原生 1024² 约 +8.5 GiB，可能放得下也可能退 tiled，2048² 约 +43 GiB 一定退 tiled；采样阶段的激活取决于注意力实现，没有模拟。
 
+### 9.35 多帧第二层的入口（钩子 H1 + H3 + H6，分支 video-l2-entry）
+
+**要做什么：** PLAN-video.md §1 的 H1（放开多帧、估算是上界）、H3（输出直接写进缓冲）、H6（`bench_vae --frames`）。第一批只放开 Wan 2.1（`comfy.ldm.wan.vae.WanVAE`）和 Wan 2.2（`vae2_2.WanVAE`）；别的 decoder 由各组验过上界后加进 `vae_video._CHUNKS`。
+
+**v0.46.3 的 Wan 2.1 decoder 和 62b3c94 不一样了：** `Decoder3d.forward` 现在返回输出块的列表（`run_up` 递归：时间上采样之后多于 2 帧就按 2 帧一块往下跑，`feat_idx` 复制），`WanVAE.decode` 最后 `torch.cat`。§9.32 的 Wan 2.1 解码路径描述是旧的，数字要重测。
+
+**H1：哪些放开、怎么给上界**
+
+* `_native_reason`：T > 1 的 5D latent，第一阶段模型的类（精确类型）在 `vae_video.MULTIFRAME` 里才托管，否则仍原生（信息里列出已托管的类）；设备没有分配器统计（不是 CUDA / ROCm）也原生。
+* **估算换成实测**：§9.32 说过，8×8 的形状探测只看「最大的单个张量」，看不到每卷积缓存、carry、输出块列表和 `torch.cat`，多帧时不是上界；按类型一项项补（像 §9.27）每种 decoder 都要单独建模，而且 Wan 2.1 刚改过结构。所以多帧改成**实测峰值**（`vae._probe_mf`）：用同样的帧数、零 latent，在 `MF_PROBE_SIZES`（16、32）两个 latent 尺寸上各跑一次**和真解码同一条路**（`_decode_sample`，`OpChunking` 工作区 `MF_PROBE_WORKSPACE` = 64 MiB），记 allocated 峰值（开始前先清空分配器缓存；输出缓冲在开始前分配、不算在内）；两点连线得每 latent 像素的斜率和截距。再用**解码自己的工作区**把 32 那个尺寸跑一次，只取碎片：reserved 峰值比 allocated 峰值多出的部分（几次里取最大，记作 frag）。探测的卷积列在两个尺寸上都顶到 64 MiB，落在截距里、不进斜率（多算 ≤ 2 × 64 MiB，偏保守）。最早用 1 MiB（想让工作区完全不进测量），真机上 Wan 2.1 81 帧第一次解码多花约 85 s（行块太碎），改成 64 MiB。
+* 估算 = `MF_MARGIN`（1.25）× 斜率 × 像素 + 截距 + frag + 2 × 工作区 + 输出缓冲（整批，`--gpu-only` 时）+ 一个 latent 样本。1.25 是两点连线之外的余量。缓存按（通道、维数、dtype、帧数）。
+* **为什么单独测碎片（盘点模拟里试过三种）：** 只记 allocated、靠 1.25 盖碎片：Wan 的 reserved / allocated 是 1.2–1.3，够；LTX 0.9.0 的卷积 VAE（768×512×97）第二层 reserved 6.70、allocated 3.86 GiB，估算 4.97 不是上界。两点都改记 reserved：LTX 0.9.0 还差 60 MiB（碎片来自解码的 1 GiB 大块，64 MiB 的探测看不到）。整个探测改用解码的工作区：都成了上界，但工作区进了斜率，Wan 2.1 480p 估算 10.72（实际 5.32，比原生 8.72 还高）。现在的做法（线用 64 MiB、碎片用解码工作区）在模拟里：Wan 2.1 832×480×81 估算 5.99 / 实际 5.32，Wan 2.2 1280×704×121 11.96 / 10.61，LTX 0.9.0 7.96 / 6.70，LTX 2 10.62 / 4.97（碎片在 32×32 的探测里 5.09 GiB，偏保守）。
+* 探测失败（任何异常）：没有上界就交给 ComfyUI 原生解码（`_UnboundedDecode`，记录 strategy native、原因写探测失败），不报错。
+* `_CudaPeak` 会重置设备的峰值统计：`_MemProbe` 记的这次解码的 reserved 峰值从探测开始算（探测在加载权重之后、任何解码工作之前）。
+
+**H3：输出直接写进缓冲**
+
+* `_decode_sample`：分块 IO 的 decoder（LTX，`comfy_has_chunked_io`）把 `output_buffer` 传进去，自己写（`_native_reason` 仍挡着它，F 组放开）；`vae_video._CHUNKS` 里的 decoder 用生成器逐块交出输出，每块马上拷进缓冲对应的帧，不再有「整段输出的列表 + `torch.cat`」（VAE dtype、在设备上，2 份输出）；其他 decoder 整段解码再拷。数值与原生相同：同样的调用、同样的张量，`torch.cat` 本来就是拷贝。
+* Wan 2.1：照 `WanVAE.decode` 的分块（第一块 1 个 latent 帧，之后每块 2 帧），`Decoder3d` 返回的块逐个 pop 出来交出；Wan 2.2：每个 latent 帧一块，`unpatchify` 按块做（它只把通道排到像素，不碰帧），省掉原来 O(T²) 的 `torch.cat` 链。
+* 缓冲在解码前按 sd.py 自己的 `upscale_ratio[0]` 算帧数分配；交出的帧数对不上就报内部错误。
+
+**LTX 进第二层（F 组的请求）：** `vae_video.WHOLE` 里两类 decoder 不管帧数（单帧也算）都用实测探测定上界，不在 `_CHUNKS` 里逐块交出：
+
+* 卷积 `lightricks.vae.causal_video_autoencoder.VideoVAE`（LTX 0.9.x / LTX-2 / 2.5 的卷积 VAE）：它是分块 IO（`comfy_has_chunked_io`），`_decode_sample` 把输出缓冲传给它自己写；`vae_video.chunked_io_managed` 让 `_native_reason` 放它过去，别的分块 IO decoder 仍原生。
+* 扩散 decoder `lightricks.vae.na_diffusion_decoder.CausalDiffusionVAE`（LTX-2.5，sd.py 按 `decoder.conv_in_x_t.weight` 选到这个类）：整段解码再拷进缓冲。
+* 按类判断而不按 state dict 的 key：解码时手里只有模块。
+* 随机数：卷积 VAE 解码时用全局 RNG 加 `randn_like` 噪声，探测在 `fork_rng` 里跑，真解码的噪声与原生相同；batch > 1 时原生整批一次抽、Monoload 按样本抽，结果不逐位相同（原生自己按空闲内存切子批时也一样）。扩散 decoder 用固定种子 0 的生成器，没有这个差别。
+
+**扩展点 `vae_ops.EXTRA_CHUNKERS`（给 F 组）：** 模块级列表，每项是 `(model, workspace, stats) -> 上下文管理器或 None`。`OpChunking.__enter__` 装好自己的替换之后按顺序进入（`contextlib.ExitStack`），`__exit__` 在恢复替换之前倒序退出；块里出异常、进入时出错也一样退出。返回 None 表示不管这个模型。它在模型上装的东西自己恢复；装成实例属性的替换请带 `monoload_replacement = True`，不然识别会把它当成用户的钩子。
+
+**H6：** `bench_vae.py --frames N`：随机 latent 的输出帧数（视频 VAE），latent 帧数取解码后 ≥ N 的最少帧数；标签加 `x{N}f`。
+
+**真机（CT 700，`comfyui-latest`，`tests/bench_vae.py --frames`，GiB；reserved 是比运行前多出的量）：**
+
+| VAE、分辨率×帧数 | 探测版本 | 原生 reserved / 耗时（冷 / 热） | Monoload reserved（alloc）/ 估算 | 耗时（冷 / 热） | 与原生（像素 max / PSNR） |
+|---|---|---|---|---|---|
+| Wan 2.1，832×480×81 | 1 MiB 工作区（10bcb80） | 8.74 / 32.5 s（热） | 5.34 / 5.55 | 第一次多约 85 s（探测，已改 64 MiB） | max 0.0071 |
+| Wan 2.1，1280×720×81 | reserved 连线（40b15cb） | 18.90 / 75.9 s / 75.3 s | 9.84（7.80）/ 13.77 | 91.3 s / 81.8 s | 0.0166 / 60.8 dB（323 个像素 > 0.01） |
+
+两行都在最后定下的探测（d4f419e，allocated 连线 + 碎片项）之前测的；估算都是上界。最终版本的真机读数（Wan 2.2 1280×704×121、LTX-2 卷积 VAE、LTX-2.5 扩散 decoder，各 768×512×97）在排队，测完补在这里。原生基线文件在 `/srv/comfy-latest/results/native/`。
+
+### 9.36 引擎的时间轴（钩子 H2 + H5，分支 video-engine-time）
+
+**要做什么：** PLAN-video.md §1 的 H2（`vae_engine` 认得帧：平面数、按时间分块）和 H5（视频的自检）。这一步只改引擎，**没有任何适配器用上**：现有的图片适配器都不定义 `time_chunks`，走原来的路径，行为不变（真机回归见下）。各组（A Wan、B Hunyuan、C CogVideoX…）写第一层时接上。
+
+**平面数（取自未合的 vae-refiner-layer1 f51a6bc 的引擎部分）：** 适配器给 `tdim`（张量里帧的那一维）和 `ckpt_planes`（存档的帧数），每个单元有 `Unit.tscale`（时间上采样 2、只取最后一帧 1/4 等）。一行的元素数 = 宽 × 平面数，内存和计算量的模型都按这个算；行区间与平面数无关。HunyuanImage 2.1 Refiner 一张图解成 4 帧，条带里带着全部 4 帧，就是这个。
+
+**按时间分块（stripe-major）：**
+
+* 适配器的 `time_chunks(shape)` 返回 `[TimeChunk(ct0, ct1, ot0, ot1)]`：第 k 块读存档的第 [ct0, ct1) 帧，产出输出的第 [ot0, ot1) 帧，按因果顺序。图片返回 None。
+* 存档（前缀的输出，全部帧）整份留着；每个输出条带**依次跑完所有时间块**，块与块之间带着这一条带自己的状态（`stripe_state()` 新建，`call_unit(u, x, state, k)` 调单元：每个因果卷积缓存它这几行（含 halo 行）的输入尾帧）。峰值 ≈ 存档 + 一条带 × 一块 + 这条带的缓存 + 输出，**几乎与帧数无关**。另一种顺序（每块跑完所有条带）要同时留所有条带的缓存，等于整帧的缓存，峰值高，不用。
+* 计数：`chunk_planes(chunk)` 给每级的平面数（默认 ct1 − ct0 乘各单元的 `tscale`），计划按各块里最大的取；`unit_cache(u, r, w, e)` 是单元在条带状态里跨块留的字节，在整条带期间都活着，加到每个单元的峰值上（`_chain_cost(caches=True)`）。前缀按块跑、边跑边填存档，所以 `prefix_bytes` 里总是带着存档。
+* 统计遍（整幅 GroupNorm，方案 A–D）不能和时间块一起用：`Plan` 直接报内部错误。HunyuanVideo 1.0 这种每块统计的情况由 B 组按块实现（PLAN-video §2）。
+* `run_stripes` 把每块的输出写到输出的 [ot0, ot1) 帧（`write(o0, o1, rows, t0, t1)`），交出的帧数不对就报内部错误。
+
+**H5（视频自检）：** 自检 latent 至少要跑 `SELFTEST_MIN_CHUNKS`（3）个时间块，状态才真跨过块边界（第一块常常特殊处理，至少再有两块）；不够就报内部错误，让适配器把自检 latent 的帧数给够。自检内存的上界里输出算上帧数。
+
+**回归（CT 700 的 `comfyui-latest` 里 `--cpu` 跑，图片适配器不变）：** `test_vae_stripe` 79 项、`test_vae_ldm` 104 项、`test_vae_wan22` 74 项、`test_vae_hunyuan` 58 项全过。`test_vae_stripe` 里模拟 OOM 的 `run_stripes` 替身原来只收 4 个参数，`run_stripes` 多了引擎参数后改成原样转发（4d7884d）。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
@@ -1895,45 +1954,3 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 * **预算等设置的来源**：`_Applied` 把逐项来源放进 `_SETTINGS["src"]`，`vae._from(item)` 给出「Monoload VAE 设置节点」或「环境变量 X」；预算行、预算报错、强制的条带高度 / 方案、只用第二层都写来源，预算放不下的建议按来源给（节点：改节点上的预算或改成跟随全局 / 不限；环境变量：改 `MONOLOAD_VAE_BUDGET`）。
 * **「memory leak with model SDXLClipModel」警告**：在锁定镜像里用 `/prompt` API 复现（合成 SD1.5 + 只改 UNet 的 LoRA）。条件：LoRA 没有 text-encoder key（`LoraLoader` 的 CLIP clone 不带 patch）+ Monoload LoRA Settings 接了 CLIP（又一层不带 patch 的 clone）+ 解码报错。已加载的 CLIP 是第二层 clone；release 丢掉两个节点的缓存输出后，这两层 clone 被报错留下的引用环（执行器里的 traceback / 列表）留到 release 的 `gc.collect()` 才一起回收；ComfyUI 的 `LoadedModel._switch_parent` 只往上切一层，切的时候父节点也已经死了，于是 LoadedModel 没有 patcher、但模型（底模的 `cond_stage_model`）还活着，`cleanup_models_gc` 每次加载都报「memory leak」。不是 Monoload 持有引用（追查过 CLIP clone 的引用者：只有 ComfyUI 的输出缓存和执行器的列表；解码记录、LoRA 名字元数据、Info、报错对象都不引用 CLIP）。对照：正常运行、带 TE key 的 LoRA（clone 带 patch，release 直接指回底模）、不加 LoRA 设置节点（只有一层）都不出现。修复：release 前记下每个已加载 clone 的祖先链（弱引用），`gc.collect()` 之后把没有 patcher 的条目指回活着的最近祖先（同一个模型），再同步 uuid。`tests/test_release_chain.py` 构造同样的两层 clone + 引用环：去掉修复时出现两条警告、LoadedModel 没有 patcher，加上修复后指回底模、没有警告；服务端复现也确认消失。
 * **第一次解码的实测峰值偏低**：一条带的解码 reserved 峰值不可能低于它自己的 arena，第一次只有 +1.25 GiB（arena 1.97）说明起点的 reserved 里有之前（采样）缓存下来的空闲块，被解码复用了；自检在测量窗口内只会让峰值变高。`_MemProbe` 改成先 `soft_empty_cache()` 再取起点；记录这次解码里有没有跑首次自检（`vae_engine._SELFTEST` 有没有变多），Info 注明「含首次自检」。
-
-
-### 9.35 多帧第二层的入口（钩子 H1 + H3 + H6，分支 video-l2-entry）
-
-**要做什么：** PLAN-video.md §1 的 H1（放开多帧、估算是上界）、H3（输出直接写进缓冲）、H6（`bench_vae --frames`）。第一批只放开 Wan 2.1（`comfy.ldm.wan.vae.WanVAE`）和 Wan 2.2（`vae2_2.WanVAE`）；别的 decoder 由各组验过上界后加进 `vae_video._CHUNKS`。
-
-**v0.46.3 的 Wan 2.1 decoder 和 62b3c94 不一样了：** `Decoder3d.forward` 现在返回输出块的列表（`run_up` 递归：时间上采样之后多于 2 帧就按 2 帧一块往下跑，`feat_idx` 复制），`WanVAE.decode` 最后 `torch.cat`。§9.32 的 Wan 2.1 解码路径描述是旧的，数字要重测。
-
-**H1：哪些放开、怎么给上界**
-
-* `_native_reason`：T > 1 的 5D latent，第一阶段模型的类（精确类型）在 `vae_video.MULTIFRAME` 里才托管，否则仍原生（信息里列出已托管的类）；设备没有分配器统计（不是 CUDA / ROCm）也原生。
-* **估算换成实测**：§9.32 说过，8×8 的形状探测只看「最大的单个张量」，看不到每卷积缓存、carry、输出块列表和 `torch.cat`，多帧时不是上界；按类型一项项补（像 §9.27）每种 decoder 都要单独建模，而且 Wan 2.1 刚改过结构。所以多帧改成**实测峰值**（`vae._probe_mf`）：用同样的帧数、零 latent，在 `MF_PROBE_SIZES`（16、32）两个 latent 尺寸上各跑一次**和真解码同一条路**（`_decode_sample`，`OpChunking` 工作区 `MF_PROBE_WORKSPACE` = 64 MiB），记 allocated 峰值（开始前先清空分配器缓存；输出缓冲在开始前分配、不算在内）；两点连线得每 latent 像素的斜率和截距。再用**解码自己的工作区**把 32 那个尺寸跑一次，只取碎片：reserved 峰值比 allocated 峰值多出的部分（几次里取最大，记作 frag）。探测的卷积列在两个尺寸上都顶到 64 MiB，落在截距里、不进斜率（多算 ≤ 2 × 64 MiB，偏保守）。最早用 1 MiB（想让工作区完全不进测量），真机上 Wan 2.1 81 帧第一次解码多花约 85 s（行块太碎），改成 64 MiB。
-* 估算 = `MF_MARGIN`（1.25）× 斜率 × 像素 + 截距 + frag + 2 × 工作区 + 输出缓冲（整批，`--gpu-only` 时）+ 一个 latent 样本。1.25 是两点连线之外的余量。缓存按（通道、维数、dtype、帧数）。
-* **为什么单独测碎片（盘点模拟里试过三种）：** 只记 allocated、靠 1.25 盖碎片：Wan 的 reserved / allocated 是 1.2–1.3，够；LTX 0.9.0 的卷积 VAE（768×512×97）第二层 reserved 6.70、allocated 3.86 GiB，估算 4.97 不是上界。两点都改记 reserved：LTX 0.9.0 还差 60 MiB（碎片来自解码的 1 GiB 大块，64 MiB 的探测看不到）。整个探测改用解码的工作区：都成了上界，但工作区进了斜率，Wan 2.1 480p 估算 10.72（实际 5.32，比原生 8.72 还高）。现在的做法（线用 64 MiB、碎片用解码工作区）在模拟里：Wan 2.1 832×480×81 估算 5.99 / 实际 5.32，Wan 2.2 1280×704×121 11.96 / 10.61，LTX 0.9.0 7.96 / 6.70，LTX 2 10.62 / 4.97（碎片在 32×32 的探测里 5.09 GiB，偏保守）。
-* 探测失败（任何异常）：没有上界就交给 ComfyUI 原生解码（`_UnboundedDecode`，记录 strategy native、原因写探测失败），不报错。
-* `_CudaPeak` 会重置设备的峰值统计：`_MemProbe` 记的这次解码的 reserved 峰值从探测开始算（探测在加载权重之后、任何解码工作之前）。
-
-**H3：输出直接写进缓冲**
-
-* `_decode_sample`：分块 IO 的 decoder（LTX，`comfy_has_chunked_io`）把 `output_buffer` 传进去，自己写（`_native_reason` 仍挡着它，F 组放开）；`vae_video._CHUNKS` 里的 decoder 用生成器逐块交出输出，每块马上拷进缓冲对应的帧，不再有「整段输出的列表 + `torch.cat`」（VAE dtype、在设备上，2 份输出）；其他 decoder 整段解码再拷。数值与原生相同：同样的调用、同样的张量，`torch.cat` 本来就是拷贝。
-* Wan 2.1：照 `WanVAE.decode` 的分块（第一块 1 个 latent 帧，之后每块 2 帧），`Decoder3d` 返回的块逐个 pop 出来交出；Wan 2.2：每个 latent 帧一块，`unpatchify` 按块做（它只把通道排到像素，不碰帧），省掉原来 O(T²) 的 `torch.cat` 链。
-* 缓冲在解码前按 sd.py 自己的 `upscale_ratio[0]` 算帧数分配；交出的帧数对不上就报内部错误。
-
-**LTX 进第二层（F 组的请求）：** `vae_video.WHOLE` 里两类 decoder 不管帧数（单帧也算）都用实测探测定上界，不在 `_CHUNKS` 里逐块交出：
-
-* 卷积 `lightricks.vae.causal_video_autoencoder.VideoVAE`（LTX 0.9.x / LTX-2 / 2.5 的卷积 VAE）：它是分块 IO（`comfy_has_chunked_io`），`_decode_sample` 把输出缓冲传给它自己写；`vae_video.chunked_io_managed` 让 `_native_reason` 放它过去，别的分块 IO decoder 仍原生。
-* 扩散 decoder `lightricks.vae.na_diffusion_decoder.CausalDiffusionVAE`（LTX-2.5，sd.py 按 `decoder.conv_in_x_t.weight` 选到这个类）：整段解码再拷进缓冲。
-* 按类判断而不按 state dict 的 key：解码时手里只有模块。
-* 随机数：卷积 VAE 解码时用全局 RNG 加 `randn_like` 噪声，探测在 `fork_rng` 里跑，真解码的噪声与原生相同；batch > 1 时原生整批一次抽、Monoload 按样本抽，结果不逐位相同（原生自己按空闲内存切子批时也一样）。扩散 decoder 用固定种子 0 的生成器，没有这个差别。
-
-**扩展点 `vae_ops.EXTRA_CHUNKERS`（给 F 组）：** 模块级列表，每项是 `(model, workspace, stats) -> 上下文管理器或 None`。`OpChunking.__enter__` 装好自己的替换之后按顺序进入（`contextlib.ExitStack`），`__exit__` 在恢复替换之前倒序退出；块里出异常、进入时出错也一样退出。返回 None 表示不管这个模型。它在模型上装的东西自己恢复；装成实例属性的替换请带 `monoload_replacement = True`，不然识别会把它当成用户的钩子。
-
-**H6：** `bench_vae.py --frames N`：随机 latent 的输出帧数（视频 VAE），latent 帧数取解码后 ≥ N 的最少帧数；标签加 `x{N}f`。
-
-**真机（CT 700，`comfyui-latest`，`tests/bench_vae.py --frames`，GiB；reserved 是比运行前多出的量）：**
-
-| VAE、分辨率×帧数 | 探测版本 | 原生 reserved / 耗时（冷 / 热） | Monoload reserved（alloc）/ 估算 | 耗时（冷 / 热） | 与原生（像素 max / PSNR） |
-|---|---|---|---|---|---|
-| Wan 2.1，832×480×81 | 1 MiB 工作区（10bcb80） | 8.74 / 32.5 s（热） | 5.34 / 5.55 | 第一次多约 85 s（探测，已改 64 MiB） | max 0.0071 |
-| Wan 2.1，1280×720×81 | reserved 连线（40b15cb） | 18.90 / 75.9 s / 75.3 s | 9.84（7.80）/ 13.77 | 91.3 s / 81.8 s | 0.0166 / 60.8 dB（323 个像素 > 0.01） |
-
-两行都在最后定下的探测（d4f419e，allocated 连线 + 碎片项）之前测的；估算都是上界。最终版本的真机读数（Wan 2.2 1280×704×121、LTX-2 卷积 VAE、LTX-2.5 扩散 decoder，各 768×512×97）在排队，测完补在这里。原生基线文件在 `/srv/comfy-latest/results/native/`。

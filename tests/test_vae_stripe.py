@@ -340,10 +340,10 @@ def budget_oom_tests(v, lat):
         return orig_l2(*a, **kw)
 
     def oom_above(limit):
-        def run(units, plan, ckpt, write):
+        def run(units, plan, ckpt, write, *rest):
             if max(b - a for a, b in plan.stripes) > limit:
                 raise torch.cuda.OutOfMemoryError("simulated OOM")
-            return orig_run(units, plan, ckpt, write)
+            return orig_run(units, plan, ckpt, write, *rest)
         return run
 
     mvae._run = l2
