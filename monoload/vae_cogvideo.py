@@ -211,7 +211,7 @@ def chunks(fsm, z):
 SLICE_TEMPS = 6          # row-slice temporaries bounded by this many workspaces (fp32 normalisation, the bf16 products,
                          # the padded conv input, the conv output, the conv's own layer-2 blocks)
 SELFTEST_N = 16          # self-test latent rows / cols (128 x 128 output)
-SELFTEST_T = 4           # self-test latent frames: 13 output frames, 4 phase-2 chunks
+SELFTEST_T = 4           # self-test latent frames (even: 4t = 16 output frames, 4 phase-2 chunks)
 SELFTEST_ROWS = 24       # self-test output rows per slice (3 / 6 / 12 / 24 rows at the four levels)
 MARGIN = 256 * MIB       # allocator rounding on top of the counted tensors (calibrated on the real machine, PLAN-video C)
 
