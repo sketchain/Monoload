@@ -304,7 +304,7 @@ def real_sweep(label, path, table):
             check("{} {}x{} x{} frames: L1 {} stripes x {} rows, reserved +{} <= estimate {} ({:.1f}s)".format(
                 label, W, H, nf, len(plan.stripes), plan.rows, fmt_bytes(dres), fmt_bytes(plan.estimate), dt),
                 dres <= plan.estimate and bool(torch.isfinite(out).all()))
-            known = native_file(label, size, nf)
+            known = native_file(path, size, nf)
             if known is not None and os.path.exists(known):
                 row.update(read_native(known))
                 print("  native from {}: reserved +{}".format(known, fmt_bytes(row.get("native_res") or 0)))
@@ -324,7 +324,7 @@ def real_sweep(label, path, table):
                         label, W, H, nf, d, fmt_bytes(nres), ndt), out.shape == ref.shape and d <= 0.25)
                     del ref
                 if known is not None:
-                    write_native(known, label, size, nf, nres if not isinstance(ref, Exception) else None, ndt, nalloc)
+                    write_native(known, path, lat, None if row.get("diff") is None else nres, ndt, nalloc, size, nf)
             table.append(row)
             del out
             gc.collect()
@@ -333,32 +333,42 @@ def real_sweep(label, path, table):
     mm.soft_empty_cache(True)
 
 
-def native_file(label, size, nf):
+def native_file(path, size, nf):
+    # shared layout (README.md in that directory): <vae file stem>__<W>x<H>x<frames>f.md
     if not OPTS.native_dir:
         return None
-    return os.path.join(OPTS.native_dir, "{}_{}_{}f.txt".format(label.lower().replace(" ", "").replace(".", ""), size, nf))
+    stem = os.path.splitext(os.path.basename(path))[0]
+    return os.path.join(OPTS.native_dir, "{}__{}x{}f.md".format(stem, size, nf))
 
 
 def read_native(path):
+    import re
+    text = open(path, encoding="utf-8").read()
     d = {}
-    for line in open(path):
-        k, _, v = line.strip().partition("=")
-        if k == "native_reserved_bytes":
-            d["native_res"] = int(v)
-        elif k == "native_seconds":
-            d["native_s"] = float(v)
+    m = re.search(r"reserved\s*Δ\s*([0-9.]+)\s*GiB", text)
+    if m:
+        d["native_res"] = int(float(m.group(1)) * GIB)
+    m = re.search(r"warm[^0-9]*([0-9.]+)\s*s", text) or re.search(r"耗时[^0-9]*([0-9.]+)\s*s", text)
+    if m:
+        d["native_s"] = float(m.group(1))
     return d
 
 
-def write_native(path, label, size, nf, res, secs, alloc):
+def write_native(path, vae_path, lat, res, secs, alloc, size, nf):
+    import datetime
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        f.write("model={}\nsize={}\nframes={}\nbf16=1\n".format(label, size, nf))
-        f.write("native_reserved_bytes={}\nnative_reserved_gib={}\n".format(res if res is not None else "OOM",
-                                                                           "{:.2f}".format(res / GIB) if res is not None else "OOM"))
-        f.write("native_alloc_bytes={}\nnative_seconds={:.1f}\n".format(alloc, secs))
-        f.write("how=WanVAE.decode itself (first_stage_model.decode, no comfy VAE.decode wrapper), weights loaded, latent on CPU, "
-                "max_memory_reserved growth after empty_cache; tests/test_vae_wan_video.py (wan-video-l1)\n")
+    name = os.path.basename(vae_path)
+    W, H = size.split("x")
+    peak = "OOM" if res is None else "reserved Δ {:.2f} GiB，alloc Δ {:.2f} GiB".format(res / GIB, alloc / GIB)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# {}，{}×{}×{} 帧，原生\n\n".format(name, W, H, nf))
+        f.write("- vae：{}，bf16（first_stage_model.decode 本身，不经 comfy VAE.decode 包装）\n".format(name))
+        f.write("- latent：{}，随机 randn（generator seed 1）\n".format(list(lat.shape)))
+        f.write("- 原生峰值：{}（权重已加载、empty_cache 之后的 max_memory_reserved 增量，含 GPU 上的 latent 和输出）\n".format(peak))
+        f.write("- 耗时：{:.1f} s（单次，cold）\n".format(secs))
+        f.write("- 环境：ComfyUI v0.46.3（cab5f4e），comfyui-latest（CT 103），{}，wan-video-l1 线程"
+                "（tests/test_vae_wan_video.py）\n".format(datetime.date.today().isoformat()))
+        f.write("- 原始日志：/srv/monoload-wt/logs/wanv-*.log\n")
 
 
 def print_table(table):
