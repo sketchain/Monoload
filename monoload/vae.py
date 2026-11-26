@@ -87,8 +87,8 @@ MIN_WORKSPACE = 64 * MIB
 ACTIVATION_COPIES = 4      # live full-size activations bounded by 4x the largest one (DESIGN §9.4)
 PROBE_SIZE = 8             # latent rows/cols of the shape probe
 MF_PROBE_SIZES = (16, 32)  # latent rows/cols of the two multi-frame memory probes (DESIGN §9.35)
-MF_PROBE_WORKSPACE = 64 * MIB  # their OpChunking workspace (= MIN_WORKSPACE): capped at both sizes, so in the intercept, not the
-                               # slope (an overcount of <= 2 x 64 MiB); 1 MiB made the probe ~85 s on CT 700 (Wan 2.1 81 frames)
+MF_PROBE_WORKSPACE = 64 * MIB  # their OpChunking workspace at least this (= MIN_WORKSPACE), else the decode's own: the decode's block
+                               # sizes are what fragment the allocator (LTX 0.9.0, DESIGN §9.35); 1 MiB made the probe ~85 s (Wan 2.1 81 frames)
 MF_MARGIN = 1.25           # the measured slope (bytes per latent pixel, _CudaPeak) times this: headroom over the two-point line, DESIGN §9.35
 
 
@@ -725,10 +725,11 @@ def _probe(vae, samples, vae_options):
     return p
 
 
-def _probe_mf(vae, samples, vae_options):
-    """The multi-frame memory probe (DESIGN §9.35): one sample's layer-2 decode (_decode_sample, under OpChunking with
-    MF_PROBE_WORKSPACE) of a zeros latent with all of samples' frames, at the MF_PROBE_SIZES latent sizes, measuring the
-    peak allocated above the start (the output buffer, allocated before, not counted: it is its own term). Video
+def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
+    """The multi-frame memory probe (DESIGN §9.35): one sample's layer-2 decode (_decode_sample, under OpChunking with the
+    decode's workspace, at least MF_PROBE_WORKSPACE) of a zeros latent with all of samples' frames, at the MF_PROBE_SIZES
+    latent sizes, measuring the peak above the start (_CudaPeak: allocated or reserved; the output buffer, allocated
+    before, not counted: it is its own term). Video
     decoders keep per-conv caches, carries and output pieces besides the activations; a single largest tensor (_probe)
     does not see them, the measured peak does. Linear in the latent area: slope and intercept from the two sizes.
     Cached per model and _probe_key; the global RNG state is preserved. Raises when it cannot measure."""
@@ -751,7 +752,7 @@ def _probe_mf(vae, samples, vae_options):
         with torch.inference_mode(), torch.random.fork_rng(devices=devs):
             z = torch.zeros(shape, device=vae.device, dtype=vae.vae_dtype)
             buf = torch.empty(_output_shape(vae, z), device=vae.output_device, dtype=vae.vae_output_dtype())
-            with OpChunking(fsm, MF_PROBE_WORKSPACE, OpStats()):
+            with OpChunking(fsm, max(MF_PROBE_WORKSPACE, int(workspace)), OpStats()):
                 meter.start()
                 _decode_sample(vae, z, vae_options, buf)
                 peaks.append(meter.peak())
@@ -1325,9 +1326,9 @@ def _layer2_estimate(vae, samples_in, vae_options, ws):
     probe = _PROBES.get(vae.first_stage_model, {}).get(_probe_key(vae, samples_in))
     if probe is None and _measured(vae, samples_in):
         big = samples_in[0:1, ..., :MF_PROBE_SIZES[-1], :MF_PROBE_SIZES[-1]]
-        _load_models(vae, estimate(vae, big, 0, copies=8)["total"])
+        _load_models(vae, estimate(vae, big, ws, copies=8)["total"])
         try:
-            probe = _probe_mf(vae, samples_in, vae_options)
+            probe = _probe_mf(vae, samples_in, vae_options, ws)
         except Exception as e:
             mm.soft_empty_cache(True)
             raise _UnboundedDecode("{}: {}".format(type(e).__name__, e))
