@@ -54,7 +54,7 @@ import comfy.model_management as mm  # noqa: E402
 import comfy.sd  # noqa: E402
 
 import alloc_sim  # noqa: E402
-from monoload import vae as mvae, vae_ops, vae_video  # noqa: E402
+from monoload import vae as mvae, vae_ops  # noqa: E402
 
 G = float(1 << 30)
 GIB = 1 << 30
@@ -497,8 +497,8 @@ def trace(v, shape, layer, ws=GIB):
         es.enter_context(_patched(torch.Tensor, "cpu", host_copy))
         es.enter_context(torch.inference_mode())
         es.enter_context(tracer)
-        if layer == 2 and mvae._multiframe(lat) and vae_video.multiframe(fsm):
-            # H1: Monoload's own estimate, its probe measured on this simulator (before the decode's OpChunking)
+        if layer == 2 and mvae._measured(v, lat):
+            # H1: Monoload's own estimate (multi-frame, or a decoder vae_video always measures: LTX), its probe measured on this simulator (before the decode's OpChunking)
             mvae._PROBES.pop(fsm, None)
             with _patched(mvae, "_PEAK_METER", [lambda dev: _SimMeter(sim, tracer)]):
                 probe = mvae._probe_mf(v, lat, {})
