@@ -26,6 +26,9 @@ timestep-conditioned VAEs and the diffusion decoder is the same for every mode;
                   OpChunking (conv row blocks, workspace MiB, default the global workspace), the output buffer
                   preallocated on the output device and passed in like native does: what layer 2 with the
                   output-buffer hook (PLAN H3) will measure for a chunked-io VAE.
+  mode lean[-w<MiB>]  (diffusion decoder) native VAE.decode with monoload/vae_ltx.chunking installed on the
+                  decoder (no Monoload routing): the op-level T slabs alone; prints vae_ltx.plan()'s estimate and
+                  what was split.
   --profile       one decode of --profile-mode under torch.profiler (bench_vae.profile_decode).
 
 Run inside the container, the GPU lock held:
@@ -37,7 +40,6 @@ import argparse
 import gc
 import os
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bench_vae as bv  # noqa: E402  (sets COMFY_ARGS from PID 1, boots ComfyUI)
@@ -125,6 +127,28 @@ def l2x_decode(ws):
     return run
 
 
+def lean_decode(ws):
+    from monoload import vae_ltx
+    from monoload.vae_ops import OpStats
+
+    def run(shim, latent):
+        vae = shim.vae
+        stats = OpStats()
+        prev = vae.__dict__.get("process_output", None)
+        vae.process_output = shim.process_output   # so bench_vae's capture sees the output
+        try:
+            with vae_ltx.chunking(vae.first_stage_model, ws, stats):
+                out = vae.decode(latent)
+        finally:
+            if prev is None:
+                vae.__dict__.pop("process_output", None)
+            else:
+                vae.process_output = prev
+        run.stats = stats
+        return out
+    return run
+
+
 def fmt(row):
     s = "{:>11}".format(row["status"])
     s += " {:7.1f}s".format(row.get("seconds", 0.0))
@@ -179,7 +203,20 @@ def main():
             ref = None
             for mode in modes:
                 target = vae
-                if mode.startswith("l2x"):
+                if mode.startswith("lean"):
+                    import re
+                    from monoload import vae as mvae
+                    from monoload import vae_ltx
+                    mw = re.search(r"-w(\d+)$", mode)
+                    ws = int(mw.group(1)) * 1024 * 1024 if mw else mvae.workspace()
+                    bv.configure("native")
+                    target = _Shim(vae, lean_decode(ws))
+                    if vae_ltx.kind(fsm) == "diffusion":
+                        pl = vae_ltx.plan(fsm, tuple(lat.shape), mm.dtype_size(vae.vae_dtype), ws)
+                        print("  plan ws {} MiB: estimate {} GiB at {}; stage-5 S {} GiB, context {} GiB; NA blocks {}".format(
+                            ws >> 20, bv.gib(pl["total"]), pl["phase"], bv.gib(pl["x5"]), bv.gib(pl["context"]),
+                            [(st["stage"], st["na_block"], st["t"]) for st in pl["stages"]]), flush=True)
+                elif mode.startswith("l2x"):
                     import re
                     from monoload import vae as mvae
                     mw = re.search(r"-w(\d+)$", mode)
@@ -191,6 +228,11 @@ def main():
                     torch.manual_seed(a.seed)
                     row, raw, px = bv.decode_once(target, lat, a.compare, a.sample_ms / 1000.0)
                     line = "{}x{}x{} {:<14} #{} {}".format(w, h, f, mode, rep, fmt(row))
+                    st = getattr(getattr(target, "fn", None), "stats", None)
+                    if st is not None and getattr(st, "ltx_na_calls", 0):
+                        line += "  na split {}/{} slabs {} block_min {} mlp split {}".format(
+                            getattr(st, "ltx_na_split", 0), st.ltx_na_calls, getattr(st, "ltx_na_slabs", 0),
+                            getattr(st, "ltx_na_block_min", None), getattr(st, "ltx_mlp_split", 0))
                     if a.compare and px is not None:
                         if ref is None:
                             ref = px

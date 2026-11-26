@@ -72,7 +72,7 @@ import comfy.ops
 import comfy.sd
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
-from . import settings, vae_engine, vae_hunyuan, vae_ldm, vae_ops, vae_overrides, vae_video, vae_wan, vae_wan22
+from . import settings, vae_engine, vae_hunyuan, vae_ldm, vae_ltx, vae_ops, vae_overrides, vae_video, vae_wan, vae_wan22  # noqa: F401  (vae_ltx registers in vae_ops.EXTRA_CHUNKERS)
 from .errors import MonoloadError, MonoloadVAEOOMError
 from .messages import label, msg
 from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
