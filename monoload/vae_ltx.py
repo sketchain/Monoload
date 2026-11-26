@@ -282,17 +282,19 @@ class _SwiGLUChunks:
             return self.orig(x, pre=pre, add_to=add_to)
         _note(self.stats, "ltx_mlp_split")
         out = add_to if add_to is not None else torch.empty_like(x)
-        xf = x.view(batch, t * h * w, dim)
-        of = out.view(batch, t * h * w, dim)
-        for r0 in range(0, t * h * w, chunk):
-            r1 = min(r0 + chunk, t * h * w)
-            sl = xf[:, r0:r1] if pre is None else pre(xf[:, r0:r1])
+        # tokens flattened into the W axis, so `pre` (norm + modulate with [1, 1, 1, 1, C] tables) broadcasts as native
+        n = t * h * w
+        xf = x.view(batch, 1, 1, n, dim)
+        of = out.view(batch, 1, 1, n, dim)
+        for r0 in range(0, n, chunk):
+            r1 = min(r0 + chunk, n)
+            sl = xf[:, :, :, r0:r1] if pre is None else pre(xf[:, :, :, r0:r1])
             y = mlp.w_down(torch.nn.functional.silu(mlp.w_gate(sl)) * mlp.w_up(sl))
             del sl
             if add_to is not None:
-                of[:, r0:r1] += y
+                of[:, :, :, r0:r1] += y
             else:
-                of[:, r0:r1] = y
+                of[:, :, :, r0:r1] = y
             del y
         return out
 

@@ -123,7 +123,7 @@ def l2x_decode(ws):
         del z
         shim.process_output(out)
         run.stats = stats
-        return out
+        return out.movedim(1, -1)   # like VAE.decode
     return run
 
 
