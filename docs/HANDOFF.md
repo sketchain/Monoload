@@ -1,6 +1,29 @@
-# Monoload 交接说明（第四阶段：VAE 解码管理推广到全部 VAE；4a 盘点、4b-0 修缺口、4b-1 Flux 2 第一层已完成并验收；第二轮代码审查的修正已完成并在 CT 700 上验收；图像补齐：Wan 2.2 单帧、HunyuanImage 2.1 第一层都已完成并在 CT 700 上验收；第五轮：Refiner 文件的更正、视频分析、Flux 2 dev 整套脚本，2026-10）
+# Monoload 交接说明（video 分支：适配 ComfyUI v0.46.3、视频 VAE 推广，2026-11；之前：第四阶段 VAE 推广到全部图像 VAE、第五轮，2026-10）
 
 给下一个对话用。到这里为止的功能都已在 CT 700 上验收；这份文档讲：现在是什么状态（§1）、节点和设置体系（§2）、必须遵守的规矩（§3）、第四阶段的盘点结果和下一步（§4）、环境和工具（§5）、代码地图（§6）、提交记录（§7）。细节在 README.md（使用、真机结果、bench 命令）和 docs/DESIGN.md（§9 VAE 设计，§10–§13 总开关 / LoRA 节点 / Info 节点 / 多语言）。
+
+## 0. video 分支（2026-11，先读这一节）
+
+**分支**：长期分支 `video`（从 dev 339b754 开出）。每项工作一个功能分支，从 video 开、`git merge --no-ff` 合回 video 并推送；不开 PR，不碰 `main` / `dev`（以后有空再从 video 往 main 提 PR）。每合进 video 一项就更新本节。
+
+**底座**：ComfyUI **v0.46.3**（cab5f4e，2026-11-24），前端 1.59.6，comfy-aimdo 0.6.0，comfy-kitchen 0.2.41；ComfyUI-GGUF 用 kyuz0/ComfyUI-GGUF-H3 6d33de2。**不再兼容 0.31（62b3c94）**，下面 §1–§7 里 62b3c94 / 锁定镜像的说法是 dev 时代的历史。
+真机：LXC 里的容器 `comfyui-latest`，仓库挂在 `/opt/ComfyUI/custom_nodes/monoload`，端口 8190；真机命令写成 `docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/...`，由专门的验证线程跑。GPU 稳定可用约 **55 GiB**（60 GiB OOM，卡在宿主机 `ttm.pages_limit` 默认值）；LXC 内存只给 48 GiB（运行时什么都不经过内存，§3）。
+云端：venv `/home/user/venv`（torch 2.15 CPU 可用），`COMFYUI_PATH=/home/user/ComfyUI`（v0.46.3）；只跑小测试、一次一个，不跑 `run_all.sh`。
+
+**进度**
+* **阶段 A：适配 v0.46.3（comfy-0.46-adapt，合并见 §7 末行）**——小测试全过，待真机冒烟。改了什么：
+  * `VAE.decode` 现在把 `load_models_gpu` 和输出分配包在 `comfy.model_prefetch.pause_malloc_graph()` 里：Monoload 的四处 `load_models_gpu`（自检、第一层、探测、第二层）和输出分配照做（`vae_ops.malloc_graph_paused`）。
+  * Flux 2 decoder 新的 `fused_norm` 路径（`Decoder.forward_fused` + `strip_conv`，CUDA + comfy-kitchen fp16/bf16 时启用；HIP 上只有 fp16 + fp16_conv3d，CT 700 的 `--bf16-vae` 不走）：托管解码期间临时关掉（`vae_ops.unfused_norms`），原生不动——融合内核绕过冻结统计量和 OpChunking，第一层的峰值也比它低。测试 `test_vae_flux2` 第 8 节。
+  * 新的 `VAE.clone()`（VAE 精度节点、Select VAE Device 用）只复制固定的属性：Monoload 包了 `clone`，把 VAE Settings 节点的设置带到副本上。
+  * 形状探测缓存的键加上 VAE dtype（`_probe_key`：通道、维数、dtype），换精度的副本不共用探测结果。
+  * Wan 2.2 适配器支持 `patch_size` 1 / 2 和 4D latent：**Qwen Image 2.1 的 VAE**（`WanVAE` patch_size 1、temporal_kernel 1、z 64、RGBA 输出）也走第一层（`test_vae_wan22` 第 9 节）；结构签名不再含时间核（fp32 副本只留一片）。
+  * v0.46.3 的 `pytorch_attention_enabled_vae` 在 AMD 上读 `gcnArchName`，gfx11 返回 False：**CT 700 上原生 VAE 注意力是 split**（Monoload 三种都分块，不受影响）；`vae_inventory` / `check_models` 模拟 gfx1151。
+  * 测试桩跟着改：CLIP 的 `tokenizer_metadata`、SeedVR 新的 `Attention(query_dim, norm_num_groups, eps)`。
+  * 核对过不用改的：`LowVramPatch` 新的 `prepare` / `memory_required`（`MonoloadRuntimePatch` 早已覆盖）；`load()` 现在会把形状变化的 key 烤进权重，Monoload 照旧报 `lora_shape_change`（没改）；"config" patch 变成 object patch；前端 1.59.6 仍不翻译 combo 选项，`monoload_i18n.js` 还需要。
+* **阶段 B（未开始）**：`vae_inventory` 扩到 v0.46.3 的全部 VAE；README / DESIGN / HANDOFF 更新；`docs/PLAN-video.md`（每种视频 VAE + 新图像 VAE 的第一层方案，分组可并行，含 safetensors / GGUF；覆盖 v0.46.3 里量化能跑的全部视频模型，扩散模型和文本编码器分开算；单次峰值 ≤ 55G 为主线，> 55G 单列「等宿主机调 ttm 后再验」；超大模型不分批会 OOM 时才把 TE 和视频模型分开加载；不做 MAGI-2）。
+* **阶段 C（未开始）**：多帧第二层（放开 `_native_reason` 的多帧、探测和估算认 5D、alloc_sim 验上界，DESIGN §9.32）；feat_cache 和因果时间卷积；SVD 整批第二层；LTX 分块 IO 的输出缓冲（音频仍原生）；`bench_vae --frames`；共用的第一层视频钩子（参考 vae-refiner-layer1 f51a6bc）。每项一个功能分支。
+
+**未决（等用户定）**：形状变化的 LoRA 要不要在运行时支持（现在报错，原生 v0.46.3 会烤进权重）；Refiner 第一层分支 vae-refiner-layer1；polish-after-ui-test 的复测（换底座后一起测）。
 
 ## 1. 当前状态
 
