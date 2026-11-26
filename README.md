@@ -815,7 +815,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_mod
   * 不完整的文件（0 字节、下载中断）显示 `unreadable: file too small (...)` 或 `unreadable: incomplete file: ...`，不再是 struct 的原始报错。
 * 仍出现 `failed: ...` 或 `model not detected` 的文件，把那几行发给我。
 
-云端用的两个盘点脚本（不需要模型文件，锁定镜像里跑）：`tests/vae_inventory.py`（每种 VAE 的结构、现在的路、原生 / 第二层 / 第一层的模拟峰值）、`tests/probe_vae_gaps.py`（现有缺口的小解码、第二层在多帧视频上的精度）。结果见 DESIGN.md §9.16。
+云端用的两个盘点脚本（不需要模型文件，ComfyUI v0.46.3 里跑）：`tests/vae_inventory.py`（每种 VAE 的结构、现在的路、原生 / 第二层 / 第一层的模拟峰值，托管的多帧还有第二层估算；v0.46.3 的结果见 DESIGN.md §9.39）、`tests/probe_vae_gaps.py`（现有缺口的小解码、第二层在多帧视频上的精度）。结果见 DESIGN.md §9.16。
 
 ### 9.12 Flux 2 VAE 走第一层：真机 bench（命令 X / Y / Z）
 
