@@ -133,6 +133,27 @@ class SeedVRPlan:
         return out
 
 
+def rss():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+class Sampler(bv.Sampler):
+    """bench_vae's sampler plus this process's RSS (pinned host memory shows here; the cgroup is the
+    whole LXC, other jobs' page cache moves it)."""
+
+    def read(self):
+        d = super().read()
+        d["rss"] = rss()
+        return d
+
+
 def digest(t):
     return hashlib.sha256(t.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()).hexdigest()[:16]
 
@@ -147,7 +168,7 @@ def one(vae, lat, opts, mode, sample_ms):
     row = {"mode": mode}
     t0 = time.perf_counter()
     try:
-        with bv.Sampler(sample_ms / 1000.0) as smp, bv.UnloadCounter() as uc, SeedVRPlan() as plan:
+        with Sampler(sample_ms / 1000.0) as smp, bv.UnloadCounter() as uc, SeedVRPlan() as plan:
             if mode == "native":
                 with bv.NativeGuard():
                     out = vae.decode(lat_dev, vae_options=opts)
@@ -174,6 +195,7 @@ def one(vae, lat, opts, mode, sample_ms):
         row["gtt_inc"] = None if smp.peak["gtt"] is None else smp.peak["gtt"] - smp.base["gtt"]
         row["cg_inc"] = None if smp.peak["cg"] is None else smp.peak["cg"] - smp.base["cg"]
         row["cg_peak_inc"] = None if smp.cg_peak_value is None or smp.base["cg"] is None else smp.cg_peak_value - smp.base["cg"]
+        row["rss_inc"] = None if smp.peak["rss"] is None else smp.peak["rss"] - smp.base["rss"]
         row["unloads"] = uc.n
         row["seedvr_plan"] = plan.summary()
     gc_collect()
@@ -242,9 +264,9 @@ def main():
                 if "error" in r:
                     print("  {:9s} ERROR {} | reserved peak {} inc {}".format(m, r["error"], g(r["res_peak"]), g(r["res_inc"])), flush=True)
                     continue
-                print("  {:9s} {:7.2f}s | alloc peak {} inc {} | reserved peak {} inc {} | out {} ({}) | GTT inc {} | cgroup inc {} peak-inc {} | unloads {} | seedvr {} | sha {}".format(
+                print("  {:9s} {:7.2f}s | alloc peak {} inc {} | reserved peak {} inc {} | out {} ({}) | GTT inc {} | RSS inc {} | cgroup inc {} | unloads {} | seedvr {} | sha {}".format(
                     m, r["time"], g(r["alloc_peak"]), g(r["alloc_inc"]), g(r["res_peak"]), g(r["res_inc"]), g(r["out_bytes"]), r["out_device"],
-                    g(r.get("gtt_inc")), g(r.get("cg_inc")), g(r.get("cg_peak_inc")), r.get("unloads"), r.get("seedvr_plan") or "-", r["sha"]), flush=True)
+                    g(r.get("gtt_inc")), g(r.get("rss_inc")), g(r.get("cg_inc")), r.get("unloads"), r.get("seedvr_plan") or "-", r["sha"]), flush=True)
             if "native" in shas and "monoload" in shas and shas["native"] and shas["monoload"]:
                 print("  bitwise native == monoload:", shas["native"] == shas["monoload"], flush=True)
             del lat, opts
