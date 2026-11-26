@@ -205,6 +205,7 @@ def make_clip():
     c.tokenizer = None
     c.layer_idx = None
     c.tokenizer_options = {}
+    c.tokenizer_metadata = {}   # ComfyUI v0.46: CLIP.clone copies it
     c.use_clip_schedule = False
     c.apply_hooks_to_conds = None
     return c

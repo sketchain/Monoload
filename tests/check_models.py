@@ -115,15 +115,16 @@ def files(folder, root):
 
 
 def build_vae(sd, meta):
-    orig = mm.is_amd
+    orig, orig_props = mm.is_amd, torch.cuda.get_device_properties
     mm.is_amd = lambda: True
+    torch.cuda.get_device_properties = lambda dev=None: type("P", (), {"gcnArchName": "gfx1151"})()   # v0.46.3 reads the arch when is_amd()
     logging.disable(logging.WARNING)   # the meta build's "missing keys" (encoder-only files etc.) and load messages
     try:
         with torch.device("meta"), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             v = comfy.sd.VAE(sd=sd, dtype=torch.bfloat16, metadata=meta)
     finally:
-        mm.is_amd = orig
+        mm.is_amd, torch.cuda.get_device_properties = orig, orig_props
         logging.disable(logging.NOTSET)
     if v.first_stage_model is None:
         return None

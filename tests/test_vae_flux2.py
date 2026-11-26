@@ -25,7 +25,9 @@ comfy.sd.VAE (it builds an AutoencoderKL with batch_norm_latent from the
      Monoload Info node apply to it unchanged;
   7. caching allocator (tests/alloc_sim.py, full-size Flux 2 on the meta
      device): reserved <= estimate (1344x768, 2688x1536, 4K; schemes A / B / C /
-     D at 4K), and the same as Flux ae's.
+     D at 4K), and the same as Flux ae's;
+  8. ComfyUI v0.46's fused GroupNorm path (fused_norm=True, served on CUDA + comfy-kitchen): forced served, native
+     takes it, Monoload's managed decodes take the plain path (== native unfused), flags restored.
 
     python tests/test_vae_flux2.py
 """
@@ -449,6 +451,53 @@ def allocator_tests():
           and off["reserved"] > i["reserved"] + 0.1 * G and abs(o["reserved"] / G - 1.11) <= 0.03)
 
 
+# ---------------------------------------------------------------------------
+# 8. ComfyUI v0.46's fused GroupNorm path
+# ---------------------------------------------------------------------------
+
+def fused_tests():
+    """sd.py v0.46 builds the Flux 2 decoder with fused_norm=True; where model.fused_norm_served(device, dtype) holds
+    (CUDA + comfy-kitchen, ROCm fp16) Decoder.forward takes forward_fused and the blocks their strip kernels. A managed
+    decode turns the flag off for its duration (vae_ops.unfused_norms): here fused_norm_served is forced true and every
+    fused entry point raises, so native would fail, while Monoload's layer 1 / layer 2 decode the plain path."""
+    v = flux2_vae()
+    fsm = v.first_stage_model
+    flagged = [n for n, m in fsm.named_modules() if m.__dict__.get("fused_norm") is True]
+    check("sd.py builds the Flux 2 decoder with fused_norm ({} modules flagged, Decoder among them)".format(len(flagged)),
+          any(n == "decoder" for n in flagged) and len(flagged) > 3)
+    lat = torch.randn(1, 4 * Z, 3, 4, generator=torch.Generator().manual_seed(31))
+    ref = native_decode(v, lat, raw=True)
+
+    def boom(*a, **k):
+        raise AssertionError("fused path taken")
+    saved = (ldm.fused_norm_served, ldm.Decoder.forward_fused, ldm.strip_conv, ldm.strip_down)
+    ldm.fused_norm_served = lambda device, dtype: True
+    ldm.Decoder.forward_fused = boom
+    ldm.strip_conv = boom
+    ldm.strip_down = boom
+    try:
+        try:
+            native_decode(v, lat, raw=True)
+            native_fused = False
+        except AssertionError:
+            native_fused = True
+        res = []
+        for stripe in (True, False):
+            mvae.set_stripe(stripe)
+            try:
+                out = managed_decode(v, lat, raw=True)
+            finally:
+                mvae.set_stripe(True)
+            res.append((mvae.last_decode().get("strategy"), float((out - ref).abs().max())))
+    finally:
+        ldm.fused_norm_served, ldm.Decoder.forward_fused, ldm.strip_conv, ldm.strip_down = saved
+    after = [n for n, m in fsm.named_modules() if m.__dict__.get("fused_norm") is True]
+    check("fused path served: native takes it ({}); Monoload layer 1 {} / layer 2 {} take the plain path == unfused native "
+          "(max|Δ| {:.2g} / {:.2g}); the flags are restored ({} of {})".format(native_fused, res[0][0], res[1][0], res[0][1], res[1][1],
+                                                                              len(after), len(flagged)),
+          native_fused and res[0][0] == "layer1" and res[1][0] == "layer2" and res[0][1] <= 1e-5 and res[1][1] <= 1e-5 and after == flagged)
+
+
 def main():
     if not mvae.is_installed():
         check("vae.install() on this ComfyUI", mvae.install())
@@ -460,6 +509,7 @@ def main():
     oom_budget_tests(v, lat)
     node_tests(v, lat)
     allocator_tests()
+    fused_tests()
     finish()
 
 

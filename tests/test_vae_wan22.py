@@ -39,7 +39,9 @@ CPU unless noted.
      readings (4K default alloc 1.49 / reserved 3.27 GiB, over the
      estimate); with it, layer 1 reserved <= estimate (1344x768, 2688x1536,
      4K default; 4K 32 / 64 / 512 rows; fp32 4K), the self-test's peak <= its
-     bound, layer 2's simulated peak <= the layer-2 estimate (1344x768, 4K).
+     bound, layer 2's simulated peak <= the layer-2 estimate (1344x768, 4K);
+  9. the Qwen Image 2.1 VAE (ComfyUI v0.46: WanVAE patch_size 1, 1-frame temporal kernels, RGBA, 4D latent): recognized,
+     layer 1 == native at several stripe heights and batch 2, self-test passes, layer 2 retains nothing.
 
     python tests/test_vae_wan22.py
 """
@@ -262,7 +264,7 @@ def selftest_tests(v, lat):
                                      # tolerance: the zero padding's effect decays, see halo_tests)
         return prefix, units
 
-    def wrong_unpatch(x):            # q / r swapped: a transposed 2x2 patch
+    def wrong_unpatch(x, p=2):       # q / r swapped: a transposed 2x2 patch
         return rearrange(x, "b (c q r) f h w -> b c f (h q) (w r)", q=2, r=2)
 
     for label, name, fn, want in (("a compound unit's halo far too small", "build_units", small_halo, "max|stripes - whole|"),
@@ -531,12 +533,15 @@ def allocator_tests():
     import alloc_sim
     G = float(1 << 30)
     orig_max = vae_ops.GROUP_NORM_MAX
+    orig_strip = wan22.STRIP_ELEMS
     vae_ops.GROUP_NORM_MAX = 1 << 30   # no grouped norm: the code up to this change
+    wan22.STRIP_ELEMS = 1 << 62        # and no vae2_2.strip_apply (ComfyUI v0.46 added it; the readings are from 62b3c94)
     try:
         i = alloc_sim.decode_trace(3840, 2160, "bf16", None, model="wan22")
     finally:
         vae_ops.GROUP_NORM_MAX = orig_max
-    check("without the grouped norm the simulation reproduces CT 700 (4K default 17 x 128: alloc 1.49, reserved 3.27, estimate "
+        wan22.STRIP_ELEMS = orig_strip
+    check("without the grouped norm and ComfyUI's own strips the simulation reproduces CT 700 (4K default 17 x 128: alloc 1.49, reserved 3.27, estimate "
           "1.35 GiB): alloc {:.2f}, reserved {:.2f}, estimate {:.2f} GiB".format(i["alloc"] / G, i["reserved"] / G, i["estimate"] / G),
           abs(i["alloc"] / G - 1.49) <= 0.03 and abs(i["reserved"] / G - 3.27) <= 0.05)
     for w, h, rows, dt in ((1344, 768, None, "bf16"), (2688, 1536, None, "bf16"), (3840, 2160, None, "bf16"), (3840, 2160, 32, "bf16"),
@@ -565,6 +570,73 @@ def allocator_tests():
               t["reserved"] <= est["total"])
 
 
+# ---------------------------------------------------------------------------
+# 9. the Qwen Image 2.1 VAE (ComfyUI v0.46)
+# ---------------------------------------------------------------------------
+# sd.py (v0.46.3) builds vae2_2.WanVAE(patch_size=1, temporal_kernel=1, image_channels=<head channels> (RGBA), z_dim 64,
+# dim_mult [1, 2, 4, 8, 8], temperal_downsample [False, True, True, True]) when the Wan 2.2 layout has a 1-frame head
+# kernel; latent_dim 2, so the latent is 4D and WanVAE.decode takes its cache-free path. dim / dec_dim come from the
+# state dict, so small ones work as they are.
+
+QI_Z = 64
+
+
+def qi21_model():
+    return init_random(_REAL(dim=8, dec_dim=16, z_dim=QI_Z, dim_mult=[1, 2, 4, 8, 8], num_res_blocks=2, attn_scales=[],
+                             temperal_downsample=[False, True, True, True], dropout=0.0, image_channels=4, patch_size=1, temporal_kernel=1))
+
+
+def qi21_tests():
+    m = qi21_model()
+    v = comfy.sd.VAE(sd=m.state_dict())
+    fsm = v.first_stage_model
+    check("sd.py detects the Qwen Image 2.1 VAE: WanVAE patch_size {}, decoder conv kernel {}, latent_dim {}, {} output channels, 1/{}".format(
+          getattr(fsm, "patch_size", None), tuple(fsm.decoder.conv1.kernel_size), v.latent_dim, v.output_channels, v.upscale_ratio),
+          type(fsm) is wan22.WanVAE and fsm.patch_size == 1 and tuple(fsm.decoder.conv1.kernel_size)[0] == 1 and v.latent_dim == 2
+          and v.output_channels == 4 and v.upscale_ratio == 16)
+    lat = torch.randn(1, QI_Z, 6, 5, generator=torch.Generator().manual_seed(21))
+    bound, why = w22.match(v, lat, {})
+    check("recognized by the Wan 2.2 adapter (4D latent): {} units, scale {}, no unpatchify unit".format(
+          len(bound.units) if bound else why, bound.scale if bound else "-"),
+          bound is not None and bound.scale == 16 and all(u.kind != w22.UNPATCH for u in bound.units))
+    for rows in (7, 40, None):
+        mvae.set_stripe_rows(rows)
+        try:
+            with Spy() as spy:
+                raw = managed_decode(v, lat, raw=True)
+        finally:
+            mvae.set_stripe_rows(None)
+        last = mvae.last_decode()
+        ref = native_decode(v, lat, raw=True)
+        check("Qwen Image 2.1 VAE 6x5 latent rows {}: layer 1 {} stripes, shape {} (native {}), max|Δ| {:.2g}".format(
+              rows or "default", last.get("stripes"), tuple(raw.shape), tuple(ref.shape), err(raw, ref)),
+              last.get("strategy") == "layer1" and raw.shape == ref.shape and raw.ndim == 4 and err(raw, ref) <= 1e-5 and spy.tiled == 0,
+              "strategy {} note {}".format(last.get("strategy"), last.get("layer1")))
+    out = managed_decode(v, torch.randn(2, QI_Z, 3, 4, generator=torch.Generator().manual_seed(22)))
+    ref = native_decode(v, torch.randn(2, QI_Z, 3, 4, generator=torch.Generator().manual_seed(22)))
+    check("batch 2 with process_output: shape {} (native {}, RGBA last), max|Δ| {:.2g}".format(tuple(out.shape), tuple(ref.shape), err(out, ref)),
+          out.shape == ref.shape and out.shape[-1] == 4 and err(out, ref) <= 1e-5)
+    eng._SELFTEST.clear()
+    ok, detail = eng.self_test(bound, v)
+    tb = bound.fp32_copy(torch.device("cpu"))
+    z5 = torch.randn(1, QI_Z, 1, 5, 4, generator=torch.Generator().manual_seed(23))
+    with torch.inference_mode():
+        a = tb.reference_decode(z5)
+        b = fsm.decode(z5[:, :, 0])
+    check("self-test passes ({}); the fp32 copy (patch_size {}, kernels {}) decodes as the model's 4D path (max|Δ| {:.2g})".format(
+          detail, tb.module.patch_size, sorted({tuple(m.kernel_size) for m in tb.module.modules() if isinstance(m, wan.CausalConv3d)}),
+          err(a[:, :, 0], b)), ok and err(a[:, :, 0], b) <= 1e-5 and bound.key != w22.match(wan22_vae(), lat_(6, 5), {})[0].key)
+    terms = mvae._decoder_terms(v, lat)
+    mvae.set_stripe(False)
+    try:
+        out = managed_decode(v, lat, raw=True)
+    finally:
+        mvae.set_stripe(True)
+    last = mvae.last_decode()
+    check("layer 2 on it: nothing retained (the 4D path has no feat_cache: {}), == native (max|Δ| {:.2g})".format(terms.get("retained"), err(out, native_decode(v, lat, raw=True))),
+          last.get("strategy") == "layer2" and terms.get("retained") == 0 and err(out, native_decode(v, lat, raw=True)) <= 1e-5)
+
+
 def main():
     if not mvae.is_installed():
         check("vae.install() on this ComfyUI", mvae.install())
@@ -578,6 +650,7 @@ def main():
     node_tests(v, lat)
     grouped_norm_tests(v, lat)
     allocator_tests()
+    qi21_tests()
     finish()
 
 

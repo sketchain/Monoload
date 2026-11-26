@@ -48,6 +48,8 @@ floating-point differences (different GEMM shapes), with ~1x the arithmetic:
 Everything else (GroupNorm, smaller RMS norms, upsampling, ...) stays native.
 """
 
+import contextlib
+
 import torch
 import torch.nn.functional as F
 
@@ -57,6 +59,44 @@ from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
 GIB = 1024 ** 3
 MIB = 1024 ** 2
+
+
+def malloc_graph_paused():
+    """ComfyUI v0.46's VAE.decode loads the weights and allocates its output buffer under
+    comfy.model_prefetch.pause_malloc_graph(): a comfy-compiler allocation graph being recorded on this thread
+    (a no-op otherwise) must not take allocations that outlive it. Monoload's managed decode does the same."""
+    try:
+        import comfy.model_prefetch as mp
+        return mp.pause_malloc_graph()
+    except Exception:
+        return contextlib.nullcontext()
+
+
+class unfused_norms:
+    """Turns ComfyUI v0.46's fused GroupNorm path off on a decoder while Monoload manages its decode (layer 1, its
+    self-test, layer 2, the shape probe), restored after. The LDM Decoder of the Flux 2 VAE (ddconfig fused_norm=True)
+    takes Decoder.forward_fused / ResnetBlock / Upsample strip kernels (comfy.quant_ops.ck) when
+    model.fused_norm_served(device, dtype) holds (CUDA with comfy-kitchen; on ROCm fp16 only): they compute GroupNorm
+    over whatever tensor they get and call F.conv2d directly, which breaks the stripes' frozen whole-image statistics
+    and bypasses OpChunking. With the flag off every module takes its plain path (the one 62b3c94 had)."""
+
+    def __init__(self, model):
+        self.model = model
+        self.saved = []
+
+    def __enter__(self):
+        mods = self.model.modules() if isinstance(self.model, torch.nn.Module) else ()
+        for m in mods:
+            if m.__dict__.get("fused_norm") is True:
+                self.saved.append(m)
+                m.fused_norm = False
+        return self
+
+    def __exit__(self, *exc):
+        for m in self.saved:
+            m.fused_norm = True
+        self.saved = []
+        return False
 
 
 class OpStats:
