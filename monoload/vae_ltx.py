@@ -120,11 +120,14 @@ def na_frame_bytes(h, w, dim, elem):
 
 
 def na_slab_bytes(block, kt, t, h, w, dim, elem):
-    """Workspace of one NA call at query block `block`: q, k, v and the attention output over the slab, plus up to
-    two pending block results (only when the residual writes back into x; counted always)."""
-    n = min(t, block + 2 * (kt - 1)) if (block < t and kt < t) else t
+    """Workspace of one NA call at query block `block`: q, k, v and the attention output over the slab, plus the
+    pending block results (only when the residual writes back into x; counted always): a result waits until no later
+    slab reads its frames, so the pending frames stay below halo + 2 x block."""
+    split = block < t and kt < t
+    n = min(t, block + 2 * (kt - 1)) if split else t
+    pend = min(t, (kt - 1) + 2 * block) if split else t
     f = na_frame_bytes(h, w, dim, elem)
-    return 4 * n * f + 2 * min(block, t) * f + qkv_temp_bytes(h, w, dim, elem)
+    return 4 * n * f + pend * f + qkv_temp_bytes(h, w, dim, elem)
 
 
 def qkv_temp_bytes(h, w, dim, elem):
