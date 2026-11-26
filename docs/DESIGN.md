@@ -1891,7 +1891,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 ### 9.38 SVD 的整批第二层（E 组，分支 video-svd-l2）
 
-**问题：** SVD 的 `temporal_ae.VideoDecoder` 把 batch 当时间轴（`timesteps` 默认等于 batch 大小），在帧之间做时间卷积和时间注意力。逐样本解码等于每帧单独解码，结果会变（§9.17 缺口 1），所以 4b-0 起它一直走原生。原生自己也按 `free / memory_used_decode` 把 batch 切成子批，每个子批当一段独立的视频：**原生的结果随空闲内存变**，通常一次装得下才是整批。
+**问题：** SVD 的 `temporal_ae.VideoDecoder` 把 batch 当时间轴（`timesteps` 默认等于 batch 大小），在帧之间做时间卷积和时间注意力。逐样本解码等于每帧单独解码，结果会变（§9.16 缺口 1），所以 4b-0 起它一直走原生。原生自己也按 `free / memory_used_decode` 把 batch 切成子批，每个子批当一段独立的视频：**原生的结果随空闲内存变**，通常一次装得下才是整批。
 
 **替用户定的：** 第二层**整批一次**进 `OpChunking`，不按空闲内存切。整批是模型本来的用法（img2vid 的帧数就是它训练时的时间长度），也是原生在显存够时的结果。
 
