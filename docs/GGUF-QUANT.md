@@ -1,0 +1,197 @@
+# GGUF / 量化格式上的运行时 LoRA（设计与进度）
+
+> 这份是「GGUF / 量化 LoRA 支持」线程的工作文档，随做随写，换新会话从这里接上。合并到 `video` 时再把结论并进 HANDOFF / DESIGN。最后更新：2026-11-26。
+
+## 0. 状态一览
+
+| 项 | 分支 | 状态 |
+|---|---|---|
+| 调研 + 设计（本文件） | 随各分支进 `video` | 完成 |
+| 1 GGUF（ComfyUI-GGUF 的 Unet / CLIP 加载器） | `lora-gguf` → `video` | 已合并；`tests/test_gguf_lora.py` 38 项全过（含 hook LoRA、Info 一行、非叶子 F32 modulation）；待真机（含 K-quant） |
+| 2 safetensors 各量化格式 | `lora-quant-formats` → `video` | 已合并；`tests/test_quant_formats.py` 66 项全过（hotpatch 不用改）；待真机 |
+| 3 视频模型（Wan / HunyuanVideo / LTX，含 GGUF） | `lora-video-models` → `video` | 已合并；小参数运行时换参数（§5），`tests/test_lora_param_swap.py` 44 项全过；发现原生 0.46.3 静默丢弃这类 key；视频 LoRA 下完后真机复核 |
+| 4 合成小模型测试 + 真机命令 | 各分支各自带 | CPU 测试完成；真机命令见 §6.1（`bench_lora.py` 加了 GGUF / 视频 latent / GTT 峰值） |
+
+**基准**（协调者定）：ComfyUI **v0.46.3（cab5f4e）**，前端 1.59.6；GGUF 节点用 **kyuz0/ComfyUI-GGUF-H3 6d33de2**（city96 版加 H3 / Krea2 的 fork，city96 上游 1 月起没更新）。本文的源码引用都按这两份核过；版本再变要重核 §2。
+
+**流程**（协调者定）：长期分支 `video`。阶段 A（适配新 ComfyUI）合进 `video` 之前只做调研和设计；之后从 `video` 开 feature 分支实现，`git merge --no-ff` 回 `video` 并 push。不碰 main / dev，不开 PR。真机由验证线程在用户 LXC（容器 `comfyui-latest`）上跑，这边只写命令。
+
+## 1. 硬性要求（用户定，不能松）
+
+* 模型加载后内存 + 显存任何时刻只能有一份权重：不接受整模型或一批层同时存在原权重和合并结果，不接受备份。允许：LoRA 文件常驻；临时合并时当前那一层短暂多一份。
+* 量化层：在反量化出来的临时权重上直接合并，不量化回去（比原生精确、不逐位一致也行），不让常驻占用变大。GGUF 里没量化、又被 LoRA 改到的少数层可以留备份（本设计用不上：这些层也走运行时合并，没有备份）。
+* 底模跨工作流常驻，LoRA 每个 prompt 结束释放（现有 release 机制）。默认融合 fp16 `addmm_`，留逐位一致开关（fused / exact）。
+* 运行时任何东西都不许走 CPU。
+
+## 1.1 用户的机器（2026-11-26）
+
+* CT 只给 48 GB 内存（因为定了运行时不经过内存）；GPU 稳定可用 55 GiB，估峰值以此为准。
+* 用户说的「分批跑」只针对超大模型防 OOM，不是必须；怎么做由线程自己定。
+
+## 2. 新版 ComfyUI / ComfyUI-GGUF 的相关事实
+
+### 2.1 ComfyUI v0.46.3
+
+* **量化张量**：`comfy.quant_ops.QuantizedTensor` 来自 `comfy_kitchen`（0.2.41）。格式（`QUANT_ALGOS`）：`float8_e4m3fn` / `float8_e5m2`（per-tensor scale，`TensorCoreFP8*Layout`）、`nvfp4`、`mxfp8`、`int8_tensorwise`（`TensorWiseINT8Layout`，只量化权重）、`convrot_w4a4`、`asym_w4a8_int8`、`w6a8_int8`。旧的 `scaled_fp8` 文件加载时被 `comfy.utils` 转成这套格式（`comfy/utils.py` ~1480）。层是 `mixed_precision_ops(...)` 的 `Linear`（另有 `MoEExperts`）。
+* **有 weight_function 时**：`MixedPrecisionOps.Linear.forward` 的 `_use_quantized` 要求 `weight_function` 为空，所以挂了 LoRA 的层走 `CastBiasWeightContext` → `cast_bias_weight`：先 `.to(dtype)`，`QuantizedTensor` 再 `dequantize()`，然后依次调 weight function（`comfy/ops.py` ~385–483）。这条路和 0.31 一样，Monoload 现有的「在反量化临时权重上合并」直接适用。
+* **原生打 LoRA**：`patch_weight_to_device` 对量化层用 `convert_func`（反量化）→ `calculate_weight` → `set_func`（`requantize_from_float`，随机舍入）写回，并备份原权重。
+* **Dynamic VRAM（comfy-aimdo）**：不加 `--gpu-only` / `--highvram` / `--novram` / `--cpu`、ROCm ≥ 7.14 时默认开（`main.py` ~291），`CoreModelPatcher` 换成 `ModelPatcherDynamic`。Monoload 现在遇到它会报 `dynamic_vram`。CT 700 用 `--gpu-only`，不受影响；用户新 compose 的启动参数要验证线程确认（交给阶段 A）。
+* **保存**：`model_state_dict_for_saving` 对没标 `comfy_patched_weights` 的层输出 `LazyCastingParam`（调 `patch_weight_to_device(return_weight=True)`），量化层输出 `LazyCastingQuantizedParam`（合并后量化回去，按量化格式存）。
+
+### 2.2 ComfyUI-GGUF-H3（6d33de2，city96 6ea2651 的 fork）
+
+* `GGMLTensor`（`torch.Tensor` 子类，`tensor_type` / `tensor_shape` / `patches`，H3 加了 `compute_dtype`）。H3 让 `.dtype` 对量化类型返回推断出的计算 dtype（fp16 / bf16 / fp32），**不是** uint8 存储 dtype——所以不能拿 `param.dtype` 判断是否量化，要看 `tensor_type`（`is_quantized()`）。F16 / F32 是「torch 兼容」类型，其余（Q4_K、Q8_0 …）是量化类型。BF16 张量加载时直接反量化成普通张量（≥2D 用 bf16，设备不支持 bf16 时 fp16；1D 用 fp32），**不是** GGMLTensor。
+* **Q8_CR / int8_convrot 文件**：带 `comfy.gguf.quant.*` 元数据的张量加载成 ComfyUI 原生 `int8_tensorwise`（`TensorWiseINT8Layout`）的普通 `Parameter` + `comfy_quant`，模型用 `mixed_precision_ops` 建（`get_gguf_q8_ops`）。这类层就是 §4 的 `QuantizedTensor` 情况，不经 GGML 路径；同一文件里的普通 GGML 量化张量在加载时直接反量化。Q4_PT 已退役（加载即报错）。
+* `GGMLOps`（继承 `comfy.ops.manual_cast`）：层的 `comfy_cast_weights = True`。权重或 bias 有一个是量化类型时，forward 走 `GGMLLayer.cast_bias_weight`（**方法**）→ `get_weight`：`dequantize_tensor(tensor, dtype, dequant_dtype)`（得到计算 dtype 的新张量）→ 有 `tensor.patches` 就 `comfy.lora.calculate_weight(patches, weight, key)`（中间 dtype fp32，或 `patch_dtype`）。**这条路不看 `weight_function`。** 两个都不是量化类型时走父类 → `comfy.ops.cast_bias_weight`（**函数**），会调 `weight_function`。
+* **Dynamic VRAM 版**（`GGUFModelPatcherDynamic`、`*DynamicVRAM` 加载器、`quant_ops.GGMLLayout` 的 `QuantizedTensor`）只在 comfy-aimdo 开着时用；用户 `--gpu-only` 下用不上，Monoload 遇到 aimdo 照旧报 `dynamic_vram`，**不在本次范围**。
+* `GGUFModelPatcher`（重写 `patch_weight_to_device`、`unpatch_model`、`load`、`clone`、`pin_weight_to_device`）：
+  * 量化层：不改权重、不备份，把 patch 挂到 `GGMLTensor.patches`，每次 forward 在反量化结果上合并（patch 平时在 offload 设备，`patch_on_device` 才放计算设备）。**本来就是运行时合并**，但只有 fp32 中间量的 `calculate_weight`，没有融合 / 逐位一致开关，hook LoRA 不支持（原生 `patch_hook_weight_to_device` 会往量化张量里写）。
+  * F16 / F32 层：原生方式合并进权重 + **备份**（违反要求）。
+  * `load()` 总是 `force_patch_weights=True` 调父类（lowvram 层也走 `patch_weight_to_device`，因为量化层不认 `LowVramPatch`）。
+  * `patch_weight_to_device` 签名没有 `return_weight`：保存时 `LazyCastingParam` 会 TypeError；而全量加载的层都标了 `comfy_patched_weights`，原生保存拿到的是 `ggml_save_to_state_dict` 的 meta 假数据。**原生 GGUF 本来就存不出可用的 checkpoint**（待 CPU 上确认）。
+* Monoload 现在（dev）：`_active` 看到子类重写了 `patch_weight_to_device` 就整个走原生并打一条警告，所以 GGUF 模型的 F16 / F32 层被 LoRA 改到时有备份。
+* 支持的架构（`IMG_ARCH_LIST`）：flux、sd1、sdxl、sd3、aura、hidream、cosmos、ltxv、hyvid、wan、lumina2、qwen_image，H3 另加 ideogram、krea2、minimax_h3；文本：t5、llama、qwen2vl、qwen3、qwen3vl、gemma3。
+* `GGUFModelPatcher` 的五个重写（下面）H3 与 city96 相同。
+
+## 3. 设计：GGUF（分支 `lora-gguf`）
+
+**识别**：按结构，不看名字（city96 原版和 H3 fork 都要认）。`ModelPatcher` 子类的模块里有 `GGMLOps`，层类里有 `GGMLLayer`（带 `get_weight` / `cast_bias_weight` / `is_ggml_quantized`），patcher 类有 `patch_on_device` / `mmap_released`。在 `hotpatch.install()` 和每个 prompt 开始时（`release` 包装 `execute_async` 的入口）查一次 `sys.modules`，找到就装适配器（自定义节点的加载顺序不定，prompt 开始时一定都加载完了）。不认得的子类照旧走原生 + 警告。
+
+**装什么**（只在适配器认得这个 GGUF 版本时；认不得照旧原生）：
+
+1. `GGUFModelPatcher.patch_weight_to_device`：patcher 不受 Monoload 管（`_enabled` 为 False）时调 GGUF 原函数；否则和 `ModelPatcher` 的替换一样只挂 `MonoloadRuntimePatch`（量化层和 F16 / F32 层都一样），不碰 `GGMLTensor.patches`（顺手清掉这个 key 上残留的）、不备份。`return_weight=True`（保存）时自己算：反量化 → 与 exact 路径相同的合并 → 返回计算 dtype 的张量（见 4）。
+2. `GGUFModelPatcher.load`：调 GGUF 原函数（保留它的 mmap 释放逻辑），但它传给父类的 `force_patch_weights=True` 在 Monoload 的 `_load` 里不报错（实例上打一个「GGUF 强制」标记，只在这次调用里有效）。效果：lowvram 层也挂运行时 patch，不挂 `LowVramPatch`。
+3. `GGMLLayer.cast_bias_weight`（类上包一层）：调原函数（没有 `tensor.patches`，只反量化），再把这一层 `weight_function` / `bias_function` 里 **Monoload 的运行时 patch** 依次作用在结果上（别的 weight function，比如 `add_weight_wrapper` 的，原生 GGUF 在量化层上本来就不调，保持不调）。结果和参数共用存储时（量化权重配 F32 bias，`dequantize_tensor` 对 torch 兼容类型可能原样返回参数）先 clone 再合并，绝不原地改参数。
+4. `MonoloadRuntimePatch` 认 GGML 量化参数（新增 `_is_ggml_quantized`）：
+   * **默认（fused）**：和现在一样，在反量化出来的计算 dtype 临时权重上 `addmm_`（普通 LoRA / LoCon），其余类型 `calculate_weight(intermediate_dtype=计算 dtype)`。
+   * 判断量化看 `tensor_type`，不看 `.dtype`（H3 的 `.dtype` 返回计算 dtype）。
+   * **exact**：与原生 GGUF 量化层逐位一致：`calculate_weight(patches, 反量化临时权重, key, intermediate_dtype=fp32 或层的 patch_dtype)`，结果留在计算 dtype，**不**做 `stochastic_rounding` 到参数 dtype（GGML 参数 dtype 是 uint8 存储，没有意义；原生 GGUF 也不量化回去）。
+   * hook LoRA：原生 GGUF 不支持；这里在 base 之后按 fp32 临时量 `calculate_weight`（`original_weights` 用反量化后的参数），回到计算 dtype。判定标准：与「这些层先反量化成计算 dtype 的普通参数」走同一路径逐位一致。
+   * F16 / F32 层：就是普通参数（`GGMLTensor` 子类），走 `comfy.ops.cast_bias_weight` → 现有路径；exact 与原生（GGUF 的合并 + 备份）逐位一致。传进来的临时权重先 `as_subclass(torch.Tensor)`，避免 `GGMLTensor` 的 `shape` 重写和子类分发。
+   * `_native_base`（同 key 后面有原生 `LowVramPatch` 就只加 hook）：GGML 量化层上 `LowVramPatch` 永远不会被调（3 只调 Monoload 的），所以这时视为没有。
+5. **释放**：`release.py` 不用改（按 patcher 的 `patches`，GGUF 的 `unpatch_model` 先清 `GGMLTensor.patches` 再调父类，父类是 Monoload 的 `_unpatch_model`，摘运行时 patch）。
+6. **保存**：CPU 上实测（v0.46.3 + H3）原生 GGUF 根本存不出来：量化层的 `state_dict` 是 meta 设备上的 uint8 假数据，没标 `comfy_patched_weights` 的层在 `LazyCastingParam` 里直接 `RuntimeError: only Tensors of floating point dtype can require gradients`。**决定（替用户定，可改）**：Monoload 管着的 GGUF 模型（含 GGML 量化层）进 `model_state_dict_for_saving` 时直接报 `MonoloadUnsupportedError`，写明「GGUF 模型不能存成 checkpoint，原生也不行」，不做半份文件、不静默丢 LoRA。Q8_CR 文件里的 int8 层是 `QuantizedTensor`，单独看可以存，但同一模型的其余部分仍是 GGML，所以整模型一样报错。
+7. **LoRA Settings / Info**：设置在 `model_options` 里，GGUF clone 照样复制；Info 加一行「GGUF：N 个量化层 / M 个 F16·F32 层被 LoRA 改到」。
+
+8. **GGUF VAE：这条路不存在（2026-11-26 核实）**。H3 6d33de2 只注册 `unet_gguf` / `clip_gguf` 两个文件夹，节点只有 Unet / CLIP 加载器（含 Dual / Triple / Quadruple 和 Dynamic VRAM 版），没有 VAE 加载节点；ComfyUI v0.46.3 核心也不认 `.gguf` 的 VAE（`VAELoader` 只列 `vae` 文件夹的 safetensors / pt 类扩展名，核心代码里没有任何 gguf 处理）。所以 VAE 侧没有 GGML 权重，PLAN-video 里设想的 H7（GGUF VAE 每次解码只反量化一次）已由协调者取消。以后真有 GGUF VAE 加载器，再按它读进来的权重结构（GGMLTensor 还是别的）重新设计；注意「解码期间缓存全部反量化结果」会让量化原件和整套反量化权重同时常驻，和 §1 的「只能有一份权重」冲突，做之前要问用户。
+
+**内存**：常驻 = GGUF 量化权重 + LoRA 文件（CPU）+ LoRA 张量在计算设备上的一份缓存（和现在的 safetensors 路径相同；原生 GGUF 默认每次 forward 把 patch 从 CPU 搬一次，不常驻）。每层临时：反量化结果一份（原生 GGUF 也有），exact 再加 LoRA 乘积的 fp32 中间量。没有备份。
+
+## 4. 设计：safetensors 各格式（分支 `lora-quant-formats`）
+
+逐格式确认（CPU 合成层 + 真机）：
+
+| 格式 | 层 / 张量 | 运行时 LoRA 走的路 | 精度判定 | 状态 |
+|---|---|---|---|---|
+| bf16 / fp16 / fp32 | `manual_cast` / `disable_weight_init` | 现有路径 | exact = 原生逐位一致 | 已有（`test_dtype_paths`） |
+| 普通 fp8（无 scale，e4m3 / e5m2） | `manual_cast`，参数是 fp8 | 现有：exact 下按原生随机舍入回 fp8 后再转计算 dtype（与原生烘进权重逐位一致）；fused 不舍入 | exact = 原生 | 待在新版上复核 |
+| scaled fp8（三种来源：文件里的 `comfy_quant` 张量 / 头部 `_quantization_metadata` / 旧 `scaled_fp8` 标记键 + `scale_weight`） | `convert_old_quants`（`comfy/utils.py` ~1474）统一转成 `comfy_quant` → `mixed_precision_ops`，`QuantizedTensor`（FP8 Layout） | 在反量化临时权重上合并，不量化回去 | = 「先反量化」参照 | 已有（0.31），三种来源都要用 CPU 测试锁住（协调者要求） |
+| 混合精度 fp8（如 flux2_dev_fp8mixed） | 同上，部分层 bf16 | 同上 + 非量化层走普通路径 | 同上 | 待查文件结构 |
+| int8（`int8_tensorwise`） | `QuantizedTensor`（`TensorWiseINT8Layout`） | 同 scaled fp8 | 同上 | LXC 上确认：noctQ…_int8 是 192 层 `int8_tensorwise`（`comfy_quant` 张量） |
+| nvfp4 / mxfp8 / w4a8 / w6a8 / convrot | `QuantizedTensor` | 同上 | 同上 | CPU 上 8 种格式 `from_float` → `dequantize()` 都能跑，回到 bf16（convrot / w4a8 要求输入维是 256 的倍数），待接进测试 |
+| `MoEExperts`（专家权重库） | 一个参数装 E 个专家 | LoRA key 对不上单个专家，先不支持（报错写明） | — | 待查有没有这种 LoRA |
+
+## 5. 设计：视频模型（分支 `lora-video-models`）
+
+LoRA key 映射是 ComfyUI 自己的（`comfy/lora.py` `model_lora_keys_unet` + `lora_convert`），对 GGUF 和 safetensors 一样，Monoload 拿到的已经是模型 key。Monoload 这边要保证的是：被改到的参数都能运行时合并。
+
+不是 comfy.ops 层 weight / bias 的参数（Wan 的 `blocks.N.modulation`、`head.modulation`，LTX 的 `scale_shift_table` / `audio_scale_shift_table` / `prompt_scale_shift_table`，以及纯 torch 层的权重）：`model_lora_keys_unet` 的通用规则把非 `.weight` 的 key 也映射（`diff` 形式）。
+
+**发现（2026-11-26，CPU 实测）：原生 ComfyUI v0.46.3 加载时根本不应用这些 key。** `ModelPatcher._load_list` 跳过「自己有参数、又有子模块」的模块（注释 "default random weights in non leaf modules"），所以 Wan 的 block / head、LTX 的 block 和顶层模型上的这些参数从不走 `patch_weight_to_device`，LoRA 在这些 key 上被静默丢掉（保存时 `model_state_dict_for_saving` 也直接输出原值）。lowvram 加载时纯 torch 叶子层（如 `nn.LayerNorm`）放不下也不会被打补丁。只有 hook LoRA（`patch_hooks`）会改到它们。
+
+**实现（`monoload/hotpatch.py` `MonoloadParamSwap`，按已定方案）**：
+- 在参数所属模块上挂 forward pre-hook + `always_call=True` 的 forward hook：进模块时把 `module._parameters[attr]` 换成合并后的临时张量，出来换回原参数对象；合并结果只在这个模块的 forward 期间存在（Wan 14B 每个 block 的 modulation 6×5120），不备份，原参数从不被写。
+- 合并一律用原生自己的算法，逐位一致（lora 计算 dtype → `calculate_weight` → 按 key 种子随机舍入回参数 dtype；GGUF 的 F16 / F32 张量用 ComfyUI-GGUF 的 fp32 + 种子 0），fused / exact 两种模式下都一样（参数小，不用快路径）。量化参数先反量化，结果不量化回去。
+- 参数留在 offload 设备（CPU）时，临时张量放到 patcher 的 load device 上合并，不在 CPU 上算。
+- 原生 load 不调用的 key 在 Monoload 的 `_load` 结束后统一装上（`_install_param_swaps`）；叶子层（纯 torch 层）走原来的 `patch_weight_to_device` 入口。卸载 / 换 hook 时和其它运行时补丁一起拆掉。
+- **与原生的差别（已定，不加开关）**：带这类 key 的 LoRA，Monoload 会真正应用它们，原生不会，所以「和原生的 max|Δ|」在这类 LoRA 上不为 0。LoRA 本来就该生效，原生丢掉是原生的缺陷，所以**不提供**「像原生那样丢掉」的开关（协调者 2026-11-26 定）。对照基准用「原生加载 + 对这些 key 手动调原生 `patch_weight_to_device`」。没有这类 key 的 LoRA 与原生行为不变。
+- 已核对 v0.46.3 源码：Wan（model / ar_model / animate2）、LTX（model / av_model）读这些参数都在所属模块自己的 forward 里，hook 时机覆盖得到。
+- 测试：`tests/test_lora_param_swap.py`（44 项），`tests/test_gguf_lora.py` 加了 F32 modulation。
+
+## 6. 测试计划
+
+* CPU（云端 venv，ComfyUI 目标版本 + ComfyUI-GGUF + `gguf`）：合成小模型——用 `gguf` 包写一个小 GGUF（Q8_0 / Q4_K / F16 / F32 混合）、用 `QuantizedTensor.from_float` 造各格式的 mixed ops 层；每种：fused 对独立实现逐位一致、exact 对参照逐位一致、无备份、参数字节不变、release 后无运行时 patch、保存行为。
+* 真机命令：每项写 `docker exec comfyui-latest python /opt/ComfyUI/custom_nodes/monoload/tests/...`，报每步耗时、GTT 峰值、和原生对比的 max|Δ|、有没有多出常驻。
+
+### 6.1 真机命令（给验证线程，容器 `comfyui-latest`）
+
+先释放服务器上的模型；GPU 任务用 `flock /srv/comfy/gpu.lock` 串行。文件名按 `/srv/comfy-latest/models-manifest.md` 里实际的填（下面 `<…>` 处）。每条输出里看：`step`（每步秒数）、`GTT peak`、`max|Δ|`（对 native）、`backups`（Monoload 必须是 0）、`GTT after` / `RSS`（和 native 比，不能多出常驻）。
+
+```
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest sh -c 'curl -s -X POST http://127.0.0.1:8190/free -d "{\"unload_models\":true,\"free_memory\":true}"; for t in test_quant_formats test_gguf_lora test_lora_param_swap test_dtype_paths; do python tests/$t.py 2>&1 | tail -1; done'
+```
+
+1. safetensors 量化（每个一条，`--modes native,monoload,monoload-exact`，`--combo <LoRA> --combo none`）：
+   * Flux 2 dev fp8mixed（qmeta 来源）+ mistral fp8 TE（两者都有）：`--unet <flux2_dev_fp8mixed> --clip <mistral_3_small_flux2_fp8> --clip-type flux2 --steps 4 --cfg 1`
+   * noctQ int8（`int8_tensorwise`）：`--checkpoint <noctQ…int8>` 或 `--unet` 形式，`--steps 8`
+   * wai v17 fp8（旧 scaled_fp8 标记）：`--checkpoint <wai_v17_fp8_test> --steps 8 --cfg 6`
+   * 期望：exact 对 native 的 max|Δ| 只来自「量化回去」的差（Monoload 不量化回去），fused 在 exact 附近；backups 0；GTT 峰值不高于 native。
+2. GGUF（含 K-quant）：`--unet-gguf <某视频或图像模型 Q4_K_M / Q8_0 .gguf> --clip-gguf <TE .gguf>`（或 `--clip`）。期望：**monoload-exact 对 native 的 max|Δ| = 0**（LoRA 不含 modulation / scale_shift_table key 时），backups 0（native 对 F16 / F32 层有备份）。
+3. 视频（视频 LoRA 下完后）：
+   * Wan 2.1 / 2.2 T2V：`--latent 16,9,60,104`（33 帧 832×480；Wan 2.2 5B 用 `48,9,44,80` 即 704×1280÷16），`--clip-type wan --steps 4 --cfg 1`
+   * HunyuanVideo：`--latent 16,9,60,104 --clip-type hunyuan_video`
+   * LTX：`--latent 128,5,15,26`（33 帧 832×480 ÷32、时间 ÷8），`--clip-type ltxv`
+   * 带 modulation / scale_shift_table key 的 LoRA：native 不应用它们（§5），max|Δ| 不为 0 是预期；看 monoload 和 monoload-exact 之间 max|Δ| 小、backups 0。
+   * 顺便重跑检查 2（视频 LoRA 的 key 里有没有小参数），结果写回 `/srv/comfy-latest/logs/gguf_checks.out`。
+
+### 6.2 K-quant 真机测试计划
+
+云端的 gguf-py 量化不出 K-quant（Q2_K…Q6_K 抛 NotImplementedError），IQ4_NL / IQ4_XS 也一样，所以这些类型只能在真机上用真文件验。ComfyUI-GGUF-H3 能反量化的类型：BF16、Q8_0、Q5_1、Q5_0、Q4_1、Q4_0、Q6_K、Q5_K、Q4_K、Q3_K、Q2_K、IQ4_NL、IQ4_XS（`dequant.py` 的表）；Q8_CR 的 int8 层走 ComfyUI 原生 `QuantizedTensor`，归 §4 的 int8_tensorwise。
+
+**两层验证**：
+
+1. **逐层（主判据，便宜）**：`tests/check_gguf_kquant.py --gguf <文件>`。从文件里每种量化类型各取前 `--per-type`（默认 2）个二维张量，只从 mmap 里读这几个张量，单独搭一层 GGMLOps Linear 放到 GPU 上，配一个随机 LoRA（rank 16），和原生 ComfyUI-GGUF（卸掉 Monoload）比。判据：
+   * exact 对原生 **max|Δ| = 0**（同一个反量化函数、同一个 `calculate_weight`，GPU 上也应逐位一致）；
+   * fused 在 `4 · u · max|y|` 之内（u：bf16 取 $2^{-8}$，fp16 / fp32 取 $2^{-11}$）；
+   * Monoload backups = 0，加载后常驻显存不比「不带 LoRA」多（容差 1 MiB）；
+   * 报每次 forward 毫秒数和峰值增量（反量化临时量 + 合并），和原生同量级。
+2. **整模型（端到端）**：`tests/bench_lora.py --unet-gguf …`，`--modes native,monoload,monoload-exact`，LoRA 选不含 modulation / scale_shift_table key 的（否则 max|Δ| 按 §5 不为 0）。判据：monoload-exact 对 native 的 latent max|Δ| = 0、backups 0、GTT 峰值和常驻不高于 native、每步时间比值。
+
+**文件清单**（按 `/srv/comfy-latest/models-manifest.md` 里实际有的选；每种类型至少一个文件，优先已经下载的，缺的类型标「缺文件」而不是补下大文件）：
+
+| 类型 | 用途 | 逐层 | 整模型 |
+|---|---|---|---|
+| Q4_K_M（混 Q4_K / Q6_K） | 视频模型主力量化（Wan 2.1 / 2.2 14B） | 必做 | 必做（Wan T2V，`--latent 16,9,60,104 --steps 4`） |
+| Q5_K_M（混 Q5_K / Q6_K） | 同上 | 必做 | 可选 |
+| Q3_K_M / Q3_K_S（混 Q3_K / Q4_K / Q5_K） | 大模型压显存 | 必做 | 可选 |
+| Q2_K | 最小档 | 有文件就做 | 不做 |
+| Q6_K / Q8_0 | 高质量档 | 必做 | 可选 |
+| Q4_0 / Q4_1 / Q5_0 / Q5_1 | 旧量化 | 有文件就做（CPU 已覆盖 Q4_0 / Q5_1 / Q8_0） | 不做 |
+| IQ4_NL / IQ4_XS | 少见 | 有文件就做 | 不做 |
+| 文本编码器 GGUF（umt5-xxl Q8_0 / Q5_K_M 等） | CLIPLoaderGGUF 路径 | 必做一个 | 跟着 Wan 整模型跑（`--clip-gguf`） |
+
+一个 Q4_K_M 文件里通常同时有 Q4_K 和 Q6_K（有的还有 Q5_K、F32），逐层脚本会按类型分别报。
+
+**命令**（GPU 任务用 flock 串行）：
+
+```
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comfy/gpu.lock python tests/check_gguf_kquant.py --gguf <wan2.1-t2v-14b-Q4_K_M.gguf>
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comfy/gpu.lock python tests/check_gguf_kquant.py --gguf <某 Q3_K_M / Q5_K_M / Q6_K / Q8_0 文件>
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comfy/gpu.lock python tests/check_gguf_kquant.py --gguf <umt5 TE .gguf>
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comfy/gpu.lock python tests/bench_lora.py --unet-gguf <wan2.1-t2v-14b-Q4_K_M.gguf> --clip-gguf <umt5 .gguf> --clip-type wan --latent 16,9,60,104 --steps 4 --cfg 1 --combo <不含小参数 key 的 Wan LoRA> --combo none --modes native,monoload,monoload-exact
+```
+
+**看哪里**：逐层脚本最后的 `== N checks, 0 failed` 和每类型三行 PASS；表里 exact / fused 的毫秒数和原生同量级。整模型看 summary 的 max|Δ| 列（monoload-exact 那段应为 0）、backups 列、GTT peak 表。
+
+**失败怎么判**：exact 不为 0 → 记下类型和张量名，多半是该类型反量化输出的 dtype / 设备和 `get_weight` 不一致（看 `_call_ggml`）；fused 超界但 exact 为 0 → 只是融合路径的舍入，报数据不算失败；常驻多出 → 查是否有 `GGMLTensor.patches` 残留或 LoRA 缓存重复。
+
+## 7. 已定的事（2026-11-26，协调者替用户定）
+
+* GGUF + 保存：明确报错（§3.6）。
+* 视频小参数（modulation / scale_shift_table 等）：一律按 LoRA 应用，不加「像原生那样丢掉」的开关（§5）。
+* GGUF VAE：没有加载器，H7 取消（§3.8）。
+* 视频 LoRA 改到 modulation / scale_shift_table / `.diff` / `.diff_b` 这类非 comfy.ops 小参数：按 §5 的 hook 方案支持（模块 forward 期间临时换上合并好的参数，不留备份），目标所有视频模型都能用，不等 LXC 上的 LoRA key 扫描结果。
+* Dynamic VRAM：新容器继续 `--gpu-only`；Monoload 在 Dynamic VRAM 下报清楚的错即可，暂不兼容。
+* 分支：阶段 A 合进 `video` 后从 `video` 拉 feature 分支，`--no-ff` 合回 `video`；本文件一起带进 `video`。
+* LXC 检查结果（2026-11-26，底座线程跑，原文在 LXC `/srv/comfy-latest/logs/gguf_checks.out`）：`--gpu-only` 在 compose 和运行中容器里都有。int8 = `int8_tensorwise`。fp8 那几份（flux2_dev_fp8mixed、wai_v17_fp8_test、mistral_3_small_flux2_fp8、oldt5 / umt5 fp8 scaled）文件里都没有 `comfy_quant` 张量，靠 scale 键，属于头部元数据或旧 `scaled_fp8` 标记那两种来源，第 3 条检查（原文 LXC `/srv/comfy-latest/logs/gguf_checks2.out`）：只有头部 `_quantization_metadata`：flux2_dev_fp8mixed；只有 `scaled_fp8` 标记：wai_v17_fp8_test、oldt5、umt5；两样都有：mistral_3_small_flux2_fp8（`convert_old_quants` 见到元数据就不走标记分支）。三条路径都要 CPU 测试锁住。LoRA 小参数扫描为空，是因为视频 LoRA 还没下完，下完让验证线程再查。
+
+## 8. 进度日志
+
+* 2026-11-26：读完 HANDOFF / DESIGN / hotpatch / release / lora_overrides；读 ComfyUI v0.46.3 的 quant_ops / ops / model_patcher / lora 和 ComfyUI-GGUF 全部源码；写本文件。云端 venv 在装（download.pytorch.org 被代理挡，改用 PyPI 的 torch）。
+* 2026-11-26：基准定为 ComfyUI v0.46.3 + ComfyUI-GGUF-H3 6d33de2，§2.2 按 H3 重写（`.dtype` 返回计算 dtype、Q8_CR 走原生 int8、Dynamic VRAM 版不在范围）。venv 装好（torch 2.15.0，`/home/user/venv`）。CPU 实测：8 种 `QuantizedTensor` 格式都能反量化；原生 GGUF 前向在反量化结果上合并 LoRA 与「反量化 + BA」逐位一致；原生 GGUF 保存失败（§3.6）。实验脚本在会话临时目录，没进仓库。
+* 2026-11-26：现有小测试在 v0.46.3 + CPU venv 上试跑：`test_dtype_paths` 198 项全过；`test_lora_save` 缺合成 checkpoint（要先跑 make_synthetic_checkpoint）；`test_release` 加载插件失败（`PromptServer.instance` 为空、`nodes_replacements` 导入失败），属于阶段 A 适配新版 ComfyUI 的范围，这里不改。
+* 2026-11-26：写 `tests/test_quant_formats.py`（草稿分支）：4 种来源（文件内 comfy_quant / 头部元数据 / 旧 scaled_fp8 标记 / 两者都有）× fp8，加 comfy_quant × e5m2、int8_tensorwise、nvfp4、mxfp8、convrot_w4a4、asym_w4a8_int8、w6a8_int8；经 `convert_old_quants` → `mixed_precision_ops` 真加载，一层量化一层普通。fused / exact 都与「先反量化 + LoRA」逐位一致，无备份、量化字节不变、unpatch 干净：66 项全过，dev 的 hotpatch 不用改。与原生（合并后量化回去）的差值只报告；mxfp8 / convrot / w4a8 / w6a8 的原生前向在 CPU 上没有 kernel，标 n/a。
+* 2026-11-26：GGUF 适配器草稿（草稿分支，基于 dev）：`monoload/gguf.py`（按结构找 GGUFModelPatcher / GGMLLayer / dequant.is_quantized；替换 patch_weight_to_device、包 load 打「GGUF 强制」标记、包 GGMLLayer.cast_bias_weight 只调 Monoload 的运行时 patch）；hotpatch：`_ADAPTED_PWTD` 让 `_active` 认适配后的子类、`_load` 认 GGUF 强制标记、`MonoloadRuntimePatch._call_ggml`（量化层：exact = 原生 GGUF 的 calculate_weight，fused = addmm_）、F16/F32 GGML 参数 exact 用 fp32 + seed 0（与原生 GGUF 烘焙一致）、保存含 GGML 量化层的模型报 `gguf_save`；`install()` 和每个 prompt 开始（release 的 execute_async 包装）调 `find_subclass_adapters()`。CLIPLoaderGGUF 也用 GGUFModelPatcher，一并覆盖。`tests/test_gguf_lora.py`：Q8_0 / Q4_0 / Q5_1 / F16 权重 + F32 bias（带 diff），fp32 / bf16 × 全量 / lowvram：exact 与原生 GGUF 逐位一致，fused 在界内，无备份、GGML 字节不变、unpatch 干净、保存报错：31 项全过。回归：test_dtype_paths 198、test_quant_formats 66、test_lora_lowvram_hook 14、test_master_switch 19、test_messages 15 全过。CPU venv 里 H3 用软链 `ComfyUI/custom_nodes/ComfyUI-GGUF` 挂上。gguf-py 不支持 K-quant 量化（Q4_K 等），合成测试用 Q4_0 / Q5_1 代替；K-quant 留给真机。
+* 2026-11-26：阶段 A 合进 video（8d89069）后，从 video 拉 lora-quant-formats / lora-gguf / lora-video-models 依次搬过去（hotpatch 一处冲突：`_load` 的 force_patch 注释），每个分支复跑测试后 `--no-ff` 合回 video。GGUF 加了 hook LoRA 测试（原生 GGUF 对量化层不应用 hook；参照 = 原生 ComfyUI 在反量化模型上的 hook，逐位一致）和 Info 一行；`bench_lora.py` 加 GGUF 加载、视频 latent、GTT 峰值。核实：H3 6d33de2 和 ComfyUI v0.46.3 都没有 GGUF VAE 的加载节点（H3 只注册 unet_gguf / clip_gguf）。
+* 2026-11-26：视频小参数（§5）：发现原生 v0.46.3 的 `_load_list` 跳过非叶子模块，Wan modulation / LTX scale_shift_table 上的 LoRA 被原生静默丢弃（CPU 实测，见 §5）。实现 `MonoloadParamSwap`（所属模块 forward 前后换参数，原生算法逐位一致，无备份），`_load` 后对原生不调用的 key 统一装上；根模型自己的参数（无点号 key）也支持；`gguf.dequantize` 给量化 GGML 参数用。`tests/test_lora_param_swap.py` 44 项全过（fp32 / bf16 × 全量 / lowvram × exact / fused + hook LoRA）；`test_gguf_lora` 加非叶子 F32 modulation，35 项全过；`test_lora_hot` 里「纯 torch 层报错」改成「装上换参数、卸载后拆掉」（真机测试，云端没跑）。回归 test_dtype_paths 198、test_quant_formats 66、test_lora_lowvram_hook 14、test_master_switch 19、test_messages 15 全过。
+* 2026-11-26：协调者回复：video 由适配线程推送（快进到 10b0392）；视频小参数不加开关；H7 取消。补 §3.8（GGUF VAE 不存在）、§6.2（K-quant 真机计划）和 `tests/check_gguf_kquant.py`（逐层对原生，云端用 Q8_0 / Q4_0 / Q5_1 小文件跑通 10 项）。
