@@ -33,6 +33,7 @@ import torch  # noqa: E402
 
 import comfy.lora  # noqa: E402
 import comfy.model_management  # noqa: E402
+import comfy.model_patcher  # noqa: E402
 from monoload import gguf as mgguf  # noqa: E402
 from monoload import hotpatch  # noqa: E402
 from monoload.errors import MonoloadUnsupportedError  # noqa: E402
@@ -95,6 +96,44 @@ def make_lora():
     keys = {n: n + ".weight" for n in ("q8", "q4", "q5", "f16")}
     keys["modulation"] = "modulation"
     return comfy.lora.load_lora(lora, keys, log_missing=False)
+
+
+def make_lora_seed(seed):
+    g = torch.Generator().manual_seed(seed)
+    lora = {}
+    for n in ("q8", "q4", "f16"):
+        lora[n + ".lora_up.weight"] = torch.randn(OUT, RANK, generator=g) * 0.02
+        lora[n + ".lora_down.weight"] = torch.randn(RANK, IN, generator=g) * 0.1
+    lora["modulation.diff"] = torch.randn(2, OUT, generator=g) * 0.05
+    keys = {n: n + ".weight" for n in ("q8", "q4", "f16")}
+    keys["modulation"] = "modulation"
+    return comfy.lora.load_lora(lora, keys, log_missing=False)
+
+
+def run_hooks(patcher_cls, ops, sd, hook_lora, x, native=False):
+    import comfy.hooks
+    net = Net(ops, sd)
+    if native:     # keep each tensor's own dtype (the F16 weight stays fp16; manual_cast casts it when the layer runs)
+        import comfy.utils
+        for k, t in sd.items():
+            comfy.utils.set_attr_param(net, k, t.clone())
+    base = net(x)
+    before = raw_digest(net)
+    p = patcher_cls(net, load_device=CPU, offload_device=CPU)
+    group = comfy.hooks.create_hook_lora(None, 0.6, 0.0)
+    p.add_hook_patches(group.hooks[0], hook_lora, 0.6)
+    p.hook_mode = comfy.hooks.EnumHookMode.MinVram
+    p.load(CPU, full_load=True)
+    p.patch_hooks(group)
+    y = net(x)
+    info = {"backups": len(p.backup) + len(p.hook_backup), "base": base}
+    p.unpatch_hooks()
+    info["off"] = net(x)
+    p.unpatch_model(CPU)
+    info["raw_same"] = same_raw(before, raw_digest(net))
+    info["leftover"] = sum(len(m.__dict__.get("weight_function", [])) + len(m.__dict__.get("bias_function", []))
+                           + len(m.__dict__.get("_monoload_param_swaps") or {}) for m in net.modules())
+    return y, info
 
 
 class Net(torch.nn.Module):
@@ -192,6 +231,36 @@ def main():
                 check(name + ": base model after unpatch", torch.equal(info["after"], base))
                 n += 1
     hotpatch.set_exact(False)
+
+    # hook LoRAs (native ComfyUI-GGUF does not apply them to quantized layers): exact == native ComfyUI's hooks on a
+    # plain comfy.ops model holding the dequantized weights (fp32), the F16 weight as fp16 and the F32 tensors
+    hook_lora = {k: v for k, v in make_lora_seed(3).items() if k in ("q8.weight", "q4.weight", "f16.weight", "modulation")}
+    x = (torch.randn(3, IN, generator=torch.Generator().manual_seed(2)) * 0.5)
+    ref_sd = {}
+    for k, t in sd.items():
+        ref_sd[k] = mgguf.dequantize(t, torch.float32) if mgguf.is_ggml_quantized(t) else t.as_subclass(torch.Tensor).clone()
+    import comfy.ops
+    hotpatch.uninstall()
+    mgguf.uninstall()
+    y_ref, _ = run_hooks(comfy.model_patcher.ModelPatcher, comfy.ops.manual_cast, ref_sd, hook_lora, x, native=True)
+    hotpatch.install()
+    hotpatch.set_exact(True)
+    y_h, info_h = run_hooks(pack.nodes.GGUFModelPatcher, pack.ops.GGMLOps, sd, hook_lora, x)
+    hotpatch.set_exact(False)
+    check("hook LoRA on Q8_0 / Q4_0 / F16 / F32 modulation (exact) == native hooks on the dequantized model bit for bit",
+          torch.equal(y_h, y_ref), "max_abs {:.3g}".format(float((y_h - y_ref).abs().max())))
+    check("hook LoRA: no backup, GGML bytes unchanged, hooks off == base, clean unpatch",
+          info_h["backups"] == 0 and info_h["raw_same"] and info_h["leftover"] == 0 and torch.equal(info_h["off"], info_h["base"]),
+          str({k: v for k, v in info_h.items() if k not in ("off", "base")}))
+
+    # the Info node's GGUF line
+    from monoload import info as minfo
+    net = Net(pack.ops.GGMLOps, sd)
+    p = pack.nodes.GGUFModelPatcher(net, load_device=CPU, offload_device=CPU)
+    p.add_patches(loaded, 0.8, 1.0)
+    lines = minfo.model_section(p)
+    check("Info: GGUF line counts 3 quantized and 3 F16 / F32 patched keys", mgguf.summary(p) == (3, 3)
+          and any("GGUF" in ln for ln in lines), str(mgguf.summary(p)))
 
     net = Net(pack.ops.GGMLOps, sd)
     p = pack.nodes.GGUFModelPatcher(net, load_device=CPU, offload_device=CPU)
