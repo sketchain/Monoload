@@ -36,6 +36,8 @@ _ap.add_argument("--wan22", help="Wan 2.2 VAE file (real-model section)")
 _ap.add_argument("--no-fp32", action="store_true", help="skip the real-model fp32 self-test / exactness section")
 _ap.add_argument("--route", help="WxHxF: also decode this size through comfy.sd.VAE.decode with vae_wan_video put into "
                  "vae.STRIPE_ADAPTERS for the run (needs the multi-frame entry, hook H1): layer 1 chosen, reserved <= its estimate")
+_ap.add_argument("--route-l2", default="", help="comma list of models (2.1, 2.2) whose --route size is also decoded with "
+                 "layer 1 switched off (layer 2, H1), for comparison")
 _ap.add_argument("--sizes", default="832x480,1280x720", help="WxH list of the bf16 sweep")
 _ap.add_argument("--frames", default="5,9,17,33,49,81", help="pixel frame counts of the bf16 sweep (1 + 4 k)")
 _ap.add_argument("--no-native", action="store_true", help="skip native decodes in the sweep (no diff, no native peak)")
@@ -363,7 +365,21 @@ def route_test(label, path):
     if not isinstance(out, Exception):
         check("{} route: output {} frames, finite".format(label, out.shape[1]),
               out.shape[1] == nf and bool(torch.isfinite(out).all()))
-    del v, out
+    del out
+    if label.split()[-1] in [x.strip() for x in OPTS.route_l2.split(",") if x.strip()]:
+        old = mvae.stripe_enabled()
+        mvae.set_stripe(False)
+        try:
+            out2, dt2, dres2, _ = measure(run)
+        finally:
+            mvae.set_stripe(old)
+        rec2 = mvae.last_decode()
+        e2 = rec2.get("estimate")
+        e2 = e2.get("total") if isinstance(e2, dict) else e2
+        print("  route layer 2 for comparison: {} reserved +{} (estimate {}, {:.1f}s)".format(
+            rec2.get("strategy"), fmt_bytes(dres2), fmt_bytes(e2 or 0), dt2))
+        del out2
+    del v
     gc.collect()
     mm.soft_empty_cache(True)
 
