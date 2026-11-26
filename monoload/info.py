@@ -196,7 +196,8 @@ def vae_section(v):
 
 def _runtime_patches(model):
     return sum(1 for m in model.modules() for a in ("weight_function", "bias_function")
-               for f in (m.__dict__.get(a) or ()) if getattr(f, "is_monoload_patch", False))
+               for f in (m.__dict__.get(a) or ()) if getattr(f, "is_monoload_patch", False)) \
+        + sum(len(m.__dict__.get("_monoload_param_swaps") or {}) for m in model.modules())
 
 
 def model_section(p):
@@ -212,6 +213,13 @@ def model_section(p):
     else:
         lines.append(msg("info.lora_none"))
     lines.append(msg("info.patched", n=n_patched, hooks=msg("info.hooks", n=n_hooks) if n_hooks else ""))
+    try:
+        from . import gguf
+        g = gguf.summary(p)
+    except Exception:
+        g = None
+    if g is not None:
+        lines.append(msg("info.gguf", q=g[0], plain=g[1]))
     eff, src = lo.resolve(p)
     if eff["mode"] == "native":      # ComfyUI's own LoRA handling: the merge path is not used
         from .messages import label
