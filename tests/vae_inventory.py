@@ -477,7 +477,7 @@ def trace(v, shape, layer, ws=GIB):
 
     stats = vae_ops.OpStats()
     out_shape = None
-    mf_est = None
+    mf_est = mf_parts = None
     with contextlib.ExitStack() as es:
         es.enter_context(_patched(vae_ops, "slow_dilated3d", lambda x: True))
         es.enter_context(_patched(mm, "soft_empty_cache", soft_empty_cache))
@@ -504,7 +504,9 @@ def trace(v, shape, layer, ws=GIB):
             mvae._PROBES.pop(fsm, None)
             with _patched(mvae, "_PEAK_METER", [lambda dev: _SimMeter(sim, tracer)]):
                 probe = mvae._probe_mf(v, lat, {})
-            mf_est = mvae.estimate(v, lat, ws, probe)["total"]
+            mf_parts = mvae.estimate(v, lat, ws, probe)
+            mf_est = mf_parts["total"]
+            mf_parts = dict(mf_parts, slope=probe.mf_slope, intercept=probe.mf_intercept)
             soft_empty_cache()
             sim.reset_peak()
         if layer == 2:
@@ -532,7 +534,8 @@ def trace(v, shape, layer, ws=GIB):
     big = max([b for b, _ in sim.peak_blocks if _ != "weights"] or [0])
     return {"alloc": sim.peak_allocated - base_alloc, "reserved": sim.peak_reserved - base_res, "largest_block": big,
             "out_shape": out_shape, "cache_flushes": sim.cache_flushes, "oom": sim.ooms, "conv_chunked": stats.conv_chunked, "attn_calls": stats.attn_calls,
-            "attn_unmanaged": list(stats.attn_unmanaged), "mf_estimate": mf_est}
+            "attn_unmanaged": list(stats.attn_unmanaged), "mf_estimate": mf_est,
+            "mf_parts": mf_parts}
 
 
 L1_SIM = {"ldm_sdxl": "sdxl", "ldm_sd": "sdxl", "ldm_flux": "flux", "ldm_flux2": "flux2", "wan21": "qwen", "wan22": "wan22", "hy_image21": "hy21"}
@@ -620,8 +623,12 @@ def main():
                                                                      ", unmanaged attn " + ", ".join(t["attn_unmanaged"][:3]) if t["attn_unmanaged"] else "")
                         if layer == 2 else "", time.time() - t0))
                     if t.get("mf_estimate") is not None:
-                        print("      layer2  multi-frame estimate {} GiB (probe on the simulator){}".format(
-                            gib(t["mf_estimate"]), "" if t["mf_estimate"] >= t["reserved"] else "  ** NOT AN UPPER BOUND **"))
+                        mp = t.get("mf_parts") or {}
+                        print("      layer2  multi-frame estimate {} GiB (probe on the simulator: slope {:.0f} B/px, intercept {} GiB; "
+                              "activation {}, workspace {}, output {} GiB){}".format(
+                                  gib(t["mf_estimate"]), mp.get("slope") or 0, gib(mp.get("intercept") or 0), gib(mp.get("activation", 0)),
+                                  gib(mp.get("workspace", 0)), gib(mp.get("output", 0)),
+                                  "" if t["mf_estimate"] >= t["reserved"] else "  ** NOT AN UPPER BOUND **"))
                 except Exception as e:
                     c[key] = {"error": "{}: {}".format(type(e).__name__, str(e)[:300])}
                     print("      {:7s} TRACE FAILED: {}".format(key, c[key]["error"]))
