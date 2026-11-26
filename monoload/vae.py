@@ -87,8 +87,9 @@ MIN_WORKSPACE = 64 * MIB
 ACTIVATION_COPIES = 4      # live full-size activations bounded by 4x the largest one (DESIGN §9.4)
 PROBE_SIZE = 8             # latent rows/cols of the shape probe
 MF_PROBE_SIZES = (16, 32)  # latent rows/cols of the two multi-frame memory probes (DESIGN §9.35)
-MF_PROBE_WORKSPACE = 64 * MIB  # their OpChunking workspace at least this (= MIN_WORKSPACE), else the decode's own: the decode's block
-                               # sizes are what fragment the allocator (LTX 0.9.0, DESIGN §9.35); 1 MiB made the probe ~85 s (Wan 2.1 81 frames)
+MF_PROBE_WORKSPACE = 64 * MIB  # their OpChunking workspace (= MIN_WORKSPACE): capped at both sizes, so in the intercept, not the slope;
+                               # 1 MiB made the probe ~85 s on CT 700 (Wan 2.1 81 frames). Fragmentation: one more run at the decode's own
+                               # workspace (_probe_mf, DESIGN §9.35)
 MF_MARGIN = 1.25           # the measured slope (bytes per latent pixel, _CudaPeak) times this: headroom over the two-point line, DESIGN §9.35
 
 
@@ -731,10 +732,11 @@ def _probe(vae, samples, vae_options):
 
 
 def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
-    """The multi-frame memory probe (DESIGN §9.35): one sample's layer-2 decode (_decode_sample, under OpChunking with the
-    decode's workspace, at least MF_PROBE_WORKSPACE) of a zeros latent with all of samples' frames, at the MF_PROBE_SIZES
-    latent sizes, measuring the peak above the start (_CudaPeak: allocated or reserved; the output buffer, allocated
-    before, not counted: it is its own term). Video
+    """The multi-frame memory probe (DESIGN §9.35): one sample's layer-2 decode (_decode_sample, under OpChunking with
+    MF_PROBE_WORKSPACE) of a zeros latent with all of samples' frames, at the MF_PROBE_SIZES latent sizes, measuring the
+    peak allocated above the start (_CudaPeak; the output buffer, allocated before, not counted: it is its own term),
+    and the larger size once more at the decode's workspace for the fragmentation (the reserved peak beyond the
+    allocated one; the largest of all runs). Video
     decoders keep per-conv caches, carries and output pieces besides the activations; a single largest tensor (_probe)
     does not see them, the measured peak does. Linear in the latent area: slope and intercept from the two sizes.
     Cached per model and _probe_key; the global RNG state is preserved. Raises when it cannot measure."""
@@ -750,17 +752,23 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
     t0 = time.perf_counter()
     peaks, frags = [], []
     devs = [vae.device.index or 0] if vae.device.type == "cuda" else []
-    for s in MF_PROBE_SIZES:
+    ws = max(MF_PROBE_WORKSPACE, int(workspace))
+    # the two sizes at MF_PROBE_WORKSPACE (the line: allocated bytes, the workspace capped at both sizes, so in the
+    # intercept), then the larger size again at the decode's own workspace when it is larger: its block sizes are what
+    # fragment the allocator (LTX 0.9.0), and only the fragmentation (frag) is taken from that run
+    runs = [(s, MF_PROBE_WORKSPACE) for s in MF_PROBE_SIZES] + ([(MF_PROBE_SIZES[-1], ws)] if ws > MF_PROBE_WORKSPACE else [])
+    for s, run_ws in runs:
         shape = list(samples.shape)
         shape[0] = 1
         shape[-2] = shape[-1] = s
         with torch.inference_mode(), torch.random.fork_rng(devices=devs):
             z = torch.zeros(shape, device=vae.device, dtype=vae.vae_dtype)
             buf = torch.empty(_output_shape(vae, z), device=vae.output_device, dtype=vae.vae_output_dtype())
-            with OpChunking(fsm, max(MF_PROBE_WORKSPACE, int(workspace)), OpStats()):
+            with OpChunking(fsm, run_ws, OpStats()):
                 meter.start()
                 _decode_sample(vae, z, vae_options, buf)
-                peaks.append(meter.peak())
+                if len(peaks) < len(MF_PROBE_SIZES):
+                    peaks.append(meter.peak())
                 frags.append(meter.frag())
             del z, buf
         mm.soft_empty_cache(True)
