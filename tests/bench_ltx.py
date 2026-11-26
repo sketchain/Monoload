@@ -22,6 +22,10 @@ timestep-conditioned VAEs and the diffusion decoder is the same for every mode;
 --compare prints max|d| of each mode against the first.
 
   --chunk-mib N   (native experiment) override the conv VAE's max chunk size.
+  mode l2x[-w<MiB>]  (experiment, no Monoload routing involved) the decoder's own decode under layer 2's
+                  OpChunking (conv row blocks, workspace MiB, default the global workspace), the output buffer
+                  preallocated on the output device and passed in like native does: what layer 2 with the
+                  output-buffer hook (PLAN H3) will measure for a chunked-io VAE.
   --profile       one decode of --profile-mode under torch.profiler (bench_vae.profile_decode).
 
 Run inside the container, the GPU lock held:
@@ -88,6 +92,39 @@ def latent_for(vae, w, h, frames, seed):
     return torch.randn([1, vae.latent_channels, t, h // r, w // r], generator=g)
 
 
+class _Shim:
+    """Stands in for the VAE in bench_vae.decode_once: .decode runs `fn`, .process_output is the VAE's."""
+
+    def __init__(self, vae, fn):
+        self.vae, self.fn = vae, fn
+        self.process_output = vae.process_output
+
+    def decode(self, latent):
+        return self.fn(self, latent)
+
+
+def l2x_decode(ws):
+    from monoload.vae_ops import OpChunking, OpStats
+
+    def run(shim, latent):
+        vae = shim.vae
+        fsm = vae.first_stage_model
+        z = latent.to(device=vae.device, dtype=vae.vae_dtype)
+        stats = OpStats()
+        if getattr(fsm, "comfy_has_chunked_io", False):
+            out = torch.empty(fsm.decode_output_shape(z.shape), device=vae.output_device, dtype=vae.vae_output_dtype())
+            with OpChunking(fsm, ws, stats):
+                fsm.decode(z, output_buffer=out)
+        else:
+            with OpChunking(fsm, ws, stats):
+                out = fsm.decode(z).to(device=vae.output_device, dtype=vae.vae_output_dtype())
+        del z
+        shim.process_output(out)
+        run.stats = stats
+        return out
+    return run
+
+
 def fmt(row):
     s = "{:>11}".format(row["status"])
     s += " {:7.1f}s".format(row.get("seconds", 0.0))
@@ -141,10 +178,18 @@ def main():
             lat = latent_for(vae, w, h, f, a.seed)
             ref = None
             for mode in modes:
-                bv.configure(mode)
+                target = vae
+                if mode.startswith("l2x"):
+                    import re
+                    from monoload import vae as mvae
+                    mw = re.search(r"-w(\d+)$", mode)
+                    bv.configure("native")
+                    target = _Shim(vae, l2x_decode(int(mw.group(1)) * 1024 * 1024 if mw else mvae.workspace()))
+                else:
+                    bv.configure(mode)
                 for rep in range(a.repeat):
                     torch.manual_seed(a.seed)
-                    row, raw, px = bv.decode_once(vae, lat, a.compare, a.sample_ms / 1000.0)
+                    row, raw, px = bv.decode_once(target, lat, a.compare, a.sample_ms / 1000.0)
                     line = "{}x{}x{} {:<14} #{} {}".format(w, h, f, mode, rep, fmt(row))
                     if a.compare and px is not None:
                         if ref is None:
