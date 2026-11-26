@@ -270,7 +270,8 @@ def prefix_peak_v(m, kt, h, w, f, e, ws, s, clone):
 class VideoPlan:
     """A stripe plan of a video decode: the output row stripes (engine.split_rows / stripe_needs on the units,
     exactly as for one frame) and the memory model over the time chunks. Has what vae.py reads from a plan:
-    estimate, arena, stripes, recompute, ckpt_bytes, prefix_bytes, stripe_bytes, describe()."""
+    estimate, arena, stripes, h_out, recompute, ckpt_bytes, prefix_bytes, stripe_bytes, persistent, live_peak,
+    out_segment, passes, saves / save_bytes, describe()."""
 
     def __init__(self, bound, t, h8, w8, rows, ws, elem, out_bytes):
         self.bound, self.workspace, self.elem, self.hdim = bound, ws, elem, bound.hdim
@@ -329,8 +330,13 @@ class VideoPlan:
         self.arena = eng.arena_bytes(self.live, stripes=len(self.stripes))
         self.largest = largest
         self.out_bytes = out_bytes
-        self.estimate = int(eng.out_segment(out_bytes) + self.arena + largest + eng.ESTIMATE_PAD)
+        self.out_segment = eng.out_segment(out_bytes)
+        self.estimate = int(self.out_segment + self.arena + largest + eng.ESTIMATE_PAD)
+        # the rest of what vae._decode_layer1 records from an engine Plan: no statistics passes, no saves
         self.passes = ()
+        self.saves, self.save_bytes = [], {}
+        self.persistent = 0
+        self.live_peak = self.live
 
     def describe(self):
         from .messages import msg

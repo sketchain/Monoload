@@ -34,6 +34,8 @@ _ap = argparse.ArgumentParser()
 _ap.add_argument("--wan21", help="Wan 2.1 VAE file (real-model section)")
 _ap.add_argument("--wan22", help="Wan 2.2 VAE file (real-model section)")
 _ap.add_argument("--no-fp32", action="store_true", help="skip the real-model fp32 self-test / exactness section")
+_ap.add_argument("--route", help="WxHxF: also decode this size through comfy.sd.VAE.decode with vae_wan_video put into "
+                 "vae.STRIPE_ADAPTERS for the run (needs the multi-frame entry, hook H1): layer 1 chosen, reserved <= its estimate")
 _ap.add_argument("--sizes", default="832x480,1280x720", help="WxH list of the bf16 sweep")
 _ap.add_argument("--frames", default="5,9,17,33,49,81", help="pixel frame counts of the bf16 sweep (1 + 4 k)")
 _ap.add_argument("--no-native", action="store_true", help="skip native decodes in the sweep (no diff, no native peak)")
@@ -334,6 +336,38 @@ def real_sweep(label, path, table):
     mm.soft_empty_cache(True)
 
 
+def route_test(label, path):
+    """The whole managed path (hook H1's entry + this adapter): comfy.sd.VAE.decode picks layer 1, self-test first."""
+    if not hasattr(mvae, "vae_video"):
+        print("  route: this vae.py has no multi-frame entry (H1), skipped")
+        return
+    if wv not in mvae.STRIPE_ADAPTERS:
+        mvae.STRIPE_ADAPTERS.insert(2, wv)
+    W, H, nf = [int(x) for x in OPTS.route.split("x")]
+    v = load_real(path, torch.bfloat16)
+    sc = v.spacial_compression_decode()
+    lat = lat_real(v, 1 + (nf - 1) // 4, H // sc, W // sc)
+    eng._SELFTEST.clear()
+    mm.load_models_gpu([v.patcher])   # weights in place first: the reserved growth is the decode's
+
+    def run():
+        with torch.inference_mode():
+            return comfy.sd.VAE.decode(v, lat)
+    out, dt, dres, dalloc = measure(run)
+    rec = mvae.last_decode()
+    est = (rec.get("estimate") or {}).get("total") if isinstance(rec.get("estimate"), dict) else rec.get("estimate")
+    ok = not isinstance(out, Exception) and rec.get("strategy") == "layer1" and est is not None and dres <= est
+    check("{} route {}x{}x{}: comfy.sd.VAE.decode -> {} ({}), reserved +{} <= estimate incl. self-test {} ({:.1f}s)".format(
+        label, W, H, nf, rec.get("strategy"), rec.get("adapter") or rec.get("reason"), fmt_bytes(dres),
+        fmt_bytes(est or 0), dt), ok)
+    if not isinstance(out, Exception):
+        check("{} route: output {} frames, finite".format(label, out.shape[1]),
+              out.shape[1] == nf and bool(torch.isfinite(out).all()))
+    del v, out
+    gc.collect()
+    mm.soft_empty_cache(True)
+
+
 def native_file(path, size, nf):
     # shared layout (README.md in that directory): <vae file stem>__<W>x<H>x<frames>f.md
     if not OPTS.native_dir:
@@ -404,5 +438,7 @@ if __name__ == "__main__":
                     if not OPTS.no_fp32:
                         real_fp32(label, path)
                     real_sweep(label, path, table)
+                    if OPTS.route:
+                        route_test(label, path)
             print_table(table)
     finish()
