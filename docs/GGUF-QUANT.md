@@ -78,9 +78,9 @@
 |---|---|---|---|---|
 | bf16 / fp16 / fp32 | `manual_cast` / `disable_weight_init` | 现有路径 | exact = 原生逐位一致 | 已有（`test_dtype_paths`） |
 | 普通 fp8（无 scale，e4m3 / e5m2） | `manual_cast`，参数是 fp8 | 现有：exact 下按原生随机舍入回 fp8 后再转计算 dtype（与原生烘进权重逐位一致）；fused 不舍入 | exact = 原生 | 待在新版上复核 |
-| scaled fp8 / 旧 `scaled_fp8` | `mixed_precision_ops`，`QuantizedTensor`（FP8 Layout） | 在反量化临时权重上合并，不量化回去 | = 「先反量化」参照 | 已有（0.31），待新版复核 |
+| scaled fp8（三种来源：文件里的 `comfy_quant` 张量 / 头部 `_quantization_metadata` / 旧 `scaled_fp8` 标记键 + `scale_weight`） | `convert_old_quants`（`comfy/utils.py` ~1474）统一转成 `comfy_quant` → `mixed_precision_ops`，`QuantizedTensor`（FP8 Layout） | 在反量化临时权重上合并，不量化回去 | = 「先反量化」参照 | 已有（0.31），三种来源都要用 CPU 测试锁住（协调者要求） |
 | 混合精度 fp8（如 flux2_dev_fp8mixed） | 同上，部分层 bf16 | 同上 + 非量化层走普通路径 | 同上 | 待查文件结构 |
-| int8（`int8_tensorwise`） | `QuantizedTensor`（`TensorWiseINT8Layout`） | 同 scaled fp8 | 同上 | 待查用户的 int8 文件是不是这个格式 |
+| int8（`int8_tensorwise`） | `QuantizedTensor`（`TensorWiseINT8Layout`） | 同 scaled fp8 | 同上 | LXC 上确认：noctQ…_int8 是 192 层 `int8_tensorwise`（`comfy_quant` 张量） |
 | nvfp4 / mxfp8 / w4a8 / w6a8 / convrot | `QuantizedTensor` | 同上 | 同上 | CPU 上 8 种格式 `from_float` → `dequantize()` 都能跑，回到 bf16（convrot / w4a8 要求输入维是 256 的倍数），待接进测试 |
 | `MoEExperts`（专家权重库） | 一个参数装 E 个专家 | LoRA key 对不上单个专家，先不支持（报错写明） | — | 待查有没有这种 LoRA |
 
@@ -101,9 +101,10 @@ LoRA key 映射是 ComfyUI 自己的（`comfy/lora.py` `model_lora_keys_unet` + 
 * 视频 LoRA 改到 modulation / scale_shift_table / `.diff` / `.diff_b` 这类非 comfy.ops 小参数：按 §5 的 hook 方案支持（模块 forward 期间临时换上合并好的参数，不留备份），目标所有视频模型都能用，不等 LXC 上的 LoRA key 扫描结果。
 * Dynamic VRAM：新容器继续 `--gpu-only`；Monoload 在 Dynamic VRAM 下报清楚的错即可，暂不兼容。
 * 分支：阶段 A 合进 `video` 后从 `video` 拉 feature 分支，`--no-ff` 合回 `video`；本文件一起带进 `video`。
-* 待收：底座线程在 LXC 上跑的两条检查（量化 safetensors 的 `comfy_quant` 格式、LoRA 里的非 Linear key），结果由协调者转来。
+* LXC 检查结果（2026-11-26，底座线程跑，原文在 LXC `/srv/comfy-latest/logs/gguf_checks.out`）：`--gpu-only` 在 compose 和运行中容器里都有。int8 = `int8_tensorwise`。fp8 那几份（flux2_dev_fp8mixed、wai_v17_fp8_test、mistral_3_small_flux2_fp8、oldt5 / umt5 fp8 scaled）文件里都没有 `comfy_quant` 张量，靠 scale 键，属于头部元数据或旧 `scaled_fp8` 标记那两种来源，具体哪种待第 3 条检查。LoRA 小参数扫描为空，是因为视频 LoRA 还没下完，下完让验证线程再查。
 
 ## 8. 进度日志
 
 * 2026-11-26：读完 HANDOFF / DESIGN / hotpatch / release / lora_overrides；读 ComfyUI v0.46.3 的 quant_ops / ops / model_patcher / lora 和 ComfyUI-GGUF 全部源码；写本文件。云端 venv 在装（download.pytorch.org 被代理挡，改用 PyPI 的 torch）。
 * 2026-11-26：基准定为 ComfyUI v0.46.3 + ComfyUI-GGUF-H3 6d33de2，§2.2 按 H3 重写（`.dtype` 返回计算 dtype、Q8_CR 走原生 int8、Dynamic VRAM 版不在范围）。venv 装好（torch 2.15.0，`/home/user/venv`）。CPU 实测：8 种 `QuantizedTensor` 格式都能反量化；原生 GGUF 前向在反量化结果上合并 LoRA 与「反量化 + BA」逐位一致；原生 GGUF 保存失败（§3.6）。实验脚本在会话临时目录，没进仓库。
+* 2026-11-26：现有小测试在 v0.46.3 + CPU venv 上试跑：`test_dtype_paths` 198 项全过；`test_lora_save` 缺合成 checkpoint（要先跑 make_synthetic_checkpoint）；`test_release` 加载插件失败（`PromptServer.instance` 为空、`nodes_replacements` 导入失败），属于阶段 A 适配新版 ComfyUI 的范围，这里不改。
