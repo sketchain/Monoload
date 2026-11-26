@@ -4,7 +4,7 @@ For each latent size: the decoder (an fp32 copy, and the loaded bf16 model) deco
 seeded noise natively and under vae_ltx.chunking at a few workspaces (a tiny one splits every neighbourhood attention
 into one-frame query blocks and every SwiGLU into small token chunks). Prints max|chunked - native| /
 max(1, max|native|) (fp32 must be <= vae_engine.SELFTEST_TOL, 1e-4), what was split, and the peak memory of each run
-over the weights (torch.cuda.max_memory_allocated) next to vae_ltx.plan()'s estimate.
+over the weights (torch.cuda.max_memory_allocated / max_memory_reserved) next to vae_ltx.plan()'s estimate.
 
   python tests/check_ltx_dd.py --vae ltx-2.5-video-vae-bf16.safetensors        (or --random)
       [--sizes 256x256x25,384x256x49] [--workspaces 1,64,0] (MiB; 0 = whole, no split) [--no-fp32] [--no-bf16]
@@ -35,6 +35,7 @@ def decode(fsm, z, ws=None, stats=None):
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     base = torch.cuda.memory_allocated()
+    base_res = torch.cuda.memory_reserved()
     torch.cuda.reset_peak_memory_stats()
     with torch.inference_mode():
         if ws is None:
@@ -43,7 +44,7 @@ def decode(fsm, z, ws=None, stats=None):
             with vae_ltx.chunking(fsm, ws, stats):
                 out = fsm.decode(z)
     torch.cuda.synchronize()
-    peak = torch.cuda.max_memory_allocated() - base
+    peak = (torch.cuda.max_memory_allocated() - base, torch.cuda.max_memory_reserved() - base_res)
     return out.float().cpu(), peak
 
 
@@ -87,7 +88,8 @@ def main():
             z = lat.to(device=dev, dtype=dt)
             ref, peak0 = decode(m, z)
             scale = max(1.0, ref.abs().max().item())
-            print("{} {:<9} native               peak {:6.2f} GiB  out {}".format(size, label, peak0 / GIB, tuple(ref.shape)), flush=True)
+            print("{} {:<9} native               peak alloc {:6.2f} res {:6.2f} GiB  out {}".format(
+                size, label, peak0[0] / GIB, peak0[1] / GIB, tuple(ref.shape)), flush=True)
             for ws_mib in wss:
                 ws = ws_mib * MIB if ws_mib else 1 << 62
                 st = OpStats()
@@ -96,14 +98,14 @@ def main():
                 est = vae_ltx.plan(m, tuple(z.shape), z.element_size(), ws)
                 ok = bool(torch.isfinite(out).all()) and (label != "fp32" or err <= SELFTEST_TOL)
                 failed |= not ok
-                print("{} {:<9} ws {:>5} MiB  {}  err {:.3g}  peak {:6.2f} GiB  est {:6.2f} GiB ({})  "
+                print("{} {:<9} ws {:>5} MiB  {}  err {:.3g}  peak alloc {:6.2f} res {:6.2f} GiB  est {:6.2f} GiB ({})  "
                       "na split {}/{} slabs {} block_min {}  mlp split {}".format(
-                          size, label, ws_mib or "whole", "ok  " if ok else "FAIL", err, peak / GIB, est["total"] / GIB,
+                          size, label, ws_mib or "whole", "ok  " if ok else "FAIL", err, peak[0] / GIB, peak[1] / GIB, est["total"] / GIB,
                           est["phase"], getattr(st, "ltx_na_split", 0), getattr(st, "ltx_na_calls", 0),
                           getattr(st, "ltx_na_slabs", 0), getattr(st, "ltx_na_block_min", None),
                           getattr(st, "ltx_mlp_split", 0)), flush=True)
-                if est["total"] < peak:
-                    print("   !! estimate below the measured peak", flush=True)
+                if est["total"] < peak[1]:
+                    print("   !! estimate below the measured reserved peak", flush=True)
                 del out
             del ref, z
     print("RESULT", "FAIL" if failed else "PASS")
