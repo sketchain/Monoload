@@ -1,0 +1,78 @@
+"""Multi-frame (video) decodes, layer 2: which decoders are managed with more than one latent frame (H1), how their
+output reaches the pixel buffer (H3), and the shape probe that bounds their memory (docs/PLAN-video.md §1,
+docs/DESIGN.md §9.35).
+
+  MULTIFRAME     first-stage model classes whose T > 1 decode Monoload manages (layer 2). The others stay native
+                 (vae._native_reason). A class is added once tests/test_vae_multiframe.py (alloc_sim on the meta
+                 device) shows the layer-2 estimate is an upper bound for it.
+  chunks()       the decode of one sample as a generator of output pieces in the final layout, [1, C, f, H, W],
+                 consecutive along the frames: for the decoders below the pieces the decoder already produces
+                 (ComfyUI keeps them in a list and torch.cat's them at the end: two copies of the output in the VAE
+                 dtype on the device), otherwise the whole decode as one piece. Numerically the same as decode():
+                 the same calls on the same tensors, torch.cat is a copy.
+  output_frames()  frames of the decoded output, from sd.py's own upscale_ratio.
+"""
+
+import comfy.ldm.wan.vae as wan
+import comfy.ldm.wan.vae2_2 as wan22
+
+
+def _wan21_chunks(fsm, z):
+    """comfy.ldm.wan.vae.WanVAE.decode (v0.46.3), one piece per decoder output chunk instead of a list + torch.cat."""
+    iter_ = 1 + z.shape[2] // 2
+    feat_map = [None] * wan.count_cache_layers(fsm.decoder) if iter_ > 1 else None
+    x = fsm.conv2(z)
+    for i in range(iter_):
+        xi = x[:, :, :1] if i == 0 else x[:, :, 1 + 2 * (i - 1):1 + 2 * i]
+        pieces = fsm.decoder(xi, feat_cache=feat_map, feat_idx=[0])
+        del xi
+        while pieces:
+            p = pieces.pop(0)
+            yield p
+            del p
+
+
+def _wan22_chunks(fsm, z):
+    """comfy.ldm.wan.vae2_2.WanVAE.decode (v0.46.3, 5D latent), one piece per latent frame instead of an O(T^2)
+    torch.cat chain; unpatchify (a rearrange of channels into pixels, frames untouched) per piece."""
+    feat_map = [None] * wan22.count_conv3d(fsm.decoder)
+    x = fsm.conv2(z)
+    for i in range(z.shape[2]):
+        if i == 0:
+            out = fsm.decoder(x[:, :, i:i + 1], feat_cache=feat_map, feat_idx=[0], first_chunk=True)
+        else:
+            out = fsm.decoder(x[:, :, i:i + 1], feat_cache=feat_map, feat_idx=[0])
+        p = wan22.unpatchify(out, patch_size=fsm.patch_size)
+        del out
+        yield p
+        del p
+
+
+# first-stage model class -> chunk generator; a class here is also managed with T > 1 (MULTIFRAME)
+_CHUNKS = {
+    wan.WanVAE: _wan21_chunks,
+    wan22.WanVAE: _wan22_chunks,
+}
+
+MULTIFRAME = frozenset(_CHUNKS)
+
+
+def multiframe(fsm):
+    """Whether this first-stage model's T > 1 decode is managed (its exact class: a subclass may decode differently)."""
+    return type(fsm) in MULTIFRAME
+
+
+def chunks(fsm, z, vae_options):
+    """Pieces of the decode of one sample z ([1, C, T, h, w] on the device), see the module docstring."""
+    f = _CHUNKS.get(type(fsm))
+    if f is not None and not vae_options and z.ndim == 5:
+        return f(fsm, z)
+    return iter((fsm.decode(z, **vae_options),))
+
+
+def output_frames(vae, t):
+    """Frames out of t latent frames (sd.py's upscale_ratio[0]), None if the VAE has no such rule."""
+    r = getattr(vae, "upscale_ratio", None)
+    if isinstance(r, tuple) and r and callable(r[0]):
+        return int(r[0](t))
+    return None
