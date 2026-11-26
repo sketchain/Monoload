@@ -72,7 +72,7 @@ import comfy.ops
 import comfy.sd
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
-from . import settings, vae_engine, vae_hunyuan, vae_ldm, vae_ops, vae_overrides, vae_wan, vae_wan22
+from . import settings, vae_engine, vae_hunyuan, vae_ldm, vae_ops, vae_overrides, vae_video, vae_wan, vae_wan22
 from .errors import MonoloadError, MonoloadVAEOOMError
 from .messages import label, msg
 from .vae_ops import GIB, MIB, OpChunking, OpStats, fmt_bytes
@@ -86,6 +86,11 @@ LAYER1_WORKSPACE = 128 * MIB  # layer-1 workspace without MONOLOAD_VAE_BUDGET (c
 MIN_WORKSPACE = 64 * MIB
 ACTIVATION_COPIES = 4      # live full-size activations bounded by 4x the largest one (DESIGN §9.4)
 PROBE_SIZE = 8             # latent rows/cols of the shape probe
+MF_PROBE_SIZES = (16, 32)  # latent rows/cols of the two multi-frame memory probes (DESIGN §9.35)
+MF_PROBE_WORKSPACE = 64 * MIB  # their OpChunking workspace (= MIN_WORKSPACE): capped at both sizes, so in the intercept, not the slope;
+                               # 1 MiB made the probe ~85 s on CT 700 (Wan 2.1 81 frames). Fragmentation: one more run at the decode's own
+                               # workspace (_probe_mf, DESIGN §9.35)
+MF_MARGIN = 1.25           # the measured slope (bytes per latent pixel, _CudaPeak) times this: headroom over the two-point line, DESIGN §9.35
 
 
 def parse_size(s):
@@ -570,7 +575,7 @@ def _native_reason(vae, samples):
     if getattr(samples, "is_nested", False):
         return msg("vae.nr_nested")
     model = type(fsm).__name__
-    if getattr(fsm, "comfy_has_chunked_io", False):
+    if getattr(fsm, "comfy_has_chunked_io", False) and not vae_video.chunked_io_managed(fsm):
         return msg("vae.nr_chunked_io", model=model)
     ld = getattr(vae, "latent_dim", 2)
     if ld not in (2, 3):
@@ -583,8 +588,11 @@ def _native_reason(vae, samples):
     if ld == 3:
         if samples.ndim != 5:
             return msg("vae.nr_dims", ndim=samples.ndim, ld=ld)
-        if samples.shape[2] != 1:
-            return msg("vae.nr_multiframe", t=samples.shape[2])
+        if samples.shape[2] != 1 and not vae_video.multiframe(fsm):
+            return msg("vae.nr_multiframe", t=samples.shape[2], model=model,
+                       managed=", ".join(sorted("{}.{}".format(c.__module__.rsplit(".", 1)[-1], c.__name__) for c in vae_video.MULTIFRAME)))
+        if (samples.shape[2] != 1 or vae_video.measured(fsm)) and _PEAK_METER[0](getattr(vae, "device", None)) is None:
+            return msg("vae.nr_mf_no_meter", t=samples.shape[2], dev=getattr(vae, "device", None))
     mixes, ops = _model_traits(fsm)
     if mixes:
         return msg("vae.nr_batch_time", model=model)
@@ -598,12 +606,67 @@ def _native_reason(vae, samples):
 # ---------------------------------------------------------------------------
 
 class _Probe:
-    __slots__ = ("act_bytes_per_px", "out_numel_per_px", "seconds")
+    """act_bytes_per_px: the largest single activation per latent pixel (the shape probe). A multi-frame probe
+    (_probe_mf) has mf_slope / mf_intercept instead: the peak allocated by one sample's layer-2 decode, bytes per
+    latent pixel and the constant part, from two measured sizes (act_bytes_per_px is the slope then), and mf_frag: the
+    most the allocator reserved beyond that peak (fragmentation) at either size."""
+    __slots__ = ("act_bytes_per_px", "out_numel_per_px", "seconds", "mf_slope", "mf_intercept", "mf_frag")
 
-    def __init__(self, act, out, seconds):
+    def __init__(self, act, out, seconds, mf_slope=None, mf_intercept=0, mf_frag=0):
         self.act_bytes_per_px = act
         self.out_numel_per_px = out
         self.seconds = seconds
+        self.mf_slope = mf_slope
+        self.mf_intercept = mf_intercept
+        self.mf_frag = mf_frag
+
+
+class _UnboundedDecode(Exception):
+    """A multi-frame decode whose memory probe failed: no upper bound, the decode goes native (_managed_decode)."""
+
+
+def _multiframe(samples):
+    return samples.ndim == 5 and int(samples.shape[2]) > 1
+
+
+def _measured(vae, samples):
+    """Whether layer 2's estimate is the measured probe (_probe_mf): a multi-frame latent, or a model vae_video always
+    measures (LTX, a single frame included)."""
+    return _multiframe(samples) or (samples.ndim == 5 and vae_video.measured(vae.first_stage_model))
+
+
+class _CudaPeak:
+    """Peak allocated bytes on a CUDA / ROCm device since start(), above what was allocated then, and frag(): how much
+    more the allocator reserved at its peak than that (fragmentation; the cache is emptied at start(), so the reserved
+    peak counts the segments the decode makes: LTX 0.9.0's decoder reserves 1.7x what it allocates, DESIGN §9.35).
+    Resets the device's peak statistics: _MemProbe's reserved peak of the decode in progress then starts at the probe
+    (which comes before any decode work, after loading the weights)."""
+
+    def __init__(self, dev):
+        self.dev = dev
+
+    def start(self):
+        torch.cuda.synchronize(self.dev)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(self.dev)
+        self.base = torch.cuda.memory_allocated(self.dev)
+        self.base_res = torch.cuda.memory_reserved(self.dev)
+
+    def peak(self):
+        torch.cuda.synchronize(self.dev)
+        return torch.cuda.max_memory_allocated(self.dev) - self.base
+
+    def frag(self):
+        return max(0, torch.cuda.max_memory_reserved(self.dev) - self.base_res - self.peak())
+
+
+def _cuda_peak_meter(dev):
+    if getattr(dev, "type", None) == "cuda" and torch.cuda.is_available():
+        return _CudaPeak(dev)
+    return None
+
+
+_PEAK_METER = [_cuda_peak_meter]   # device -> meter or None; tests/vae_inventory.py puts the simulator's in
 
 
 _PROBES = weakref.WeakKeyDictionary()   # first_stage_model -> {(latent channels, ndim, dtype): _Probe}
@@ -615,8 +678,10 @@ def _latent_px(samples):
 
 def _probe_key(vae, samples):
     """Latent channels, ndim and the compute dtype: ComfyUI v0.46's VAE.clone lets a VAE precision node decode the same
-    first-stage model in another dtype, and the probe's bytes per pixel are in the decode's dtype."""
-    return (int(samples.shape[1]), samples.ndim, str(vae.vae_dtype))
+    first-stage model in another dtype, and the probe's bytes per pixel are in the decode's dtype. Multi-frame: and the
+    number of latent frames (the probe measures the whole decode)."""
+    key = (int(samples.shape[1]), samples.ndim, str(vae.vae_dtype))
+    return key + (int(samples.shape[2]),) if _measured(vae, samples) else key
 
 
 def _probe(vae, samples, vae_options):
@@ -666,6 +731,57 @@ def _probe(vae, samples, vae_options):
     return p
 
 
+def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
+    """The multi-frame memory probe (DESIGN §9.35): one sample's layer-2 decode (_decode_sample, under OpChunking with
+    MF_PROBE_WORKSPACE) of a zeros latent with all of samples' frames, at the MF_PROBE_SIZES latent sizes, measuring the
+    peak allocated above the start (_CudaPeak; the output buffer, allocated before, not counted: it is its own term),
+    and the larger size once more at the decode's workspace for the fragmentation (the reserved peak beyond the
+    allocated one; the largest of all runs). Video
+    decoders keep per-conv caches, carries and output pieces besides the activations; a single largest tensor (_probe)
+    does not see them, the measured peak does. Linear in the latent area: slope and intercept from the two sizes.
+    Cached per model and _probe_key; the global RNG state is preserved. Raises when it cannot measure."""
+    fsm = vae.first_stage_model
+    key = _probe_key(vae, samples)
+    per_model = _PROBES.setdefault(fsm, {})
+    hit = per_model.get(key)
+    if hit is not None:
+        return hit
+    meter = _PEAK_METER[0](vae.device)
+    if meter is None:
+        raise MonoloadError("no allocator statistics on {}".format(vae.device))
+    t0 = time.perf_counter()
+    peaks, frags = [], []
+    devs = [vae.device.index or 0] if vae.device.type == "cuda" else []
+    ws = max(MF_PROBE_WORKSPACE, int(workspace))
+    # the two sizes at MF_PROBE_WORKSPACE (the line: allocated bytes, the workspace capped at both sizes, so in the
+    # intercept), then the larger size again at the decode's own workspace when it is larger: its block sizes are what
+    # fragment the allocator (LTX 0.9.0), and only the fragmentation (frag) is taken from that run
+    runs = [(s, MF_PROBE_WORKSPACE) for s in MF_PROBE_SIZES] + ([(MF_PROBE_SIZES[-1], ws)] if ws > MF_PROBE_WORKSPACE else [])
+    for s, run_ws in runs:
+        shape = list(samples.shape)
+        shape[0] = 1
+        shape[-2] = shape[-1] = s
+        with torch.inference_mode(), torch.random.fork_rng(devices=devs):
+            z = torch.zeros(shape, device=vae.device, dtype=vae.vae_dtype)
+            buf = torch.empty(_output_shape(vae, z), device=vae.output_device, dtype=vae.vae_output_dtype())
+            with OpChunking(fsm, run_ws, OpStats()):
+                meter.start()
+                _decode_sample(vae, z, vae_options, buf)
+                if len(peaks) < len(MF_PROBE_SIZES):
+                    peaks.append(meter.peak())
+                frags.append(meter.frag())
+            del z, buf
+        mm.soft_empty_cache(True)
+    a, b = MF_PROBE_SIZES[0] ** 2, MF_PROBE_SIZES[1] ** 2
+    slope = max(0.0, (peaks[1] - peaks[0]) / (b - a))
+    intercept = max(0.0, peaks[1] - slope * b)
+    r = vae.spacial_compression_decode()
+    out_numel = getattr(vae, "output_channels", 3) * r * r * (vae_video.output_frames(vae, int(samples.shape[2])) or 1)
+    p = _Probe(slope, out_numel, time.perf_counter() - t0, mf_slope=slope, mf_intercept=intercept, mf_frag=max(frags))
+    per_model[key] = p
+    return p
+
+
 def _static_act_bytes_per_px(vae):
     """Fallback when the probe fails: the widest conv at full output resolution."""
     cmax = 1
@@ -692,7 +808,12 @@ def estimate(vae, samples, budget, probe=None, retained=0, copies=ACTIVATION_COP
       + retained              (what the decoder's own decode keeps alive besides its activations, one sample:
                                _decoder_terms; Wan 2.2's feat_cache clones, DESIGN §9.23)"""
     px = _latent_px(samples)
-    if probe is not None:
+    if probe is not None and probe.mf_slope is not None:
+        # multi-frame (DESIGN §9.35): the measured peak of one sample's decode, everything it keeps alive included
+        act = MF_MARGIN * probe.mf_slope * px + probe.mf_intercept + probe.mf_frag
+        out_numel = probe.out_numel_per_px * px
+        copies, retained = 1, 0
+    elif probe is not None:
         act = probe.act_bytes_per_px * px
         out_numel = probe.out_numel_per_px * px
     else:
@@ -729,22 +850,66 @@ def _decoder_terms(vae, samples):
 # the decode
 # ---------------------------------------------------------------------------
 
+def _output_shape(vae, z):
+    """Decoded shape of latent z when it can be known before decoding (a multi-frame decode, a decoder with chunked
+    output), else None."""
+    fsm = vae.first_stage_model
+    if getattr(fsm, "comfy_has_chunked_io", False):
+        return tuple(fsm.decode_output_shape(z.shape))
+    if _measured(vae, z) and vae_video.multiframe(fsm):
+        r = vae.spacial_compression_decode()
+        return (int(z.shape[0]), getattr(vae, "output_channels", 3), vae_video.output_frames(vae, int(z.shape[2])),
+                int(z.shape[-2]) * r, int(z.shape[-1]) * r)
+    return None
+
+
+def _decode_sample(vae, z, vae_options, dest):
+    """Decode one sample z (on the device, VAE dtype) straight into dest (the output buffer's slice for it, H3 of
+    docs/PLAN-video.md): a decoder with chunked output writes into it itself (output_buffer); a multi-frame decoder
+    in vae_video's table hands over its pieces as it makes them, each copied in at its frames (no list + torch.cat
+    of the whole output in the VAE dtype); others decode whole and are copied in. Values as native's
+    .to(output dtype, copy=True) + copy_."""
+    fsm = vae.first_stage_model
+    if getattr(fsm, "comfy_has_chunked_io", False):
+        fsm.decode(z, output_buffer=dest, **vae_options)
+        return
+    f = 0
+    for piece in vae_video.chunks(fsm, z, vae_options):
+        if piece.ndim == 5 and dest.ndim == 5:
+            n = int(piece.shape[2])
+            dest[:, :, f:f + n].copy_(piece)
+            f += n
+        else:
+            dest.copy_(piece)
+            f = None
+        del piece
+    if f is not None and f != dest.shape[2]:
+        raise MonoloadError("multi-frame decode produced {} frames, the output has {}".format(f, dest.shape[2]))
+
+
 def _run(vae, samples_in, vae_options, budget, stats):
     """Layer 2: the original decoder forward under OpChunking, one sample at a
-    time, written into the output buffer like native decode."""
+    time, written into the output buffer like native decode (_decode_sample)."""
     fsm = vae.first_stage_model
     pixel_samples = None
     n = samples_in.shape[0]
+    shape = _output_shape(vae, samples_in)
+    if shape is not None:
+        with vae_ops.malloc_graph_paused():
+            pixel_samples = torch.empty(shape, device=vae.output_device, dtype=vae.vae_output_dtype())
     with OpChunking(fsm, budget, stats):
         for i in range(n):
             samples = samples_in[i:i + 1].to(device=vae.device, dtype=vae.vae_dtype)
-            out = fsm.decode(samples, **vae_options)
-            del samples
-            if pixel_samples is None:
+            if pixel_samples is not None:
+                _decode_sample(vae, samples, vae_options, pixel_samples[i:i + 1])
+                del samples
+            else:
+                out = fsm.decode(samples, **vae_options)
+                del samples
                 with vae_ops.malloc_graph_paused():
                     pixel_samples = torch.empty((n,) + tuple(out.shape[1:]), device=vae.output_device, dtype=vae.vae_output_dtype())
-            pixel_samples[i:i + 1].copy_(out)   # = native's .to(output_device, output dtype, copy=True) + copy_
-            del out
+                pixel_samples[i:i + 1].copy_(out)   # = native's .to(output_device, output dtype, copy=True) + copy_
+                del out
             vae.process_output(pixel_samples[i:i + 1])
     return pixel_samples
 
@@ -834,17 +999,26 @@ def _managed_decode(self, samples_in, vae_options):
         samples_in = samples_in[:, :, 0]
     _sync()  # do not count work queued before this decode
     t0 = time.perf_counter()
-    with mm.cuda_device_context(self.device), vae_ops.unfused_norms(self.first_stage_model):
-        bud = budget()
-        if bud:
-            return _decode_budget(self, samples_in, vae_options, t0, bud)
-        bound, why = _select_layer1(self, samples_in, vae_options)
-        if bound is not None:
-            ok, detail = _layer1_self_test(self, bound)
-            if ok:
-                return _decode_layer1(self, samples_in, bound, t0, detail)
-            why = "layer-1 self-test failed ({})".format(detail)
-        return _decode_layer2(self, samples_in, vae_options, t0, why)
+    try:
+        with mm.cuda_device_context(self.device), vae_ops.unfused_norms(self.first_stage_model):
+            bud = budget()
+            if bud:
+                return _decode_budget(self, samples_in, vae_options, t0, bud)
+            bound, why = _select_layer1(self, samples_in, vae_options)
+            if bound is not None:
+                ok, detail = _layer1_self_test(self, bound)
+                if ok:
+                    return _decode_layer1(self, samples_in, bound, t0, detail)
+                why = "layer-1 self-test failed ({})".format(detail)
+            return _decode_layer2(self, samples_in, vae_options, t0, why)
+    except _UnboundedDecode as e:
+        # a multi-frame decode whose memory probe failed: no bound to hand load_models_gpu, so ComfyUI decodes it
+        logging.warning(msg("vae.mf_probe_failed", err=e))
+        _LAST.clear()
+        _LAST.update({"strategy": "native", "reason": msg("vae.mf_probe_failed", err=e)})
+        out = _ORIG["decode"](self, samples_in, vae_options)
+        _LAST["seconds"] = time.perf_counter() - t0
+        return out
 
 
 def _layer1_self_test(vae, bound):
@@ -1164,7 +1338,15 @@ def _layer2_estimate(vae, samples_in, vae_options, ws):
     """(estimate dict, probe or None) of a layer-2 decode with workspace ws; the
     shape probe (first decode of this model and latent layout) loads the weights."""
     probe = _PROBES.get(vae.first_stage_model, {}).get(_probe_key(vae, samples_in))
-    if probe is None:
+    if probe is None and _measured(vae, samples_in):
+        big = samples_in[0:1, ..., :MF_PROBE_SIZES[-1], :MF_PROBE_SIZES[-1]]
+        _load_models(vae, estimate(vae, big, ws, copies=8)["total"])
+        try:
+            probe = _probe_mf(vae, samples_in, vae_options, ws)
+        except Exception as e:
+            mm.soft_empty_cache(True)
+            raise _UnboundedDecode("{}: {}".format(type(e).__name__, e))
+    elif probe is None:
         # the shape probe needs the weights where they compute. It is one plain decode of a PROBE_SIZE x PROBE_SIZE
         # latent, not under OpChunking: no workspace in what it asks for (with ws it asked ~2 GiB for tens of MiB;
         # load_models_gpu adds its minimum_inference_memory on top anyway; review 2026-10 item 23)

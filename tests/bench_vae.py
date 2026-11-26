@@ -259,13 +259,28 @@ def load_latent(path):
     return lat["latent_tensor"].float() * mult
 
 
-def random_latent(vae, w, h, seed, std):
+def latent_frames(vae, frames):
+    """Latent frames for `frames` output frames: the fewest whose decode (sd.py's upscale_ratio[0]) gives at least that many."""
+    r = getattr(vae, "upscale_ratio", None)
+    if not (isinstance(r, tuple) and r and callable(r[0])):
+        raise SystemExit("--frames: this VAE has no frame rule (upscale_ratio)")
+    t = 1
+    while r[0](t) < frames:
+        t += 1
+    if r[0](t) != frames:
+        print("[bench] --frames {}: the decode gives {} frames ({} latent frames)".format(frames, r[0](t), t))
+    return t
+
+
+def random_latent(vae, w, h, seed, std, frames=1):
     r = vae.spacial_compression_decode()
     if w % r or h % r:
         raise SystemExit("resolution {}x{} is not a multiple of {}".format(w, h, r))
     shape = [1, vae.latent_channels]
     if vae.latent_dim == 3:
-        shape.append(1)
+        shape.append(latent_frames(vae, frames) if frames > 1 else 1)
+    elif frames > 1:
+        raise SystemExit("--frames: not a video VAE (latent_dim {})".format(vae.latent_dim))
     shape += [h // r, w // r]
     g = torch.Generator().manual_seed(seed)
     return torch.randn(shape, generator=g) * std
@@ -900,6 +915,7 @@ def main():
     p.add_argument("--res", default="1344x768,2688x1536,3840x2160", help="output resolutions WxH, comma separated (random latents)")
     p.add_argument("--latent", action="append", help="SaveLatent .latent file instead of random latents (repeatable; path, or name in input/ or output/)")
     p.add_argument("--seed", type=int, default=0, help="seed of the random latents")
+    p.add_argument("--frames", type=int, default=1, help="output frames of the random latents (video VAEs; e.g. 81 for Wan)")
     p.add_argument("--latent-std", type=float, default=1.0, help="std of the random latents")
     p.add_argument("--modes", default="native,monoload,native2",
                    help="comma list run in order per resolution: native, monoload (layer 1 where recognized, else layer 2), "
@@ -958,7 +974,8 @@ def main():
     else:
         for res in a.res.split(","):
             w, h = (int(x) for x in res.lower().split("x"))
-            inputs.append((res, random_latent(vae, w, h, a.seed, a.latent_std), "random seed {}".format(a.seed)))
+            inputs.append((res + ("x{}f".format(a.frames) if a.frames > 1 else ""), random_latent(vae, w, h, a.seed, a.latent_std, a.frames),
+                           "random seed {}".format(a.seed)))
     for label, lat, what in inputs:
         print("input {}: latent {} ({}), native estimate {}".format(label, list(lat.shape), what,
                                                                      vae_ops.fmt_bytes(mvae._native_estimate(vae, lat.shape))))

@@ -26,8 +26,9 @@
   * 不是 comfy.ops 层 weight / bias 的参数（Wan `modulation`、LTX `scale_shift_table` 等、纯 torch 层）：`MonoloadParamSwap`，所属模块 forward 期间换上合并好的临时参数，出来换回，无备份，原生算法逐位一致。**原生 v0.46.3 加载时静默丢弃这些 key**（`_load_list` 跳过非叶子模块），所以带这类 key 的 LoRA 和原生比 max|Δ| 不为 0（已定：不加「跟原生一样丢掉」的开关）。`tests/test_lora_param_swap.py`（44 项）；`test_lora_hot` 里原来的「纯 torch 层报错」改成「换参数」。
   * K-quant 等云端造不出的 GGUF 类型：`tests/check_gguf_kquant.py`（真机逐层对原生），计划见 `docs/GGUF-QUANT.md` §6.2。GGUF VAE 没有加载器（H3 和核心都没有），H7 已取消。
   * `bench_lora.py` 加了 `--unet-gguf` / `--clip-gguf` / `--latent C,T,H,W` / `--batch`，每个组合报 GTT 峰值（20 ms 采样）。
+* **H1 / H3 / H6：多帧第二层入口（video-l2-entry，合并见 §7）**——Wan 2.1 / 2.2 和 LTX（0.9.x 卷积 VAE 的 chunked io、LTX 2.5 扩散 decoder `CausalDiffusionVAE`）的 5D latent 走第二层，峰值靠实测探测 `vae._probe_mf` 定上界（16、32 两个 latent 尺寸在 64 MiB 工作区上的 allocated 连线 × `MF_MARGIN` 1.25，加上在解码自己工作区上再跑一次量到的碎片），输出块直接写进预分配的输出缓冲；F 组的扩展点 `vae_ops.EXTRA_CHUNKERS`；`bench_vae --frames N`。真机：Wan 2.1 720p×81 原生 reserved 18.90 → 9.84 GiB，估算 13.77，像素 max 0.0166（PSNR 60.8），热解码慢 9%。最终探测的真机读数在排队（DESIGN §9.35 表）。
 * **阶段 B**：**`docs/PLAN-video.md` 已写（合并见 §7）**——共用钩子 H1–H7、各 VAE 的第一层方案和 A–H 分组、模型清单与单次峰值（> 55 只有 MiniMax H3 完整版 bf16 DiT）、开工顺序。还没做：`vae_inventory` 扩到 v0.46.3 的全部 VAE；README / DESIGN / HANDOFF 更新；`docs/PLAN-video.md`（每种视频 VAE + 新图像 VAE 的第一层方案，分组可并行，含 safetensors / GGUF；覆盖 v0.46.3 里量化能跑的全部视频模型，扩散模型和文本编码器分开算；单次峰值 ≤ 55G 为主线，> 55G 单列「等宿主机调 ttm 后再验」；超大模型不分批会 OOM 时才把 TE 和视频模型分开加载；不做 MAGI-2）。
-* **阶段 C（未开始）**：多帧第二层（放开 `_native_reason` 的多帧、探测和估算认 5D、alloc_sim 验上界，DESIGN §9.32）；feat_cache 和因果时间卷积；SVD 整批第二层；LTX 分块 IO 的输出缓冲（音频仍原生）；`bench_vae --frames`；共用的第一层视频钩子（参考 vae-refiner-layer1 f51a6bc）。每项一个功能分支。
+* **阶段 C（进行中）**：多帧第二层入口已合（上面 H1）；剩下feat_cache 和因果时间卷积；SVD 整批第二层；LTX 分块 IO 的输出缓冲（音频仍原生）；`bench_vae --frames`；共用的第一层视频钩子（参考 vae-refiner-layer1 f51a6bc）。每项一个功能分支。
 
 **待办（视频这一轮之后）**：形状变化的 LoRA 的运行时支持——协调者替用户定：这次冲刺先保持报错（原生 v0.46.3 会烤进权重），视频做完再考虑。
 
@@ -258,6 +259,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | **video 分支**：适配 ComfyUI v0.46.3（阶段 A） | 8d89069 |
 | video：PLAN-video.md | d58707f |
 | **video 分支**：LoRA 量化 safetensors 测试 / GGUF / 视频小参数 | 见 `git log --first-parent video`（Merge lora-quant-formats / lora-gguf / lora-video-models） |
+| **video 分支**：H1 / H3 / H6 多帧第二层入口、LTX 进第二层、`EXTRA_CHUNKERS` | Merge video-l2-entry（`git log --first-parent video`） |
 | 本文件 | 本文件所在的提交（`git log --first-parent video` 最上面几条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。

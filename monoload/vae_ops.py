@@ -537,16 +537,26 @@ def is_replacement(fn):
     return getattr(fn, "monoload_replacement", False) is True
 
 
+# Extension point for model-specific op handling (docs/PLAN-video.md, group F: LTX in monoload/vae_ltx.py): each entry is
+# a callable (model, workspace, stats) -> context manager or None, entered (in list order) by every OpChunking after its
+# own replacements are installed and exited (in reverse) before they are restored, also when the block raises. A
+# callable returns None for a model it does not handle. Whatever it installs on the model it must restore itself; an
+# instance attribute it installs should carry monoload_replacement = True (is_replacement) so that recognition
+# (vae_engine.hooked_module) does not take it for a user hook.
+EXTRA_CHUNKERS = []
+
+
 class OpChunking:
     """Install the per-instance conv / attention replacements on `model` for
-    the duration of the `with` block; everything is restored in __exit__,
-    also when the block raises (OOM included)."""
+    the duration of the `with` block, then enter EXTRA_CHUNKERS; everything is
+    restored in __exit__, also when the block raises (OOM included)."""
 
     def __init__(self, model, budget, stats=None):
         self.model = model
         self.budget = int(budget)
         self.stats = stats if stats is not None else OpStats()
         self._saved = []
+        self._extra = None
 
     def __enter__(self):
         known = known_attention()
@@ -576,10 +586,21 @@ class OpChunking:
                     self._saved.append((m, attr, fn))
                     m.__dict__[attr] = _AttnChunker(impl, self.budget, self.stats)
                     self.stats.attn_modules += 1
+            self._extra = contextlib.ExitStack()
+            for make in list(EXTRA_CHUNKERS):
+                cm = make(self.model, self.budget, self.stats)
+                if cm is not None:
+                    self._extra.enter_context(cm)
         except BaseException:
+            self._close_extra()
             self._restore()
             raise
         return self.stats
+
+    def _close_extra(self, *exc):
+        extra, self._extra = self._extra, None
+        if extra is not None:
+            extra.__exit__(*(exc or (None, None, None)))
 
     def _restore(self):
         while self._saved:
@@ -590,7 +611,10 @@ class OpChunking:
                 m.__dict__[attr] = prev
 
     def __exit__(self, *exc):
-        self._restore()
+        try:
+            self._close_extra(*exc)
+        finally:
+            self._restore()
         return False
 
 
