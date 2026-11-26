@@ -38,6 +38,8 @@ _ap.add_argument("--route", help="WxHxF: also decode this size through comfy.sd.
                  "vae.STRIPE_ADAPTERS for the run (needs the multi-frame entry, hook H1): layer 1 chosen, reserved <= its estimate")
 _ap.add_argument("--route-l2", default="", help="comma list of models (2.1, 2.2) whose --route size is also decoded with "
                  "layer 1 switched off (layer 2, H1), for comparison")
+_ap.add_argument("--fill", action="store_true", help="sweep: the tallest stripes that fit the free memory (default: the "
+                 "plan a decode with no budget picks, vae.choose_plan)")
 _ap.add_argument("--sizes", default="832x480,1280x720", help="WxH list of the bf16 sweep")
 _ap.add_argument("--frames", default="5,9,17,33,49,81", help="pixel frame counts of the bf16 sweep (1 + 4 k)")
 _ap.add_argument("--no-native", action="store_true", help="skip native decodes in the sweep (no diff, no native peak)")
@@ -288,8 +290,12 @@ def real_sweep(label, path, table):
             free = mm.get_free_memory(v.device)
             if OPTS.rows:
                 plan = b.plan(v, lat, 0, ws, rows=OPTS.rows, out_bytes=b.output_bytes(v, lat))
-            else:
+            elif OPTS.fill:
                 plan = b.plan(v, lat, free, ws, out_bytes=b.output_bytes(v, lat)) or b.smallest_plan(v, lat, ws, b.output_bytes(v, lat))
+            else:
+                # what a decode picks with no budget (vae.choose_plan: the tallest stripes whose arena stays at that of
+                # 128-row stripes), at its workspace
+                plan, _, ws, _ = mvae.choose_plan(v, lat, b, b.output_bytes(v, lat))
             po = v.process_output
             v.process_output = lambda image: image
 
