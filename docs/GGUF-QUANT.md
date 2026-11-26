@@ -115,20 +115,20 @@ LoRA key 映射是 ComfyUI 自己的（`comfy/lora.py` `model_lora_keys_unet` + 
 
 ### 6.1 真机命令（给验证线程，容器 `comfyui-latest`）
 
-**在真机上跑某个分支（不动共用的 `/srv/monoload`、不重启容器）**：`comfyui-latest` 把宿主机 `/srv/monoload` 挂成 `custom_nodes/monoload`，所以 worktree 放在它下面被忽略的 `.wt/` 里，容器就能直接看到：
+**在真机上跑某个分支（按 `/srv/comfy/GPU-LOCK.md`，验证线程维护）**：worktree 放 `/srv/monoload-wt/<名字>`（`/srv/monoload` 归验证线程，不在里面切分支或改文件）；用 GPU 一律 `/srv/comfy/gpulock run "<线程>: <在干什么>" <命令…>`，锁内用 `COMFY_MONOLOAD_SRC` 让容器把 worktree 挂成 `custom_nodes/monoload`，结束时 gpulock 自动恢复容器：
 
 ```
-cd /srv/monoload && grep -qx '.wt/' .git/info/exclude || echo '.wt/' >> .git/info/exclude
-git fetch origin <分支> && git worktree add --detach .wt/<名字> origin/<分支>
-flock /srv/comfy/gpu.lock docker exec -w /opt/ComfyUI/custom_nodes/monoload/.wt/<名字> comfyui-latest python tests/<脚本>.py …
+cd /srv/monoload && git fetch origin <分支> && git worktree add --detach /srv/monoload-wt/<名字> origin/<分支>
+/srv/comfy/gpulock run "gguf: <在干什么>" bash -c 'COMFY_MONOLOAD_SRC=/srv/monoload-wt/<名字> docker compose -f /opt/comfy-latest/compose.yaml up -d --force-recreate && docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/<脚本>.py …'
+/srv/comfy/gpulock status
 ```
 
-`tests/` 脚本把自己所在仓库放在 `sys.path` 最前，导入的就是 worktree 里的 `monoload`；ComfyUI 只加载 `custom_nodes/monoload/__init__.py`，不会去碰 `.wt/`。`flock` 在宿主机上套在 `docker exec` 外面（锁文件 `/srv/comfy/gpu.lock` 不在容器里）。改了代码在宿主机 worktree 里 `git pull` 即可，容器里立刻生效。要让整个 ComfyUI 服务加载某个分支，才另起临时容器（同镜像、换端口如 8192、把 worktree 挂成 `custom_nodes/monoload`），用完删掉。
+本线程的包装脚本是 `/srv/monoload-wt/gguf-run/gq.sh <日志名> <容器内命令…>`（日志在同目录 `logs/`）。下面的命令都按「worktree 已挂成 `custom_nodes/monoload`」写，前面要套上面这层锁。缺 LoRA 的模型用 `tests/make_model_lora.py <模型文件> <输出>` 生成随机 LoRA（放 `/models/comfy/loras/_monoload_synth/`，只加不改）。
 
-先释放服务器上的模型；GPU 任务用 `flock /srv/comfy/gpu.lock` 串行。文件名按 `/srv/comfy-latest/models-manifest.md` 里实际的填（下面 `<…>` 处）。每条输出里看：`step`（每步秒数）、`GTT peak`、`max|Δ|`（对 native）、`backups`（Monoload 必须是 0）、`GTT after` / `RSS`（和 native 比，不能多出常驻）。
+先释放服务器上的模型；GPU 任务用 gpulock 串行（见上）。文件名按 `/srv/comfy-latest/models-manifest.md` 里实际的填（下面 `<…>` 处）。每条输出里看：`step`（每步秒数）、`GTT peak`、`max|Δ|`（对 native）、`backups`（Monoload 必须是 0）、`GTT after` / `RSS`（和 native 比，不能多出常驻）。
 
 ```
-flock /srv/comfy/gpu.lock docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest sh -c 'curl -s -X POST http://127.0.0.1:8190/free -d "{\"unload_models\":true,\"free_memory\":true}"; for t in test_quant_formats test_gguf_lora test_lora_param_swap test_dtype_paths; do python tests/$t.py 2>&1 | tail -1; done'
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest sh -c 'curl -s -X POST http://127.0.0.1:8190/free -d "{\"unload_models\":true,\"free_memory\":true}"; for t in test_quant_formats test_gguf_lora test_lora_param_swap test_dtype_paths; do python tests/$t.py 2>&1 | tail -1; done'
 ```
 
 1. safetensors 量化（每个一条，`--modes native,monoload,monoload-exact`，`--combo <LoRA> --combo none`）：
@@ -172,13 +172,13 @@ flock /srv/comfy/gpu.lock docker exec -w /opt/ComfyUI/custom_nodes/monoload comf
 
 一个 Q4_K_M 文件里通常同时有 Q4_K 和 Q6_K（有的还有 Q5_K、F32），逐层脚本会按类型分别报。
 
-**命令**（GPU 任务用 flock 串行）：
+**命令**（每条套 gpulock，见 §6.1 开头）：
 
 ```
-flock /srv/comfy/gpu.lock docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/check_gguf_kquant.py --gguf <wan2.1-t2v-14b-Q4_K_M.gguf>
-flock /srv/comfy/gpu.lock docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/check_gguf_kquant.py --gguf <某 Q3_K_M / Q5_K_M / Q6_K / Q8_0 文件>
-flock /srv/comfy/gpu.lock docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/check_gguf_kquant.py --gguf <umt5 TE .gguf>
-flock /srv/comfy/gpu.lock docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/bench_lora.py --unet-gguf <wan2.1-t2v-14b-Q4_K_M.gguf> --clip-gguf <umt5 .gguf> --clip-type wan --latent 16,9,60,104 --steps 4 --cfg 1 --combo <不含小参数 key 的 Wan LoRA> --combo none --modes native,monoload,monoload-exact
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/check_gguf_kquant.py --gguf <wan2.1-t2v-14b-Q4_K_M.gguf>
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/check_gguf_kquant.py --gguf <某 Q3_K_M / Q5_K_M / Q6_K / Q8_0 文件>
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/check_gguf_kquant.py --gguf <umt5 TE .gguf>
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/bench_lora.py --unet-gguf <wan2.1-t2v-14b-Q4_K_M.gguf> --clip-gguf <umt5 .gguf> --clip-type wan --latent 16,9,60,104 --steps 4 --cfg 1 --combo <不含小参数 key 的 Wan LoRA> --combo none --modes native,monoload,monoload-exact
 ```
 
 **看哪里**：逐层脚本最后的 `== N checks, 0 failed` 和每类型三行 PASS；表里 exact / fused 的毫秒数和原生同量级。整模型看 summary 的 max|Δ| 列（monoload-exact 那段应为 0）、backups 列、GTT peak 表。
