@@ -23,14 +23,15 @@
 * **LoRA：量化 safetensors / GGUF / 视频小参数（lora-quant-formats、lora-gguf、lora-video-models 三次合并）**——CPU 小测试全过，待真机。设计和进度在 `docs/GGUF-QUANT.md`。
   * 各种量化 safetensors（fp8 e4m3 / e5m2、int8_tensorwise、nvfp4、mxfp8、convrot_w4a4、asym_w4a8_int8、w6a8_int8；fp8 的三种来源：文件内 `comfy_quant` / 头部 `_quantization_metadata` / 旧 `scaled_fp8` 标记）：hotpatch 不用改，`tests/test_quant_formats.py`（66 项）锁住「在反量化临时权重上合并、不量化回去、无备份」。
   * ComfyUI-GGUF（UnetLoaderGGUF / CLIPLoaderGGUF，按结构找，`monoload/gguf.py`）：量化层合并进 GGMLLayer 反量化出的临时权重（exact = 原生 GGUF 的算法逐位一致，默认 fused），F16 / F32 层也运行时合并、不备份（原生会备份）；hook LoRA 也支持（原生 GGUF 对量化层不应用 hook）；保存 GGUF 模型报 `gguf_save`；Info 节点多一行 GGUF 统计。每个 prompt 开始重新找一次（自定义节点可能比 Monoload 后加载）。`tests/test_gguf_lora.py`（38 项）。
-  * 不是 comfy.ops 层 weight / bias 的参数（Wan `modulation`、LTX `scale_shift_table` 等、纯 torch 层）：`MonoloadParamSwap`，所属模块 forward 期间换上合并好的临时参数，出来换回，无备份，原生算法逐位一致。**原生 v0.46.3 加载时静默丢弃这些 key**（`_load_list` 跳过非叶子模块），所以带这类 key 的 LoRA 和原生比 max|Δ| 不为 0。`tests/test_lora_param_swap.py`（44 项）；`test_lora_hot` 里原来的「纯 torch 层报错」改成「换参数」。
+  * 不是 comfy.ops 层 weight / bias 的参数（Wan `modulation`、LTX `scale_shift_table` 等、纯 torch 层）：`MonoloadParamSwap`，所属模块 forward 期间换上合并好的临时参数，出来换回，无备份，原生算法逐位一致。**原生 v0.46.3 加载时静默丢弃这些 key**（`_load_list` 跳过非叶子模块），所以带这类 key 的 LoRA 和原生比 max|Δ| 不为 0（已定：不加「跟原生一样丢掉」的开关）。`tests/test_lora_param_swap.py`（44 项）；`test_lora_hot` 里原来的「纯 torch 层报错」改成「换参数」。
+  * K-quant 等云端造不出的 GGUF 类型：`tests/check_gguf_kquant.py`（真机逐层对原生），计划见 `docs/GGUF-QUANT.md` §6.2。GGUF VAE 没有加载器（H3 和核心都没有），H7 已取消。
   * `bench_lora.py` 加了 `--unet-gguf` / `--clip-gguf` / `--latent C,T,H,W` / `--batch`，每个组合报 GTT 峰值（20 ms 采样）。
 * **阶段 B**：**`docs/PLAN-video.md` 已写（合并见 §7）**——共用钩子 H1–H7、各 VAE 的第一层方案和 A–H 分组、模型清单与单次峰值（> 55 只有 MiniMax H3 完整版 bf16 DiT）、开工顺序。还没做：`vae_inventory` 扩到 v0.46.3 的全部 VAE；README / DESIGN / HANDOFF 更新；`docs/PLAN-video.md`（每种视频 VAE + 新图像 VAE 的第一层方案，分组可并行，含 safetensors / GGUF；覆盖 v0.46.3 里量化能跑的全部视频模型，扩散模型和文本编码器分开算；单次峰值 ≤ 55G 为主线，> 55G 单列「等宿主机调 ttm 后再验」；超大模型不分批会 OOM 时才把 TE 和视频模型分开加载；不做 MAGI-2）。
 * **阶段 C（未开始）**：多帧第二层（放开 `_native_reason` 的多帧、探测和估算认 5D、alloc_sim 验上界，DESIGN §9.32）；feat_cache 和因果时间卷积；SVD 整批第二层；LTX 分块 IO 的输出缓冲（音频仍原生）；`bench_vae --frames`；共用的第一层视频钩子（参考 vae-refiner-layer1 f51a6bc）。每项一个功能分支。
 
 **待办（视频这一轮之后）**：形状变化的 LoRA 的运行时支持——协调者替用户定：这次冲刺先保持报错（原生 v0.46.3 会烤进权重），视频做完再考虑。
 
-**未决（等用户定）**：视频 LoRA 的 modulation / scale_shift_table 这类 key，Monoload 应用、原生丢弃，要不要加开关「跟原生一样丢掉」（现在：应用）；Refiner 第一层分支 vae-refiner-layer1；polish-after-ui-test 的复测（换底座后一起测）。
+**未决（等用户定）**：Refiner 第一层分支 vae-refiner-layer1；polish-after-ui-test 的复测（换底座后一起测）。
 
 ## 1. 当前状态
 

@@ -73,6 +73,8 @@
 6. **保存**：CPU 上实测（v0.46.3 + H3）原生 GGUF 根本存不出来：量化层的 `state_dict` 是 meta 设备上的 uint8 假数据，没标 `comfy_patched_weights` 的层在 `LazyCastingParam` 里直接 `RuntimeError: only Tensors of floating point dtype can require gradients`。**决定（替用户定，可改）**：Monoload 管着的 GGUF 模型（含 GGML 量化层）进 `model_state_dict_for_saving` 时直接报 `MonoloadUnsupportedError`，写明「GGUF 模型不能存成 checkpoint，原生也不行」，不做半份文件、不静默丢 LoRA。Q8_CR 文件里的 int8 层是 `QuantizedTensor`，单独看可以存，但同一模型的其余部分仍是 GGML，所以整模型一样报错。
 7. **LoRA Settings / Info**：设置在 `model_options` 里，GGUF clone 照样复制；Info 加一行「GGUF：N 个量化层 / M 个 F16·F32 层被 LoRA 改到」。
 
+8. **GGUF VAE：这条路不存在（2026-11-26 核实）**。H3 6d33de2 只注册 `unet_gguf` / `clip_gguf` 两个文件夹，节点只有 Unet / CLIP 加载器（含 Dual / Triple / Quadruple 和 Dynamic VRAM 版），没有 VAE 加载节点；ComfyUI v0.46.3 核心也不认 `.gguf` 的 VAE（`VAELoader` 只列 `vae` 文件夹的 safetensors / pt 类扩展名，核心代码里没有任何 gguf 处理）。所以 VAE 侧没有 GGML 权重，PLAN-video 里设想的 H7（GGUF VAE 每次解码只反量化一次）已由协调者取消。以后真有 GGUF VAE 加载器，再按它读进来的权重结构（GGMLTensor 还是别的）重新设计；注意「解码期间缓存全部反量化结果」会让量化原件和整套反量化权重同时常驻，和 §1 的「只能有一份权重」冲突，做之前要问用户。
+
 **内存**：常驻 = GGUF 量化权重 + LoRA 文件（CPU）+ LoRA 张量在计算设备上的一份缓存（和现在的 safetensors 路径相同；原生 GGUF 默认每次 forward 把 patch 从 CPU 搬一次，不常驻）。每层临时：反量化结果一份（原生 GGUF 也有），exact 再加 LoRA 乘积的 fp32 中间量。没有备份。
 
 ## 4. 设计：safetensors 各格式（分支 `lora-quant-formats`）
@@ -102,7 +104,7 @@ LoRA key 映射是 ComfyUI 自己的（`comfy/lora.py` `model_lora_keys_unet` + 
 - 合并一律用原生自己的算法，逐位一致（lora 计算 dtype → `calculate_weight` → 按 key 种子随机舍入回参数 dtype；GGUF 的 F16 / F32 张量用 ComfyUI-GGUF 的 fp32 + 种子 0），fused / exact 两种模式下都一样（参数小，不用快路径）。量化参数先反量化，结果不量化回去。
 - 参数留在 offload 设备（CPU）时，临时张量放到 patcher 的 load device 上合并，不在 CPU 上算。
 - 原生 load 不调用的 key 在 Monoload 的 `_load` 结束后统一装上（`_install_param_swaps`）；叶子层（纯 torch 层）走原来的 `patch_weight_to_device` 入口。卸载 / 换 hook 时和其它运行时补丁一起拆掉。
-- **与原生的差别**：带这类 key 的 LoRA，Monoload 会真正应用它们，原生不会，所以「和原生的 max|Δ|」在这类 LoRA 上不为 0（这是原生的缺陷，Monoload 的结果是 LoRA 作者的本意；对照基准用「原生加载 + 对这些 key 手动调原生 `patch_weight_to_device`」）。没有这类 key 的 LoRA 与原生行为不变。
+- **与原生的差别（已定，不加开关）**：带这类 key 的 LoRA，Monoload 会真正应用它们，原生不会，所以「和原生的 max|Δ|」在这类 LoRA 上不为 0。LoRA 本来就该生效，原生丢掉是原生的缺陷，所以**不提供**「像原生那样丢掉」的开关（协调者 2026-11-26 定）。对照基准用「原生加载 + 对这些 key 手动调原生 `patch_weight_to_device`」。没有这类 key 的 LoRA 与原生行为不变。
 - 已核对 v0.46.3 源码：Wan（model / ar_model / animate2）、LTX（model / av_model）读这些参数都在所属模块自己的 forward 里，hook 时机覆盖得到。
 - 测试：`tests/test_lora_param_swap.py`（44 项），`tests/test_gguf_lora.py` 加了 F32 modulation。
 
@@ -132,9 +134,52 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest sh -c 'curl -s 
    * 带 modulation / scale_shift_table key 的 LoRA：native 不应用它们（§5），max|Δ| 不为 0 是预期；看 monoload 和 monoload-exact 之间 max|Δ| 小、backups 0。
    * 顺便重跑检查 2（视频 LoRA 的 key 里有没有小参数），结果写回 `/srv/comfy-latest/logs/gguf_checks.out`。
 
+### 6.2 K-quant 真机测试计划
+
+云端的 gguf-py 量化不出 K-quant（Q2_K…Q6_K 抛 NotImplementedError），IQ4_NL / IQ4_XS 也一样，所以这些类型只能在真机上用真文件验。ComfyUI-GGUF-H3 能反量化的类型：BF16、Q8_0、Q5_1、Q5_0、Q4_1、Q4_0、Q6_K、Q5_K、Q4_K、Q3_K、Q2_K、IQ4_NL、IQ4_XS（`dequant.py` 的表）；Q8_CR 的 int8 层走 ComfyUI 原生 `QuantizedTensor`，归 §4 的 int8_tensorwise。
+
+**两层验证**：
+
+1. **逐层（主判据，便宜）**：`tests/check_gguf_kquant.py --gguf <文件>`。从文件里每种量化类型各取前 `--per-type`（默认 2）个二维张量，只从 mmap 里读这几个张量，单独搭一层 GGMLOps Linear 放到 GPU 上，配一个随机 LoRA（rank 16），和原生 ComfyUI-GGUF（卸掉 Monoload）比。判据：
+   * exact 对原生 **max|Δ| = 0**（同一个反量化函数、同一个 `calculate_weight`，GPU 上也应逐位一致）；
+   * fused 在 `4 · u · max|y|` 之内（u：bf16 取 $2^{-8}$，fp16 / fp32 取 $2^{-11}$）；
+   * Monoload backups = 0，加载后常驻显存不比「不带 LoRA」多（容差 1 MiB）；
+   * 报每次 forward 毫秒数和峰值增量（反量化临时量 + 合并），和原生同量级。
+2. **整模型（端到端）**：`tests/bench_lora.py --unet-gguf …`，`--modes native,monoload,monoload-exact`，LoRA 选不含 modulation / scale_shift_table key 的（否则 max|Δ| 按 §5 不为 0）。判据：monoload-exact 对 native 的 latent max|Δ| = 0、backups 0、GTT 峰值和常驻不高于 native、每步时间比值。
+
+**文件清单**（按 `/srv/comfy-latest/models-manifest.md` 里实际有的选；每种类型至少一个文件，优先已经下载的，缺的类型标「缺文件」而不是补下大文件）：
+
+| 类型 | 用途 | 逐层 | 整模型 |
+|---|---|---|---|
+| Q4_K_M（混 Q4_K / Q6_K） | 视频模型主力量化（Wan 2.1 / 2.2 14B） | 必做 | 必做（Wan T2V，`--latent 16,9,60,104 --steps 4`） |
+| Q5_K_M（混 Q5_K / Q6_K） | 同上 | 必做 | 可选 |
+| Q3_K_M / Q3_K_S（混 Q3_K / Q4_K / Q5_K） | 大模型压显存 | 必做 | 可选 |
+| Q2_K | 最小档 | 有文件就做 | 不做 |
+| Q6_K / Q8_0 | 高质量档 | 必做 | 可选 |
+| Q4_0 / Q4_1 / Q5_0 / Q5_1 | 旧量化 | 有文件就做（CPU 已覆盖 Q4_0 / Q5_1 / Q8_0） | 不做 |
+| IQ4_NL / IQ4_XS | 少见 | 有文件就做 | 不做 |
+| 文本编码器 GGUF（umt5-xxl Q8_0 / Q5_K_M 等） | CLIPLoaderGGUF 路径 | 必做一个 | 跟着 Wan 整模型跑（`--clip-gguf`） |
+
+一个 Q4_K_M 文件里通常同时有 Q4_K 和 Q6_K（有的还有 Q5_K、F32），逐层脚本会按类型分别报。
+
+**命令**（GPU 任务用 flock 串行）：
+
+```
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comfy/gpu.lock python tests/check_gguf_kquant.py --gguf <wan2.1-t2v-14b-Q4_K_M.gguf>
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comfy/gpu.lock python tests/check_gguf_kquant.py --gguf <某 Q3_K_M / Q5_K_M / Q6_K / Q8_0 文件>
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comfy/gpu.lock python tests/check_gguf_kquant.py --gguf <umt5 TE .gguf>
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comfy/gpu.lock python tests/bench_lora.py --unet-gguf <wan2.1-t2v-14b-Q4_K_M.gguf> --clip-gguf <umt5 .gguf> --clip-type wan --latent 16,9,60,104 --steps 4 --cfg 1 --combo <不含小参数 key 的 Wan LoRA> --combo none --modes native,monoload,monoload-exact
+```
+
+**看哪里**：逐层脚本最后的 `== N checks, 0 failed` 和每类型三行 PASS；表里 exact / fused 的毫秒数和原生同量级。整模型看 summary 的 max|Δ| 列（monoload-exact 那段应为 0）、backups 列、GTT peak 表。
+
+**失败怎么判**：exact 不为 0 → 记下类型和张量名，多半是该类型反量化输出的 dtype / 设备和 `get_weight` 不一致（看 `_call_ggml`）；fused 超界但 exact 为 0 → 只是融合路径的舍入，报数据不算失败；常驻多出 → 查是否有 `GGMLTensor.patches` 残留或 LoRA 缓存重复。
+
 ## 7. 已定的事（2026-11-26，协调者替用户定）
 
 * GGUF + 保存：明确报错（§3.6）。
+* 视频小参数（modulation / scale_shift_table 等）：一律按 LoRA 应用，不加「像原生那样丢掉」的开关（§5）。
+* GGUF VAE：没有加载器，H7 取消（§3.8）。
 * 视频 LoRA 改到 modulation / scale_shift_table / `.diff` / `.diff_b` 这类非 comfy.ops 小参数：按 §5 的 hook 方案支持（模块 forward 期间临时换上合并好的参数，不留备份），目标所有视频模型都能用，不等 LXC 上的 LoRA key 扫描结果。
 * Dynamic VRAM：新容器继续 `--gpu-only`；Monoload 在 Dynamic VRAM 下报清楚的错即可，暂不兼容。
 * 分支：阶段 A 合进 `video` 后从 `video` 拉 feature 分支，`--no-ff` 合回 `video`；本文件一起带进 `video`。
@@ -149,3 +194,4 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest sh -c 'curl -s 
 * 2026-11-26：GGUF 适配器草稿（草稿分支，基于 dev）：`monoload/gguf.py`（按结构找 GGUFModelPatcher / GGMLLayer / dequant.is_quantized；替换 patch_weight_to_device、包 load 打「GGUF 强制」标记、包 GGMLLayer.cast_bias_weight 只调 Monoload 的运行时 patch）；hotpatch：`_ADAPTED_PWTD` 让 `_active` 认适配后的子类、`_load` 认 GGUF 强制标记、`MonoloadRuntimePatch._call_ggml`（量化层：exact = 原生 GGUF 的 calculate_weight，fused = addmm_）、F16/F32 GGML 参数 exact 用 fp32 + seed 0（与原生 GGUF 烘焙一致）、保存含 GGML 量化层的模型报 `gguf_save`；`install()` 和每个 prompt 开始（release 的 execute_async 包装）调 `find_subclass_adapters()`。CLIPLoaderGGUF 也用 GGUFModelPatcher，一并覆盖。`tests/test_gguf_lora.py`：Q8_0 / Q4_0 / Q5_1 / F16 权重 + F32 bias（带 diff），fp32 / bf16 × 全量 / lowvram：exact 与原生 GGUF 逐位一致，fused 在界内，无备份、GGML 字节不变、unpatch 干净、保存报错：31 项全过。回归：test_dtype_paths 198、test_quant_formats 66、test_lora_lowvram_hook 14、test_master_switch 19、test_messages 15 全过。CPU venv 里 H3 用软链 `ComfyUI/custom_nodes/ComfyUI-GGUF` 挂上。gguf-py 不支持 K-quant 量化（Q4_K 等），合成测试用 Q4_0 / Q5_1 代替；K-quant 留给真机。
 * 2026-11-26：阶段 A 合进 video（8d89069）后，从 video 拉 lora-quant-formats / lora-gguf / lora-video-models 依次搬过去（hotpatch 一处冲突：`_load` 的 force_patch 注释），每个分支复跑测试后 `--no-ff` 合回 video。GGUF 加了 hook LoRA 测试（原生 GGUF 对量化层不应用 hook；参照 = 原生 ComfyUI 在反量化模型上的 hook，逐位一致）和 Info 一行；`bench_lora.py` 加 GGUF 加载、视频 latent、GTT 峰值。核实：H3 6d33de2 和 ComfyUI v0.46.3 都没有 GGUF VAE 的加载节点（H3 只注册 unet_gguf / clip_gguf）。
 * 2026-11-26：视频小参数（§5）：发现原生 v0.46.3 的 `_load_list` 跳过非叶子模块，Wan modulation / LTX scale_shift_table 上的 LoRA 被原生静默丢弃（CPU 实测，见 §5）。实现 `MonoloadParamSwap`（所属模块 forward 前后换参数，原生算法逐位一致，无备份），`_load` 后对原生不调用的 key 统一装上；根模型自己的参数（无点号 key）也支持；`gguf.dequantize` 给量化 GGML 参数用。`tests/test_lora_param_swap.py` 44 项全过（fp32 / bf16 × 全量 / lowvram × exact / fused + hook LoRA）；`test_gguf_lora` 加非叶子 F32 modulation，35 项全过；`test_lora_hot` 里「纯 torch 层报错」改成「装上换参数、卸载后拆掉」（真机测试，云端没跑）。回归 test_dtype_paths 198、test_quant_formats 66、test_lora_lowvram_hook 14、test_master_switch 19、test_messages 15 全过。
+* 2026-11-26：协调者回复：video 由适配线程推送（快进到 10b0392）；视频小参数不加开关；H7 取消。补 §3.8（GGUF VAE 不存在）、§6.2（K-quant 真机计划）和 `tests/check_gguf_kquant.py`（逐层对原生，云端用 Q8_0 / Q4_0 / Q5_1 小文件跑通 10 项）。
