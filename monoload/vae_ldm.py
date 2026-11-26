@@ -31,6 +31,10 @@ kept whole (saves) is the GroupNorm scheme:
     B  the output of every level below full resolution (H/4, H/2)
     C  B and the output of every block at full resolution
 
+ComfyUI v0.46.3 gives the Flux 2 decoder (ddconfig fused_norm=True) a fused path (Decoder.forward_fused, strip kernels
+of comfy-kitchen) when model.fused_norm_served(device, dtype) holds; a managed decode turns it off for its duration
+(vae_ops.unfused_norms), so the module calls are the plain ones above.
+
 Recognized only when every piece is the one checked here (exact classes,
 kernels, paddings, no attention in the up levels, no time dimension / carried
 convs, no tanh_out / give_pre_end, no hooks); anything else stays on layer 2

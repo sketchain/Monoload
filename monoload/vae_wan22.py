@@ -13,6 +13,12 @@ autopad="causal_zero" fast path), Resample("upsample3d") only marks its cache
     -> decoder.head[*] -> unpatchify(patch_size=2)
 
 and calling the modules without a cache (feat_cache None) computes the same.
+ComfyUI v0.46.3: a 4D latent (the Qwen Image 2.1 VAE, WanVAE(patch_size=1, temporal_kernel=1, z 64, RGBA head),
+latent_dim 2) decodes exactly so, without a feat_cache; a 5D single frame still passes one. Without a cache the
+ResidualBlocks, the Resample's upsampling and the DupUp3D sum run in row strips of their own (vae2_2.strip_apply,
+2**24 elements, exact halos): the same values, fewer live tensors than counted below (an upper bound). The Qwen
+Image 2.1 VAE has no unpatchify (patch_size 1) and 1-frame temporal kernels (the same module calls for one frame).
+
 Each Up_ResidualBlock is x_main = ResidualBlocks then Resample (nearest x2 +
 3x3 conv) on x, plus avg_shortcut = DupUp3D(x, first_chunk) (channels repeated,
 depth-to-space 2x2, for a temporal block the last of the two time slices), the
@@ -48,8 +54,13 @@ from .vae_engine import CONV, POINT, RES, Unit, conv_extra, conv_io
 from .vae_wan import _causal_conv, _rms, attention_peak, attn_split, no_dropout, res_peak
 
 DUPUP = "dupup"       # an Up_ResidualBlock with its DupUp3D shortcut (scale 2)
-UNPATCH = "unpatch"   # unpatchify(patch_size=2) of the decoder output (scale 2)
-PATCH = 2             # WanVAE.decode's unpatchify patch size (62b3c94)
+UNPATCH = "unpatch"   # unpatchify(patch_size) of the decoder output (scale patch_size)
+
+
+def patch_size(fsm):
+    """WanVAE.decode's unpatchify patch size: 2 for the Wan 2.2 VAE, 1 for the Qwen Image 2.1 VAE (ComfyUI v0.46's
+    WanVAE(patch_size=...); a WanVAE without the attribute is the older fixed 2)."""
+    return int(getattr(fsm, "patch_size", 2))
 
 
 # ---------------------------------------------------------------------------
@@ -180,8 +191,11 @@ def wan22_structure(fsm):
         return "decoder.head: " + e, None
     if int(head[0].gamma.shape[0]) != c or conv_io(head[2])[0] != c:
         return "decoder.head on {} channels gets {}".format(conv_io(head[2])[0], c), None
-    if conv_io(head[2])[1] % (PATCH * PATCH):
-        return "decoder.head gives {} channels (unpatchify {}x{} needs a multiple of {})".format(conv_io(head[2])[1], PATCH, PATCH, PATCH * PATCH), None
+    p = patch_size(fsm)
+    if p not in (1, 2):
+        return "patch size {} (1 or 2 expected)".format(p), None
+    if conv_io(head[2])[1] % (p * p):
+        return "decoder.head gives {} channels (unpatchify {}x{} needs a multiple of {})".format(conv_io(head[2])[1], p, p, p * p), None
     h = eng.hooked_module(fsm)
     if h:
         return "module {} has a forward hook or an instance-level forward".format(h), None
@@ -199,8 +213,19 @@ class _UpBlock:
         return self.blk(x, None, [0], True)
 
 
-def _unpatch(x):
-    return wan22.unpatchify(x, patch_size=PATCH)
+def _unpatch(x, p=2):
+    return wan22.unpatchify(x, patch_size=p)
+
+
+class _Unpatch:
+    """unpatchify(patch_size) of the decoder output, per stripe (depth-to-space p x p, halo 0)."""
+    __slots__ = ("p",)
+
+    def __init__(self, p):
+        self.p = p
+
+    def __call__(self, x):
+        return _unpatch(x, self.p)   # looked up at call time (tests/test_vae_wan22.py injects a wrong one)
 
 
 def _res_macs(rb):
@@ -235,7 +260,9 @@ def build_units(fsm):
     units.append(Unit(POINT, rms, 0, 1, c, c, "decoder.head.0"))
     units.append(Unit(POINT, silu, 0, 1, c, c, "decoder.head.1"))
     units.append(Unit(CONV, conv, 1, 1, cin, cout, "decoder.head.2", 9 * cin * cout))
-    units.append(Unit(UNPATCH, _unpatch, 0, PATCH, cout, cout // (PATCH * PATCH), "unpatchify"))
+    p = patch_size(fsm)
+    if p > 1:
+        units.append(Unit(UNPATCH, _Unpatch(p), 0, p, cout, cout // (p * p), "unpatchify"))
     return prefix, units
 
 
@@ -243,6 +270,7 @@ def signature(fsm, units):
     """Structure key (self-test cache)."""
     dec = fsm.decoder
     return ("WanVAE2.2", int(fsm.conv2.weight.shape[0]), tuple(dec.dim_mult), int(dec.dim), int(dec.num_res_blocks),
+            patch_size(fsm),   # not the temporal kernel: the fp32 copy keeps one time slice of every kernel (one frame reads no other)
             tuple((u.kind, u.cin, u.cout, (u.extra or {}).get("ft")) for u in units))
 
 
@@ -374,7 +402,16 @@ class Wan22Stripe(eng.StripeAdapter):
         return retained_bytes(self.fsm.decoder, h, w, e)
 
     def output_shape(self, samples):
+        if samples.ndim == 4:   # an image VAE's latent (Qwen Image 2.1: latent_dim 2): WanVAE.decode's 4D path
+            return (samples.shape[0], self.out_channels, int(samples.shape[-2]) * self.scale, int(samples.shape[-1]) * self.scale)
         return (samples.shape[0], self.out_channels, samples.shape[2], int(samples.shape[-2]) * self.scale, int(samples.shape[-1]) * self.scale)
+
+    def run(self, vae, samples_in, plan, budget_ws, stats):
+        # ComfyUI v0.46 WanVAE.decode of a 4D latent: decoder(conv2(z.unsqueeze(2)), first_chunk=True), unpatchify,
+        # squeeze(2) -- the same module calls as one frame, without a feat_cache. The stripes work on the 5D view.
+        if samples_in.ndim == 4:
+            return super().run(vae, samples_in.unsqueeze(2), plan, budget_ws, stats).squeeze(2)
+        return super().run(vae, samples_in, plan, budget_ws, stats)
 
     # self-test
 
@@ -402,11 +439,13 @@ class Wan22Stripe(eng.StripeAdapter):
         fsm = self.fsm
         dec = fsm.decoder
         holder = torch.nn.Module()
+        holder.patch_size = patch_size(fsm)   # WanVAE.decode (reference_decode) reads it
         z = int(fsm.conv2.weight.shape[0])
         with eng.skeleton():
             holder.conv2 = wan.CausalConv3d(z, z, 1)
             holder.decoder = wan22.Decoder3d(dec.dim, dec.z_dim, list(dec.dim_mult), dec.num_res_blocks, list(dec.attn_scales),
-                                             list(dec.temperal_upsample), 0.0)
+                                             list(dec.temperal_upsample), 0.0, out_channels=conv_io(dec.head[2])[1],
+                                             temporal_kernel=int(dec.conv1.weight.shape[2]))
             for m in holder.modules():
                 if isinstance(m, wan.CausalConv3d) and m.weight.shape[2] > 1:
                     m.weight = torch.nn.Parameter(torch.empty(m.weight.shape[:2] + (1,) + m.weight.shape[3:]), requires_grad=False)
@@ -458,10 +497,14 @@ def retained_bytes(dec, h, w, e):
 
 def decoder_terms(vae, samples):
     """The layer-2 estimate's terms (vae._decoder_terms) for any vae2_2.WanVAE, by its class: a forward hook or
-    vae_options keep the stripe decoder off it (match), not the feat_cache clones of its own decode. None for others."""
+    vae_options keep the stripe decoder off it (match), not the feat_cache clones of its own decode. None for others.
+    A 4D latent (ComfyUI v0.46: the Qwen Image 2.1 VAE, an image VAE) takes WanVAE.decode's path without a
+    feat_cache: nothing retained."""
     fsm = getattr(vae, "first_stage_model", None)
     if type(fsm) is not wan22.WanVAE or type(getattr(fsm, "decoder", None)) is not wan22.Decoder3d:
         return None
+    if samples.ndim == 4:
+        return {"retained": 0}
     return {"retained": retained_bytes(fsm.decoder, int(samples.shape[-2]), int(samples.shape[-1]), mm.dtype_size(vae.vae_dtype))}
 
 
@@ -473,7 +516,7 @@ def match(vae, samples, vae_options):
         return None, reason
     if vae_options:
         return None, "vae_options {} given".format(sorted(vae_options))
-    if samples.ndim != 5 or samples.shape[2] != 1:
+    if not (samples.ndim == 4 or (samples.ndim == 5 and samples.shape[2] == 1)):
         return None, "latent is not a single frame ({})".format(list(samples.shape))
     if samples.shape[1] != fsm.conv2.weight.shape[1]:
         return None, "latent has {} channels, conv2 expects {}".format(samples.shape[1], fsm.conv2.weight.shape[1])
@@ -486,6 +529,7 @@ class _Shim:
     def __init__(self, holder):
         self.conv2 = holder.conv2
         self.decoder = holder.decoder
+        self.patch_size = holder.patch_size
         self._holder = holder
 
     def named_modules(self):

@@ -203,7 +203,7 @@ def attention_tests():
     # VAE): chunked the same way (review 2026-10 item 12)
     from comfy.ldm.seedvr import vae as seedvr_vae
     torch.manual_seed(4)
-    sa = seedvr_vae.Attention(32, heads=1, dim_head=32, norm_num_groups=8, residual_connection=True)
+    sa = seedvr_vae.Attention(32, norm_num_groups=8, eps=1e-6)   # ComfyUI v0.46: (query_dim, norm_num_groups, eps), residual included
     with torch.no_grad():
         for p_ in sa.parameters():
             p_.copy_(torch.randn(p_.shape) * 0.2)

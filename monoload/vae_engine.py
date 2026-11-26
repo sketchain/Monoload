@@ -1024,7 +1024,8 @@ class StripeAdapter:
         pixel_samples = None
         if not OUTPUT_IN_ARENA:
             mm.soft_empty_cache()
-            pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
+            with vae_ops.malloc_graph_paused():
+                pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
         arena = bool(plan.arena) and arena_supported(vae.device)
         if arena:
             reserve_arena(vae.device, plan.arena)
@@ -1048,7 +1049,8 @@ class StripeAdapter:
                 elif arena and CKPT_LOW and not OUTPUT_IN_ARENA:
                     ckpt = move_low(ckpt, vae.device)
                 if pixel_samples is None:
-                    pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
+                    with vae_ops.malloc_graph_paused():
+                        pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
                 dst = pixel_samples[i:i + 1]
 
                 def write(o0, o1, rows, dst=dst):
