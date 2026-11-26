@@ -574,7 +574,7 @@ def _native_reason(vae, samples):
     if getattr(samples, "is_nested", False):
         return msg("vae.nr_nested")
     model = type(fsm).__name__
-    if getattr(fsm, "comfy_has_chunked_io", False):
+    if getattr(fsm, "comfy_has_chunked_io", False) and not vae_video.chunked_io_managed(fsm):
         return msg("vae.nr_chunked_io", model=model)
     ld = getattr(vae, "latent_dim", 2)
     if ld not in (2, 3):
@@ -587,12 +587,11 @@ def _native_reason(vae, samples):
     if ld == 3:
         if samples.ndim != 5:
             return msg("vae.nr_dims", ndim=samples.ndim, ld=ld)
-        if samples.shape[2] != 1:
-            if not vae_video.multiframe(fsm):
-                return msg("vae.nr_multiframe", t=samples.shape[2], model=model,
-                           managed=", ".join(sorted("{}.{}".format(c.__module__.rsplit(".", 1)[-1], c.__name__) for c in vae_video.MULTIFRAME)))
-            if _PEAK_METER[0](getattr(vae, "device", None)) is None:
-                return msg("vae.nr_mf_no_meter", t=samples.shape[2], dev=getattr(vae, "device", None))
+        if samples.shape[2] != 1 and not vae_video.multiframe(fsm):
+            return msg("vae.nr_multiframe", t=samples.shape[2], model=model,
+                       managed=", ".join(sorted("{}.{}".format(c.__module__.rsplit(".", 1)[-1], c.__name__) for c in vae_video.MULTIFRAME)))
+        if (samples.shape[2] != 1 or vae_video.measured(fsm)) and _PEAK_METER[0](getattr(vae, "device", None)) is None:
+            return msg("vae.nr_mf_no_meter", t=samples.shape[2], dev=getattr(vae, "device", None))
     mixes, ops = _model_traits(fsm)
     if mixes:
         return msg("vae.nr_batch_time", model=model)
@@ -625,6 +624,12 @@ class _UnboundedDecode(Exception):
 
 def _multiframe(samples):
     return samples.ndim == 5 and int(samples.shape[2]) > 1
+
+
+def _measured(vae, samples):
+    """Whether layer 2's estimate is the measured probe (_probe_mf): a multi-frame latent, or a model vae_video always
+    measures (LTX, a single frame included)."""
+    return _multiframe(samples) or (samples.ndim == 5 and vae_video.measured(vae.first_stage_model))
 
 
 class _CudaPeak:
@@ -664,7 +669,7 @@ def _probe_key(vae, samples):
     first-stage model in another dtype, and the probe's bytes per pixel are in the decode's dtype. Multi-frame: and the
     number of latent frames (the probe measures the whole decode)."""
     key = (int(samples.shape[1]), samples.ndim, str(vae.vae_dtype))
-    return key + (int(samples.shape[2]),) if _multiframe(samples) else key
+    return key + (int(samples.shape[2]),) if _measured(vae, samples) else key
 
 
 def _probe(vae, samples, vae_options):
@@ -830,7 +835,7 @@ def _output_shape(vae, z):
     fsm = vae.first_stage_model
     if getattr(fsm, "comfy_has_chunked_io", False):
         return tuple(fsm.decode_output_shape(z.shape))
-    if _multiframe(z) and vae_video.multiframe(fsm):
+    if _measured(vae, z) and vae_video.multiframe(fsm):
         r = vae.spacial_compression_decode()
         return (int(z.shape[0]), getattr(vae, "output_channels", 3), vae_video.output_frames(vae, int(z.shape[2])),
                 int(z.shape[-2]) * r, int(z.shape[-1]) * r)
@@ -1312,7 +1317,7 @@ def _layer2_estimate(vae, samples_in, vae_options, ws):
     """(estimate dict, probe or None) of a layer-2 decode with workspace ws; the
     shape probe (first decode of this model and latent layout) loads the weights."""
     probe = _PROBES.get(vae.first_stage_model, {}).get(_probe_key(vae, samples_in))
-    if probe is None and _multiframe(samples_in):
+    if probe is None and _measured(vae, samples_in):
         big = samples_in[0:1, ..., :MF_PROBE_SIZES[-1], :MF_PROBE_SIZES[-1]]
         _load_models(vae, estimate(vae, big, 0, copies=8)["total"])
         try:

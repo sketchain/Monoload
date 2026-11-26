@@ -3,8 +3,13 @@ output reaches the pixel buffer (H3), and the shape probe that bounds their memo
 docs/DESIGN.md §9.35).
 
   MULTIFRAME     first-stage model classes whose T > 1 decode Monoload manages (layer 2). The others stay native
-                 (vae._native_reason). A class is added once tests/test_vae_multiframe.py (alloc_sim on the meta
-                 device) shows the layer-2 estimate is an upper bound for it.
+                 (vae._native_reason). A class is added once the real machine (bench_vae --frames) and
+                 tests/vae_inventory.py (the simulator) show the layer-2 estimate is an upper bound for it.
+  WHOLE          classes decoded whole by their own decode (no pieces here), whose layer-2 estimate is always the
+                 measured probe (vae._probe_mf), a single frame included: LTX's convolutional VideoVAE (0.9.x /
+                 LTX-2 / 2.5; it has chunked output, comfy_has_chunked_io, and writes into the output buffer itself)
+                 and LTX's diffusion decoder (CausalDiffusionVAE / NADiffusionDecoder; sd.py: decoder.conv_in_x_t.weight).
+                 Group F (docs/PLAN-video.md) adds their own op handling through vae_ops.EXTRA_CHUNKERS.
   chunks()       the decode of one sample as a generator of output pieces in the final layout, [1, C, f, H, W],
                  consecutive along the frames: for the decoders below the pieces the decoder already produces
                  (ComfyUI keeps them in a list and torch.cat's them at the end: two copies of the output in the VAE
@@ -13,6 +18,8 @@ docs/DESIGN.md §9.35).
   output_frames()  frames of the decoded output, from sd.py's own upscale_ratio.
 """
 
+import comfy.ldm.lightricks.vae.causal_video_autoencoder as ltx
+import comfy.ldm.lightricks.vae.na_diffusion_decoder as ltx_diffusion
 import comfy.ldm.wan.vae as wan
 import comfy.ldm.wan.vae2_2 as wan22
 
@@ -54,12 +61,25 @@ _CHUNKS = {
     wan22.WanVAE: _wan22_chunks,
 }
 
-MULTIFRAME = frozenset(_CHUNKS)
+WHOLE = frozenset((ltx.VideoVAE, ltx_diffusion.CausalDiffusionVAE))
+
+MULTIFRAME = frozenset(_CHUNKS) | WHOLE
 
 
 def multiframe(fsm):
     """Whether this first-stage model's T > 1 decode is managed (its exact class: a subclass may decode differently)."""
     return type(fsm) in MULTIFRAME
+
+
+def measured(fsm):
+    """Whether layer 2 always bounds this model's decode with the measured probe (WHOLE), whatever the frames."""
+    return type(fsm) in WHOLE
+
+
+def chunked_io_managed(fsm):
+    """Whether a model with chunked output (comfy_has_chunked_io: it writes into the output buffer itself) is managed:
+    LTX's VideoVAE. The others (MiniMax H3, SeedVR2, RelayFlash: they tile themselves) stay native."""
+    return type(fsm) is ltx.VideoVAE
 
 
 def chunks(fsm, z, vae_options):
