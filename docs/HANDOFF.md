@@ -11,7 +11,7 @@
 云端：venv `/home/user/venv`（torch 2.15 CPU 可用），`COMFYUI_PATH=/home/user/ComfyUI`（v0.46.3）；只跑小测试、一次一个，不跑 `run_all.sh`。
 
 **进度**
-* **阶段 A：适配 v0.46.3（comfy-0.46-adapt，合并见 §7 末行）**——小测试全过，待真机冒烟。改了什么：
+* **阶段 A：适配 v0.46.3（comfy-0.46-adapt，合并 8d89069）**——小测试全过，待真机冒烟。改了什么：
   * `VAE.decode` 现在把 `load_models_gpu` 和输出分配包在 `comfy.model_prefetch.pause_malloc_graph()` 里：Monoload 的四处 `load_models_gpu`（自检、第一层、探测、第二层）和输出分配照做（`vae_ops.malloc_graph_paused`）。
   * Flux 2 decoder 新的 `fused_norm` 路径（`Decoder.forward_fused` + `strip_conv`，CUDA + comfy-kitchen fp16/bf16 时启用；HIP 上只有 fp16 + fp16_conv3d，CT 700 的 `--bf16-vae` 不走）：托管解码期间临时关掉（`vae_ops.unfused_norms`），原生不动——融合内核绕过冻结统计量和 OpChunking，第一层的峰值也比它低。测试 `test_vae_flux2` 第 8 节。
   * 新的 `VAE.clone()`（VAE 精度节点、Select VAE Device 用）只复制固定的属性：Monoload 包了 `clone`，把 VAE Settings 节点的设置带到副本上。
@@ -203,7 +203,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * `monoload/nodes/`：注册表 + 三个节点。`web/`：`monoload_info.js`、`monoload_i18n.js`。`locales/`：界面翻译。
 * **小测试**（都不需要真实模型）：`test_entry.py`（开关组合，见文件头；其中 `MONOLOAD_VAE_BUDGET` + `MONOLOAD_VAE_STRIPE_ROWS`、`MONOLOAD_VAE_GN_SCHEME` 两种不在 `run_all.sh` 里，要手动跑）、`test_master_switch.py`、`test_messages.py`、`test_info_node.py`、`test_release_chain.py`、`test_vae_node.py`、`test_vae.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_wan22.py`、`test_vae_hunyuan.py`、`test_vae_refiner.py`（`refiner_vae=False` 的第二层估算和官方 Refiner 文件的 decoder）、`test_vae_stripe.py`、`test_dtype_paths.py`（默认和 `MONOLOAD_EXACT=1`）、`test_lora_node.py` 和 `test_lora_save.py`（要合成 checkpoint）。CT 700 检查脚本另有 `check_lora_save.py`（README §9.15）、`run_flux2_dev.py`（Flux 2 dev 整套，README §9.23）。需要真实 SD1.5 的：`test_lora_hot.py`、`test_quant.py`、`test_release.py`。
 
-## 7. 提交记录（`dev` 上的合并）
+## 7. 提交记录（`dev` 上的合并；video 分支的在表末）
 
 | 内容 | 合并 |
 |---|---|
@@ -247,6 +247,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | Refiner 第二层估算（`refiner_vae=False`）/ 官方 Refiner 文件的更正 | f7e1aa2 / b426588 |
 | 视频分析 / Flux 2 dev 整套脚本 | 565e73b / 2219844 |
 | （未合并）`refiner_vae=False` 的第一层：分支 vae-refiner-layer1 | f51a6bc |
-| 本文件 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
+| **video 分支**：适配 ComfyUI v0.46.3（阶段 A） | 8d89069 |
+| 本文件 | 本文件所在的提交（`git log --first-parent video` 最上面几条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。
