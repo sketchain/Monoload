@@ -9,7 +9,7 @@
 | 调研 + 设计（本文件） | `gguf-quant-design`（基于 dev 339b754 的本地草稿） | 进行中 |
 | 1 GGUF（ComfyUI-GGUF 的 Unet / CLIP 加载器） | `lora-gguf` | 设计完成，等 `video` 阶段 A 合并后实现 |
 | 2 safetensors 各量化格式 | `lora-quant-formats` | 设计中 |
-| 3 视频模型（Wan / HunyuanVideo / LTX，含 GGUF） | `lora-video-models` | 设计中 |
+| 3 视频模型（Wan / HunyuanVideo / LTX，含 GGUF） | `lora-video-models` | 设计定了（§5 hook 方案），等阶段 A |
 | 4 合成小模型测试 + 真机命令 | 各分支各自带 | 未开始 |
 
 **基准**（协调者定）：ComfyUI **v0.46.3（cab5f4e）**，前端 1.59.6；GGUF 节点用 **kyuz0/ComfyUI-GGUF-H3 6d33de2**（city96 版加 H3 / Krea2 的 fork，city96 上游 1 月起没更新）。本文的源码引用都按这两份核过；版本再变要重核 §2。
@@ -88,17 +88,20 @@
 
 LoRA key 映射是 ComfyUI 自己的（`comfy/lora.py` `model_lora_keys_unet` + `lora_convert`），对 GGUF 和 safetensors 一样，Monoload 拿到的已经是模型 key。Monoload 这边要保证的是：被改到的参数都能运行时合并。
 
-已知缺口：不是 comfy.ops 层 weight / bias 的参数（Wan 的 `blocks.N.modulation`、`head.modulation`，LTX 的 `scale_shift_table` 之类）。`model_lora_keys_unet` 的通用规则把非 `.weight` 的 key 也映射（`diff` 形式），Monoload 现在对这种 key 报 `lora_non_comfy_ops_param`。**方案（待确认真有 LoRA 用到）**：对这种参数在所属模块上挂 forward pre-hook / always-call 的 forward hook，进模块时把参数换成合并后的临时张量、出来换回，合并结果只在这个模块的 forward 期间存在（这些参数都很小，比如 Wan 14B 的 modulation 6×5120），等于「当前那一层短暂多一份」，不备份。
+已知缺口：不是 comfy.ops 层 weight / bias 的参数（Wan 的 `blocks.N.modulation`、`head.modulation`，LTX 的 `scale_shift_table` 之类）。`model_lora_keys_unet` 的通用规则把非 `.weight` 的 key 也映射（`diff` 形式），Monoload 现在对这种 key 报 `lora_non_comfy_ops_param`。**方案（已定，§7）**：对这种参数在所属模块上挂 forward pre-hook / always-call 的 forward hook，进模块时把参数换成合并后的临时张量、出来换回，合并结果只在这个模块的 forward 期间存在（这些参数都很小，比如 Wan 14B 的 modulation 6×5120），等于「当前那一层短暂多一份」，不备份。
 
 ## 6. 测试计划
 
 * CPU（云端 venv，ComfyUI 目标版本 + ComfyUI-GGUF + `gguf`）：合成小模型——用 `gguf` 包写一个小 GGUF（Q8_0 / Q4_K / F16 / F32 混合）、用 `QuantizedTensor.from_float` 造各格式的 mixed ops 层；每种：fused 对独立实现逐位一致、exact 对参照逐位一致、无备份、参数字节不变、release 后无运行时 patch、保存行为。
 * 真机命令：每项写 `docker exec comfyui-latest python /opt/ComfyUI/custom_nodes/monoload/tests/...`，报每步耗时、GTT 峰值、和原生对比的 max|Δ|、有没有多出常驻。
 
-## 7. 要用户定的事（随时补）
+## 7. 已定的事（2026-11-26，协调者替用户定）
 
-* GGUF + 保存：原生存不出来（见 §3.6）。已替用户定为「明确报错」，要别的做法再说。
-* 视频 LoRA 改到非 comfy.ops 参数时：做 §5 的 hook 方案（不备份），还是继续报错？（先等验证线程看用户手上的 LoRA 有没有这种 key。）
+* GGUF + 保存：明确报错（§3.6）。
+* 视频 LoRA 改到 modulation / scale_shift_table / `.diff` / `.diff_b` 这类非 comfy.ops 小参数：按 §5 的 hook 方案支持（模块 forward 期间临时换上合并好的参数，不留备份），目标所有视频模型都能用，不等 LXC 上的 LoRA key 扫描结果。
+* Dynamic VRAM：新容器继续 `--gpu-only`；Monoload 在 Dynamic VRAM 下报清楚的错即可，暂不兼容。
+* 分支：阶段 A 合进 `video` 后从 `video` 拉 feature 分支，`--no-ff` 合回 `video`；本文件一起带进 `video`。
+* 待收：底座线程在 LXC 上跑的两条检查（量化 safetensors 的 `comfy_quant` 格式、LoRA 里的非 Linear key），结果由协调者转来。
 
 ## 8. 进度日志
 
