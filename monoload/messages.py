@@ -86,6 +86,15 @@ M = {
         "--disable-dynamic-vram, set the model's Monoload LoRA Settings mode to native, or set MONOLOAD=0 / MONOLOAD_DISABLE=1.",
         "ComfyUI 开启了 DynamicVRAM（comfy-aimdo），Monoload 不支持在这种模式下打 LoRA。请用 --gpu-only / --highvram / "
         "--disable-dynamic-vram 启动，或把这个模型的 Monoload LoRA 设置的模式设成「原生」，或设 MONOLOAD=0 / MONOLOAD_DISABLE=1。"),
+    "lora.gguf_unknown": (
+        "[Monoload] {cls} looks like ComfyUI-GGUF but not a version Monoload knows; its LoRA handling stays native",
+        "[Monoload] {cls} 看起来是 ComfyUI-GGUF，但不是 Monoload 认得的版本；它的 LoRA 处理保持原生"),
+    "lora.gguf_adapter_failed": ("[Monoload] looking for ComfyUI-GGUF failed", "[Monoload] 查找 ComfyUI-GGUF 失败"),
+    "lora.gguf_save": (
+        "a GGUF model cannot be saved as a checkpoint (native ComfyUI-GGUF cannot either: its quantized layers have no "
+        "real state dict). Save the LoRA separately, or load a safetensors model to save a merged checkpoint.",
+        "GGUF 模型不能存成 checkpoint（原生 ComfyUI-GGUF 也不行：量化层没有真实的 state dict）。请单独保存 LoRA，"
+        "或加载 safetensors 模型再存合并后的 checkpoint。"),
     "lora.not_layer_param": ("the patch target is not a parameter of a layer", "patch 的目标不是某个层的参数"),
     "lora.non_comfy_ops": (
         "the module {module} whose parameter the LoRA / patch changes is not a comfy.ops layer and has no runtime merge path; "

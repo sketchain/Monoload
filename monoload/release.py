@@ -346,6 +346,11 @@ def install():
 
     async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
         try:
+            from . import hotpatch
+            hotpatch.find_subclass_adapters()
+        except Exception:
+            logging.exception(msg("lora.gguf_adapter_failed"))
+        try:
             return await orig(self, prompt, prompt_id, extra_data, execute_outputs)
         finally:
             try:
