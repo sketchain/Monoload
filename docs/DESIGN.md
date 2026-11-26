@@ -1854,7 +1854,18 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 | Wan 2.1，832×480×81 | 1 MiB 工作区（10bcb80） | 8.74 / 32.5 s（热） | 5.34 / 5.55 | 第一次多约 85 s（探测，已改 64 MiB） | max 0.0071 |
 | Wan 2.1，1280×720×81 | reserved 连线（40b15cb） | 18.90 / 75.9 s / 75.3 s | 9.84（7.80）/ 13.77 | 91.3 s / 81.8 s | 0.0166 / 60.8 dB（323 个像素 > 0.01） |
 
-两行都在最后定下的探测（d4f419e，allocated 连线 + 碎片项）之前测的；估算都是上界。最终版本的真机读数（Wan 2.2 1280×704×121、LTX-2 卷积 VAE、LTX-2.5 扩散 decoder，各 768×512×97）在排队，测完补在这里。原生基线文件在 `/srv/comfy-latest/results/native/`。
+| Wan 2.2，1280×704×121 | 最终（d4f419e） | 39.68 / 178.0 s / 176.5 s | 10.65（8.73）/ 11.96 | 294.8 s / 141.8 s | 0.020 / 60.8 dB（633 个像素 > 0.01） |
+| LTX-2 卷积，768×512×97 | 最终（d4f419e） | 59.29（alloc 6.17：碎片）/ 5.2 s / 4.9 s | 冷 8.33（7.12）、热 7.84（4.26）/ 7.86 | 50.7 s / 4.8 s | 0.0059 / 68.0 dB |
+| LTX-2.5 扩散，768×512×97 | 最终（d4f419e） | 9.91 / 17.6 s / 17.3 s | 冷 28.14（20.59）、热 10.27（7.78）/ 19.10 | 124.9 s / 17.2 s | 逐位相同 |
+
+前两行在最后定下的探测（d4f419e，allocated 连线 + 碎片项）之前测的。原生基线文件在 `/srv/comfy-latest/results/native/`。
+
+**最终版读出来的两个问题，及处理（分支 video-probe-clip）：**
+
+* **探测比解码本身大。** 两个探测尺寸固定 16 × 16 和 32 × 32 latent；768×512 的 latent 只有 16 × 24，32 × 32 的那次探测解得比真解码还多。LTX-2 冷跑 reserved 8.33 高过估算 7.86（热跑 7.84 在估算内：多出的是探测自己）；LTX-2.5 扩散 decoder 冷跑 reserved 28.14，是原生的 3 倍。改成每个探测尺寸按解码自己的 latent 截断（`_mf_probe_shapes`：大的取 min(行, 32) × min(列, 32)，小的取 min(·, 16)，截断后两者一样大就取大的一半），截断后的形状进探测缓存的 key，之后更大的解码会重新探测；不截断（latent 两边都 ≥ 32）时 key 和行为与原来一样，Wan 2.2 704 那行不受影响。
+* **扩散 decoder 在 F 组的模块合进来之前没有可切的算子。** 第二层对它切了 0 个卷积（它的注意力是 NA3D，卷积也不在可切范围），只多了探测的三次解码，估算 19.10 比原生的 8.09 还高（会多挤掉别的模型），没有任何好处。改成只有 `vae_ltx`（F 组，可选导入，挂在 `vae_ops.EXTRA_CHUNKERS` 上）在时才把 `CausalDiffusionVAE` 放进 `vae_video.WHOLE`；没有时多帧照旧原生。F 组合入时 `vae.py` 的 import 行不用再加 `vae_ltx`（加了也无害）。
+
+改后的回归：CT 700 容器里 `--cpu` 跑 `test_vae` 136 项、`test_vae_selftiled` 19 项、`test_vae_stripe` 79 项全过。LTX-2 卷积 VAE 768×512×97（截断后探测 16 × 16 / 16 × 24）和 1280×704×97（16 × 16 / 22 × 32）的真机复测在排队，测完补在这里。
 
 ### 9.36 引擎的时间轴（钩子 H2 + H5，分支 video-engine-time）
 
@@ -1887,7 +1898,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **测试：** `tests/test_vae_norm_g.py`（真机 GPU 上跑，没有 GPU 时 CPU）：两种模块只在 `OpChunking` 里被换、小通道逐位相同、fp32 / bf16 精度、替换期间不当钩子、退出后无残留；整个 LTX 2 `VideoVAE(version=2)` decoder（随机权重，全宽）和 `vae_refiner.Decoder(refiner_vae=True)`（阈值降到 16 通道让小模型的 norm 都换）在 `OpChunking` 下与原生一致。`tests/check_norm_reduce.py --pixelnorm`：真机量原生 PixelNorm 的峰值（含 x²）、归约是否另开临时缓冲，与分组版对比峰值、误差、耗时。
 
-**回归（CT 700 的 `comfyui-latest` 里 `--cpu` 跑）：** `test_vae_norm_g` 7 项、`test_vae_stripe` 79 项全过；`test_vae_refiner` 13 项全过。真机 GPU 上的 `test_vae_norm_g` 和 `check_norm_reduce --pixelnorm` 在排队，测完补在这里。
+**回归（CT 700 的 `comfyui-latest` 里 `--cpu` 跑）：** `test_vae_norm_g` 7 项、`test_vae_stripe` 79 项全过；`test_vae_refiner` 13 项全过。**真机 GPU（CT 700，`comfyui-latest`，d4f419e 之上的 video-norm-g）：** `test_vae_norm_g` 7 项全过（cuda fp32 / bf16 两种模块、整个 LTX 2 decoder 41 个 PixelNorm 换掉后与原生相对差 4e-6、Refiner decoder 36 个 RMS norm 相对差 1.9e-6），`test_vae_wan22` 74 项全过。`check_norm_reduce --pixelnorm --quick`：原生 PixelNorm 在 70 次调用里有 14 次另开归约临时缓冲（4992–38400 个位置、1024 通道）；分组版在输出之外最多多 1.6 MiB，与原生 max|Δ| 0.0625（bf16），对 fp64 的相对误差 0.00271（原生 0.00278）。
 
 ### 9.38 SVD：整批第二层不合，保持原生（E 组，分支 video-svd-l2 留着不合）
 

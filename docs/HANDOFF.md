@@ -27,6 +27,7 @@
   * K-quant 等云端造不出的 GGUF 类型：`tests/check_gguf_kquant.py`（真机逐层对原生），计划见 `docs/GGUF-QUANT.md` §6.2。GGUF VAE 没有加载器（H3 和核心都没有），H7 已取消。
   * `bench_lora.py` 加了 `--unet-gguf` / `--clip-gguf` / `--latent C,T,H,W` / `--batch`，每个组合报 GTT 峰值（20 ms 采样）。
 * **H1 / H3 / H6：多帧第二层入口（video-l2-entry，合并见 §7）**——Wan 2.1 / 2.2 和 LTX（0.9.x 卷积 VAE 的 chunked io、LTX 2.5 扩散 decoder `CausalDiffusionVAE`）的 5D latent 走第二层，峰值靠实测探测 `vae._probe_mf` 定上界（16、32 两个 latent 尺寸在 64 MiB 工作区上的 allocated 连线 × `MF_MARGIN` 1.25，加上在解码自己工作区上再跑一次量到的碎片），输出块直接写进预分配的输出缓冲；F 组的扩展点 `vae_ops.EXTRA_CHUNKERS`；C 组的 CogVideoX 登记（`vae_video`，可选导入 `vae_cogvideo`，没合进来时照旧原生）；`bench_vae --frames N`。真机：Wan 2.1 720p×81 原生 reserved 18.90 → 9.84 GiB，估算 13.77，像素 max 0.0166（PSNR 60.8），热解码慢 9%。最终探测的真机读数在排队（DESIGN §9.35 表）。
+* **多帧探测按 latent 截断；LTX-2.5 扩散 decoder 等 F 组（video-probe-clip，合并见 §7）**——最终版探测的真机读数（DESIGN §9.35 表）：Wan 2.2 1280×704×121 原生 reserved 39.68 → 10.65 GiB，估算 11.96 是上界，热跑快 20%；LTX-2 卷积 768×512×97 原生 59.29（碎片）→ 8.33，但冷跑高过估算 7.86（多出的是 32 × 32 的探测本身，比 16 × 24 的真解码还大）；LTX-2.5 扩散 decoder 第二层什么都切不到，冷跑 28.14 是原生 9.91 的 3 倍。改了两处：探测尺寸按解码自己的 latent 截断（截断形状进缓存 key）；`CausalDiffusionVAE` 只有 F 组的 `vae_ltx`（可选导入）在时才托管，没有时多帧原生。CPU 回归全过；LTX-2 截断后的真机复测在排队。H4 的 GPU 测试（`test_vae_norm_g`、`check_norm_reduce --pixelnorm`）真机全过（DESIGN §9.37）。三份原生基线写进 `/srv/comfy-latest/results/native/`。
 * **H2 / H5：引擎的时间轴（video-engine-time，合并见 §7）**——`vae_engine` 认帧：单元的 `tscale`、适配器的 `tdim` / `ckpt_planes` 决定每行平面数；适配器给 `time_chunks` 就按「条带为主」跑时间块，每条带带着自己的因果卷积缓存跨块；统计遍不能和时间块同用（B 组的 HunyuanVideo 1.0 按块统计自己实现）；视频自检至少 3 个时间块。现有图片适配器不受影响，CPU 回归全过。各组第一层接上（DESIGN §9.36）。
 * **H4：方案 G 扩到 Refiner 的 RMS_norm 和 LTX 的 PixelNorm（video-norm-g，合并见 §7）**——`OpChunking` 里把通道 > 510 的 `vae_refiner.RMS_norm` 和每个 `PixelNorm`（按调用判断通道数）换成分组归约，躲开 ROCm 的 32 KiB / 位置归约临时缓冲；小通道逐位相同。现在只第二层用到，各组写第一层时照 Wan 2.2 把 `grouped_norm_bytes` 加进单元（DESIGN §9.37）。H7 取消（PLAN-video §5）。
 * **盘点（video-inventory，合并见 §7）**——`tests/vae_inventory.py` 跟到 v0.46.3（新 VAE 四种、托管多帧走 Monoload 自己的路和 H1 估算），结果 DESIGN §9.39：托管的 Wan 2.1 / 2.2、LTX 0.9.0 / 2 的估算都是上界；LTX 扩散 decoder、RelayFlash 在 meta 上追踪不了，要真机。
@@ -268,6 +269,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | **video 分支**：H2 / H5 引擎时间轴 | 0e1b913 |
 | **video 分支**：H4 方案 G（Refiner RMS_norm、LTX PixelNorm） | Merge video-norm-g（`git log --first-parent video`） |
 | video：G 组（自带分块的 transformer VAE）保持原生、路由测试、bench_selftiled | 见 `git log --first-parent video`（Merge video-g-selftiled） |
+| **video 分支**：多帧探测按 latent 截断；LTX-2.5 扩散 decoder 等 F 组的 `vae_ltx` 再托管 | Merge video-probe-clip（`git log --first-parent video`） |
 | 本文件 | 本文件所在的提交（`git log --first-parent video` 最上面几条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。
