@@ -19,6 +19,8 @@ docs/DESIGN.md §9.35).
 """
 
 import comfy.ldm.cogvideo.vae as cogvideo
+import comfy.ldm.cosmos.vae as cosmos
+import comfy.ldm.genmo.vae.model as genmo
 import comfy.ldm.lightricks.vae.causal_video_autoencoder as ltx
 import comfy.ldm.lightricks.vae.na_diffusion_decoder as ltx_diffusion
 import comfy.ldm.wan.vae as wan
@@ -28,6 +30,14 @@ try:   # group C's module (CogVideoX); until it is merged CogVideoX stays native
     from . import vae_cogvideo
 except ImportError:
     vae_cogvideo = None
+try:   # group D (Mochi, Cosmos 1.0); until merged their T > 1 stays native
+    from . import vae_mochi
+except ImportError:
+    vae_mochi = None
+try:
+    from . import vae_cosmos
+except ImportError:
+    vae_cosmos = None
 
 
 def _wan21_chunks(fsm, z):
@@ -68,6 +78,10 @@ _CHUNKS = {
 }
 if vae_cogvideo is not None:
     _CHUNKS[cogvideo.AutoencoderKLCogVideoX] = vae_cogvideo.chunks   # group C: up_blocks[1]'s time upsampling per chunk
+if vae_mochi is not None:
+    _CHUNKS[genmo.VideoVAE] = vae_mochi.chunks          # group D: one frame at a time, causal-conv caches
+if vae_cosmos is not None:
+    _CHUNKS[cosmos.CausalContinuousVideoTokenizer] = vae_cosmos.chunks
 
 WHOLE = frozenset((ltx.VideoVAE, ltx_diffusion.CausalDiffusionVAE))
 

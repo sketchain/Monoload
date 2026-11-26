@@ -1841,7 +1841,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 * 按类判断而不按 state dict 的 key：解码时手里只有模块。
 * 随机数：卷积 VAE 解码时用全局 RNG 加 `randn_like` 噪声，探测在 `fork_rng` 里跑，真解码的噪声与原生相同；batch > 1 时原生整批一次抽、Monoload 按样本抽，结果不逐位相同（原生自己按空闲内存切子批时也一样）。扩散 decoder 用固定种子 0 的生成器，没有这个差别。
 
-**CogVideoX 的登记（给 C 组，取自 C 组的 9a3d534）：** `vae_video._CHUNKS` 加 `cogvideo.AutoencoderKLCogVideoX → vae_cogvideo.chunks`，`output_frames` 先问 `vae_cogvideo.output_frames`（sd.py 的 4t − 3 只在 t 为奇数时对，t 为偶数时实际出 4t 帧）。`vae_cogvideo` 是 C 组的模块，按可选导入写：它合进来之前 CogVideoX 的多帧照旧走原生。C 组的第一层也按可选导入接上：`vae.STRIPE_ADAPTERS` 末尾加 `vae_cogvideo`（它的 `match` 只认 2 帧及以上的 CogVideoX latent，单帧仍走第二层）；`vae_engine.self_test` 先看绑定对象有没有 `self_test_run(vae)`，有就用它（C 组的第一层不是引擎的条带单元，自己在 fp32 副本上比原生 `chunks()` 和逐行版本，阈值同样 1e-4），没有照旧 `_self_test_run`。第一层留不留由真机上和第二层的对比决定。
+**CogVideoX 的登记（给 C 组，取自 C 组的 9a3d534）：** `vae_video._CHUNKS` 加 `cogvideo.AutoencoderKLCogVideoX → vae_cogvideo.chunks`，`output_frames` 先问 `vae_cogvideo.output_frames`（sd.py 的 4t − 3 只在 t 为奇数时对，t 为偶数时实际出 4t 帧）。`vae_cogvideo` 是 C 组的模块，按可选导入写：它合进来之前 CogVideoX 的多帧照旧走原生。D 组（Mochi `genmo.VideoVAE`、Cosmos 1.0 `cosmos.CausalContinuousVideoTokenizer`）同样按可选导入登记进 `_CHUNKS`（`vae_mochi.chunks` / `vae_cosmos.chunks`，DESIGN §9.40），模块没合进来前照旧原生。C 组的第一层也按可选导入接上：`vae.STRIPE_ADAPTERS` 末尾加 `vae_cogvideo`（它的 `match` 只认 2 帧及以上的 CogVideoX latent，单帧仍走第二层）；`vae_engine.self_test` 先看绑定对象有没有 `self_test_run(vae)`，有就用它（C 组的第一层不是引擎的条带单元，自己在 fp32 副本上比原生 `chunks()` 和逐行版本，阈值同样 1e-4），没有照旧 `_self_test_run`。第一层留不留由真机上和第二层的对比决定。
 
 **扩展点 `vae_ops.EXTRA_CHUNKERS`（给 F 组）：** 模块级列表，每项是 `(model, workspace, stats) -> 上下文管理器或 None`。`OpChunking.__enter__` 装好自己的替换之后按顺序进入（`contextlib.ExitStack`），`__exit__` 在恢复替换之前倒序退出；块里出异常、进入时出错也一样退出。返回 None 表示不管这个模型。它在模型上装的东西自己恢复；装成实例属性的替换请带 `monoload_replacement = True`，不然识别会把它当成用户的钩子。
 
@@ -1952,7 +1952,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **测试：** `tests/test_vae_stream.py`（随机权重、真实尺寸、真机 GPU）：流式拼起来对原生 fp32 相对误差 ≤ 1e-5（单纯流式和 1 MiB 工作区的 OpChunking 两种），bf16 误差不超过原生的 2 倍，用户 hook / Cosmos 单帧 / 别的类整段解码，模块上不留东西。云端 CPU 跑过一次（DC 离线时）：fp32 相对误差 Mochi 1.2e-6、Cosmos 9.9e-7，bf16 和原生一样。
 
-**接入：** 登记要改 `vae_video.py`（适配线程的文件），按 951868b 的写法可选导入（没合进来时照旧原生）。合之前 `tests/group_d_reg.py` 自己登记，`tests/sim_group_d.py`、`tests/bench_group_d.py`（包一层 `bench_vae`，例：`python tests/bench_group_d.py --vae mochi_vae.safetensors --res 848x480 --frames 85 --modes native,monoload`）用它。
+**接入：** 登记在 `vae_video.py`，适配线程按 951868b 的写法合进 video（855469a，可选导入：没有这两个模块时照旧原生）。`tests/group_d_reg.py` 再登记一次也无害（`setdefault`），`tests/sim_group_d.py`、`tests/bench_group_d.py`（包一层 `bench_vae`，例：`python tests/bench_group_d.py --vae mochi_vae.safetensors --res 848x480 --frames 85 --modes native,monoload`）用它。
 
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
