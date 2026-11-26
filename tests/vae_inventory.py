@@ -1,4 +1,4 @@
-"""Phase 4a: inventory of every VAE comfy.sd.VAE (ComfyUI 0.31.0) can build.
+"""Phase 4a: inventory of every VAE comfy.sd.VAE (ComfyUI v0.46.3) can build.
 
 For each kind the first-stage model is built full size on the meta device with
 the configuration comfy/sd.py uses, and its state dict (meta tensors) is handed
@@ -17,8 +17,12 @@ No model files, no memory (meta tensors). Then, for typical latents:
                 copies, the caching allocator): native decode and layer 2
                 (1 GiB workspace), reserved increase as bench_vae measures it
                 (weights loaded, cache emptied; the output buffer, fp32, on the
-                device as with --gpu-only). Layer 1 for the kinds with an
-                adapter (alloc_sim.decode_trace). ComfyUI's own estimate
+                device as with --gpu-only). A multi-frame layer 2 (H1 of
+                docs/PLAN-video.md, DESIGN §9.35) decodes into the output buffer
+                piece by piece as Monoload does (vae._decode_sample), and its
+                estimate comes from vae._probe_mf run on the simulator (its peak
+                meter is the simulated allocator's). Layer 1 for the kinds with
+                an adapter (alloc_sim.decode_trace). ComfyUI's own estimate
                 (memory_used_decode, AMD) for comparison.
 
     python tests/vae_inventory.py                  # all kinds, all cases
@@ -240,6 +244,21 @@ def _minimax_video():
     return lambda: m.MiniMaxH3VideoVAE()
 
 
+def _minimax_image(cls):
+    import comfy.ldm.minimax.vae as m
+    return lambda: getattr(m, cls)()
+
+
+def _ltx_diffusion():
+    import comfy.ldm.lightricks.vae.na_diffusion_decoder as n
+    return lambda: n.CausalDiffusionVAE(config=None)
+
+
+def _relayflash(factor):
+    import comfy.ldm.wan.model_vsr as r
+    return lambda: r.RelayFlash(factor)
+
+
 def _pixel():
     import comfy.pixel_space_convert as p
     return p.PixelspaceConversionVAE
@@ -277,6 +296,12 @@ KINDS = [
     ("stage_a", "Stable Cascade Stage A（VQGAN，4x）", _stage_a(), None, (), IMG1, None),
     ("stage_c_prev", "Stable Cascade Stage C previewer", _previewer(), None, (), [(1024, 1024, 1)], None),
     ("minimax_video", "MiniMax H3 视频（comfy_has_chunked_io，内部分块）", _minimax_video(), None, (), [(832, 480, 73)], None),
+    ("minimax_image", "MiniMax-H3-Image（单帧 2D ViT decoder，16 头）", _minimax_image("MiniMaxH3ImageVAE"), None, (), IMG, None),
+    ("ph3_image", "p-h3-image（单帧 2D ViT decoder，32 头）", _minimax_image("PH3ImageVAE"), None, (), IMG, None),
+    ("ltx_diffusion", "LTX 扩散 decoder（na_diffusion_decoder.CausalDiffusionVAE；sd.py 注释写「LTX 2.4」，F 组核实）", _ltx_diffusion(), None, (),
+     [(768, 512, 97)], None),
+    ("relayflash", "RelayVSR Flash x2（wan.model_vsr.RelayFlash，comfy_has_chunked_io，Wan 2.2 latent）", _relayflash(2), None, (),
+     [(1280, 704, 1)], {"config": '{"upscale_factor": 2}'}),
     ("pixel", "像素空间（Chroma Radiance / Z-Image pixel / PixelDiT / HiDream O1）", _pixel(), None, (), IMG1, None),
 ]
 
@@ -290,6 +315,9 @@ UNTRACED = [
     ("minimax_audio", "MiniMax H3 音频（[B, 32, 2, T]）", dict(latent_dim=2, extra_1d_channel=None, upscale_ratio=800)),
     ("hunyuan3d", "Hunyuan3D 2.0 / 2.1（ShapeVAE）", dict(latent_dim=1)),
     ("triposplat", "TripoSplat（OctreeGaussianDecoder，VAE.decode 直接报错）", dict(latent_dim=1)),
+    ("minimax_music3", "MiniMax Music3 DAV（音频，[B, 128, T]）", dict(latent_dim=1, upscale_ratio=512)),
+    ("trellis2_shape", "Trellis2 形状 VAE（稀疏 3D）", dict(latent_dim=1)),
+    ("trellis2_texture", "Trellis2 纹理 VAE（稀疏 3D）", dict(latent_dim=1)),
 ]
 
 
@@ -378,9 +406,31 @@ def structure(fsm):
     return c
 
 
+class _SimMeter:
+    """vae._PEAK_METER's meter on the simulator, as vae._CudaPeak: the cache emptied at start(), the allocated peak
+    above what was allocated then, and frag(): how much more was reserved at the peak."""
+
+    def __init__(self, sim, tracer):
+        self.sim, self.tracer, self.base, self.base_res = sim, tracer, 0, 0
+
+    def start(self):
+        self.tracer.poll()
+        self.sim.empty_cache()
+        self.sim.reset_peak()
+        self.base, self.base_res = self.sim.allocated, self.sim.reserved
+
+    def peak(self):
+        self.tracer.poll()
+        return self.sim.peak_allocated - self.base
+
+    def frag(self):
+        return max(0, self.sim.peak_reserved - self.base_res - self.peak())
+
+
 def path(v, shape):
     lat = torch.empty(shape, device="meta", dtype=v.vae_dtype)
-    reason = mvae._native_reason(v, lat)
+    with _patched(mvae, "_PEAK_METER", [lambda dev: object()]):   # CT 700 has allocator statistics; the meta device none
+        reason = mvae._native_reason(v, lat)
     if reason is not None:
         return "native", reason
     if v.latent_dim == 2 and lat.ndim == 5:
@@ -430,6 +480,7 @@ def trace(v, shape, layer, ws=GIB):
 
     stats = vae_ops.OpStats()
     out_shape = None
+    mf_est = mf_parts = None
     with contextlib.ExitStack() as es:
         es.enter_context(_patched(vae_ops, "slow_dilated3d", lambda x: True))
         es.enter_context(_patched(mm, "soft_empty_cache", soft_empty_cache))
@@ -451,14 +502,29 @@ def trace(v, shape, layer, ws=GIB):
         es.enter_context(_patched(torch.Tensor, "cpu", host_copy))
         es.enter_context(torch.inference_mode())
         es.enter_context(tracer)
+        if layer == 2 and mvae._measured(v, lat) and path(v, shape)[0] != "native":   # a native multi-frame kind: hypothetical layer 2, no H1 estimate
+            # H1: Monoload's own estimate (multi-frame, or a decoder vae_video always measures: LTX), its probe measured on this simulator (before the decode's OpChunking)
+            mvae._PROBES.pop(fsm, None)
+            with _patched(mvae, "_PEAK_METER", [lambda dev: _SimMeter(sim, tracer)]):
+                probe = mvae._probe_mf(v, lat, {}, ws)
+            mf_parts = mvae.estimate(v, lat, ws, probe)
+            mf_est = mf_parts["total"]
+            mf_parts = dict(mf_parts, slope=probe.mf_slope, intercept=probe.mf_intercept, frag=probe.mf_frag)
+            soft_empty_cache()
+            sim.reset_peak()
         if layer == 2:
             es.enter_context(vae_ops.OpChunking(fsm, ws, stats))
-        n = shape[0] if layer == 0 else 1      # native decodes the batch at once (memory permitting), layer 2 one sample at a time
+        whole = getattr(mvae, "_whole_batch", lambda v: False)(v)   # E (SVD): layer 2 decodes the whole batch at once too
+        n = shape[0] if layer == 0 or whole else 1      # native decodes the batch at once (memory permitting), layer 2 one sample at a time
         for i in range(0, shape[0], n):
             z = torch.empty((n,) + tuple(shape[1:]), device="meta", dtype=v.vae_dtype)   # the latent copied to the device
             if getattr(fsm, "comfy_has_chunked_io", False):
                 pix = torch.empty(fsm.decode_output_shape(z.shape), device="meta", dtype=torch.float32)
                 fsm.decode(z, output_buffer=pix)
+                out_shape = tuple(pix.shape)
+            elif layer == 2 and mvae._output_shape(v, z) is not None:   # H3: pieces straight into the buffer
+                pix = torch.empty(mvae._output_shape(v, z), device="meta", dtype=torch.float32)
+                mvae._decode_sample(v, z, {}, pix)
                 out_shape = tuple(pix.shape)
             else:
                 out = fsm.decode(z)
@@ -472,7 +538,8 @@ def trace(v, shape, layer, ws=GIB):
     big = max([b for b, _ in sim.peak_blocks if _ != "weights"] or [0])
     return {"alloc": sim.peak_allocated - base_alloc, "reserved": sim.peak_reserved - base_res, "largest_block": big,
             "out_shape": out_shape, "cache_flushes": sim.cache_flushes, "oom": sim.ooms, "conv_chunked": stats.conv_chunked, "attn_calls": stats.attn_calls,
-            "attn_unmanaged": list(stats.attn_unmanaged)}
+            "attn_unmanaged": list(stats.attn_unmanaged), "mf_estimate": mf_est,
+            "mf_parts": mf_parts}
 
 
 L1_SIM = {"ldm_sdxl": "sdxl", "ldm_sd": "sdxl", "ldm_flux": "flux", "ldm_flux2": "flux2", "wan21": "qwen", "wan22": "wan22", "hy_image21": "hy21"}
@@ -559,6 +626,13 @@ def main():
                         ", {} convs chunked, {} attn calls{}".format(t["conv_chunked"], t["attn_calls"],
                                                                      ", unmanaged attn " + ", ".join(t["attn_unmanaged"][:3]) if t["attn_unmanaged"] else "")
                         if layer == 2 else "", time.time() - t0))
+                    if t.get("mf_estimate") is not None:
+                        mp = t.get("mf_parts") or {}
+                        print("      layer2  multi-frame estimate {} GiB (probe on the simulator: slope {:.0f} B/px, intercept {} GiB, frag {} GiB; "
+                              "activation {}, workspace {}, output {} GiB){}".format(
+                                  gib(t["mf_estimate"]), mp.get("slope") or 0, gib(mp.get("intercept") or 0), gib(mp.get("frag") or 0), gib(mp.get("activation", 0)),
+                                  gib(mp.get("workspace", 0)), gib(mp.get("output", 0)),
+                                  "" if t["mf_estimate"] >= t["reserved"] else "  ** NOT AN UPPER BOUND **"))
                 except Exception as e:
                     c[key] = {"error": "{}: {}".format(type(e).__name__, str(e)[:300])}
                     print("      {:7s} TRACE FAILED: {}".format(key, c[key]["error"]))

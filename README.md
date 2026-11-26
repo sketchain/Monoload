@@ -815,7 +815,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/check_mod
   * 不完整的文件（0 字节、下载中断）显示 `unreadable: file too small (...)` 或 `unreadable: incomplete file: ...`，不再是 struct 的原始报错。
 * 仍出现 `failed: ...` 或 `model not detected` 的文件，把那几行发给我。
 
-云端用的两个盘点脚本（不需要模型文件，锁定镜像里跑）：`tests/vae_inventory.py`（每种 VAE 的结构、现在的路、原生 / 第二层 / 第一层的模拟峰值）、`tests/probe_vae_gaps.py`（现有缺口的小解码、第二层在多帧视频上的精度）。结果见 DESIGN.md §9.16。
+云端用的两个盘点脚本（不需要模型文件，ComfyUI v0.46.3 里跑）：`tests/vae_inventory.py`（每种 VAE 的结构、现在的路、原生 / 第二层 / 第一层的模拟峰值，托管的多帧还有第二层估算；v0.46.3 的结果见 DESIGN.md §9.39）、`tests/probe_vae_gaps.py`（现有缺口的小解码、第二层在多帧视频上的精度）。结果见 DESIGN.md §9.16。
 
 ### 9.12 Flux 2 VAE 走第一层：真机 bench（命令 X / Y / Z）
 
@@ -1330,7 +1330,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 
 ### 9.22 视频（多帧）：要下的文件和 bench 命令（DESIGN §9.32，先分析）
 
-**状态：只有分析，插件没有改，视频照旧走原生。** 下面的命令要先给 `tests/bench_vae.py` 加一个 `--frames N`（随机 latent 的帧数；现在只生成 1 帧，测不了视频）。这是测试工具的改动，**还没做**，等你定（DESIGN §9.32 第 4 点）。
+**状态（video 分支）：** `tests/bench_vae.py --frames N` 已加（H6）。多帧第二层已托管 Wan 2.1 / 2.2、LTX（卷积 VAE 和 LTX-2.5 扩散 decoder），CogVideoX、Cosmos 1.0、Mochi 在 C、D 组的模块合入后托管，HunyuanVideo 1.0 / 1.5（含 Kandinsky 5、HunyuanImage 2.1 Refiner 的多帧）按 decoder 结构托管（DESIGN §9.35、§9.40）；其余照旧原生。SVD 保持原生（DESIGN §9.38）。真机现在用新容器 `comfyui-latest`（v0.46.3），下面命令里的 `comfyui` 换成它；`--modes native,monoload` 同时测两边。原生基线统一记在 `/srv/comfy-latest/results/native/`。
 
 **文件**（字节数、sha256 来自 HF API；都不用登录，`resolve` 链接直接 302；放到 `/models/comfy/vae/`，LTX 和 SVD 是 checkpoint，放 `/models/comfy/checkpoints/`）：
 
@@ -1356,7 +1356,7 @@ cd /models/comfy/checkpoints && wget -O ltxv-2b-0.9.8-distilled-fp8.safetensors 
 cd /models/comfy/checkpoints && wget -O svd_xt.safetensors https://huggingface.co/stabilityai/stable-video-diffusion-img2vid-xt/resolve/main/svd_xt.safetensors && sha256sum svd_xt.safetensors   # b2652c23d64a1da5f14d55011b9b6dce55f2e72e395719f1cd1f8a079b00a451
 ```
 
-**bench（加了 `--frames` 之后）：** 现在 Monoload 对多帧走原生，所以先测原生的基线（`--modes native`）；做了第二层以后再加 `monoload-l2`。每个 VAE 一条：
+**bench：** 下面是当时只测原生基线的命令（`--modes native`）；托管的 VAE 用 `--modes native,monoload`。每个 VAE 一条：
 
 ```bash
 # V1–V7（832x480 和 1280x720，81 帧；Mochi 79 帧 / 848x480，LTX 1280x704）
