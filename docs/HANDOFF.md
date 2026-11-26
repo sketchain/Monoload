@@ -250,6 +250,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | 视频分析 / Flux 2 dev 整套脚本 | 565e73b / 2219844 |
 | （未合并）`refiner_vae=False` 的第一层：分支 vae-refiner-layer1 | f51a6bc |
 | **video 分支**：适配 ComfyUI v0.46.3（阶段 A） | 8d89069 |
+| video：PLAN-video.md | d58707f |
 | 本文件 | 本文件所在的提交（`git log --first-parent video` 最上面几条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。
