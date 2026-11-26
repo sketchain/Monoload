@@ -143,6 +143,11 @@ def copy_tests(cls, sd, lat):
     chained = node_apply(cls, big, gn_scheme="C", stripe_rows=16)
     check("chained nodes: the downstream node's items override, the ones it leaves unset keep the upstream node's ({})".format(vo.overrides(chained)),
           vo.overrides(chained) == {"budget": 1024 << 30, "gn_scheme": "C", "stripe_rows": 16} and vo.overrides(big) == {"budget": 1024 << 30})
+    if hasattr(comfy.sd.VAE, "clone"):
+        cl = chained.clone()
+        check("ComfyUI v0.46 VAE.clone (VAE precision / device nodes) keeps the node's settings ({}); a plain VAE's clone has none".format(
+              vo.overrides(cl)), vo.overrides(cl) == vo.overrides(chained) and vo.overrides(sd.clone()) == {}
+              and cl.first_stage_model is sd.first_stage_model)
     fsm = sd.first_stage_model
     with torch.no_grad():   # the test VAE was built from decoder weights only
         init_random(fsm.encoder)

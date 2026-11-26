@@ -307,20 +307,31 @@ def _patched(obj, name, value):
 EXTRA_KEYS = {"cosmos": {"decoder.unpatcher3d.wavelets": (8,)}}
 
 
+class _Gfx1151:
+    gcnArchName = "gfx1151"   # CT 700 (Strix Halo); v0.46.3 pytorch_attention_enabled_vae reads it when is_amd()
+
+
+@contextlib.contextmanager
+def _as_ct700():
+    """is_amd() true and the GPU a gfx1151, as on CT 700 (no GPU needed)."""
+    with _patched(mm, "is_amd", lambda: True), _patched(torch.cuda, "get_device_properties", lambda dev=None: _Gfx1151()):
+        yield
+
+
 def build(kind):
     name, used, builder, rename, drop, cases, meta = kind
     sd = _meta_sd(builder, rename, drop)
     for k, shape in EXTRA_KEYS.get(name, {}).items():
         sd[k] = torch.empty(shape, device="meta")
     try:
-        with _patched(mm, "is_amd", lambda: True), torch.device("meta"):
+        with _as_ct700(), torch.device("meta"):
             v = comfy.sd.VAE(sd=sd, dtype=torch.bfloat16, metadata=meta)
     except RuntimeError as e:
         if "meta" not in str(e):
             raise
         # an __init__ reading tensor values: build it on the CPU (zeros), then move the model to the meta device
         sd = {k: torch.zeros(t.shape, dtype=t.dtype) for k, t in sd.items()}
-        with _patched(mm, "is_amd", lambda: True):
+        with _as_ct700():
             v = comfy.sd.VAE(sd=sd, dtype=torch.bfloat16, metadata=meta)
         del sd
         v.first_stage_model.to("meta")

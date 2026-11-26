@@ -679,8 +679,10 @@ def _load(self, device_to=None, lowvram_model_memory=0, force_patch_weights=Fals
     if not _active(self):
         return _ORIG["load"](self, device_to, lowvram_model_memory=lowvram_model_memory, force_patch_weights=force_patch_weights, full_load=full_load)
     _check_dynamic(self)
-    # No caller in ComfyUI 0.31 passes force_patch_weights=True (saving goes through model_state_dict_for_saving,
-    # below); a custom node that asks for the patches to be baked in gets an error instead of base weights.
+    # No caller in ComfyUI (62b3c94 .. v0.46.3) passes force_patch_weights=True (saving goes through
+    # model_state_dict_for_saving, below); a custom node that asks for the patches to be baked in gets an error instead
+    # of base weights. (v0.46's load() also bakes a key whose patches change the weight's shape: our
+    # patch_weight_to_device refuses those keys, MonoloadUnsupportedError "lora_shape_change", as before.)
     # ComfyUI-GGUF's load always forces it (monoload/gguf.py): there it only means lowvram layers get a runtime patch.
     if force_patch_weights and len(self.patches) > 0 and not self.__dict__.get("_monoload_gguf_forced", False):
         raise MonoloadUnsupportedError("force_patch_weights", msg("lora.force_patch"), key=_first_key(self))

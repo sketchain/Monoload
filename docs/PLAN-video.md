@@ -1,0 +1,173 @@
+# Monoload 视频计划（video 分支，ComfyUI v0.46.3，2026-11）
+
+给并行开工的各线程用：每种视频 VAE（和 v0.46.3 新增的图像 VAE）第一层怎么做、按什么分组、各组依赖哪些共用钩子；以及要覆盖的视频模型、单次峰值怎么估、真机按什么顺序验。分析的依据是 DESIGN §9.32（62b3c94 时代的视频分析；v0.46.3 里 Wan 2.1、两个 Hunyuan、CogVideoX、Cosmos、Mochi、LTX 卷积 VAE 的解码代码没有变，结论仍然适用）加上 v0.46.3 的新代码（`git diff 62b3c94 v0.46.3`：`wan/vae2_2.py`、`seedvr/vae.py` 重写、`minimax/vae.py`、新的 `lightricks/vae/na_diffusion_decoder.py`、`wan/model_vsr.py`）。
+
+## 0. 规矩（§3 之外，这一轮新加的）
+
+* **单次峰值 ≤ 55 GiB 是主线**：CT 700 现在 GPU 稳定可用约 55 GiB（60 GiB OOM，卡在宿主机 `ttm.pages_limit` 默认值）。单次峰值 = 同一时刻装在 GPU 上的最大的那一份：扩散模型（DiT）、文本编码器（TE）、VAE 解码（权重 + Monoload 估算），三者取最大（ComfyUI 换模型时会卸前一个；Monoload 的估算交给 `load_models_gpu`，它按需卸别的）。**> 55 GiB 的单列一组，标「等宿主机调 ttm 后再验」**，代码照写、照做小测试，真机等调完再跑。
+* **分批加载只在需要时**：只有超大模型、TE 和 DiT 同时在 GPU 上会 OOM 时，才分开（先编码、卸 TE、再加载 DiT）；怎么分由做那一组的线程判断，写进它的真机命令。
+* **运行时什么都不经过内存**（HANDOFF §3）：LXC 只给了 48 GiB 内存，GTT 不算在里面；任何方案都不许放到 CPU 上（包括自检、缓存、输出列表）。
+* **safetensors 和 GGUF 都要做**：DiT / TE 的 GGUF 由 GGUF 线程负责（LoRA 运行时合并到 GGUF 权重上）；VAE 这边见 §5。
+* **不做 MAGI-2。**
+* 每个第一层适配器：fp32 自检（相对误差 ≤ 1e-4）、alloc_sim 扫尺寸证明 reserved ≤ 估算、`MONOLOAD=0` 与原生逐位相同、默认行为不变；不认得的结构走第二层或原生，不报错。
+
+## 1. 共用钩子（阶段 C 先做，各组依赖它们）
+
+| 钩子 | 内容 | 谁用 | 状态 |
+|---|---|---|---|
+| **H1 多帧入口** | `_native_reason` 放开 T > 1 的 5D latent（按 decoder 类型白名单逐个放开，没放开的仍原生）；形状探测和 `estimate` 认 5D；`decoder_terms` 加多帧项：每卷积缓存（`retained`）、carry、**输出列表 + `torch.cat`（2 × 输出）**、CogVideoX 一直活着的第一段；alloc_sim 的 5D 跟踪（`decode_trace` / `vi.trace` 带 T），扫尺寸确认估算是上界（DESIGN §9.32：现有估算对多帧基本都不是上界）| 全部多帧第二层、全部视频第一层 | 阶段 C |
+| **H2 引擎的时间轴** | 从分支 vae-refiner-layer1（f51a6bc，DESIGN §9.34 分支版）只取引擎部分：`Unit.tscale`、`StripeAdapter.tdim` / `ckpt_planes`、`Plan` 的平面数（每行元素数 = 宽 × 平面数，区间倒推不变）。再加**按时间块推进**：适配器给出时间块序列（Wan 2.1：1 + 2 + 2…；Wan 2.2：1 + 1…；Hunyuan：2 帧一块），引擎「条带为主」地跑：对每个输出行条带，依次跑全部时间块，**每个条带自己的每卷积缓存 / carry 只有条带那么大**（含 halo 行），时间块之间留在条带里；低分辨率前缀对整段视频算一次存档 | 视频第一层（A、B、C、D 组）| 阶段 C |
+| **H3 直接写输出** | 每个时间块 / 条带的输出直接写进预分配的 5D 输出（`vae_dtype` 或 fp32，和原生 `VAE.decode` 一样在 `output_device`），不留 Python 列表、不 `cat`（原生的 2 × 输出这一项没了）；LTX / RelayFlash / MiniMax 的 `output_buffer` 走同一个接口 | 全部视频第一层；LTX 第二层 | 阶段 C |
+| **H4 方案 G 推广** | 分组求范数（≤ 510 通道一组，fp32 合并）扩到 `vae_refiner.RMS_norm`（没有 `channel_first` / `bias`，要一个变体）和 LTX 的 PixelNorm（`mean(x²)`，1024 通道）；**替用户定：扩**（理由同 Wan 2.2：ROCm 归约内核每位置 32 KiB 的临时缓冲落在缓存外、开新段，DESIGN §9.28 / §9.32 第 2 点）| B 组（HunyuanVideo 1.5 / Refiner）、F 组（LTX）| 阶段 C |
+| **H5 视频自检** | fp32 自检用小尺寸、少量时间块（≥ 3 块，让缓存跨块）：副本只留每个 `CausalConv3d` 用得到的时间核切片；自检上界算进第一次的估算（同图像）| 全部视频第一层 | 阶段 C |
+| **H6 测量** | `bench_vae --frames N`（随机 latent 带时间维，按 VAE 的 `downscale_ratio` 算 T）；`vae_inventory` 的视频用例；README 给每组的命令模板 | 全部 | 阶段 C |
+
+**做法要点（H2）**：图像第一层是「前缀整图 → 存档 → 按输出行条带倒推重算」。视频多一个时间轴，但 Wan / Hunyuan / CogVideoX 第二段的 decoder 本来就**按时间块因果地**跑、块之间只传每卷积最后 2 帧（`feat_cache` / carry），这些缓存在空间上是**逐像素局部**的（3×3 卷积的 halo 之外不读别的行）。所以条带为主：存档（整段视频的低分辨率前缀，例如 Wan 2.1 的 r 级：81 帧 832×480 约 100 MB）→ 对每个条带，从存档切出 halo 行、依次跑全部时间块、条带自己的缓存跟着走 → 写进输出。峰值 = 存档 + 一个条带一个时间块的激活 + 条带的缓存 + 输出，与帧数基本无关（只有存档和输出随帧数涨）。halo 按单元倒推（和图像一样），缓存的 halo 行要和条带一起保存（缓存存的是卷积**输入**，halo 已经包含）。
+
+## 2. 每种 VAE 的方案和分组
+
+图例：**原生** = 现在的路；**L2** = 多帧第二层（阶段 C 的 H1）；**L1** = 视频第一层（各组线程）。峰值数字是 DESIGN §9.32 的 alloc_sim（GiB，reserved，原生 > 60 记 OOM；第二层工作区 1 GiB）。
+
+### A 组：Wan VAE（价值最大，先开）
+
+| VAE | 用在哪些模型 | 832×480×81 原生 → L2 | 720p×81 原生 → L2 |
+|---|---|---|---|
+| Wan 2.1 VAE（`wan/vae.py`，16 ch，8×）| Wan 2.1 全系、**Wan 2.2 A14B**（T2V / I2V / S2V / Animate / Camera）、Wan Animate 2、VACE、FunControl、HuMo、SCAIL / SCAIL2、FlowRVS、CausalAR、WanDancer、Cosmos Predict 2 视频；图像：Qwen-Image、Krea 2、Anima、JoyImage | 8.72 → 4.96 | 20.29 → 8.99 |
+| Wan 2.2 VAE（`vae2_2.py`，48 ch，16×）| Wan 2.2 TI2V 5B；图像：PAN2 | 17.90 → 5.20 | 40.49 → 9.47 |
+
+* **L1 方案**：扩展现有的 `vae_wan` / `vae_wan22` 单帧适配器到多帧，走 H2 的条带为主。时间块：Wan 2.1 第一块 1 个 latent 帧、之后每块 2 帧，`Resample` 的时间上采样（`time_conv`）第一块跳过；Wan 2.2 每块 1 帧，第一块不做时间卷积、`DupUp3D` 丢掉多出的帧，缓存总是补成 2 帧（`clone`）。单元沿用单帧的划分（halo 不变：时间核不影响空间 halo），每个单元多一个「条带缓存」状态。注意 v0.46.3 的 Wan 2.2：`feat_cache is None` 时 `ResidualBlock` / 上采样 / `DupUp3D` 会自己按行分块（`strip_apply`），多帧路径总是带缓存，不触发；我们的单元调用时传缓存，也不触发。
+* 方案 G 已覆盖 Wan 2.2 的 1024 / 512 通道 RMS；Wan 2.1 最多 384 通道，不用分组。
+* 预计 L1：与帧数基本无关的 1–2 GiB + 存档 + 输出（720p×81 fp32 输出 0.9 GiB）。
+
+### B 组：Hunyuan VAE
+
+| VAE | 用在哪些模型 | 832×480×81 原生 → L2 | 720p×81 原生 → L2 |
+|---|---|---|---|
+| HunyuanVideo 1.0（LDM `AutoencoderKL` conv3d，`CarriedConv3d`，GroupNorm）| HunyuanVideo T2V / I2V / SkyReels I2V、Kandinsky 5 视频 | 74.1（OOM）→ 14.98 | 171（OOM）→ 37.88 |
+| HunyuanVideo 1.5（`vae_refiner`，`refiner_vae=True`，RMS norm）| HunyuanVideo 1.5、1.5 SR distilled；图像：HunyuanImage 2.1 Refiner 官方文件 | 50.01 → 9.14 | 110（OOM）→ 22.95 |
+
+* **难点：mid 的全局注意力跨全部帧**（tokens = T·h·w），在全部 latent 帧上一次算完，然后 `torch.split` 成 2 帧一块跑上采样路径。L1：前缀 = `conv_in` + mid（整段视频，latent 分辨率；注意力用第二层的 query 分块）+ 存档；之后条带为主跑各块。
+* HunyuanVideo 1.0 的 GroupNorm：原生是**每个时间块各自统计**（块内全部帧、整幅空间）→ L1 要每块一个统计遍（LDM 的方案 B 机制按块做，H2 的平面数正好描述「每行 2 帧」）。HunyuanVideo 1.5 是 RMS norm，没有统计遍（像 Wan 2.2），但要 H4（方案 G 扩到 `vae_refiner.RMS_norm`）。
+* 顺带：HunyuanImage 2.1 Refiner 官方文件的单帧第一层（DESIGN §9.31，和 Wan 2.2 单帧同类）在这一组做掉。分支 vae-refiner-layer1 的 `refiner_vae=False` 适配器仍不合（官方文件用不上）。
+
+### C 组：CogVideoX
+
+| VAE | 模型 | 720×480×49 | 832×480×81 原生 → L2 | 720p×81 原生 → L2 |
+|---|---|---|---|---|
+| `cogvideo/vae.py`（GroupNorm、`conv_caches`）| CogVideoX 2B / 5B、I2V、Inpaint | — | 53.12 → 19.28 | 121（OOM）→ 45.41 |
+
+* 原生：第一段**整段视频**一起过 `conv_in`、mid、前两级上采样（时间 ×2），第二段每 4 帧一块过后两级（`conv_caches`）；各块 `.cpu()` 存主机最后 `cat`——**这违反「不经过内存」**，Monoload 接管时第二段的输出要直接写设备上的输出（H3）。
+* L1：第一段的 GroupNorm 统计量跨整段视频 → 统计遍按「每行全部帧」（H2 平面数 = T）；第一段的低分辨率部分进存档；第二段条带为主、按 4 帧块推进、条带自己的 `conv_caches`。
+* L2 的探测现在会失败（读 meta 张量的值），H1 里要修。
+
+### D 组：Cosmos 1.0、Mochi（整段一次、没有时间块）
+
+| VAE | 模型 | 832×480 原生 → L2 | 720p 原生 → L2 |
+|---|---|---|---|
+| Cosmos CV8x8x8（因式分解卷积、每帧 1 组 GroupNorm、空间注意力 + 每像素时间注意力、haar）| Cosmos 1.0 T2V / I2V（7B / 14B）| 11.63 → 4.15 | 21.27 → 11.05 |
+| Mochi（`PConv3d` 时间复制补边、每帧 GroupNorm、`DepthToSpaceTime`）| Mochi 1 | 337（OOM）→ 54.36（79 帧）| 762（OOM）→ 106（OOM）|
+
+* 两者都**整段视频一次**过 decoder，没有因果缓存可借；时间卷积是非因果的（两边都读）。L1 = **时空条带**：沿时间也按块切，块之间带时间 halo（倒推出来，和空间 halo 同一套）重算，而不是缓存。H2 的「时间块」在这里是带 halo 的重叠块。
+* Cosmos：每帧 GroupNorm（1 组）= 每帧整幅统计 → 统计遍按帧；空间注意力每帧整幅（全局）→ 注意力所在的几级进前缀；时间注意力每像素沿全部帧（行局部）→ 条带内整段时间一起算（这一级时间不能切块）。Cosmos 的 L2 已经 2–3 倍，L1 优先级低。
+* **Mochi 只有 L1 一条路**（L2 在 720p 仍 > 60 GiB）：每帧 GroupNorm 统计遍（按帧、每次 8 帧的分组照原生）、`PConv3d` 的复制补边在条带边界要用真实相邻行（不是补边）——和 Wan 的 zeros 补边不同，halo 倒推时要区分「图像边缘复制」和「条带内部边界」。工作量最大，放最后。
+
+### E 组：SVD（4D，batch 是时间轴）
+
+* 阶段 C 做**整批 L2**（与原生同样的子批划分一次进 `OpChunking`；原生按空闲内存分子批，结果随空闲内存变——Monoload 选的子批要与原生在同样空闲内存下相同，或者整批，文档写清）。只省约 20%（GroupNorm 跨整批帧）。L1 以后再说（统计遍按「每行全部帧」，H2 可描述）。
+* 模型：SVD / SVD-XT、SV3D（图像转 3D 轨道视频，同 VAE）。
+
+### F 组：LTX
+
+| VAE | 模型 | 1280×704×97 原生 → L2（模拟）|
+|---|---|---|
+| LTX 0.9.0 卷积 VAE（`causal_video_autoencoder`，`comfy_has_chunked_io`，PixelNorm）| LTX-Video 0.9.0 | 51.35 → 6.40 |
+| LTX 0.9.5+ / LTX-2 卷积 VAE（version 2）| LTX-Video 0.9.5+、LTX-2（LTXAV 的视频部分）| 59.33 → 6.94 |
+| **LTX 2.4 扩散 decoder**（`na_diffusion_decoder.CausalDiffusionVAE`，v0.46.3 新增）| LTX-2.4（及沿用它的后续版本）| 未模拟 |
+| LTX-2 音频 VAE | LTXAV 的音频 | 原生（音频不管）|
+
+* 卷积 VAE：原生按**总**显存定块大小（32–128 MiB）沿 T 切块递归、写进 `output_buffer`；模拟的原生 reserved 远大于 alloc（30–59  对 6–10 GiB），是碎片——**先上真机确认原生基线**（H6 的 `--frames`）。L2：`_run` 把 `output_buffer` 传进去（H3）。L1：PixelNorm 每位置独立、没有统计量 → 空间条带精确；reflect 空间补边同 Mochi 要区分边缘和内部边界；时间块交给原生的递归（块内条带）。
+* **LTX 2.4 扩散 decoder**：没有卷积和已知注意力（邻域注意力 `comfy_kitchen.na3d` + SwiGLU MLP，自带 MLP 按 token 分块），L2 无从套；单步 x0，但要一份像素大小的噪声（`generator`）。L1 方案：邻域注意力窗口固定 → 时空条带的 halo = 各级窗口半径之和（按级倒推）；噪声整幅生成一次（与输出同大小，进估算）再按条带切片，保证与原生逐位相同。**先测原生峰值**，够低就不做 L1。
+* H4：PixelNorm 的 1024 通道 `mean(x²)` 按道理也触发 ROCm 归约缓冲，跟踪器要先模拟、真机核实。
+
+### G 组：本来就自己分块的 transformer VAE（先测原生，够低就不做）
+
+| VAE | 模型 | 说明 |
+|---|---|---|
+| MiniMax H3 视频（`ViT3DDecoder`，`comfy_has_chunked_io`，内部按时间块；v0.46.3 新增 Sol 非因果 decoder `NonCausalViT3DDecoder`：16×16 token 窗口 × 5 latent 帧 + 每块 5 个全局 token，int8 量化 decoder 可选）| MiniMax H3（视频 + 音频）| 原生自己限了窗口和块；先测 |
+| MiniMax H3 图像 / P-H3 图像（2D ViT decoder）| MiniMax H3 Image | 先测；整幅全局注意力的话 L2 可套 query 分块（不是 ComfyUI 的 VAE 注意力函数，要单独识别）|
+| SeedVR2（`seedvr/vae.py`，v0.46.3 重写，`handles_tiling`，`comfy_has_chunked_io`）| SeedVR2 3B / 7B（视频超分）| 自带 tiling；先测 |
+| RelayFlash（`wan/model_vsr.py`，v0.46.3 新增，逐帧窗口注意力、`output_buffer`）| Wan 2.2 RelayVSR | 逐帧、窗口 48×48 / 24×24；先测 |
+
+* 这一组的线程只做：H6 的测量命令、原生峰值表、判断要不要 L1；要做的话方案都是「窗口注意力 → halo = 窗口半径」，单独立项。
+
+### H 组：预览用的小 VAE（不做）
+
+TAESD / TAEF1 / TAEF2、**Qwen Image 2.1 TAESD（64 ch，16×，RGBA，v0.46.3 新增）**、TAEHV / lighttaew2.1 / TAEW2.2 / lighttae_hv15、MiniMax H3 的 TAEHV：几 MB 的权重，峰值本来就低；保持原生 / 第二层现状。
+
+### v0.46.3 的新图像 VAE
+
+| VAE | 状态 |
+|---|---|
+| Qwen Image 2.1 VAE（`vae2_2.WanVAE`，patch_size 1、temporal_kernel 1、z 64、RGBA，4D latent）| **阶段 A 已做**：走 Wan 2.2 适配器的第一层（`test_vae_wan22` 第 9 节），待真机 |
+| Qwen Image 2.1 TAESD | H 组，不做 |
+| MiniMax H3 Image / P-H3 Image | G 组 |
+| Trellis2 shape / texture VAE、Hunyuan3D、TripoSplat | 3D，不是图像 / 视频解码，原生 |
+| MiniMax Music3 DAV、YuE2 Oobleck、MiniMax H3 音频、Stable Audio 3 等 | 音频，原生 |
+
+## 3. 模型清单和单次峰值
+
+（见下表；尺寸来自 Hugging Face 文件页，按 ComfyUI 实际在用的量化形式。单次峰值 = max(DiT, TE, VAE 解码)；VAE 解码按 Monoload 管理后的估算。）
+
+单位：Hugging Face 文件页的 GB（10⁹ 字节；GiB ≈ GB × 0.93）。「?」= 没查到。来源仓库：Comfy-Org 各 *_repackaged、city96 / QuantStack 的 GGUF、Lightricks、Kijai、kandinskylab、mcmonkey、numz、zai-org（2026-11-26 查）。**采样时的单次峰值还要加 DiT 的激活**（720p×81 量级几 GiB，由各组线程在真机上量），表里只算权重。
+
+| 家族 / 变体 | DiT（bf16 · fp8 · GGUF Q8 · Q4_K_M）| TE | VAE（文件）→ 组 | 单次最大（权重）| 分组 |
+|---|---|---|---|---|---|
+| Wan 2.1 T2V 14B | 28.58 · 14.29 · 15.88 · 10.12 | umt5_xxl 11.37 · fp8 6.74 | wan_2.1_vae 0.25 → A | DiT | ≤ 55 |
+| Wan 2.1 I2V / FLF2V 14B（+ clip_vision_h 1.26）| 32.79 · 16.40 · 18.14 · 11.34 | 同上 | 同上 → A | DiT | ≤ 55 |
+| Wan 2.1 1.3B（T2V / Fun / Camera / VACE 1.3B）| 2.84–4.31 | 同上 | 同上 → A | TE | ≤ 55 |
+| Wan 2.1 VACE 14B / Fun Camera 14B / MagRef | 34.68 / 33.80 / 32.79（无 fp8）| 同上 | 同上 → A | DiT | ≤ 55 |
+| Wan 2.1 HuMo / FlowRVS / SCAIL / SCAIL2 / CausalAR | ?（14B 级，约 28–35 · 14–17）| 同上 | 同上 → A | DiT | ≤ 55（待核实）|
+| Wan 2.2 T2V / I2V A14B（高噪 + 低噪两个，分阶段只驻留一个）| 每个 28.58 · 14.29 · 15.41 · 9.65 | 同上 | wan_2.1_vae → A | DiT | ≤ 55 |
+| Wan 2.2 TI2V 5B / Fun 5B | 10.00 · — · 5.40 · 3.43 | 同上 | wan2.2_vae 1.41 → A | TE | ≤ 55 |
+| Wan 2.2 S2V 14B（+ wav2vec2 0.63）| 32.59 · 16.39 | 同上 | wan_2.1_vae → A | DiT | ≤ 55 |
+| Wan 2.2 Animate 14B | 34.55 · int8 18.41 · 18.72 · 11.50 | 同上 | 同上 → A | DiT | ≤ 55 |
+| Wan 2.2 Fun Camera / Control / Inpaint / VACE 14B、ChronoEdit | 28.58–34.68 · 14.29–17.35 | 同上 | 同上 → A | DiT | ≤ 55 |
+| Wan 2.2 RelayVSR / WanDancer、Wan Animate 2 | ? | 同上 | RelayFlash → G / wan_2.1_vae → A | ? | 待核实 |
+| HunyuanVideo 1.0 T2V / I2V / SkyReels | 25.64 · ? · 13.97 · 7.88 | llava_llama3 16.07 · fp8 9.09（+ clip_l 0.25）| hunyuan_video_vae_bf16 0.49 → B | DiT | ≤ 55 |
+| HunyuanVideo 1.5（T2V / I2V，480p / 720p，蒸馏版）、SR distilled | 16.65 · 8.33 | qwen_2.5_vl_7b 16.58 · fp8 9.38（+ byt5 0.44）| hunyuanvideo15_vae_fp16 2.52 → B | DiT / TE | ≤ 55 |
+| Kandinsky 5 Video Lite 2B | 4.57 | qwen_2.5_vl_7b（同上）+ clip_l | hunyuan_video_vae → B | TE | ≤ 55 |
+| Kandinsky 5 Video Pro 19B | 43.39（只有 bf16）| 同上 | 同上 → B | DiT 40.4 GiB | ≤ 55（激活余量小）|
+| LTX-Video 0.9.x 2B / 13B | 5.72–9.37 / 28.58 · 15.69 | t5xxl 9.79 · fp8 5.16 | 内嵌（卷积 VAE）→ F | DiT | ≤ 55 |
+| LTX-2 19B（音视频）| 43.29 · 27.08 · fp4 19.99 | gemma_3_12B 24.38 · fp8 13.21（+ text_projection 2.31）| LTX-2 卷积 VAE + 音频 → F | DiT | ≤ 55 |
+| LTX-2.3 22B（音视频）| 完整 46.15（含 VAE）· transformer-only bf16 42.02 · fp8 23.47–25.23 · int8 21.51 | 同上 | LTX23_video_vae 1.45 + audio 0.36 → F | DiT | ≤ 55（bf16 激活余量小）|
+| LTX-2.4 / 2.5 | ?（下载线程在下 unsloth 的 GGUF 镜像，尺寸以它为准）| ? | 2.4 扩散 decoder → F | ? | 待核实 |
+| MiniMax H3 pruned（视频 + 音频）| 40.23 · 20.96 · int8 20.97 · w6a8 15.98 | qwen3vl_32b 51.51 · int8 27.14 · nvfp4 15.69 | video 5.21（int8 2.81）/ sol 3.60 / audio 0.61 → G | **TE bf16 48 GiB** | ≤ 55（TE bf16 时 TE 和 DiT 必须分开加载）|
+| MiniMax H3 完整（fl2va / ref2va）| **66.28** · int8 34.04 | 同上 | 同上 → G | **DiT bf16 61.7 GiB** | **bf16：> 55，等宿主机调 ttm 后再验**；int8：≤ 55 |
+| MiniMax H3 Image | ? | 同上 | H3 图像 VAE → G | ? | 待核实 |
+| Mochi 1 | 20.06 · 10.03 | t5xxl 9.79 · 5.16 | mochi_vae 0.92 → D（只有 L1 能把 720p 放进 55）| DiT | ≤ 55（VAE 原生 OOM）|
+| Cosmos 1.0 7B / 14B | 14.47 / 28.53 | oldt5_xxl ? | CV8x8x8 ? → D | DiT | ≤ 55 |
+| Cosmos Predict 2 视频 2B / 14B | 3.91 / 28.53 | oldt5_xxl ? | wan_2.1_vae（未核实）→ A | DiT | ≤ 55 |
+| CogVideoX 2B / 5B / I2V / Inpaint | 5B 11.15（2B ?）| t5xxl 9.79 · 5.16 | 0.86 → C | DiT | ≤ 55 |
+| SVD / SVD-XT、SV3D | 9.56 | 无（CLIP vision）| SD VAE（内嵌）→ E | DiT | ≤ 55 |
+| SeedVR2 3B / 7B（视频超分）| 6.78 · 3.39 / 16.48 · 8.24 | 无 | ema_vae_fp16 0.50 → G | DiT | ≤ 55 |
+
+**结论：**
+* **> 55 GiB 只有一项：MiniMax H3 完整版的 bf16 DiT（61.7 GiB）** → 单列「等宿主机调 ttm 后再验」；它的 int8（31.7 GiB）和 pruned 各档都在主线。
+* **要分开加载 TE 和 DiT 的**：MiniMax H3 用 qwen3vl_32b bf16（48 GiB）时，任何 DiT 都放不进剩下的 7 GiB；其余家族 TE + DiT 同时驻留也多在 55 以内（最大的组合 LTX-2.3 bf16 42 + gemma bf16 22.7 ≈ 65 GiB 也超，ComfyUI 本来就会按需卸 TE，真机看日志确认）。
+* **VAE 解码在 Monoload 管理下都远小于 DiT**（§2 的 L2 数字 4–45 GiB，L1 预计 1–3 GiB + 输出），不会决定单次峰值；**例外是 Mochi**（L2 在 720p 仍 > 60，必须 L1）和 CogVideoX 720p（L2 45 GiB，接近线）。原生解码有好几种超过 55（HunyuanVideo、CogVideoX、Mochi 的 720p），这正是要 Monoload 的地方。
+* 主线验证的模型按价值排：Wan 2.2 A14B（fp8 / GGUF）、Wan 2.2 TI2V 5B、HunyuanVideo 1.5、LTX-2.3、HunyuanVideo 1.0、Kandinsky 5、CogVideoX、Cosmos Predict 2、Mochi、MiniMax H3（pruned / int8）、SeedVR2、SVD；Cosmos 1.0 与 LTX 0.9.x 只做冒烟。
+
+## 4. 并行开工的顺序
+
+1. **阶段 C（本线程）先出 H1 + H3 + H6**（多帧第二层的入口、直接写输出、`--frames`）：A / B / C / F 组的第二层立刻能用，真机能测原生基线。
+2. 同时开：**A 组（Wan）L1**、**G 组测量**（只要 H6）、**F 组的原生基线**（只要 H6）。
+3. H2 + H4 + H5 合进 video 后开：**B 组（Hunyuan）L1**、**C 组（CogVideoX）L1**。
+4. 最后：**D 组（Mochi / Cosmos）L1**、E 组的 L1、F 组 L1（看基线）。
+
+每组一个线程、一个功能分支（从 video 开，合回 video），各自写真机命令（`docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/...`，带预期和看哪项）交给验证线程。改 `vae_engine.py` / `vae.py` 的共用部分只在阶段 C 做；各组线程只加适配器文件和测试，需要改共用部分时先发给本线程。
+
+## 5. GGUF
+
+* DiT / TE：GGUF 线程（量化 LoRA 运行时合并）。
+* VAE：ComfyUI-GGUF（kyuz0/ComfyUI-GGUF-H3）能把 VAE 也放成 GGUF 时，权重在每次 `forward` 里反量化（`GGMLOps` 的 cast）。Monoload 的第二层 / 第一层把卷积按行分块、条带重算，**同一个卷积会被调用很多次 → 每次都反量化一遍**，又慢、又多一份反量化的临时量。共用钩子（阶段 C 加，记作 H7）：托管解码期间，对每个模块只反量化一次、缓存到解码结束（算进估算：反量化后的权重大小），fp32 自检照常。识别时按 `weight` 的类型（GGML 张量）判断，不靠类名；没有 GGUF VAE 文件时这条不生效。
+* 先确认 kyuz0/ComfyUI-GGUF-H3 6d33de2 有没有 VAE 的 GGUF 加载节点、各视频 VAE 有没有现成的 GGUF 文件（交给 GGUF 线程 / 下载线程核实，结果补进本节）。

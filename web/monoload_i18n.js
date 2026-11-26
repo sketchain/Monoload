@@ -1,8 +1,10 @@
 // Monoload: display-only translation of the Monoload nodes' dropdown options.
 // The labels come from the official locales files (locales/<lang>/nodeDefs.json,
-// inputs.<name>.options), served by ComfyUI at /i18n. ComfyUI's frontend 1.48.7
-// translates node names, input names, outputs and tooltips from those files but
-// not combo option labels, so this sets the combo widget's getOptionLabel: only
+// inputs.<name>.options), served by ComfyUI at /i18n. ComfyUI's frontend (1.48.7,
+// still so in 1.59.6) translates node names, input names, outputs and tooltips from
+// those files but not combo option labels (1.59.6 translates only settings' options),
+// so this sets the combo widget's getOptionLabel (read by both the canvas combo and
+// the Vue node widget in 1.59.6): only
 // what is shown changes, the value saved in the workflow stays the English one.
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";

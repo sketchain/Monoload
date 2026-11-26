@@ -606,11 +606,17 @@ class _Probe:
         self.seconds = seconds
 
 
-_PROBES = weakref.WeakKeyDictionary()   # first_stage_model -> {(latent channels, ndim): _Probe}
+_PROBES = weakref.WeakKeyDictionary()   # first_stage_model -> {(latent channels, ndim, dtype): _Probe}
 
 
 def _latent_px(samples):
     return int(samples.shape[-2]) * int(samples.shape[-1])
+
+
+def _probe_key(vae, samples):
+    """Latent channels, ndim and the compute dtype: ComfyUI v0.46's VAE.clone lets a VAE precision node decode the same
+    first-stage model in another dtype, and the probe's bytes per pixel are in the decode's dtype."""
+    return (int(samples.shape[1]), samples.ndim, str(vae.vae_dtype))
 
 
 def _probe(vae, samples, vae_options):
@@ -621,7 +627,7 @@ def _probe(vae, samples, vae_options):
     latent area. Cached per model and latent layout; the global RNG state is
     preserved."""
     fsm = vae.first_stage_model
-    key = (int(samples.shape[1]), samples.ndim)
+    key = _probe_key(vae, samples)
     per_model = _PROBES.setdefault(fsm, {})
     hit = per_model.get(key)
     if hit is not None:
@@ -735,7 +741,8 @@ def _run(vae, samples_in, vae_options, budget, stats):
             out = fsm.decode(samples, **vae_options)
             del samples
             if pixel_samples is None:
-                pixel_samples = torch.empty((n,) + tuple(out.shape[1:]), device=vae.output_device, dtype=vae.vae_output_dtype())
+                with vae_ops.malloc_graph_paused():
+                    pixel_samples = torch.empty((n,) + tuple(out.shape[1:]), device=vae.output_device, dtype=vae.vae_output_dtype())
             pixel_samples[i:i + 1].copy_(out)   # = native's .to(output_device, output dtype, copy=True) + copy_
             del out
             vae.process_output(pixel_samples[i:i + 1])
@@ -749,6 +756,12 @@ def _sync():
     sync = getattr(mm, "synchronize", None)
     if sync is not None:
         sync()
+
+
+def _load_models(vae, need):
+    """load_models_gpu with Monoload's estimate, as ComfyUI v0.46's VAE.decode calls it (under pause_malloc_graph)."""
+    with vae_ops.malloc_graph_paused():
+        mm.load_models_gpu([vae.patcher], memory_required=need, force_full_load=vae.disable_offload)
 
 
 def _native_estimate(vae, shape):
@@ -821,7 +834,7 @@ def _managed_decode(self, samples_in, vae_options):
         samples_in = samples_in[:, :, 0]
     _sync()  # do not count work queued before this decode
     t0 = time.perf_counter()
-    with mm.cuda_device_context(self.device):
+    with mm.cuda_device_context(self.device), vae_ops.unfused_norms(self.first_stage_model):
         bud = budget()
         if bud:
             return _decode_budget(self, samples_in, vae_options, t0, bud)
@@ -839,7 +852,7 @@ def _layer1_self_test(vae, bound):
     if hit is None:
         # the self-test copies the decoder's weights: they must be loaded
         need = bound.selftest_memory()
-        mm.load_models_gpu([vae.patcher], memory_required=need, force_full_load=vae.disable_offload)
+        _load_models(vae, need)
         hit = vae_engine.self_test(bound, vae)
         _SELFTEST_IN_DECODE[0] = max(_SELFTEST_IN_DECODE[0], need)
         if hit[0]:
@@ -1082,7 +1095,7 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
     plan, bud, ws, policy = choice or choose_plan(self, samples_in, bound, outb)
     floor_ws = min(MIN_WORKSPACE, ws)
     min_rows = min(vae_engine.MIN_ROWS, max(b - a for a, b in plan.stripes))
-    mm.load_models_gpu([self.patcher], memory_required=plan.estimate, force_full_load=self.disable_offload)
+    _load_models(self, plan.estimate)
     retries = 0
     first_est = plan.estimate
     while True:
@@ -1150,14 +1163,13 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
 def _layer2_estimate(vae, samples_in, vae_options, ws):
     """(estimate dict, probe or None) of a layer-2 decode with workspace ws; the
     shape probe (first decode of this model and latent layout) loads the weights."""
-    probe = _PROBES.get(vae.first_stage_model, {}).get((int(samples_in.shape[1]), samples_in.ndim))
+    probe = _PROBES.get(vae.first_stage_model, {}).get(_probe_key(vae, samples_in))
     if probe is None:
         # the shape probe needs the weights where they compute. It is one plain decode of a PROBE_SIZE x PROBE_SIZE
         # latent, not under OpChunking: no workspace in what it asks for (with ws it asked ~2 GiB for tens of MiB;
         # load_models_gpu adds its minimum_inference_memory on top anyway; review 2026-10 item 23)
         small = samples_in[0:1, ..., :PROBE_SIZE, :PROBE_SIZE]
-        mm.load_models_gpu([vae.patcher], memory_required=estimate(vae, small, 0, **_decoder_terms(vae, small))["total"],
-                           force_full_load=vae.disable_offload)
+        _load_models(vae, estimate(vae, small, 0, **_decoder_terms(vae, small))["total"])
         probe = _shape_probe(vae, samples_in, vae_options)
     return estimate(vae, samples_in, ws, probe, **_decoder_terms(vae, samples_in)), probe
 
@@ -1184,7 +1196,7 @@ def _decode_layer2(self, samples_in, vae_options, t0, l1_note, est=None, probe=N
     with mm.cuda_device_context(self.device):
         if est is None:
             est, probe = _layer2_estimate(self, samples_in, vae_options, budget)
-        mm.load_models_gpu([self.patcher], memory_required=est["total"], force_full_load=self.disable_offload)
+        _load_models(self, est["total"])
         while True:
             stats = OpStats()
             oom = False
@@ -1278,11 +1290,28 @@ def install():
     _ORIG["decode"] = comfy.sd.VAE.__dict__["decode"]
     _decode.__wrapped__ = _ORIG["decode"]
     comfy.sd.VAE.decode = _decode
+    clone = comfy.sd.VAE.__dict__.get("clone")
+    if clone is not None:
+        _ORIG["clone"] = clone
+        _clone.__wrapped__ = clone
+        comfy.sd.VAE.clone = _clone
     return True
+
+
+def _clone(self, *args, **kwargs):
+    """ComfyUI v0.46's VAE.clone (VAE precision / device nodes) copies a fixed list of attributes: the settings a
+    Monoload VAE Settings node set on this VAE go with the clone too, as they go with a shallow copy."""
+    n = _ORIG["clone"](self, *args, **kwargs)
+    s = self.__dict__.get(vae_overrides.ATTR)
+    if s is not None and vae_overrides.ATTR not in n.__dict__:
+        setattr(n, vae_overrides.ATTR, dict(s))
+    return n
 
 
 def uninstall():
     if not _ORIG:
         return False
     comfy.sd.VAE.decode = _ORIG.pop("decode")
+    if "clone" in _ORIG:
+        comfy.sd.VAE.clone = _ORIG.pop("clone")
     return True

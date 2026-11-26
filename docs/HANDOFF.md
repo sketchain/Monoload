@@ -1,6 +1,36 @@
-# Monoload 交接说明（第四阶段：VAE 解码管理推广到全部 VAE；4a 盘点、4b-0 修缺口、4b-1 Flux 2 第一层已完成并验收；第二轮代码审查的修正已完成并在 CT 700 上验收；图像补齐：Wan 2.2 单帧、HunyuanImage 2.1 第一层都已完成并在 CT 700 上验收；第五轮：Refiner 文件的更正、视频分析、Flux 2 dev 整套脚本，2026-10）
+# Monoload 交接说明（video 分支：适配 ComfyUI v0.46.3、视频 VAE 推广，2026-11；之前：第四阶段 VAE 推广到全部图像 VAE、第五轮，2026-10）
 
 给下一个对话用。到这里为止的功能都已在 CT 700 上验收；这份文档讲：现在是什么状态（§1）、节点和设置体系（§2）、必须遵守的规矩（§3）、第四阶段的盘点结果和下一步（§4）、环境和工具（§5）、代码地图（§6）、提交记录（§7）。细节在 README.md（使用、真机结果、bench 命令）和 docs/DESIGN.md（§9 VAE 设计，§10–§13 总开关 / LoRA 节点 / Info 节点 / 多语言）。
+
+## 0. video 分支（2026-11，先读这一节）
+
+**分支**：长期分支 `video`（从 dev 339b754 开出）。每项工作一个功能分支，从 video 开、`git merge --no-ff` 合回 video 并推送；不开 PR，不碰 `main` / `dev`（以后有空再从 video 往 main 提 PR）。每合进 video 一项就更新本节。
+
+**底座**：ComfyUI **v0.46.3**（cab5f4e，2026-11-24），前端 1.59.6，comfy-aimdo 0.6.0，comfy-kitchen 0.2.41；ComfyUI-GGUF 用 kyuz0/ComfyUI-GGUF-H3 6d33de2。**不再兼容 0.31（62b3c94）**，下面 §1–§7 里 62b3c94 / 锁定镜像的说法是 dev 时代的历史。
+真机：LXC 里的容器 `comfyui-latest`，仓库挂在 `/opt/ComfyUI/custom_nodes/monoload`，端口 8190；真机命令写成 `docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/...`，由专门的验证线程跑。GPU 稳定可用约 **55 GiB**（60 GiB OOM，卡在宿主机 `ttm.pages_limit` 默认值）；LXC 内存只给 48 GiB（运行时什么都不经过内存，§3）。
+云端：venv `/home/user/venv`（torch 2.15 CPU 可用），`COMFYUI_PATH=/home/user/ComfyUI`（v0.46.3）；只跑小测试、一次一个，不跑 `run_all.sh`。
+
+**进度**
+* **阶段 A：适配 v0.46.3（comfy-0.46-adapt，合并 8d89069）**——小测试全过，待真机冒烟。改了什么：
+  * `VAE.decode` 现在把 `load_models_gpu` 和输出分配包在 `comfy.model_prefetch.pause_malloc_graph()` 里：Monoload 的四处 `load_models_gpu`（自检、第一层、探测、第二层）和输出分配照做（`vae_ops.malloc_graph_paused`）。
+  * Flux 2 decoder 新的 `fused_norm` 路径（`Decoder.forward_fused` + `strip_conv`，CUDA + comfy-kitchen fp16/bf16 时启用；HIP 上只有 fp16 + fp16_conv3d，CT 700 的 `--bf16-vae` 不走）：托管解码期间临时关掉（`vae_ops.unfused_norms`），原生不动——融合内核绕过冻结统计量和 OpChunking，第一层的峰值也比它低。测试 `test_vae_flux2` 第 8 节。
+  * 新的 `VAE.clone()`（VAE 精度节点、Select VAE Device 用）只复制固定的属性：Monoload 包了 `clone`，把 VAE Settings 节点的设置带到副本上。
+  * 形状探测缓存的键加上 VAE dtype（`_probe_key`：通道、维数、dtype），换精度的副本不共用探测结果。
+  * Wan 2.2 适配器支持 `patch_size` 1 / 2 和 4D latent：**Qwen Image 2.1 的 VAE**（`WanVAE` patch_size 1、temporal_kernel 1、z 64、RGBA 输出）也走第一层（`test_vae_wan22` 第 9 节）；结构签名不再含时间核（fp32 副本只留一片）。
+  * v0.46.3 的 `pytorch_attention_enabled_vae` 在 AMD 上读 `gcnArchName`，gfx11 返回 False：**CT 700 上原生 VAE 注意力是 split**（Monoload 三种都分块，不受影响）；`vae_inventory` / `check_models` 模拟 gfx1151。
+  * 测试桩跟着改：CLIP 的 `tokenizer_metadata`、SeedVR 新的 `Attention(query_dim, norm_num_groups, eps)`。
+  * 核对过不用改的：`LowVramPatch` 新的 `prepare` / `memory_required`（`MonoloadRuntimePatch` 早已覆盖）；`load()` 现在会把形状变化的 key 烤进权重，Monoload 照旧报 `lora_shape_change`（没改）；"config" patch 变成 object patch；前端 1.59.6 仍不翻译 combo 选项，`monoload_i18n.js` 还需要。
+* **LoRA：量化 safetensors / GGUF / 视频小参数（lora-quant-formats、lora-gguf、lora-video-models 三次合并）**——CPU 小测试全过，待真机。设计和进度在 `docs/GGUF-QUANT.md`。
+  * 各种量化 safetensors（fp8 e4m3 / e5m2、int8_tensorwise、nvfp4、mxfp8、convrot_w4a4、asym_w4a8_int8、w6a8_int8；fp8 的三种来源：文件内 `comfy_quant` / 头部 `_quantization_metadata` / 旧 `scaled_fp8` 标记）：hotpatch 不用改，`tests/test_quant_formats.py`（66 项）锁住「在反量化临时权重上合并、不量化回去、无备份」。
+  * ComfyUI-GGUF（UnetLoaderGGUF / CLIPLoaderGGUF，按结构找，`monoload/gguf.py`）：量化层合并进 GGMLLayer 反量化出的临时权重（exact = 原生 GGUF 的算法逐位一致，默认 fused），F16 / F32 层也运行时合并、不备份（原生会备份）；hook LoRA 也支持（原生 GGUF 对量化层不应用 hook）；保存 GGUF 模型报 `gguf_save`；Info 节点多一行 GGUF 统计。每个 prompt 开始重新找一次（自定义节点可能比 Monoload 后加载）。`tests/test_gguf_lora.py`（38 项）。
+  * 不是 comfy.ops 层 weight / bias 的参数（Wan `modulation`、LTX `scale_shift_table` 等、纯 torch 层）：`MonoloadParamSwap`，所属模块 forward 期间换上合并好的临时参数，出来换回，无备份，原生算法逐位一致。**原生 v0.46.3 加载时静默丢弃这些 key**（`_load_list` 跳过非叶子模块），所以带这类 key 的 LoRA 和原生比 max|Δ| 不为 0。`tests/test_lora_param_swap.py`（44 项）；`test_lora_hot` 里原来的「纯 torch 层报错」改成「换参数」。
+  * `bench_lora.py` 加了 `--unet-gguf` / `--clip-gguf` / `--latent C,T,H,W` / `--batch`，每个组合报 GTT 峰值（20 ms 采样）。
+* **阶段 B**：**`docs/PLAN-video.md` 已写（合并见 §7）**——共用钩子 H1–H7、各 VAE 的第一层方案和 A–H 分组、模型清单与单次峰值（> 55 只有 MiniMax H3 完整版 bf16 DiT）、开工顺序。还没做：`vae_inventory` 扩到 v0.46.3 的全部 VAE；README / DESIGN / HANDOFF 更新；`docs/PLAN-video.md`（每种视频 VAE + 新图像 VAE 的第一层方案，分组可并行，含 safetensors / GGUF；覆盖 v0.46.3 里量化能跑的全部视频模型，扩散模型和文本编码器分开算；单次峰值 ≤ 55G 为主线，> 55G 单列「等宿主机调 ttm 后再验」；超大模型不分批会 OOM 时才把 TE 和视频模型分开加载；不做 MAGI-2）。
+* **阶段 C（未开始）**：多帧第二层（放开 `_native_reason` 的多帧、探测和估算认 5D、alloc_sim 验上界，DESIGN §9.32）；feat_cache 和因果时间卷积；SVD 整批第二层；LTX 分块 IO 的输出缓冲（音频仍原生）；`bench_vae --frames`；共用的第一层视频钩子（参考 vae-refiner-layer1 f51a6bc）。每项一个功能分支。
+
+**待办（视频这一轮之后）**：形状变化的 LoRA 的运行时支持——协调者替用户定：这次冲刺先保持报错（原生 v0.46.3 会烤进权重），视频做完再考虑。
+
+**未决（等用户定）**：视频 LoRA 的 modulation / scale_shift_table 这类 key，Monoload 应用、原生丢弃，要不要加开关「跟原生一样丢掉」（现在：应用）；Refiner 第一层分支 vae-refiner-layer1；polish-after-ui-test 的复测（换底座后一起测）。
 
 ## 1. 当前状态
 
@@ -180,7 +210,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * `monoload/nodes/`：注册表 + 三个节点。`web/`：`monoload_info.js`、`monoload_i18n.js`。`locales/`：界面翻译。
 * **小测试**（都不需要真实模型）：`test_entry.py`（开关组合，见文件头；其中 `MONOLOAD_VAE_BUDGET` + `MONOLOAD_VAE_STRIPE_ROWS`、`MONOLOAD_VAE_GN_SCHEME` 两种不在 `run_all.sh` 里，要手动跑）、`test_master_switch.py`、`test_messages.py`、`test_info_node.py`、`test_release_chain.py`、`test_vae_node.py`、`test_vae.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_wan22.py`、`test_vae_hunyuan.py`、`test_vae_refiner.py`（`refiner_vae=False` 的第二层估算和官方 Refiner 文件的 decoder）、`test_vae_stripe.py`、`test_dtype_paths.py`（默认和 `MONOLOAD_EXACT=1`）、`test_lora_node.py` 和 `test_lora_save.py`（要合成 checkpoint）。CT 700 检查脚本另有 `check_lora_save.py`（README §9.15）、`run_flux2_dev.py`（Flux 2 dev 整套，README §9.23）。需要真实 SD1.5 的：`test_lora_hot.py`、`test_quant.py`、`test_release.py`。
 
-## 7. 提交记录（`dev` 上的合并）
+## 7. 提交记录（`dev` 上的合并；video 分支的在表末）
 
 | 内容 | 合并 |
 |---|---|
@@ -224,6 +254,9 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | Refiner 第二层估算（`refiner_vae=False`）/ 官方 Refiner 文件的更正 | f7e1aa2 / b426588 |
 | 视频分析 / Flux 2 dev 整套脚本 | 565e73b / 2219844 |
 | （未合并）`refiner_vae=False` 的第一层：分支 vae-refiner-layer1 | f51a6bc |
-| 本文件 | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
+| **video 分支**：适配 ComfyUI v0.46.3（阶段 A） | 8d89069 |
+| video：PLAN-video.md | d58707f |
+| **video 分支**：LoRA 量化 safetensors 测试 / GGUF / 视频小参数 | 见 `git log --first-parent video`（Merge lora-quant-formats / lora-gguf / lora-video-models） |
+| 本文件 | 本文件所在的提交（`git log --first-parent video` 最上面几条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。
