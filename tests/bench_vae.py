@@ -272,11 +272,11 @@ def latent_frames(vae, frames):
     return t
 
 
-def random_latent(vae, w, h, seed, std, frames=1):
+def random_latent(vae, w, h, seed, std, frames=1, batch=1):
     r = vae.spacial_compression_decode()
     if w % r or h % r:
         raise SystemExit("resolution {}x{} is not a multiple of {}".format(w, h, r))
-    shape = [1, vae.latent_channels]
+    shape = [batch, vae.latent_channels]
     if vae.latent_dim == 3:
         shape.append(latent_frames(vae, frames) if frames > 1 else 1)
     elif frames > 1:
@@ -916,6 +916,7 @@ def main():
     p.add_argument("--latent", action="append", help="SaveLatent .latent file instead of random latents (repeatable; path, or name in input/ or output/)")
     p.add_argument("--seed", type=int, default=0, help="seed of the random latents")
     p.add_argument("--frames", type=int, default=1, help="output frames of the random latents (video VAEs; e.g. 81 for Wan)")
+    p.add_argument("--batch", type=int, default=1, help="batch size of the random latents (SVD: the batch is its frames, e.g. 14 or 25)")
     p.add_argument("--latent-std", type=float, default=1.0, help="std of the random latents")
     p.add_argument("--modes", default="native,monoload,native2",
                    help="comma list run in order per resolution: native, monoload (layer 1 where recognized, else layer 2), "
@@ -974,7 +975,8 @@ def main():
     else:
         for res in a.res.split(","):
             w, h = (int(x) for x in res.lower().split("x"))
-            inputs.append((res + ("x{}f".format(a.frames) if a.frames > 1 else ""), random_latent(vae, w, h, a.seed, a.latent_std, a.frames),
+            inputs.append((res + ("x{}f".format(a.frames) if a.frames > 1 else "") + ("b{}".format(a.batch) if a.batch > 1 else ""),
+                           random_latent(vae, w, h, a.seed, a.latent_std, a.frames, a.batch),
                            "random seed {}".format(a.seed)))
     for label, lat, what in inputs:
         print("input {}: latent {} ({}), native estimate {}".format(label, list(lat.shape), what,
