@@ -17,7 +17,7 @@ the first chunk. Every one of those cached tensors is local in the rows the way 
 conv's input rows, a 1x1 time_conv's input rows), and the per-frame attention sits in the middle, which the
 single-frame adapters already put into the whole-image prefix.
 
-So the decode runs stripe-major, on the engine's time axis (docs/PLAN-video.md H2, DESIGN §9.36 / §9.39):
+So the decode runs stripe-major, on the engine's time axis (docs/PLAN-video.md H2, DESIGN §9.36 / §9.40):
 
   1. prefix (prefix_pass, the adapter's own): conv2 on the whole latent, then for each time chunk the prefix
      modules of the single-frame adapter (decoder.conv1, middle, Wan 2.1 also the ResidualBlocks before the first
