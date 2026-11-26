@@ -407,19 +407,21 @@ def structure(fsm):
 
 
 class _SimMeter:
-    """vae._PEAK_METER's meter on the simulator: allocated bytes above start() (CUDA's max_memory_allocated)."""
+    """vae._PEAK_METER's meter on the simulator, as vae._CudaPeak: the cache emptied at start(), then the larger of the
+    allocated and the reserved peak above what was there."""
 
     def __init__(self, sim, tracer):
-        self.sim, self.tracer, self.base = sim, tracer, 0
+        self.sim, self.tracer, self.base, self.base_res = sim, tracer, 0, 0
 
     def start(self):
         self.tracer.poll()
+        self.sim.empty_cache()
         self.sim.reset_peak()
-        self.base = self.sim.allocated
+        self.base, self.base_res = self.sim.allocated, self.sim.reserved
 
     def peak(self):
         self.tracer.poll()
-        return self.sim.peak_allocated - self.base
+        return max(self.sim.peak_allocated - self.base, self.sim.peak_reserved - self.base_res)
 
 
 def path(v, shape):
