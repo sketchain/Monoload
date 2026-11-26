@@ -93,16 +93,43 @@
   * **为什么不走条带引擎**：条带的光环要把各层窗口半径累加——第 5 段 8 层 × 每层 10 帧（k_t − 1）= 80 帧，加上前 4 段，一个条带的重算量比它本身还大；而注意力本身逐层就能精确切开（每层只要 k_t − 1 帧光环、不累加），切完以后剩下的整份张量只有 x 和 context 两份，已经把 1920×1088×193 压进 55 GiB 主线。真要更大（x + context 本身超了）才需要跨层流式，到时再议。
 * H4：PixelNorm 的 1024 通道 `mean(x²)` 按道理也触发 ROCm 归约缓冲，跟踪器要先模拟、真机核实。
 
-### G 组：本来就自己分块的 transformer VAE（先测原生，够低就不做）
+### G 组：本来就自己分块的 transformer VAE（结论：原生已够，Monoload 只透传，不做 L1 / L2）
 
-| VAE | 模型 | 说明 |
-|---|---|---|
-| MiniMax H3 视频（`ViT3DDecoder`，`comfy_has_chunked_io`，内部按时间块；v0.46.3 新增 Sol 非因果 decoder `NonCausalViT3DDecoder`：16×16 token 窗口 × 5 latent 帧 + 每块 5 个全局 token，int8 量化 decoder 可选）| MiniMax H3（视频 + 音频）| 原生自己限了窗口和块；先测 |
-| MiniMax H3 图像 / P-H3 图像（2D ViT decoder）| MiniMax H3 Image | 先测；整幅全局注意力的话 L2 可套 query 分块（不是 ComfyUI 的 VAE 注意力函数，要单独识别）|
-| SeedVR2（`seedvr/vae.py`，v0.46.3 重写，`handles_tiling`，`comfy_has_chunked_io`）| SeedVR2 3B / 7B（视频超分）| 自带 tiling；先测 |
-| RelayFlash（`wan/model_vsr.py`，v0.46.3 新增，逐帧窗口注意力、`output_buffer`）| Wan 2.2 RelayVSR | 逐帧、窗口 48×48 / 24×24；先测 |
+五个类都声明 `comfy_has_chunked_io`（往 `VAE.decode` 预分配的输出里写），`vae._native_reason` 在看帧数之前就把它们判成原生（`vae.nr_chunked_io`），图像和视频、单帧和多帧都一样；`tests/test_vae_selftiled.py` 锁住这条路由（不加载权重，只用类，19 项，真机 2026-11-26 全过）。**H1 放开多帧时，`comfy_has_chunked_io` 的判断要留在多帧白名单之前**（或白名单里不放这五个类），否则第二层的 8×8 探测、按面积外推会套到它们的 Linear / 自带注意力上，只添乱。
 
-* 这一组的线程只做：H6 的测量命令、原生峰值表、判断要不要 L1；要做的话方案都是「窗口注意力 → halo = 窗口半径」，单独立项。
+为什么不做：它们自己把显存限住了，峰值 ≈ 权重 + 输出 + 一个块的工作量，工作量和帧数基本无关。
+
+| VAE（类） | 自己怎么分块 | 原生峰值（CT 700 实测，reserved） | 结论 |
+|---|---|---|---|
+| MiniMax H3 视频，原版 decoder（`MiniMaxH3VideoVAE` + `ViT3DDecoder`） | 时间上 5 + 2 个 latent 一块，空间 256 px tile（一次最多 4 块），边解边写输出 | 见下表：1080p 107 帧总共 11.8 GiB（权重 4.85 + 输出 2.5 + 工作量 < 2.5）| 原生已够，只透传 |
+| MiniMax H3 视频，Sol decoder（`NonCausalViT3DDecoder`） | 整段的残差流 + 5 个 latent 一块的 q/k/v 环（ring 2）| 待测（已排队）。按代码算：残差流每输出像素·帧 4 B（2048 维 bf16 ÷ 16×16×4 像素），只有 fp32 输出（12 B）的三分之一；q/k/v/注意力输出的环 1080p 约 1.3 GiB、单块 qkv / MLP 临时量约 1 GiB，与帧数无关。1080p 107 帧估 ≈ 权重 + 输出 2.5 + 残差 1.1 + 2.5 | 只透传：随帧数涨的部分以 ComfyUI 预分配的输出为主，第一层省不掉它；残差流整段在显存里是这个 decoder 的设计（不重算时间重叠），拆开就不是同一个结果 |
+| MiniMax H3 Image / P-H3 Image（`H3ImageVAE` 子类） | 同原版的 256 px tile | 没有单独的 Image 模型文件（Comfy-Org/MiniMax-H3 只有 fl2va / ref2va），按原版的数推 | 只透传 |
+| SeedVR2（`VideoAutoencoderKLWrapper`） | 按空闲显存定每片几个 latent 帧；卷积 / GroupNorm 0.5 GiB 一块；放不下时把因果缓存放到锁页内存（`CausalMemoryCache(offload=True)`，每输出像素 6200 B）| 待测（已排队）。它自己的估算（`comfy_memory_used_decode`，按实测拟合，`comfy_decode_estimate_is_reliable`）：每输出像素 3150 B，**bf16 再 ×5**（只有 fp16 channels-last 走拟合的快路径）——1080p 一帧约 30 GiB、4K 约 120 GiB，4K 直接走它自己的空间分块（`preferred_decode_tile`，最大 768 px） | 只透传：峰值由它自己按空闲显存规划、估算可靠、放不下自动分块，第一层要重写它的因果缓存机制（4a 盘点就不建议）。能省的是精度：SeedVR2 VAE 用 fp16 比 bf16 少约 5 倍，这是用户侧的选择，不是 Monoload 的事 |
+| RelayVSR Flash（`RelayFlash`） | 逐帧解码，窗口注意力 48×48 / 24×24，`HostWriter` 直接写输出 | 待测（已排队）。按代码：一帧的工作量，和帧数无关 | 只透传 |
+
+**MiniMax H3 原版 decoder 实测**（`minimax_h3_video_vae_fp16.safetensors`，`--gpu-only --bf16-vae`，权重 4.85 GiB；随机 latent；`tests/bench_selftiled.py`；原生和装了 Monoload 的输出逐位相同）：
+
+| 尺寸 | 帧（latent） | 耗时 | 解码多占（alloc / reserved）| 其中输出（fp32）| 总 reserved |
+|---|---|---|---|---|---|
+| 1280×720 | 22（7） | 13 s | 0.84 / 1.49 GiB | 0.23 | 6.47 |
+| 1280×720 | 107（32） | 76 s | ≤ 2.20 / ≤ 3.26 | 1.10 | ≤ 8.24 |
+| 1920×1088 | 22（7） | 28 s | 1.35 / 2.40 | 0.51 | 7.38 |
+| 1920×1088 | 107（32） | 159 s | ≤ 5.00 / ≤ 6.79 | 2.50 | ≤ 11.77 |
+
+「≤」：这一轮的脚本在读峰值前把输出（`movedim` 过、不连续）在显存里拷了一份再算哈希，多出一份输出大小，所以长片段的数是上界（d3f7707 已改）；短片段的数不受影响（拷贝比解码本身的峰值小），由它可知工作量约 0.6 GiB（720p）/ 0.85 GiB（1080p），不随帧数涨。ComfyUI 自己的估算（`memory_used_decode`：720p 0.58–1.02、1080p 1.05–1.66 GiB）不含输出，只拿去 `load_models_gpu` 腾地方，不影响结果。单次峰值由 DiT / TE 决定（§3），VAE 不是瓶颈。
+
+**GGUF VAE**：社区有 MiniMax H3 视频 VAE Q8_0（2.94 GB）和 SeedVR2 VAE F16（0.50 GB）的 GGUF，但 ComfyUI 核心的 `VAELoader` 不列 `.gguf`，ComfyUI-GGUF（kyuz0 H3）只有 UNet / CLIP 加载器——**没有能把它们当 VAE 加载的节点**（真机核实）。`bench_selftiled --gguf` 用 gguf 包读出来、反量化成 fp16 再构造 `comfy.sd.VAE`（SeedVR2 F16：250 个张量，正常构造），解码就是 fp16 VAE 的解码，峰值同 safetensors 版。
+
+真机命令（在容器里另起进程、拿 GPU 锁、先让服务器卸模型；结果写进 `/srv/comfy-latest/results/native/`）：
+
+```bash
+/srv/comfy/gpulock run "G组: MiniMax 原生峰值" docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/bench_selftiled.py --vae minimax_h3_video_vae_fp16.safetensors --res 1920x1088 --frames 22,107 --modes native,monoload
+/srv/comfy/gpulock run "G组: SeedVR2 原生峰值" docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/bench_selftiled.py --gguf seedvr2_ema_vae_f16.gguf --res 1920x1080,3840x2160 --frames 33 --modes native
+/srv/comfy/gpulock run "G组: RelayVSR 原生峰值" docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/bench_selftiled.py --vae relayvsr_flash_vae_x4_fp32.safetensors --relay --res 1920x1080,3840x2160 --frames 31 --modes native
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/test_vae_selftiled.py   # 不占 GPU（--cpu），预期 19 项全过
+```
+
+预期：`bitwise native == monoload: True`；MiniMax 1080p 22 帧解码多占 ≈ 1.35 GiB（alloc）；没有 `TILED_FALLBACK` / `OOM`。
 
 ### H 组：预览用的小 VAE（不做）
 
@@ -173,5 +200,4 @@ TAESD / TAEF1 / TAEF2、**Qwen Image 2.1 TAESD（64 ch，16×，RGBA，v0.46.3 �
 ## 5. GGUF
 
 * DiT / TE：GGUF 线程（量化 LoRA 运行时合并）。
-* VAE：ComfyUI-GGUF（kyuz0/ComfyUI-GGUF-H3）能把 VAE 也放成 GGUF 时，权重在每次 `forward` 里反量化（`GGMLOps` 的 cast）。Monoload 的第二层 / 第一层把卷积按行分块、条带重算，**同一个卷积会被调用很多次 → 每次都反量化一遍**，又慢、又多一份反量化的临时量。共用钩子（阶段 C 加，记作 H7）：托管解码期间，对每个模块只反量化一次、缓存到解码结束（算进估算：反量化后的权重大小），fp32 自检照常。识别时按 `weight` 的类型（GGML 张量）判断，不靠类名；没有 GGUF VAE 文件时这条不生效。
-* 先确认 kyuz0/ComfyUI-GGUF-H3 6d33de2 有没有 VAE 的 GGUF 加载节点、各视频 VAE 有没有现成的 GGUF 文件（交给 GGUF 线程 / 下载线程核实，结果补进本节）。
+* VAE：**不做（原计划的钩子 H7 已取消，2026-11-26）。** ComfyUI v0.46.3 核心和 kyuz0/ComfyUI-GGUF-H3 6d33de2 都没有 GGUF VAE 的加载器（GGUF 线程核实，见 `docs/GGUF-QUANT.md`）；现成的视频 VAE GGUF 文件只有 MiniMax-H3 Q8_0、SeedVR2 F16（社区），加载不了。另外原设想的「每模块反量化一次、缓存到解码结束」等于同时多留一份权重，违反「权重只留一份」，也不该做。以后真有 GGUF VAE 加载器再议。
