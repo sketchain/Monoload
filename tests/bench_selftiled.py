@@ -216,6 +216,7 @@ def g(n):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--vae", help="VAE file in models/vae (VAELoader)")
+    p.add_argument("--vae-path", help="VAE safetensors by path (comfy.sd.VAE with the file's metadata), for files not in models/vae")
     p.add_argument("--gguf", help="GGUF VAE file (models/vae name or path), dequantized to fp16")
     p.add_argument("--res", default="1280x720", help="decoded WxH list")
     p.add_argument("--frames", default="33", help="pixel frame counts")
@@ -231,6 +232,11 @@ def main():
     if a.gguf:
         stock_gguf_check(os.path.basename(a.gguf))
         vae, src = load_gguf_vae(a.gguf)
+    elif a.vae_path:
+        import comfy.utils
+        sd, meta = comfy.utils.load_torch_file(a.vae_path, return_metadata=True)
+        vae, src = comfy.sd.VAE(sd=sd, metadata=meta), "path " + os.path.basename(a.vae_path)
+        vae.throw_exception_if_invalid()
     else:
         vae, src = nodes.VAELoader().load_vae(a.vae)[0], "VAELoader " + a.vae
     fsm = vae.first_stage_model
