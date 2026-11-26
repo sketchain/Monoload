@@ -1923,6 +1923,37 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **命令：** `python tests/vae_inventory.py [--only wan21,ltxv2] [--no-trace] [--json out.json]`（CPU、meta 设备，几分钟）。
 
+### 9.40 D 组：Mochi、Cosmos 1.0 逐帧流式的第二层（分支 claude/project-thread-gjyfzb）
+
+**问题：** Mochi 和 Cosmos 1.0 的 decoder 一次吃下整段视频。Mochi 848×480×85 原生模拟 362 GiB（OOM → tiled），整段视频进第二层还要 59.32；Cosmos 1280×704×121 原生 30.18，整段第二层 12.99（§9.39）。两种 decoder 跨帧的东西都只有**因果时间卷积**（只看前面几帧）和**时间上采样**，所以可以一帧一帧地流过去，每个因果卷积带着自己前几帧的缓存。
+
+**做法（`monoload/vae_mochi.py`、`monoload/vae_cosmos.py`，各自的 `chunks(fsm, z)` 登记进 `vae_video._CHUNKS`）：**
+* **深度优先、一次一帧：** 每一级的输出切成单帧（`PIECE_FRAMES` = 1，固定，探测的斜率才不随尺寸变）再进下一级，所以每个模块按时间顺序见到自己的帧；每一级的输入在输出出来后立刻放掉（迭代写法；递归写法会把每级输出一直留到最底层，Mochi 720p 多 1.5 GiB）。输出块按帧序出来，`vae._decode_sample` 逐块拷进输出缓冲（H3）。
+* **因果卷积的缓存：** 进 `_Stream` 时给每个时间核 > 1 的因果卷积挂实例 `forward`（带 `monoload_replacement` 标记，出来时摘掉）：第一次调用照原生在前面补首帧（Mochi `PConv3d` 的 replicate / zeros，Cosmos `CausalConv3d` 的首帧重复），以后把缓存的 kernel−1 帧接在前面；输出帧就是原生的那一帧。
+* **Mochi：** decoder 摊平成一串级（ResBlock、1×1×1 卷积、`Conv1x1`、`DepthToSpaceTime`），从 latent 第一帧起整条流下去；`DepthToSpaceTime` 只在第一次调用时丢掉前 texp−1 帧（t 帧 latent → 6t−5 帧）。没有注意力，GroupNorm 是逐帧的（`GroupNormSpatial`），不用改。
+* **Cosmos（`DecoderFactorized`）：** 第一个带时间上采样的层级之前（conv_in、mid 的空间注意力和**因果时间注意力**、上面的 up 层级）在 latent 分辨率上照原生整段跑一遍；从那一级的 `upsample` 起流式：首帧出 1 帧、其余每帧 ×2（`repeat_interleave`），后面的层级、`norm_out`、`conv_out`、haar 反变换（只有第一块去掉 patch_size−1 帧）逐帧。流式部分要求没有注意力、`CausalNormalize` 的 num_groups == 1（逐帧的 GroupNorm）、没有第二次时间上采样；t = 1 时整段解码。
+* **认结构不认文件名：** `structure(fsm)` 检查类、每一级的模块种类、因果卷积的时间步长 / 膨胀、没有别人挂的实例 `forward`（用户的 hook）；任何一条不符就 `yield fsm.decode(z)`，和原生一样。
+* **数值：** 同样的模块算同样的帧，卷积 / GroupNorm 只是一次算 1–3 帧，可能挑到别的 kernel：fp 接近，不逐位相同。`MONOLOAD=0` 不经过这里，照旧逐位等于原生。
+
+**模拟（`tests/sim_group_d.py`，bf16，GiB，reserved 增量；估算是 H1 探测在模拟器上量的）：**
+
+| VAE、分辨率×帧数 | 原生 | 整段第二层（§9.39） | 流式第二层 | 估算 |
+|---|---|---|---|---|
+| Mochi，848×480×85 | 362（OOM） | 59.32 | **5.55** | 7.19 |
+| Mochi，1280×720×85 | 820（OOM） | 106 | **11.45** | 13.22 |
+| Mochi，848×480×163 | — | — | **5.90** | 7.55 |
+| Cosmos 1.0，1280×704×121 | 30.18 | 12.99 | **4.15** | 5.78 |
+| Cosmos 1.0，1920×1088×121 | 55.63 | — | **9.87** | 10.51 |
+| Cosmos 1.0，1280×704×57 | 14.88 | — | **2.79** | 5.04 |
+
+估算全是上界。Mochi 的峰值主要是缓存（38 个因果卷积各 2 帧，720p 约 5.7 GiB，几乎不随帧数变）；Cosmos 的峰值在 latent 分辨率的整段前缀加输出缓冲（fp32，1.22 GiB）。
+
+**第一层：两种都不做。** 流式第二层已经远低于 55 GiB，也低于各自 DiT 的峰值；第一层（按行条带）只能再压缓存或前缀，换不来决定性的差别（按「和第二层比」的规矩）。
+
+**测试：** `tests/test_vae_stream.py`（随机权重、真实尺寸、真机 GPU）：流式拼起来对原生 fp32 相对误差 ≤ 1e-5（单纯流式和 1 MiB 工作区的 OpChunking 两种），bf16 误差不超过原生的 2 倍，用户 hook / Cosmos 单帧 / 别的类整段解码，模块上不留东西。云端 CPU 跑过一次（DC 离线时）：fp32 相对误差 Mochi 1.2e-6、Cosmos 9.9e-7，bf16 和原生一样。
+
+**接入：** 登记要改 `vae_video.py`（适配线程的文件），按 951868b 的写法可选导入（没合进来时照旧原生）。合之前 `tests/group_d_reg.py` 自己登记，`tests/sim_group_d.py`、`tests/bench_group_d.py`（包一层 `bench_vae`，例：`python tests/bench_group_d.py --vae mochi_vae.safetensors --res 848x480 --frames 85 --modes native,monoload`）用它。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。

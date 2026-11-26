@@ -31,6 +31,7 @@
 * **H4：方案 G 扩到 Refiner 的 RMS_norm 和 LTX 的 PixelNorm（video-norm-g，合并见 §7）**——`OpChunking` 里把通道 > 510 的 `vae_refiner.RMS_norm` 和每个 `PixelNorm`（按调用判断通道数）换成分组归约，躲开 ROCm 的 32 KiB / 位置归约临时缓冲；小通道逐位相同。现在只第二层用到，各组写第一层时照 Wan 2.2 把 `grouped_norm_bytes` 加进单元（DESIGN §9.37）。H7 取消（PLAN-video §5）。
 * **盘点（video-inventory，合并见 §7）**——`tests/vae_inventory.py` 跟到 v0.46.3（新 VAE 四种、托管多帧走 Monoload 自己的路和 H1 估算），结果 DESIGN §9.39：托管的 Wan 2.1 / 2.2、LTX 0.9.0 / 2 的估算都是上界；LTX 扩散 decoder、RelayFlash 在 meta 上追踪不了，要真机。
 * **E 组 SVD：整批第二层不合，保持原生**——模拟里只省 20%（25.71 → 20.72 GiB），而且探测估算 20.03 给不出上界（整批时碎片随尺寸涨）。代码留在分支 video-svd-l2（DESIGN §9.38）。
+* **D 组 Mochi / Cosmos 1.0：逐帧流式的第二层（分支 claude/project-thread-gjyfzb，待合）**——`vae_mochi.py` / `vae_cosmos.py` 的 `chunks` 按帧深度优先、因果卷积带缓存；模拟 Mochi 848×480×85 原生 362（OOM）→ 5.55 GiB，Cosmos 1280×704×121 30.18 → 4.15，估算都是上界；两种都不做第一层。登记要在 `vae_video.py` 加可选导入（适配线程合）。真机等 DC（DESIGN §9.40）。
 * **阶段 B**：**`docs/PLAN-video.md` 已写（合并见 §7）**——共用钩子 H1–H7、各 VAE 的第一层方案和 A–H 分组、模型清单与单次峰值（> 55 只有 MiniMax H3 完整版 bf16 DiT）、开工顺序。`docs/PLAN-video.md`（每种视频 VAE + 新图像 VAE 的第一层方案，分组可并行，含 safetensors / GGUF；覆盖 v0.46.3 里量化能跑的全部视频模型，扩散模型和文本编码器分开算；单次峰值 ≤ 55G 为主线，> 55G 单列「等宿主机调 ttm 后再验」；超大模型不分批会 OOM 时才把 TE 和视频模型分开加载；不做 MAGI-2）。
 * **阶段 C（进行中）**：多帧第二层入口已合（上面 H1）；剩下feat_cache 和因果时间卷积；SVD 整批第二层；LTX 分块 IO 的输出缓冲（音频仍原生）；`bench_vae --frames`；共用的第一层视频钩子（参考 vae-refiner-layer1 f51a6bc）。每项一个功能分支。
 
