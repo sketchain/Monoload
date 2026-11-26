@@ -1929,4 +1929,11 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 **H6：** `bench_vae.py --frames N`：随机 latent 的输出帧数（视频 VAE），latent 帧数取解码后 ≥ N 的最少帧数；标签加 `x{N}f`。
 
-**真机（CT 700，`comfyui-latest`）：** 见下面的结果表（随测随补）。
+**真机（CT 700，`comfyui-latest`，`tests/bench_vae.py --frames`，GiB；reserved 是比运行前多出的量）：**
+
+| VAE、分辨率×帧数 | 探测版本 | 原生 reserved / 耗时（冷 / 热） | Monoload reserved（alloc）/ 估算 | 耗时（冷 / 热） | 与原生（像素 max / PSNR） |
+|---|---|---|---|---|---|
+| Wan 2.1，832×480×81 | 1 MiB 工作区（10bcb80） | 8.74 / 32.5 s（热） | 5.34 / 5.55 | 第一次多约 85 s（探测，已改 64 MiB） | max 0.0071 |
+| Wan 2.1，1280×720×81 | reserved 连线（40b15cb） | 18.90 / 75.9 s / 75.3 s | 9.84（7.80）/ 13.77 | 91.3 s / 81.8 s | 0.0166 / 60.8 dB（323 个像素 > 0.01） |
+
+两行都在最后定下的探测（d4f419e，allocated 连线 + 碎片项）之前测的；估算都是上界。最终版本的真机读数（Wan 2.2 1280×704×121、LTX-2 卷积 VAE、LTX-2.5 扩散 decoder，各 768×512×97）在排队，测完补在这里。原生基线文件在 `/srv/comfy-latest/results/native/`。
