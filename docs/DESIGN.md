@@ -2163,6 +2163,21 @@ Monoload 的目标是降峰值，「原生放得进 cap 就走原生」也不做
 * `MONOLOAD=0`：装着 Monoload 的 `VAE.decode` 与卸掉时逐位相同（t = 13 / 12）。fp32 自检 5e-6（容差 1e-4）。
 * 第一层省一半峰值，第二层每个卷积只算一次、在 720p 快约 45%，所以 `prefer_layer2`：放得下第二层就走第二层。
 
+### 9.47 第一层自检的通过结果落盘（分支 video-selftest-cache）
+
+**问题：** 第一层每种结构在每个进程第一次解码前跑一次自检（`vae_engine.self_test`：fp32 副本、小 latent、强制小条带对整图），结果只存在进程内的 `vae_engine._SELFTEST`。ComfyUI 每次重启后的第一次第一层解码都要再跑一遍。Wan 2.2 5B 视频（640×352×33，latent 9 帧）的自检在真机上要 74.9 s，video 回归 92cbd3d 里 `wan22_5b` 的 on / on2 因此是 185 / 181 s，off 是 98 s。
+
+**做法：** 通过的自检写进探测缓存的同一个文件（§9.44，`MONOLOAD_PROBE_CACHE`），用自己的键：`["selftest", 格式版本, 权重指纹, str(bound.key), 显卡名, torch 版本, Monoload 源码指纹]`，条目是 `{"selftest": "ok", "detail", "seconds", "saved"}`。缓存格式升到 5，旧文件整个作废、重新测。
+
+* **读：** `_layer1_self_test` 和 `choose_budget` 在看 `_SELFTEST` 之前先查文件（`_selftest_from_disk`），命中就把这次通过放进 `_SELFTEST`（detail 后面标「passed before … cached」）。于是 `_selftest_pending` 返回 0：预算模式不再给自检留内存，`_SELFTEST_IN_DECODE` 也不设，估算和以后的解码一样。
+* **写：** 只写通过的。失败的不落盘，下个进程再测一次（失败本来就退到第二层，多测一次的代价只是时间）。
+* **`_MemProbe` 的 `selftest` 标志** 只数真正跑了的自检（`_selftests_run`：`_SELFTEST` 里扣掉从文件读来的），bench 不会把命中缓存的解码当成含自检的冷跑。
+* 源码指纹覆盖 `monoload/*.py`：引擎、适配器改了任何一行都重新测，和探测缓存一样。
+
+**真机（comfyui-latest，wan2.2_vae，latent 1×48×9×22×40 即 `wan22_5b` 的尺寸，同一个新缓存文件跑两个进程）：** 进程 1 跑自检后解码 93.8 s，写入 1 条自检条目；进程 2 跳过自检（本进程跑过的自检 0 个），托管解码 18.1 s，原生 10.1 s；两个进程的输出 sha256 相同（f7d4ae2fe6cee7b6）。
+
+**自检规模不缩：** 已经是最小的覆盖（24×24 latent、3 个时间块让缓存跨 2 个块边界、8 MiB 工作区让条带里的卷积也走第二层分块，930 次分块卷积）。慢主要是 fp32 加小分块，缩小会丢覆盖。落盘之后每个（权重、代码版本）只测一次，不值得动。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
