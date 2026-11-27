@@ -7,7 +7,7 @@
 | 项 | 分支 | 状态 |
 |---|---|---|
 | 调研 + 设计（本文件） | 随各分支进 `video` | 完成 |
-| 1 GGUF（ComfyUI-GGUF 的 Unet / CLIP 加载器） | `lora-gguf` → `video` | 已合并；`tests/test_gguf_lora.py` 38 项全过（含 hook LoRA、Info 一行、非叶子 F32 modulation）；真机逐层 Q8_0 / Q4_K / Q6_K 全过（exact 对原生逐位一致），Wan 2.2 A14B Q4_K_M + lightx2v 整模型 exact 逐位一致、0 备份、每步 0.96x / 1.01x（§8）；其余 K-quant / IQ4 类型机器上没有文件（§6.2） |
+| 1 GGUF（ComfyUI-GGUF 的 Unet / CLIP 加载器） | `lora-gguf` → `video` | 已合并；`tests/test_gguf_lora.py` 38 项全过（含 hook LoRA、Info 一行、非叶子 F32 modulation）；真机逐层 ComfyUI-GGUF 支持的 12 种量化类型（Q2_K ~ Q6_K、Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0、IQ4_NL / IQ4_XS）全过，exact 对原生逐位一致（§6.2）；Wan 2.2 A14B Q4_K_M + lightx2v 整模型 exact 逐位一致、0 备份、每步 0.96x / 1.01x（§8） |
 | 2 safetensors 各量化格式 | `lora-quant-formats` → `video` | 已合并；`tests/test_quant_formats.py` 66 项全过（hotpatch 不用改）；真机 test_quant（fp8）默认 / exact 全过，Wan 2.2 14B fp8 整模型 0 备份、每步 1.01x（§8） |
 | 3 视频模型（Wan / HunyuanVideo / LTX，含 GGUF） | `lora-video-models` → `video` | 已合并；小参数运行时换参数（§5），`tests/test_lora_param_swap.py` 44 项全过；发现原生 0.46.3 静默丢弃这类 key；视频 LoRA 下完后真机复核 |
 | 4 合成小模型测试 + 真机命令 | 各分支各自带 | CPU 测试完成；真机命令见 §6.1（`bench_lora.py` 加了 GGUF / 视频 latent / GTT 峰值） |
@@ -162,15 +162,15 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest sh -c 'curl -s 
 | 类型 | 用途 | 逐层 | 整模型 | 真机结果（2026-11-27） |
 |---|---|---|---|---|
 | Q4_K_M（混 Q4_K / Q6_K） | 视频模型主力量化（Wan 2.1 / 2.2 14B） | 必做 | 必做（Wan T2V，`--latent 16,9,60,104 --steps 4`） | 逐层过（Wan 2.1 T2V 14B、LTX-2.5 22B、Qwen3-VL 32B TE），整模型过（Wan 2.2 A14B LowNoise + lightx2v），§8 |
-| Q5_K_M（混 Q5_K / Q6_K） | 同上 | 必做 | 可选 | 缺文件 |
-| Q3_K_M / Q3_K_S（混 Q3_K / Q4_K / Q5_K） | 大模型压显存 | 必做 | 可选 | 缺文件 |
-| Q2_K | 最小档 | 有文件就做 | 不做 | 缺文件 |
+| Q5_K_M（混 Q5_K / Q6_K） | 同上 | 必做 | 可选 | 逐层过（Wan 2.1 T2V 1.3B q5_k_m，另见 q3_k_m 里的 Q5_K） |
+| Q3_K_M / Q3_K_S（混 Q3_K / Q4_K / Q5_K） | 大模型压显存 | 必做 | 可选 | 逐层过（Wan 2.1 T2V 1.3B q3_k_m） |
+| Q2_K | 最小档 | 有文件就做 | 不做 | 逐层过（Wan 2.1 T2V 1.3B q2_k，混 Q2_K / Q3_K） |
 | Q6_K / Q8_0 | 高质量档 | 必做 | 可选 | Q6_K 随 Q4_K_M 文件逐层过；Q8_0 逐层过（HunyuanVideo I2V），§8 |
-| Q4_0 / Q4_1 / Q5_0 / Q5_1 | 旧量化 | 有文件就做（CPU 已覆盖 Q4_0 / Q5_1 / Q8_0） | 不做 | 缺文件（只有 CPU 合成测试） |
-| IQ4_NL / IQ4_XS | 少见 | 有文件就做 | 不做 | 缺文件 |
+| Q4_0 / Q4_1 / Q5_0 / Q5_1 | 旧量化 | 有文件就做（CPU 已覆盖 Q4_0 / Q5_1 / Q8_0） | 不做 | 四种都逐层过（Wan 2.1 T2V 1.3B q4_0 / q4_1 / q5_0 / q5_1） |
+| IQ4_NL / IQ4_XS | 少见 | 有文件就做 | 不做 | 逐层过（没有扩散模型的文件，用 unsloth Qwen3-0.6B 的 IQ4_NL / IQ4_XS；逐层脚本只读张量，和模型结构无关） |
 | 文本编码器 GGUF（umt5-xxl Q8_0 / Q5_K_M 等） | CLIPLoaderGGUF 路径 | 必做一个 | 跟着 Wan 整模型跑（`--clip-gguf`） | 没有 umt5 GGUF；用 qwen3vl_32b_minimax_h3-Q4_K_M 逐层过（单层 GGMLOps，不经 CLIPLoaderGGUF），Wan 整模型用 fp8 umt5 |
 
-机器上（`/srv/comfy-latest/models-manifest.md`）的 GGUF 只有 Q4_K_M、Q8_0 和 F16 三种，按上面的规矩缺的类型不补下。
+机器上原有的 GGUF（`/srv/comfy-latest/models-manifest.md`）只有 Q4_K_M、Q8_0 和 F16 三种；缺的类型由协调者定了补下小文件：calcuis/wan-1.3b-gguf 的七个（q2_k、q3_k_m、q4_0、q4_1、q5_0、q5_1、q5_k_m）和 unsloth/Qwen3-0.6B-GGUF 的 IQ4_NL / IQ4_XS，共 6.9 GB，放在 `/models/comfy/diffusion_models/_monoload_quanttest/`。ComfyUI-GGUF-H3 能反量化的 12 种量化类型（BF16 是普通 torch 类型，不算）因此全部有真文件覆盖，没有「上游不支持」的目标类型。
 
 一个 Q4_K_M 文件里通常同时有 Q4_K 和 Q6_K（有的还有 Q5_K、F32），逐层脚本会按类型分别报。
 
@@ -216,3 +216,4 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/be
   * **K-quant 逐层**（`check_gguf_kquant.py`，每种类型取前 2 个二维张量，随机 r16 LoRA，bf16 计算）：三个 Q4_K_M 文件各 13 项全过，文件里都只有 Q4_K 和 Q6_K 两种。exact 对原生 ComfyUI-GGUF 全部 max|Δ| = 0；fused max|Δ| 0.0156 ~ 0.0625，都在界内（界 0.035 ~ 0.316）；backups 0，常驻多出 0。Wan 2.1 T2V 14B [5120, 5120]：Q4_K 不带 LoRA 3.31 ms / 131 MiB，原生 6.20 / 300，exact 6.16 / 300，fused 3.94 / 131；Q6_K 4.47 / 129、7.41 / 300、7.37 / 300、5.16 / 129。LTX-2.5 22B distilled（audio connector 层）、Qwen3-VL 32B（MiniMax-H3 的文本编码器）同样全过。
   * **Wan 2.2 T2V A14B LowNoise Q4_K_M 整模型**（`--latent 16,9,60,104 --steps 4 --cfg 1`，真 LoRA `wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise`，400 key，文本编码器 umt5 fp8）：monoload-exact 对原生 latent **max|Δ| = 0**（这个 LoRA 没有小参数 key，GGUF 原生也不量化回去，所以逐位一致），默认路径 max 1.22 / mean 0.027（LoRA 效果 max 6.86 / mean 0.909）。三种模式都 0 备份。打补丁原生 35.28 s、Monoload 0.07 s；第一步原生 55.5 s、Monoload 23.1 s。每步原生 23.97 s、默认 22.97 s（0.96x）、exact 24.16 s（1.01x）。GTT 峰值原生 19.52 GiB、默认 19.64、exact 20.56；exact 多出的约 1 GiB 推断是单层 fp32 合并临时量被 PyTorch 缓存留住（同一模式不带 LoRA 那趟的峰值也是 20.56，是整个模式里的最大值），不是权重副本，没单独测。
   * 这次整模型跑完后逐层探测崩了：GGUF 参数的存储形状是打包后的块（Q4_K [5120, 5120] 存成 [5120, 2880] 字节），探测直接按存储形状合并。改成按 `GGMLLayer.cast_bias_weight` 的方式先在设备上反量化，比较精度按计算 dtype（量化参数不量化回去）；没重跑，逐层精度已由 `check_gguf_kquant.py` 覆盖。
+  * **补齐其余 GGML 类型的逐层验证**（2026-11-27，`check_gguf_kquant.py`，一次 gpulock 跑完 9 个文件）：99 项全过，0 失败。Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、Q4_0、Q4_1、Q5_0、Q5_1、IQ4_NL、IQ4_XS 的 exact 对原生 ComfyUI-GGUF 全部 max|Δ| = 0；fused max|Δ| 0.0312 ~ 0.0625，都在界内（界 0.080 ~ 0.221）；backups 0，常驻多出 0。耗时和峰值和 Q4_K 一样的规律：exact 和原生同量级（Wan 1.3B ffn.2 [1536, 8960]：Q4_1 原生 3.17 ms / 158 MiB、exact 3.14 / 158、fused 1.84 / 66，不带 LoRA 1.61 / 66），fused 的峰值等于不带 LoRA。至此 ComfyUI-GGUF-H3 支持的量化类型全部在真机上逐位验证过。
