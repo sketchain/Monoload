@@ -33,6 +33,7 @@ from common import check, finish  # noqa: E402
 import torch  # noqa: E402
 
 import comfy.lora  # noqa: E402
+import comfy.model_management  # noqa: E402
 import comfy.model_patcher  # noqa: E402
 import comfy.ops  # noqa: E402
 import comfy.utils  # noqa: E402
@@ -104,7 +105,9 @@ def build(source, algo, dequantize_first=False):
     net = Net(comfy.ops.mixed_precision_ops({}, compute_dtype=COMPUTE))
     net.load_state_dict(sd, strict=False)
     if dequantize_first and isinstance(net.a.weight, QuantizedTensor):
-        net.a.weight = torch.nn.Parameter(net.a.weight.dequantize(), requires_grad=False)
+        w = net.a.weight   # dequantized where the runtime merge dequantizes it (CPU and GPU kernels differ in the last bit)
+        net.a.weight = torch.nn.Parameter(w.to(comfy.model_management.get_torch_device()).dequantize().to(w.device),
+                                          requires_grad=False)
         net.a.layout_type = None
     return net
 
