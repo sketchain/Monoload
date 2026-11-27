@@ -808,8 +808,11 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
                 pk, fr = meter.peak(), meter.frag()
                 if len(peaks) < len(sizes):
                     peaks.append(pk)
+                    # the ratio only from the MF_PROBE_WORKSPACE runs: the decode-workspace run's large blocks fragment
+                    # a small decode by a near-constant amount (CogVideoX t = 21: 3.0 GiB on a 2.3 GiB peak, ratio 2.30
+                    # scaled to the full decode: 52.5 GiB estimated for 27.6 reserved); it gives the absolute frag only
+                    ratios.append((pk + fr) / pk if pk > 0 else 1.0)
                 frags.append(fr)
-                ratios.append((pk + fr) / pk if pk > 0 else 1.0)
             del z, buf
         mm.soft_empty_cache(True)
     a, b = (h * w for h, w in sizes)
@@ -835,8 +838,8 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
 # again). Only real CUDA / ROCm measurements (_CudaPeak) are kept; the simulator's never.
 # MONOLOAD_PROBE_CACHE: a file path, or 0 / off to keep nothing on disk; default <ComfyUI user dir>/monoload/probe_cache.json.
 
-PROBE_CACHE_VERSION = 5   # 2: entries carry mf_ratio (DESIGN §9.35); 3: integer sample positions; 4: largest tensors only;
-                          # 5: passed layer-1 self-tests (DESIGN §9.47)
+PROBE_CACHE_VERSION = 6   # 2: entries carry mf_ratio (DESIGN §9.35); 3: integer sample positions; 4: largest tensors only;
+                          # 5: passed layer-1 self-tests (DESIGN §9.47); 6: mf_ratio without the decode-workspace run
 PROBE_CACHE_MAX = 512              # entries; the oldest go first
 _PROBE_CACHE = {"path": None, "loaded": False, "entries": {}}
 _FINGERPRINTS = weakref.WeakKeyDictionary()   # first_stage_model -> hex digest of its weights
