@@ -21,7 +21,7 @@ def fake_vae():
     return v
 
 
-def route(prefer, est_total, total, cap=None, unbounded=False):
+def route(prefer, est_total, total, cap=None, unbounded=False, rows=None):
     """Which path _managed_decode takes; returns (path, self-test ran)."""
     calls = {"path": None, "selftest": False}
     bound = types.SimpleNamespace(name="Fake", prefer_layer2=prefer)
@@ -59,9 +59,11 @@ def route(prefer, est_total, total, cap=None, unbounded=False):
         old = os.environ.pop("MONOLOAD_VAE_FIT_CAP", None)
         if cap:
             os.environ["MONOLOAD_VAE_FIT_CAP"] = cap
+        mvae.set_stripe_rows(rows)
         try:
             mvae._managed_decode(fake_vae(), torch.zeros(1, 16, 5, 8, 8), {})
         finally:
+            mvae.set_stripe_rows(None)
             os.environ.pop("MONOLOAD_VAE_FIT_CAP", None)
             if old is not None:
                 os.environ["MONOLOAD_VAE_FIT_CAP"] = old
@@ -83,6 +85,9 @@ def main():
     check("prefer_layer2, layer-2 probe failed: layer 1 (not native)", p == "layer1" and st, repr((p, st)))
     p, st = route(False, 1, 62 * GIB)
     check("no prefer_layer2: layer 1 as before", p == "layer1" and st, repr((p, st)))
+    p, st = route(True, 26 * GIB, 62 * GIB, rows=64)
+    check("prefer_layer2 but a forced stripe height (MONOLOAD_VAE_STRIPE_ROWS): layer 1, its self-test runs",
+          p == "layer1" and st, repr((p, st)))
 
     # the fragmentation ratio scales the allocated bound; the absolute fragmentation is a floor
     v = fake_vae()

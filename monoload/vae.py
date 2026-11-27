@@ -1187,9 +1187,10 @@ def _managed_decode(self, samples_in, vae_options):
             if bud:
                 return _decode_budget(self, samples_in, vae_options, t0, bud)
             bound, why = _select_layer1(self, samples_in, vae_options)
-            if bound is not None and getattr(bound, "prefer_layer2", False):
+            if bound is not None and getattr(bound, "prefer_layer2", False) and not stripe_rows():
                 # an adapter whose layer 1 is the fallback (CogVideoX): layer 2 when its bound fits the device, and
-                # only then layer 1 (its first-use self-test runs only when layer 1 is really chosen)
+                # only then layer 1 (its first-use self-test runs only when layer 1 is really chosen). A forced stripe
+                # height (MONOLOAD_VAE_STRIPE_ROWS / set_stripe_rows) asks for layer 1: no layer 2 then (DESIGN §9.35)
                 est = probe = None
                 try:
                     est, probe = _layer2_estimate(self, samples_in, vae_options, workspace())
