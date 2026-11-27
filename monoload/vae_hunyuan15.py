@@ -56,6 +56,12 @@ CHUNK = 2            # latent frames per time chunk (vae_refiner.Decoder.forward
 SELFTEST_SIZE = 12   # latent rows / cols of the self-test: 192 output rows, 5 stripes of SELFTEST_ROWS
 SELFTEST_FRAMES = 5  # latent frames of the multi-frame self-test: chunks of 2, 2, 1 (SELFTEST_MIN_CHUNKS = 3)
 
+# A HunyuanVideo 1.5 video (T > 1) goes to layer 2 (DESIGN §9.41): on the GPU (832x480x81) layer 1 reserves 2.54 GiB
+# against layer 2's 10.43 but takes 1.56x as long, and the plan's estimate (2.33) is under it: the carries' clones
+# and the top level's padded input fragment the arena, two requests land outside it where `largest` covers one. Its
+# self-test bound is short likewise. The tests switch it on; the Refiner (one frame) is not affected.
+MULTIFRAME_ENABLED = False
+
 
 # ---------------------------------------------------------------------------
 # structure
@@ -580,6 +586,9 @@ def match(vae, samples, vae_options):
         return None, "latent has {} dims".format(samples.ndim)
     if samples.shape[1] != fsm.decoder.z_channels:
         return None, "latent has {} channels, the decoder takes {}".format(samples.shape[1], fsm.decoder.z_channels)
+    if int(samples.shape[2]) > 1 and not MULTIFRAME_ENABLED:
+        return None, ("video (HunyuanVideo 1.5): layer 1 off: on the GPU it is 1.56x slower than layer 2 and its memory "
+                      "estimate is under the reserved growth (DESIGN §9.41)")
     return HV15Stripe(fsm, int(samples.shape[2]) == 1), None
 
 
