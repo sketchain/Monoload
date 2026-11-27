@@ -835,7 +835,7 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
 # again). Only real CUDA / ROCm measurements (_CudaPeak) are kept; the simulator's never.
 # MONOLOAD_PROBE_CACHE: a file path, or 0 / off to keep nothing on disk; default <ComfyUI user dir>/monoload/probe_cache.json.
 
-PROBE_CACHE_VERSION = 2   # 2: entries carry mf_ratio (the probes' reserved / allocated ratio, DESIGN §9.35)
+PROBE_CACHE_VERSION = 4   # 2: entries carry mf_ratio (DESIGN §9.35); 3: integer sample positions; 4: largest tensors only
 PROBE_CACHE_MAX = 512              # entries; the oldest go first
 _PROBE_CACHE = {"path": None, "loaded": False, "entries": {}}
 _FINGERPRINTS = weakref.WeakKeyDictionary()   # first_stage_model -> hex digest of its weights
@@ -869,24 +869,35 @@ def _code_fingerprint():
     return _CODE_FP[0]
 
 
+FINGERPRINT_SAMPLED = 16   # value samples from this many of the largest tensors
+
+
 def _weights_fingerprint(fsm):
-    """Hex digest of the model's class, parameter / buffer names, shapes, dtypes and 64 evenly spaced values of each
-    (on the device they live on, one small copy each); computed once per model object."""
+    """Hex digest of the model's class, every parameter / buffer name, shape and dtype, and 64 evenly spaced values of
+    each of the FINGERPRINT_SAMPLED largest tensors (on the device they live on, one small copy each); computed once per
+    model object. Only the largest: a parameter the checkpoint does not have stays uninitialized memory (ComfyUI's ops
+    skip the init; HunyuanVideo 1.5's unused temb_proj biases), different in every process, and those are small."""
     fp = _FINGERPRINTS.get(fsm)
     if fp is not None:
         return fp
     h = hashlib.sha256("{}.{}".format(type(fsm).__module__, type(fsm).__qualname__).encode())
+    sampled = []
     with torch.no_grad():
         for name, t in fsm.state_dict(keep_vars=True).items():
             if not isinstance(t, torch.Tensor):
                 continue
             t = torch.Tensor.as_subclass(t.detach(), torch.Tensor)
             h.update("{}|{}|{}".format(name, tuple(t.shape), t.dtype).encode())
-            n = t.numel()
-            if n == 0 or t.device.type == "meta":
-                continue
+            if t.numel() and t.device.type != "meta":
+                sampled.append((t.numel(), name, t))
+        sampled.sort(key=lambda e: (-e[0], e[1]))
+        for n, name, t in sampled[:FINGERPRINT_SAMPLED]:
             flat = t.reshape(-1)
-            idx = torch.linspace(0, n - 1, steps=min(64, n), device=flat.device).long()
+            # integer positions: a float32 linspace rounds its last index up to n past 2**24 elements (HV1.5 has a
+            # 226M-element conv weight), and an out-of-range index_select is a hardware exception on ROCm
+            k = min(64, n)
+            idx = (torch.arange(k, dtype=torch.int64) * (n - 1) // max(k - 1, 1)).clamp_(0, n - 1).to(flat.device)
+            h.update(name.encode())
             h.update(flat.index_select(0, idx).float().cpu().numpy().tobytes())
     fp = h.hexdigest()[:32]
     _FINGERPRINTS[fsm] = fp
