@@ -686,7 +686,20 @@ def _probe_key(vae, samples):
     first-stage model in another dtype, and the probe's bytes per pixel are in the decode's dtype. Multi-frame: and the
     number of latent frames (the probe measures the whole decode)."""
     key = (int(samples.shape[1]), samples.ndim, str(vae.vae_dtype))
-    return key + (int(samples.shape[2]),) if _measured(vae, samples) else key
+    return key + (int(samples.shape[2]),) + _mf_probe_shapes(samples)[-1] if _measured(vae, samples) else key
+
+
+def _mf_probe_shapes(samples):
+    """The latent (rows, cols) of the multi-frame memory probes: MF_PROBE_SIZES, each clipped to the decode's own latent,
+    so no probe decodes more than the decode itself (at 768x512 an LTX-2.5 diffusion-decoder probe at 32 x 32 reserved
+    28 GiB for a 10 GiB decode; LTX-2's probe peak was above the decode's and above its estimate, DESIGN §9.35). The
+    smaller one halves the larger when clipping made them equal. Part of the probe key: a larger decode probes again."""
+    h, w = int(samples.shape[-2]), int(samples.shape[-1])
+    b = (min(h, MF_PROBE_SIZES[-1]), min(w, MF_PROBE_SIZES[-1]))
+    a = (min(h, MF_PROBE_SIZES[0]), min(w, MF_PROBE_SIZES[0]))
+    if a[0] * a[1] >= b[0] * b[1]:
+        a = (max(1, b[0] // 2), max(1, b[1] // 2))
+    return a, b
 
 
 def _probe(vae, samples, vae_options):
@@ -761,24 +774,25 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
     # the two sizes at MF_PROBE_WORKSPACE (the line: allocated bytes, the workspace capped at both sizes, so in the
     # intercept), then the larger size again at the decode's own workspace when it is larger: its block sizes are what
     # fragment the allocator (LTX 0.9.0), and only the fragmentation (frag) is taken from that run
-    runs = [(s, MF_PROBE_WORKSPACE) for s in MF_PROBE_SIZES] + ([(MF_PROBE_SIZES[-1], ws)] if ws > MF_PROBE_WORKSPACE else [])
-    for s, run_ws in runs:
+    sizes = _mf_probe_shapes(samples)
+    runs = [(hw, MF_PROBE_WORKSPACE) for hw in sizes] + ([(sizes[-1], ws)] if ws > MF_PROBE_WORKSPACE else [])
+    for hw, run_ws in runs:
         shape = list(samples.shape)
         shape[0] = 1
-        shape[-2] = shape[-1] = s
+        shape[-2:] = hw
         with torch.inference_mode(), torch.random.fork_rng(devices=devs):
             z = torch.zeros(shape, device=vae.device, dtype=vae.vae_dtype)
             buf = torch.empty(_output_shape(vae, z), device=vae.output_device, dtype=vae.vae_output_dtype())
             with OpChunking(fsm, run_ws, OpStats()):
                 meter.start()
                 _decode_sample(vae, z, vae_options, buf)
-                if len(peaks) < len(MF_PROBE_SIZES):
+                if len(peaks) < len(sizes):
                     peaks.append(meter.peak())
                 frags.append(meter.frag())
             del z, buf
         mm.soft_empty_cache(True)
-    a, b = MF_PROBE_SIZES[0] ** 2, MF_PROBE_SIZES[1] ** 2
-    slope = max(0.0, (peaks[1] - peaks[0]) / (b - a))
+    a, b = (h * w for h, w in sizes)
+    slope = max(0.0, (peaks[1] - peaks[0]) / (b - a)) if b > a else 0.0
     intercept = max(0.0, peaks[1] - slope * b)
     r = vae.spacial_compression_decode()
     out_numel = getattr(vae, "output_channels", 3) * r * r * (vae_video.output_frames(vae, int(samples.shape[2])) or 1)
