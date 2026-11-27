@@ -123,6 +123,11 @@
 
 **GGUF VAE**：社区有 MiniMax H3 视频 VAE Q8_0（2.94 GB）和 SeedVR2 VAE F16（0.50 GB）的 GGUF，但 ComfyUI 核心的 `VAELoader` 不列 `.gguf`，ComfyUI-GGUF（kyuz0 H3）只有 UNet / CLIP 加载器——**没有能把它们当 VAE 加载的节点**（真机核实）。`bench_selftiled --gguf` 用 gguf 包读出来、反量化成 fp16 再构造 `comfy.sd.VAE`（SeedVR2 F16：250 个张量，正常构造），解码就是 fp16 VAE 的解码，峰值同 safetensors 版。
 
+两个文件都已真机验证（2026-11-27，`bench_selftiled --gguf`，1280×720×33，`--bf16-vae`；原生 = 卸掉 Monoload 的 VAE 包装，Monoload = `MONOLOAD=1` 装上）：
+* **SeedVR2 F16**（250 个张量全 F16）：正常构造 `VideoAutoencoderKLWrapper`，权重 0.47 GiB；解码 reserved 40.94 / alloc 22.90 GiB（增量 40.36），69 s，因果缓存放锁页内存；Monoload 路由「自带分块 IO，原生」，和原生逐位相同。
+* **MiniMax-H3 Q8_0**（562 个张量：417 F16、145 Q8_0）：社区转换器（gestura）把 35 个 5 维 Conv3d 权重压成 4 维（前两维合并），又没写 ComfyUI-GGUF 约定的 `comfy.gguf.orig_shape.<名字>`，直接构造会 size mismatch。**不是 ComfyUI 的问题，是文件不合约定**：将来就算有按 ComfyUI-GGUF 约定写的 GGUF VAE 加载器也读不了它。`--shapes-from minimax_h3_video_vae_fp16.safetensors`（只读头）按参考文件还原形状以后能加载，逐张量和 fp16 版比最差相对误差 6.1e-3（Q8_0 量化本身，`decoder.transformer_blocks.35.ff.w1`；还原错了会是 1 量级）；权重 4.85 GiB（反量化成 fp16），解码 22 帧 reserved 6.24 / alloc 5.77 GiB（增量 1.26），13 s；Monoload 原生透传，逐位相同。
+* 结论不变：核心和 ComfyUI-GGUF H3 都**不支持**把 GGUF 当 VAE 加载（工作流里用不了）；反量化后它们就是普通 fp16 VAE，路由和峰值同 safetensors 版，Monoload 不用为 GGUF VAE 做任何事。
+
 真机命令（在容器里另起进程、拿 GPU 锁、先让服务器卸模型；结果写进 `/srv/comfy-latest/results/native/`）：
 
 ```bash
