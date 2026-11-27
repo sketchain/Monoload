@@ -1330,7 +1330,7 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui python tests/bench_vae
 
 ### 9.22 视频（多帧）：要下的文件和 bench 命令（DESIGN §9.32，先分析）
 
-**状态（video 分支）：** `tests/bench_vae.py --frames N` 已加（H6）。多帧第二层已托管 Wan 2.1 / 2.2、LTX（卷积 VAE 和 LTX-2.5 扩散 decoder），CogVideoX、Cosmos 1.0、Mochi 在 C、D 组的模块合入后托管，HunyuanVideo 1.0 / 1.5（含 Kandinsky 5、HunyuanImage 2.1 Refiner 的多帧）按 decoder 结构托管（DESIGN §9.35、§9.41）；其余照旧原生。SVD 保持原生（DESIGN §9.38）。真机现在用新容器 `comfyui-latest`（v0.46.3），下面命令里的 `comfyui` 换成它；`--modes native,monoload` 同时测两边。原生基线统一记在 `/srv/comfy-latest/results/native/`。
+**状态（video 分支）：** `tests/bench_vae.py --frames N` 已加（H6）。多帧第二层已托管 Wan 2.1 / 2.2、LTX（卷积 VAE 和 LTX-2.5 扩散 decoder）、Cosmos 1.0、Mochi，HunyuanVideo 1.0 / 1.5（含 Kandinsky 5、HunyuanImage 2.1 Refiner 的多帧）按 decoder 结构托管，CogVideoX 由 C 组的 `vae_cogvideo` 托管（第二层放得下走第二层，否则第一层）（DESIGN §9.35、§9.41、§9.43、§9.46）；其余照旧原生。SVD 保持原生（DESIGN §9.38）。真机现在用新容器 `comfyui-latest`（v0.46.3），下面命令里的 `comfyui` 换成它；`--modes native,monoload` 同时测两边。原生基线统一记在 `/srv/comfy-latest/results/native/`。
 
 **文件**（字节数、sha256 来自 HF API；都不用登录，`resolve` 链接直接 302；放到 `/models/comfy/vae/`，LTX 和 SVD 是 checkpoint，放 `/models/comfy/checkpoints/`）：
 
