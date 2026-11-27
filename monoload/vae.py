@@ -835,7 +835,7 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
 # again). Only real CUDA / ROCm measurements (_CudaPeak) are kept; the simulator's never.
 # MONOLOAD_PROBE_CACHE: a file path, or 0 / off to keep nothing on disk; default <ComfyUI user dir>/monoload/probe_cache.json.
 
-PROBE_CACHE_VERSION = 1
+PROBE_CACHE_VERSION = 2   # 2: entries carry mf_ratio (the probes' reserved / allocated ratio, DESIGN §9.35)
 PROBE_CACHE_MAX = 512              # entries; the oldest go first
 _PROBE_CACHE = {"path": None, "loaded": False, "entries": {}}
 _FINGERPRINTS = weakref.WeakKeyDictionary()   # first_stage_model -> hex digest of its weights
@@ -934,7 +934,7 @@ def _probe_cache_get(disk):
         return None
     try:
         return _Probe(float(e["slope"]), float(e["out"]), 0.0, mf_slope=float(e["slope"]),
-                      mf_intercept=float(e["intercept"]), mf_frag=float(e["frag"]))
+                      mf_intercept=float(e["intercept"]), mf_frag=float(e["frag"]), mf_ratio=float(e["ratio"]))
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -945,7 +945,8 @@ def _probe_cache_put(disk, p):
         return
     entries = _PROBE_CACHE["entries"]
     entries.pop(disk, None)
-    entries[disk] = {"slope": p.mf_slope, "intercept": p.mf_intercept, "frag": p.mf_frag, "out": p.out_numel_per_px,
+    entries[disk] = {"slope": p.mf_slope, "intercept": p.mf_intercept, "frag": p.mf_frag, "ratio": p.mf_ratio,
+                     "out": p.out_numel_per_px,
                      "seconds": round(p.seconds, 2), "saved": int(time.time())}
     while len(entries) > PROBE_CACHE_MAX:
         entries.pop(next(iter(entries)))
