@@ -48,6 +48,8 @@ _ap.add_argument("--native-dir", help="shared directory of native results, one f
 _ap.add_argument("--no-small", action="store_true", help="skip the small-model sections")
 _ap.add_argument("--workspace", default="64M", help="layer-2 workspace inside the stripes on the GPU")
 _ap.add_argument("--rows", type=int, default=None, help="force a stripe height in the sweep (default: the plan for the free memory)")
+_ap.add_argument("--mem-history", action="store_true", help="sweep: record the allocator's history during each layer-1 "
+                 "decode and print what is live at the allocated peak and the segments at the reserved peak (slow)")
 OPTS, _rest = _ap.parse_known_args()
 sys.argv = [sys.argv[0]] + _rest
 
@@ -226,13 +228,61 @@ def lat_real(v, t, h, w, seed=1):
     return torch.randn(1, c, t, h, w, generator=torch.Generator().manual_seed(seed))
 
 
-def measure(fn):
+def _frame(ev):
+    """'file:line name' of the innermost python frame of an allocation inside monoload or comfy."""
+    for fr in ev.get("frames") or ():
+        f = fr.get("filename", "")
+        if ("monoload" in f or "/comfy" in f) and "test_vae_wan_video" not in f:
+            return "{}:{} {}".format(os.path.basename(f), fr.get("line"), fr.get("name"))
+    fr = (ev.get("frames") or [{}])[0]
+    return "{}:{} {}".format(os.path.basename(fr.get("filename", "?")), fr.get("line"), fr.get("name"))
+
+
+def mem_history_report(top=14):
+    """Replay the recorded allocator trace: the live blocks at the allocated peak (grouped by allocating frame)
+    and the segments at the reserved peak (blocks live before the recording are not seen)."""
+    tr = torch.cuda.memory._snapshot()["device_traces"][torch.cuda.current_device()]
+    live, cur, peak, at_peak = {}, 0, 0, []
+    segs, seg, segpeak, seg_at = {}, 0, 0, []
+    for ev in tr:
+        a = ev["action"]
+        if a == "alloc":
+            live[ev["addr"]] = ev
+            cur += ev["size"]
+            if cur > peak:
+                peak, at_peak = cur, list(live.values())
+        elif a == "free_completed":
+            e = live.pop(ev["addr"], None)
+            if e is not None:
+                cur -= e["size"]
+        elif a in ("segment_alloc", "segment_map"):
+            segs[ev["addr"]] = ev["size"]
+            seg += ev["size"]
+            if seg > segpeak:
+                segpeak, seg_at = seg, sorted(segs.values(), reverse=True)
+        elif a in ("segment_free", "segment_unmap"):
+            seg -= segs.pop(ev["addr"], 0)
+    groups = {}
+    for e in at_peak:
+        k = _frame(e)
+        n, b = groups.get(k, (0, 0))
+        groups[k] = (n + 1, b + e["size"])
+    print("  mem history: allocated peak +{} ({} live blocks), reserved peak +{} in {} new segments".format(
+        fmt_bytes(peak), len(at_peak), fmt_bytes(segpeak), len(seg_at)))
+    for k, (n, b) in sorted(groups.items(), key=lambda kv: -kv[1][1])[:top]:
+        print("    live at peak: {:>10}  x{:<4} {}".format(fmt_bytes(b), n, k))
+    print("    segments at reserved peak: " + ", ".join(fmt_bytes(x) for x in seg_at[:top]))
+
+
+def measure(fn, history=False):
     """(result or exception, seconds, reserved growth, allocated growth)."""
     gc.collect()
     mm.soft_empty_cache(True)
     torch.cuda.synchronize()
     base_r, base_a = torch.cuda.memory_reserved(), torch.cuda.memory_allocated()
     torch.cuda.reset_peak_memory_stats()
+    if history:
+        torch.cuda.memory._record_memory_history(max_entries=2000000, stacks="python")
     t0 = time.perf_counter()
     try:
         res = fn()
@@ -242,6 +292,11 @@ def measure(fn):
             raise
         res = e
     dt = time.perf_counter() - t0
+    if history:
+        try:
+            mem_history_report()
+        finally:
+            torch.cuda.memory._record_memory_history(enabled=None)
     return res, dt, torch.cuda.max_memory_reserved() - base_r, torch.cuda.max_memory_allocated() - base_a
 
 
@@ -297,7 +352,7 @@ def real_sweep(label, path, table):
                 with torch.inference_mode():
                     return b.run(v, lat, plan, ws, OpStats())
             try:
-                out, dt, dres, dalloc = measure(run_l1)
+                out, dt, dres, dalloc = measure(run_l1, OPTS.mem_history)
             finally:
                 v.process_output = po
             row = {"model": label, "size": size, "frames": nf, "stripes": len(plan.stripes), "rows": plan.rows,
@@ -306,8 +361,8 @@ def real_sweep(label, path, table):
                 check("{} {}x{} x{}: L1 OOM: {}".format(label, W, H, nf, str(out).splitlines()[0][:160]), False)
                 table.append(row)
                 continue
-            check("{} {}x{} x{} frames: L1 {} stripes x {} rows, reserved +{} <= estimate {} ({:.1f}s)".format(
-                label, W, H, nf, len(plan.stripes), plan.rows, fmt_bytes(dres), fmt_bytes(plan.estimate), dt),
+            check("{} {}x{} x{} frames: L1 {} stripes x {} rows, reserved +{} (allocated +{}) <= estimate {} ({:.1f}s)".format(
+                label, W, H, nf, len(plan.stripes), plan.rows, fmt_bytes(dres), fmt_bytes(dalloc), fmt_bytes(plan.estimate), dt),
                 dres <= plan.estimate and bool(torch.isfinite(out).all()))
             known = native_file(path, size, nf)
             if known is not None and os.path.exists(known):
