@@ -57,7 +57,9 @@ settings outrank the budget.
 """
 
 import glob
+import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -779,6 +781,11 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
     meter = _PEAK_METER[0](vae.device)
     if meter is None:
         raise MonoloadError("no allocator statistics on {}".format(vae.device))
+    disk = _probe_disk_key(vae, key, workspace) if isinstance(meter, _CudaPeak) else None
+    hit = _probe_cache_get(disk)
+    if hit is not None:
+        per_model[key] = hit
+        return hit
     t0 = time.perf_counter()
     peaks, frags, ratios = [], [], []
     devs = [vae.device.index or 0] if vae.device.type == "cuda" else []
@@ -813,7 +820,143 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
     p = _Probe(slope, out_numel, time.perf_counter() - t0, mf_slope=slope, mf_intercept=intercept, mf_frag=max(frags),
                mf_ratio=max(ratios))
     per_model[key] = p
+    _probe_cache_put(disk, p)
     return p
+
+
+# ---------------------------------------------------------------------------
+# the multi-frame probe's results on disk
+# ---------------------------------------------------------------------------
+# _probe_mf decodes the model two or three times at small sizes the first time a model and latent layout is seen in a
+# process (Wan 2.2 5B 9 frames ~40 s, LTX-2.5 768x512x97 ~78 s, CT 700); every ComfyUI restart paid it again. The result
+# (slope, intercept, fragmentation, output size) is kept in a JSON file keyed by everything it depends on: the weights
+# (_weights_fingerprint), the in-memory key (channels, ndim, dtype, frames, probe sizes), the decode's workspace, the
+# device name, torch's version and Monoload's own source (_code_fingerprint: any change to the chunking code measures
+# again). Only real CUDA / ROCm measurements (_CudaPeak) are kept; the simulator's never.
+# MONOLOAD_PROBE_CACHE: a file path, or 0 / off to keep nothing on disk; default <ComfyUI user dir>/monoload/probe_cache.json.
+
+PROBE_CACHE_VERSION = 1
+PROBE_CACHE_MAX = 512              # entries; the oldest go first
+_PROBE_CACHE = {"path": None, "loaded": False, "entries": {}}
+_FINGERPRINTS = weakref.WeakKeyDictionary()   # first_stage_model -> hex digest of its weights
+_CODE_FP = []
+
+
+def _probe_cache_path():
+    raw = os.environ.get("MONOLOAD_PROBE_CACHE", "").strip()
+    if raw.lower() in settings.FALSE:
+        return None
+    if raw:
+        return raw
+    try:
+        import folder_paths
+        return os.path.join(folder_paths.get_user_directory(), "monoload", "probe_cache.json")
+    except Exception:
+        return None
+
+
+def _code_fingerprint():
+    if not _CODE_FP:
+        h = hashlib.sha256()
+        here = os.path.dirname(os.path.abspath(__file__))
+        for f in sorted(glob.glob(os.path.join(here, "*.py"))):
+            try:
+                with open(f, "rb") as fh:
+                    h.update(os.path.basename(f).encode() + b"\0" + fh.read())
+            except OSError:
+                pass
+        _CODE_FP.append(h.hexdigest()[:16])
+    return _CODE_FP[0]
+
+
+def _weights_fingerprint(fsm):
+    """Hex digest of the model's class, parameter / buffer names, shapes, dtypes and 64 evenly spaced values of each
+    (on the device they live on, one small copy each); computed once per model object."""
+    fp = _FINGERPRINTS.get(fsm)
+    if fp is not None:
+        return fp
+    h = hashlib.sha256("{}.{}".format(type(fsm).__module__, type(fsm).__qualname__).encode())
+    with torch.no_grad():
+        for name, t in fsm.state_dict(keep_vars=True).items():
+            if not isinstance(t, torch.Tensor):
+                continue
+            t = torch.Tensor.as_subclass(t.detach(), torch.Tensor)
+            h.update("{}|{}|{}".format(name, tuple(t.shape), t.dtype).encode())
+            n = t.numel()
+            if n == 0 or t.device.type == "meta":
+                continue
+            flat = t.reshape(-1)
+            idx = torch.linspace(0, n - 1, steps=min(64, n), device=flat.device).long()
+            h.update(flat.index_select(0, idx).float().cpu().numpy().tobytes())
+    fp = h.hexdigest()[:32]
+    _FINGERPRINTS[fsm] = fp
+    return fp
+
+
+def _probe_disk_key(vae, key, workspace):
+    """The cache key of a probe, or None (no cache file, or the key cannot be made)."""
+    if _probe_cache_path() is None:
+        return None
+    try:
+        dev = vae.device
+        name = torch.cuda.get_device_name(dev) if dev.type == "cuda" else str(dev)
+        return json.dumps([PROBE_CACHE_VERSION, _weights_fingerprint(vae.first_stage_model), [str(k) for k in key],
+                           int(max(MF_PROBE_WORKSPACE, int(workspace))), name, torch.__version__, _code_fingerprint()])
+    except Exception as e:
+        logging.debug("[Monoload] probe cache key: %s: %s", type(e).__name__, e)
+        return None
+
+
+def _probe_cache_load():
+    path = _probe_cache_path()
+    if _PROBE_CACHE["loaded"] and _PROBE_CACHE["path"] == path:
+        return path
+    _PROBE_CACHE.update(path=path, loaded=True, entries={})
+    if path is None:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if data.get("version") == PROBE_CACHE_VERSION and isinstance(data.get("entries"), dict):
+            _PROBE_CACHE["entries"] = data["entries"]
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.debug("[Monoload] probe cache %s not read: %s: %s", path, type(e).__name__, e)
+    return path
+
+
+def _probe_cache_get(disk):
+    if disk is None or _probe_cache_load() is None:
+        return None
+    e = _PROBE_CACHE["entries"].get(disk)
+    if not isinstance(e, dict):
+        return None
+    try:
+        return _Probe(float(e["slope"]), float(e["out"]), 0.0, mf_slope=float(e["slope"]),
+                      mf_intercept=float(e["intercept"]), mf_frag=float(e["frag"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _probe_cache_put(disk, p):
+    path = _probe_cache_load() if disk is not None else None
+    if path is None:
+        return
+    entries = _PROBE_CACHE["entries"]
+    entries.pop(disk, None)
+    entries[disk] = {"slope": p.mf_slope, "intercept": p.mf_intercept, "frag": p.mf_frag, "out": p.out_numel_per_px,
+                     "seconds": round(p.seconds, 2), "saved": int(time.time())}
+    while len(entries) > PROBE_CACHE_MAX:
+        entries.pop(next(iter(entries)))
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = "{}.{}.tmp".format(path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"version": PROBE_CACHE_VERSION, "entries": entries}, fh)
+        os.replace(tmp, path)
+    except OSError as e:
+        logging.debug("[Monoload] probe cache %s not written: %s", path, e)
 
 
 def _static_act_bytes_per_px(vae):
@@ -1417,7 +1560,11 @@ def _decode_layer1(self, samples_in, bound, t0, selftest, choice=None, considere
 
 def _layer2_estimate(vae, samples_in, vae_options, ws):
     """(estimate dict, probe or None) of a layer-2 decode with workspace ws; the
-    shape probe (first decode of this model and latent layout) loads the weights."""
+    shape probe (first decode of this model and latent layout) loads the weights. A decoder whose own module bounds
+    its decode (vae_video.analytic_estimate: the LTX-2.5 diffusion decoder) is not probed."""
+    analytic = _analytic_estimate(vae, samples_in, ws)
+    if analytic is not None:
+        return analytic, None
     probe = _PROBES.get(vae.first_stage_model, {}).get(_probe_key(vae, samples_in))
     if probe is None and _measured(vae, samples_in):
         big = samples_in[0:1, ..., :MF_PROBE_SIZES[-1], :MF_PROBE_SIZES[-1]]
@@ -1435,6 +1582,24 @@ def _layer2_estimate(vae, samples_in, vae_options, ws):
         _load_models(vae, estimate(vae, small, 0, **_decoder_terms(vae, small))["total"])
         probe = _shape_probe(vae, samples_in, vae_options)
     return estimate(vae, samples_in, ws, probe, **_decoder_terms(vae, samples_in)), probe
+
+
+def _analytic_estimate(vae, samples_in, ws):
+    """estimate()'s dict from vae_video.analytic_estimate (one sample's decode) plus the output buffer, or None."""
+    shape = (1,) + tuple(int(d) for d in samples_in.shape[1:])
+    act = vae_video.analytic_estimate(vae.first_stage_model, shape, mm.dtype_size(vae.vae_dtype), ws)
+    if act is None:
+        return None
+    out_bytes = 0
+    oshape = _output_shape(vae, samples_in)
+    if oshape is not None and _same_device(vae.output_device, vae.device):
+        n = 1
+        for d in oshape:
+            n *= int(d)
+        out_bytes = n * mm.dtype_size(vae.vae_output_dtype())
+    # plan()'s total has the latent and the decoder's own workspace in it
+    return {"total": int(act + out_bytes), "activation": int(act), "workspace": int(ws), "output": int(out_bytes),
+            "latent": 0, "retained": 0, "analytic": True}
 
 
 def _shape_probe(vae, samples_in, vae_options):
