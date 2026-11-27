@@ -1865,7 +1865,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 * **探测比解码本身大。** 两个探测尺寸固定 16 × 16 和 32 × 32 latent；768×512 的 latent 只有 16 × 24，32 × 32 的那次探测解得比真解码还多。LTX-2 冷跑 reserved 8.33 高过估算 7.86（热跑 7.84 在估算内：多出的是探测自己）；LTX-2.5 扩散 decoder 冷跑 reserved 28.14，是原生的 3 倍。改成每个探测尺寸按解码自己的 latent 截断（`_mf_probe_shapes`：大的取 min(行, 32) × min(列, 32)，小的取 min(·, 16)，截断后两者一样大就取大的一半），截断后的形状进探测缓存的 key，之后更大的解码会重新探测；不截断（latent 两边都 ≥ 32）时 key 和行为与原来一样，Wan 2.2 704 那行不受影响。
 * **扩散 decoder 在 F 组的模块合进来之前没有可切的算子。** 第二层对它切了 0 个卷积（它的注意力是 NA3D，卷积也不在可切范围），只多了探测的三次解码，估算 19.10 比原生的 8.09 还高（会多挤掉别的模型），没有任何好处。改成只有 `vae_ltx`（F 组，可选导入，挂在 `vae_ops.EXTRA_CHUNKERS` 上）在时才把 `CausalDiffusionVAE` 放进 `vae_video.WHOLE`；没有时多帧照旧原生。F 组合入时 `vae.py` 的 import 行不用再加 `vae_ltx`（加了也无害）。
 
-改后的回归：CT 700 容器里 `--cpu` 跑 `test_vae` 136 项、`test_vae_selftiled` 19 项、`test_vae_stripe` 79 项全过。LTX-2 卷积 VAE 768×512×97（截断后探测 16 × 16 / 16 × 24）和 1280×704×97（16 × 16 / 22 × 32）的真机复测在排队，测完补在这里。
+改后的回归：CT 700 容器里 `--cpu` 跑 `test_vae` 136 项、`test_vae_selftiled` 19 项、`test_vae_stripe` 79 项全过。LTX-2 卷积 VAE 截断后的真机复测（第二层，`MONOLOAD_VAE_FIT_CAP=55G`）：768×512×97（探测 16 × 16 / 16 × 24）估算 9.29 ≥ reserved +4.97 GiB（GTT +6.93），冷跑 24.7 s；1280×704×97（16 × 16 / 22 × 32）估算 12.67 ≥ reserved +8.32（冷 42.7 s）/ +8.24（热 11.4 s），GTT +8.43，原生估算 13.09。两档估算都是上界，冷跑不再超。截断后 LTX-2 的精度降到 PSNR 54.9（px max 0.045），怀疑是 H4 分组 PixelNorm 的 bf16 舍入，fp32 对照在排队。
 
 ### 9.36 引擎的时间轴（钩子 H2 + H5，分支 video-engine-time）
 
@@ -2006,6 +2006,28 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 **决定：HunyuanVideo 1.5 的第一层只作后备（`HV15Stripe.prefer_layer2 = True`，多帧单帧都是；`MULTIFRAME_ENABLED = True`，设成 False 则视频一律第二层）。** 适配线程的 `prefer_layer2` 路由（video-l2-frag 784aca3）：默认策略下先算第二层估算，放得下设备（`vae.layer2_room`，CT 700 用 `MONOLOAD_VAE_FIT_CAP`）就走第二层，放不下才走第一层（自检也只在真选第一层时跑）。理由：第一层省 7.9 GiB 但慢 56%，480p 的第二层只要 10.4 GiB；大尺寸第二层放不下时第一层 2.5 GiB 级别兜底。第一层的估算还不是上界，少算的原因用 `alloc_sim` 查到了（模拟 2.90 对估算 2.69，与真机同向）：reserved 峰值时 arena（2094 MiB）里散着各条带各卷积的 carry 克隆，留下的洞都小于 220 MiB，于是有**两个**请求落到 arena 外各开一段——最上一级卷积补边 + 拼 carry 的输入（`cat`，277 MiB）和一段 228 MiB 的 carry 克隆——而估算里的 `largest` 只给一个请求留了位置（270 MiB）。多帧自检的上界也同样不够（模拟 5350 对 `selftest_memory` 4814 MiB）。这和 Wan 2.1 多帧估算少算（§9.40）可能是同一类：带时间块的条带把每个单元的 carry 留在 arena 里，碎片比单帧多；修法在引擎（时间块时 arena 的余量或 `largest` 计入 carry 造成的第二个落单请求，或者 carry 先在 arena 前端预留），已转给改 `vae_engine.py` 的线程。Refiner（单帧）的第一层估算是上界（0.77 对 1.00，自检 3.45 对 4.27），没有碎片问题，但 2048² 第二层只要 10.06 GiB、比第一层快 1.5 倍（15.0 对 22.6 s），所以同样第二层优先、第一层兜底（第二层放不下设备时，例如更大的尺寸或 `MONOLOAD_VAE_FIT_CAP` 压低）。两者对原生像素最大差 0.001。tests/test_vae_hunyuan15.py 里第一层的各项检查临时把 `prefer_layer2` 设成 False，免得路由把小尺寸送去第二层。
 
 **HunyuanVideo 1.0 / Kandinsky 5 的第一层：** 原生 GroupNorm 是每个时间块各自统计（块内 2 帧 × 整幅），条带为主的引擎要每块一个统计遍，H2 不支持统计遍和时间块同时用。先用第二层的真机数据（832×480×81 模拟 14.98 GiB）看够不够，再定做不做。
+
+### 9.42 视频 F 组：LTX（卷积 VAE 只走第二层；LTX-2.5 扩散 decoder 用 `vae_ltx`，分支 claude/project-thread-b4e366）
+
+（§9.41 留给 B 组的分支。）范围和逐项理由见 PLAN-video F 组，这里记结论和真机数。
+
+**卷积 VAE（LTX 0.9.x / LTX-2，`causal_video_autoencoder.VideoVAE`）：不做第一层。** H1 的第二层已把原生 reserved 的碎片消掉（ROCm 上 cudnn 关着，im2col 一次 5.8 GiB；原生 OOM 后清缓存才跑完）：LTX-2 1280×704×97 56.76 → 7.99 GiB，1920×1088×193 55.95 → 16.14 GiB，时间不变（11.7 → 11.4 s、51.5 → 52.4 s）。第一层（PixelNorm 空间条带）再省也只是几 GiB，不值。
+
+**扩散 decoder（`na_diffusion_decoder.CausalDiffusionVAE`）：算子级精确切分，不走条带。** 结构是 4 段确定性块 + 第 5 段 8 个扩散块，全是邻域注意力（`comfy_kitchen.na3d`，窗口 11³）和 SwiGLU，没有卷积可切。条带的光环要把各层窗口半径累加（第 5 段就 80 帧），比条带本身还大；而邻域注意力逐层就能精确切开：
+* NATTEN 窗口 `start = clamp(i − k//2, 0, L − k)`，离查询最远 k_t − 1 帧，所以查询块 [a, b) 配 n = (b − a) + 2(k_t − 1) 帧的段（贴边时整段往里挪）时窗口和整块相同；只切 T，RoPE 按全局位置切片。fp32 和原生比 ≤ 5.6e-6（`check_ltx_dd.py`）。
+* kernel 对段里每帧都算，所以块要大：4n 帧的 q/k/v/输出放进 max(工作区, 半份激活)，至少 2(k_t − 1) 帧，段的 T × H ≤ 65535（HIP grid）。第一版按 1 GiB 工作区定块，第 5 段只剩 1 帧（段 21 帧），慢 14 倍，段长不一把 reserved 碎到 alloc 的 3 倍；改成一次调用内等长段、共用一份 q/k/v、残差提前写回、进第 5 段前清一次缓存以后 reserved ≈ alloc + 0.2～1 GiB。
+* SwiGLU 按工作区限 token；decoder 的 forward 换成同样步骤的精简版（最后一次上采样只算保留的帧，`conv_in_x_t` / `norm_out` / `conv_out` 分块写结果，噪声整块同一 generator 生成）。
+* 峰值 ≈ x + context + 一段 + 挂起结果 + 像素，193 帧约 3 × S（S = 第 5 段一份激活），原生约 6 × S。
+
+**真机（CT 700，2026-11-27，`ltx-2.5-video-vae-bf16`，`--bf16-vae`，1 GiB 工作区）：**
+
+| 尺寸 | 原生 reserved / alloc / 时间 | Monoload reserved / alloc / 时间 | max\|d\| |
+|---|---|---|---|
+| 768×512×97，正常入口（探测 + `vae_ltx`） | 9.84 / 7.35 / 17.9 s | 冷 5.59 / 5.27 / 109.7 s，热 5.52 / 5.20 / 31.3 s | 0.0020 |
+| 1920×1088×97，直接装 `vae_ltx`（lean） | 50.15 / 38.82 / 106.3 s | 26.07 / 25.12 / 190.9 s（`plan` 估 25.17 → reserved 口径 26.68） | 0.027 |
+| 1920×1088×193，lean | — | 排队 | — |
+
+冷跑多出的约 78 s 是适配线程的两次探测解码（`vae._probe_mf`，每个模型和形状一次）。**定案：合**——峰值约减半，慢约 1.8 倍（光环帧的重复注意力；块已是预算内最大）。`plan()` 的总数改成 reserved 口径（allocated 上界 × 1.05 + 256 MiB；fp32 小尺寸实测 reserved 比 allocated 上界多 6–10 %，这一档 2.55 → 2.93 ≥ 2.70），路由仍用探测。
 
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
