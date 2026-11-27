@@ -74,15 +74,15 @@ def route(prefer, est_total, total, cap=None, unbounded=False):
 
 def main():
     p, st = route(True, 26 * GIB, 62 * GIB)
-    check("prefer_layer2, estimate 26 GiB on a 62 GiB device (1 GiB weights): layer 2, no layer-1 self-test", p == "layer2" and not st, (p, st))
+    check("prefer_layer2, estimate 26 GiB on a 62 GiB device (1 GiB weights): layer 2, no layer-1 self-test", p == "layer2" and not st, repr((p, st)))
     p, st = route(True, 58 * GIB, 62 * GIB, cap="55G")
-    check("prefer_layer2, 58 GiB with MONOLOAD_VAE_FIT_CAP=55G: layer 1, its self-test runs", p == "layer1" and st, (p, st))
+    check("prefer_layer2, 58 GiB with MONOLOAD_VAE_FIT_CAP=55G: layer 1, its self-test runs", p == "layer1" and st, repr((p, st)))
     p, st = route(True, 58 * GIB, 62 * GIB)
-    check("prefer_layer2, 58 GiB on 62 GiB without a cap (61 GiB room): layer 2", p == "layer2", (p, st))
+    check("prefer_layer2, 58 GiB on 62 GiB without a cap (61 GiB room): layer 2", p == "layer2", repr((p, st)))
     p, st = route(True, 1, 62 * GIB, unbounded=True)
-    check("prefer_layer2, layer-2 probe failed: layer 1 (not native)", p == "layer1" and st, (p, st))
+    check("prefer_layer2, layer-2 probe failed: layer 1 (not native)", p == "layer1" and st, repr((p, st)))
     p, st = route(False, 1, 62 * GIB)
-    check("no prefer_layer2: layer 1 as before", p == "layer1" and st, (p, st))
+    check("no prefer_layer2: layer 1 as before", p == "layer1" and st, repr((p, st)))
 
     # the fragmentation ratio scales the allocated bound; the absolute fragmentation is a floor
     v = fake_vae()
@@ -90,10 +90,10 @@ def main():
     pr = mvae._Probe(1000.0, 0, 0.0, mf_slope=1000.0, mf_intercept=0, mf_frag=0, mf_ratio=1.4)
     e = mvae.estimate(v, lat, 0, pr)
     alloc = mvae.MF_MARGIN * 1000.0 * 100 * 100
-    check("ratio 1.4: activation = 1.4 x the allocated bound", abs(e["activation"] - int(alloc * 1.4)) <= 1, (e["activation"], alloc))
+    check("ratio 1.4: activation = 1.4 x the allocated bound", abs(e["activation"] - int(alloc * 1.4)) <= 1, repr((e["activation"], alloc)))
     pr = mvae._Probe(1000.0, 0, 0.0, mf_slope=1000.0, mf_intercept=0, mf_frag=10 ** 9, mf_ratio=1.01)
     e = mvae.estimate(v, lat, 0, pr)
-    check("small ratio, large absolute fragmentation: allocated + fragmentation", e["activation"] == int(alloc + 10 ** 9), e["activation"])
+    check("small ratio, large absolute fragmentation: allocated + fragmentation", e["activation"] == int(alloc + 10 ** 9), repr(e["activation"]))
     finish()
 
 
