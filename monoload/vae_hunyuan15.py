@@ -56,11 +56,12 @@ CHUNK = 2            # latent frames per time chunk (vae_refiner.Decoder.forward
 SELFTEST_SIZE = 12   # latent rows / cols of the self-test: 192 output rows, 5 stripes of SELFTEST_ROWS
 SELFTEST_FRAMES = 5  # latent frames of the multi-frame self-test: chunks of 2, 2, 1 (SELFTEST_MIN_CHUNKS = 3)
 
-# A HunyuanVideo 1.5 video (T > 1) goes to layer 2 (DESIGN §9.41): on the GPU (832x480x81) layer 1 reserves 2.54 GiB
-# against layer 2's 10.43 but takes 1.56x as long, and the plan's estimate (2.33) is under it: the carries' clones
-# and the top level's padded input fragment the arena, two requests land outside it where `largest` covers one. Its
-# self-test bound is short likewise. The tests switch it on; the Refiner (one frame) is not affected.
-MULTIFRAME_ENABLED = False
+# A HunyuanVideo 1.5 video (T > 1) is layer 1 only as the fallback (prefer_layer2, DESIGN §9.41): on the GPU
+# (832x480x81) layer 1 reserves 2.54 GiB against layer 2's 10.43 but takes 1.56x as long, so layer 2 when its estimate
+# fits the device (vae.layer2_room), layer 1 past that. Its plan's estimate is still under the reserved growth there
+# (2.33): the carries' clones and the top level's padded input fragment the arena, two requests land outside it where
+# `largest` covers one (an engine fix, the vae_engine owner's). False: a video never takes layer 1 (layer 2 as before).
+MULTIFRAME_ENABLED = True
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +385,12 @@ class HV15Stripe(eng.StripeAdapter):
         self.fsm = fsm
         self.single = bool(single)
         self.module = fsm if module is None else module
+
+    @property
+    def prefer_layer2(self):
+        """A video: layer 2 when its estimate fits the device, layer 1 only past that (vae.py's prefer_layer2 routing;
+        1.56x slower than layer 2 at 832x480x81). One frame (the Refiner): layer 1 as usual."""
+        return not self.single
         self.name = "HunyuanVideo 1.5 stripes" + (" (single frame)" if self.single else "")
         self.prefix, self.units = build_units(fsm, self.single)
         self.scale = 1
@@ -587,8 +594,7 @@ def match(vae, samples, vae_options):
     if samples.shape[1] != fsm.decoder.z_channels:
         return None, "latent has {} channels, the decoder takes {}".format(samples.shape[1], fsm.decoder.z_channels)
     if int(samples.shape[2]) > 1 and not MULTIFRAME_ENABLED:
-        return None, ("video (HunyuanVideo 1.5): layer 1 off: on the GPU it is 1.56x slower than layer 2 and its memory "
-                      "estimate is under the reserved growth (DESIGN §9.41)")
+        return None, "video (HunyuanVideo 1.5): layer 1 off (MULTIFRAME_ENABLED, DESIGN §9.41)"
     return HV15Stripe(fsm, int(samples.shape[2]) == 1), None
 
 

@@ -19,8 +19,7 @@ registration in vae.py is the adapter thread's).
   5. caching allocator (tests/alloc_sim.py, full size on the meta device): layer-1 reserved <= estimate for the
      Refiner (1344x768, 2048x2048, 3072x3072, bf16 / fp16 / fp32), and the estimate far below layer 2's; the
      HunyuanVideo 1.5 video plans (832x480x81, 1280x720x121) and the multi-frame self-test bound are printed, not
-     checked: they are under the simulated reserved, which is why a video stays on layer 2 (MULTIFRAME_ENABLED off,
-     DESIGN §9.41; switched on here for the other tests).
+     checked: they are under the simulated reserved (DESIGN §9.41; a video takes layer 1 only past layer 2's room).
 
     python tests/test_vae_hunyuan15.py
 """
@@ -282,7 +281,7 @@ def allocator_tests():
         if frames == 1:
             check(msg, i["reserved"] <= i["estimate"] and (l2 is None or i["estimate"] < l2["reserved"]))
         else:
-            print("[INFO] {} ({}; multi-frame layer 1 is off)".format(msg, "holds" if i["reserved"] <= i["estimate"] else "does not hold"))
+            print("[INFO] {} ({})".format(msg, "holds" if i["reserved"] <= i["estimate"] else "does not hold: the arena fragmentation of the carries"))
     for dt, t in (("bf16", 1), ("fp32", 1), ("bf16", 5)):
         pk, left, bound = alloc_sim.selftest_trace("hv15", dt, latent_frames=t)
         msg = "self-test ({}, {}): simulated reserved peak {:.0f} MiB <= selftest_memory {:.0f} MiB, nothing left".format(
@@ -290,7 +289,7 @@ def allocator_tests():
         if t == 1:
             check(msg, pk <= bound and left == 0)
         else:
-            print("[INFO] {} ({}; multi-frame layer 1 is off)".format(msg, "holds" if pk <= bound and left == 0 else "does not hold"))
+            print("[INFO] {} ({})".format(msg, "holds" if pk <= bound and left == 0 else "does not hold"))
 
 
 def main():
@@ -298,10 +297,14 @@ def main():
         check("vae.install() on this ComfyUI", mvae.install())
     with registered():
         v = hv15_vae(dtype=torch.float32)
+        b5, _ = h15.match(v, lat_(4, 4, t=5), {})
+        b1, _ = h15.match(v, lat_(4, 4), {})
+        check("video: layer 1 as the fallback (prefer_layer2), one frame: layer 1 as usual",
+              h15.MULTIFRAME_ENABLED and b5.prefer_layer2 is True and b1.prefer_layer2 is False)
+        h15.MULTIFRAME_ENABLED = False
         b, why = h15.match(v, lat_(4, 4, t=5), {})
-        check("multi-frame off by default (MULTIFRAME_ENABLED False): not matched ({})".format(why),
-              not h15.MULTIFRAME_ENABLED and b is None and "layer 1 off" in why and h15.match(v, lat_(4, 4), {})[0] is not None)
-        h15.MULTIFRAME_ENABLED = True   # the remaining tests measure the multi-frame path too
+        h15.MULTIFRAME_ENABLED = True
+        check("MULTIFRAME_ENABLED False: a video not matched ({})".format(why), b is None and "layer 1 off" in why)
         recognition_tests(v)
         single_tests(v)
         multi_tests(v)
