@@ -71,6 +71,8 @@ HIP_GRID_MAX = 65535
 QKV_CHUNK_ELEMS = 2 ** 25   # native NeighborhoodAttention3D's qkv/proj chunk (elements of [tokens, dim])
 SWIGLU_TERMS = 3            # [tokens, hidden] temporaries alive at once in SwiGLU: gate, silu(gate) * up, up
 SLACK = 64 * 1024 * 1024    # small per-op temporaries not modelled (RoPE tables, norm weights, rounding)
+RESERVED_RATIO = 1.05       # plan() total: reserved over the allocated bound (measured <= 1.04 at 1920x1088x97)
+RESERVED_PAD = 256 * 1024 * 1024   # plus a fixed pad for small sizes (fp32 256x256x25: alloc bound 2.55, reserved 2.70 GiB)
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +527,8 @@ def plan(fsm, latent_shape, elem, workspace):
       stage 5 input:   context + x_t + x + one patchify/proj chunk
       stage 5 blocks:  context + x_t + x + max(context_proj chunk, NA slab workspace, SwiGLU chunk)
       stage 5 output:  x_t + x + pixel output + one norm/proj chunk
-    plus the latent and SLACK per phase."""
+    plus the latent and SLACK per phase. total is on the reserved basis: the allocated bound times RESERVED_RATIO
+    plus RESERVED_PAD (measured on gfx1151: reserved over alloc stayed within 4 % + 0.25 GiB, fp32 and bf16)."""
     dec = fsm.decoder
     b, _, lt, lh, lw = latent_shape
     pad = dec.trailing_pad_latent_frames
@@ -581,7 +584,8 @@ def plan(fsm, latent_shape, elem, workspace):
     phases.append(("stage5 output", pix + x5 + pix + out_chunk))
     stages.append({"stage": len(dec.det_stages) + 1, "t": t5, "h": h5, "w": w5, "dim": c5, "kernel_t": kt5, "na_block": bf5})
     worst = max(phases, key=lambda p: p[1])
-    return {"total": int(worst[1] + lat + SLACK), "phase": worst[0], "phases": phases, "stages": stages,
+    alloc = worst[1] + lat + SLACK
+    return {"total": int(alloc * RESERVED_RATIO + RESERVED_PAD), "phase": worst[0], "phases": phases, "stages": stages,
             "context": int(ctx), "x5": int(x5), "pixels": int(pix), "frames": t5}
 
 
