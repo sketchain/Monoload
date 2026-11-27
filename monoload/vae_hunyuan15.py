@@ -385,12 +385,6 @@ class HV15Stripe(eng.StripeAdapter):
         self.fsm = fsm
         self.single = bool(single)
         self.module = fsm if module is None else module
-
-    @property
-    def prefer_layer2(self):
-        """A video: layer 2 when its estimate fits the device, layer 1 only past that (vae.py's prefer_layer2 routing;
-        1.56x slower than layer 2 at 832x480x81). One frame (the Refiner): layer 1 as usual."""
-        return not self.single
         self.name = "HunyuanVideo 1.5 stripes" + (" (single frame)" if self.single else "")
         self.prefix, self.units = build_units(fsm, self.single)
         self.scale = 1
@@ -401,6 +395,12 @@ class HV15Stripe(eng.StripeAdapter):
         self.key = signature(fsm, self.units, self.single)
         self._frames = 1                                   # latent frames of the latest time_chunks (the prefix's planes)
         self._planes = [1] * (len(self.units) + 1)         # planes at each level (the largest over the chunks), likewise
+
+    @property
+    def prefer_layer2(self):
+        """A video: layer 2 when its estimate fits the device, layer 1 only past that (vae.py's prefer_layer2 routing;
+        1.56x slower than layer 2 at 832x480x81). One frame (the Refiner): layer 1 as usual."""
+        return not self.single
 
     # time axis
 
