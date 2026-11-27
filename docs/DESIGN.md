@@ -2029,9 +2029,47 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 冷跑多出的约 78 s 是适配线程的两次探测解码（`vae._probe_mf`，每个模型和形状一次）。**定案：合**——峰值约减半，慢约 1.8 倍（光环帧的重复注意力；块已是预算内最大）。`plan()` 的总数改成 reserved 口径（allocated 上界 × 1.05 + 256 MiB；fp32 小尺寸实测 reserved 比 allocated 上界多 6–10 %，这一档 2.55 → 2.93 ≥ 2.70），路由仍用探测。
 
-### 9.44 多帧探测结果落盘；LTX-2.5 扩散 decoder 不探测；不按原生估计放弃第二层（分支 video-probe-cache）
+### 9.43 D 组：Mochi、Cosmos 1.0 逐帧流式的第二层（分支 claude/project-thread-gjyfzb）
 
-（§9.43 留给 video-carry-store。）
+**问题：** Mochi 和 Cosmos 1.0 的 decoder 一次吃下整段视频。Mochi 848×480×85 原生模拟 362 GiB（OOM → tiled），整段视频进第二层还要 59.32；Cosmos 1280×704×121 原生 30.18，整段第二层 12.99（§9.39）。两种 decoder 跨帧的东西都只有**因果时间卷积**（只看前面几帧）和**时间上采样**，所以可以一帧一帧地流过去，每个因果卷积带着自己前几帧的缓存。
+
+**做法（`monoload/vae_mochi.py`、`monoload/vae_cosmos.py`，各自的 `chunks(fsm, z)` 登记进 `vae_video._CHUNKS`）：**
+* **深度优先、一次一帧：** 每一级的输出切成单帧（`PIECE_FRAMES` = 1，固定，探测的斜率才不随尺寸变）再进下一级，所以每个模块按时间顺序见到自己的帧；每一级的输入在输出出来后立刻放掉（迭代写法；递归写法会把每级输出一直留到最底层，Mochi 720p 多 1.5 GiB）。输出块按帧序出来，`vae._decode_sample` 逐块拷进输出缓冲（H3）。
+* **因果卷积的缓存：** 进 `_Stream` 时给每个时间核 > 1 的因果卷积挂实例 `forward`（带 `monoload_replacement` 标记，出来时摘掉）：第一次调用照原生在前面补首帧（Mochi `PConv3d` 的 replicate / zeros，Cosmos `CausalConv3d` 的首帧重复），以后把缓存的 kernel−1 帧接在前面；输出帧就是原生的那一帧。
+* **Mochi：** decoder 摊平成一串级（ResBlock、1×1×1 卷积、`Conv1x1`、`DepthToSpaceTime`），从 latent 第一帧起整条流下去；`DepthToSpaceTime` 只在第一次调用时丢掉前 texp−1 帧（t 帧 latent → 6t−5 帧）。没有注意力，GroupNorm 是逐帧的（`GroupNormSpatial`），不用改。
+* **Cosmos（`DecoderFactorized`）：** 第一个带时间上采样的层级之前（conv_in、mid 的空间注意力和**因果时间注意力**、上面的 up 层级）在 latent 分辨率上照原生整段跑一遍；从那一级的 `upsample` 起流式：首帧出 1 帧、其余每帧 ×2（`repeat_interleave`），后面的层级、`norm_out`、`conv_out`、haar 反变换（只有第一块去掉 patch_size−1 帧）逐帧。流式部分要求没有注意力、`CausalNormalize` 的 num_groups == 1（逐帧的 GroupNorm）、没有第二次时间上采样；t = 1 时整段解码。
+* **认结构不认文件名：** `structure(fsm)` 检查类、每一级的模块种类、因果卷积的时间步长 / 膨胀、没有别人挂的实例 `forward`（用户的 hook）；任何一条不符就 `yield fsm.decode(z)`，和原生一样。
+* **数值：** 同样的模块算同样的帧，卷积 / GroupNorm 只是一次算 1–3 帧，可能挑到别的 kernel：fp 接近，不逐位相同。`MONOLOAD=0` 不经过这里，照旧逐位等于原生。
+
+**模拟（`tests/sim_group_d.py`，bf16，GiB，reserved 增量；估算是 H1 探测在模拟器上量的）：**
+
+| VAE、分辨率×帧数 | 原生 | 整段第二层（§9.39） | 流式第二层 | 估算 |
+|---|---|---|---|---|
+| Mochi，848×480×85 | 362（OOM） | 59.32 | **5.55** | 7.19 |
+| Mochi，1280×720×85 | 820（OOM） | 106 | **11.45** | 13.22 |
+| Mochi，848×480×163 | — | — | **5.90** | 7.55 |
+| Cosmos 1.0，1280×704×121 | 30.18 | 12.99 | **4.15** | 5.78 |
+| Cosmos 1.0，1920×1088×121 | 55.63 | — | **9.87** | 10.51 |
+| Cosmos 1.0，1280×704×57 | 14.88 | — | **2.79** | 5.04 |
+
+估算全是上界。Mochi 的峰值主要是缓存（38 个因果卷积各 2 帧，720p 约 5.7 GiB，几乎不随帧数变）；Cosmos 的峰值在 latent 分辨率的整段前缀加输出缓冲（fp32，1.22 GiB）。
+
+**真机（CT 103，2026-11-27，`tests/bench_group_d.py`，reserved Δ，GiB；原始日志 /srv/monoload-wt/logs/groupd-*.log）：**
+
+| VAE、分辨率×帧数 | 原生 | Monoload（流式第二层） | 估算 | warm 耗时（原生 → Monoload） | 和原生比 |
+|---|---|---|---|---|---|
+| Cosmos 1.0（bf16），1280×704×121 | 30.18 | **2.96** | 4.58 | 8.5 → 10.4 s | 像素 max 0.0215，PSNR 54.8（bf16 噪声级：fp32 下流式对原生 ≤ 2e-6） |
+| Mochi（fp16），848×480×85 | OOM → tiled（到 OOM 为止 36.49） | **5.16** | 6.83 | tiled 29 s（含 OOM）→ 67 s | 原生放不下，没有参照（小尺寸见下） |
+
+估算都是上界，0 次 OOM 重试。`tests/check_group_d_zero.py`（真实权重，Mochi 424×240×31、Cosmos 640×352×33）：MONOLOAD=0 对原生逐位一致；Monoload 开着对原生像素 max Mochi 0.0005、Cosmos 0.0176。`tests/test_vae_stream.py` 真机 22/22（fp32 相对误差 Mochi 3.4e-6、Cosmos 1.9e-6）。Mochi 慢在每帧一遍的 1020 次分块卷积（1 GiB 工作区）。**透传原生（退到 tiled）不选：** 原生那一次（先整段试、OOM 后 ComfyUI 自己退到 tiled，共 29.2 s）的峰值 reserved Δ 36.49 / GTT Δ 36.54 GiB，是 Monoload 5.16 的 7 倍；tiled 的输出也不等于原生（瓦片接缝）。峰值优先，保持流式第二层。
+
+**第一层：两种都不做。** 流式第二层已经远低于 55 GiB，也低于各自 DiT 的峰值；第一层（按行条带）只能再压缓存或前缀，换不来决定性的差别（按「和第二层比」的规矩）。
+
+**测试：** `tests/test_vae_stream.py`（随机权重、真实尺寸、真机 GPU）：流式拼起来对原生 fp32 相对误差 ≤ 1e-5（单纯流式和 1 MiB 工作区的 OpChunking 两种），bf16 误差不超过原生的 2 倍，用户 hook / Cosmos 单帧 / 别的类整段解码，模块上不留东西。真机结果见上。
+
+**接入：** 登记在 `vae_video.py`，适配线程按 951868b 的写法合进 video（855469a，可选导入：没有这两个模块时照旧原生）。`tests/group_d_reg.py` 再登记一次也无害（`setdefault`），`tests/sim_group_d.py`、`tests/bench_group_d.py`（包一层 `bench_vae`，例：`python tests/bench_group_d.py --vae mochi_vae.safetensors --res 848x480 --frames 85 --modes native,monoload`）用它。
+
+### 9.44 多帧探测结果落盘；LTX-2.5 扩散 decoder 不探测；不按原生估计放弃第二层（分支 video-probe-cache）
 
 **为什么要缓存。** 第二层的多帧估计来自 `_probe_mf`：在两个小尺寸上真解码两次，必要时在本次 workspace 下再解码一次量碎片。结果原先只存在进程内存里（`_PROBES`），ComfyUI 每次重启以后，每个模型和 latent 布局第一次解码都要再冷跑一遍：Wan 2.2 5B 9 帧约 40 s，LTX-2.5 768×512×97 约 78 s（CT 700）。verify 每一档都重建容器，所以每档都要付这笔时间。
 

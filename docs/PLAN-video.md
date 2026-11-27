@@ -69,9 +69,8 @@
 | Cosmos CV8x8x8（因式分解卷积、每帧 1 组 GroupNorm、空间注意力 + 每像素时间注意力、haar）| Cosmos 1.0 T2V / I2V（7B / 14B）| 11.63 → 4.15 | 21.27 → 11.05 |
 | Mochi（`PConv3d` 时间复制补边、每帧 GroupNorm、`DepthToSpaceTime`）| Mochi 1 | 337（OOM）→ 54.36（79 帧）| 762（OOM）→ 106（OOM）|
 
-* 两者都**整段视频一次**过 decoder，没有因果缓存可借；时间卷积是非因果的（两边都读）。L1 = **时空条带**：沿时间也按块切，块之间带时间 halo（倒推出来，和空间 halo 同一套）重算，而不是缓存。H2 的「时间块」在这里是带 halo 的重叠块。
-* Cosmos：每帧 GroupNorm（1 组）= 每帧整幅统计 → 统计遍按帧；空间注意力每帧整幅（全局）→ 注意力所在的几级进前缀；时间注意力每像素沿全部帧（行局部）→ 条带内整段时间一起算（这一级时间不能切块）。Cosmos 的 L2 已经 2–3 倍，L1 优先级低。
-* **Mochi 只有 L1 一条路**（L2 在 720p 仍 > 60 GiB）：每帧 GroupNorm 统计遍（按帧、每次 8 帧的分组照原生）、`PConv3d` 的复制补边在条带边界要用真实相邻行（不是补边）——和 Wan 的 zeros 补边不同，halo 倒推时要区分「图像边缘复制」和「条带内部边界」。工作量最大，放最后。
+* **结果（D 组做完，DESIGN §9.43）：不做第一层，改成逐帧流式的第二层。** 上面「时间卷积非因果、没有缓存可借」的判断不对：v0.46.3 里两种 decoder 跨帧的只有**因果**时间卷积（Mochi `PConv3d` 前面补首帧，Cosmos `CausalConv3d` 首帧重复）和时间上采样，Cosmos 的时间注意力在第一次时间上采样之前（latent 分辨率，整段照原生跑）。所以按帧深度优先、每个因果卷积带前 k−1 帧缓存，就能一帧一帧地流过去（`vae_mochi.py` / `vae_cosmos.py`）。
+* 真机（reserved Δ）：Cosmos 1280×704×121 原生 30.18 → **2.96 GiB**；Mochi 848×480×85 原生 OOM → tiled，Monoload **5.16 GiB**（模拟 1280×720×85 是 11.45）。都远低于 DiT，第一层换不来决定性的差别。
 
 ### E 组：SVD（4D，batch 是时间轴）
 
@@ -179,7 +178,7 @@ TAESD / TAEF1 / TAEF2、**Qwen Image 2.1 TAESD（64 ch，16×，RGBA，v0.46.3 �
 | MiniMax H3 pruned（视频 + 音频）| 40.23 · 20.96 · int8 20.97 · w6a8 15.98 | qwen3vl_32b 51.51 · int8 27.14 · nvfp4 15.69 | video 5.21（int8 2.81）/ sol 3.60 / audio 0.61 → G | **TE bf16 48 GiB** | ≤ 55（TE bf16 时 TE 和 DiT 必须分开加载）|
 | MiniMax H3 完整（fl2va / ref2va）| **66.28** · int8 34.04 | 同上 | 同上 → G | **DiT bf16 61.7 GiB** | **bf16：> 55，等宿主机调 ttm 后再验**；int8：≤ 55 |
 | MiniMax H3 Image | ? | 同上 | H3 图像 VAE → G | ? | 待核实 |
-| Mochi 1 | 20.06 · 10.03 | t5xxl 9.79 · 5.16 | mochi_vae 0.92 → D（只有 L1 能把 720p 放进 55）| DiT | ≤ 55（VAE 原生 OOM）|
+| Mochi 1 | 20.06 · 10.03 | t5xxl 9.79 · 5.16 | mochi_vae 0.92 → D（流式第二层，720p 模拟 11.45）| DiT | ≤ 55（VAE 原生 OOM）|
 | Cosmos 1.0 7B / 14B | 14.47 / 28.53 | oldt5_xxl ? | CV8x8x8 ? → D | DiT | ≤ 55 |
 | Cosmos Predict 2 视频 2B / 14B | 3.91 / 28.53 | oldt5_xxl ? | wan_2.1_vae（未核实）→ A | DiT | ≤ 55 |
 | CogVideoX 2B / 5B / I2V / Inpaint | 5B 11.15（2B ?）| t5xxl 9.79 · 5.16 | 0.86 → C | DiT | ≤ 55 |
@@ -189,7 +188,7 @@ TAESD / TAEF1 / TAEF2、**Qwen Image 2.1 TAESD（64 ch，16×，RGBA，v0.46.3 �
 **结论：**
 * **> 55 GiB 只有一项：MiniMax H3 完整版的 bf16 DiT（61.7 GiB）** → 单列「等宿主机调 ttm 后再验」；它的 int8（31.7 GiB）和 pruned 各档都在主线。
 * **要分开加载 TE 和 DiT 的**：MiniMax H3 用 qwen3vl_32b bf16（48 GiB）时，任何 DiT 都放不进剩下的 7 GiB；其余家族 TE + DiT 同时驻留也多在 55 以内（最大的组合 LTX-2.3 bf16 42 + gemma bf16 22.7 ≈ 65 GiB 也超，ComfyUI 本来就会按需卸 TE，真机看日志确认）。
-* **VAE 解码在 Monoload 管理下都远小于 DiT**（§2 的 L2 数字 4–45 GiB，L1 预计 1–3 GiB + 输出），不会决定单次峰值；**例外是 Mochi**（L2 在 720p 仍 > 60，必须 L1）和 CogVideoX 720p（L2 45 GiB，接近线）。原生解码有好几种超过 55（HunyuanVideo、CogVideoX、Mochi 的 720p），这正是要 Monoload 的地方。
+* **VAE 解码在 Monoload 管理下都远小于 DiT**（§2 的 L2 数字 4–45 GiB，L1 预计 1–3 GiB + 输出），不会决定单次峰值；Mochi 原来是例外（整段 L2 在 720p > 60），D 组的流式第二层已降到 11.45（模拟）；CogVideoX 720p（L2 45 GiB，接近线）。原生解码有好几种超过 55（HunyuanVideo、CogVideoX、Mochi 的 720p），这正是要 Monoload 的地方。
 * 主线验证的模型按价值排：Wan 2.2 A14B（fp8 / GGUF）、Wan 2.2 TI2V 5B、HunyuanVideo 1.5、LTX-2.3、HunyuanVideo 1.0、Kandinsky 5、CogVideoX、Cosmos Predict 2、Mochi、MiniMax H3（pruned / int8）、SeedVR2、SVD；Cosmos 1.0 与 LTX 0.9.x 只做冒烟。
 
 ## 4. 并行开工的顺序
@@ -197,7 +196,7 @@ TAESD / TAEF1 / TAEF2、**Qwen Image 2.1 TAESD（64 ch，16×，RGBA，v0.46.3 �
 1. **阶段 C（本线程）先出 H1 + H3 + H6**（多帧第二层的入口、直接写输出、`--frames`）：A / B / C / F 组的第二层立刻能用，真机能测原生基线。
 2. 同时开：**A 组（Wan）L1**、**G 组测量**（只要 H6）、**F 组的原生基线**（只要 H6）。
 3. H2 + H4 + H5 合进 video 后开：**B 组（Hunyuan）L1**、**C 组（CogVideoX）L1**。
-4. 最后：**D 组（Mochi / Cosmos）L1**、E 组的 L1、F 组 L1（看基线）。
+4. 最后：E 组的 L1、F 组 L1（看基线）。D 组（Mochi / Cosmos）已用流式第二层解决，不做 L1（DESIGN §9.43）。
 
 每组一个线程、一个功能分支（从 video 开，合回 video），各自写真机命令（`docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/...`，带预期和看哪项）交给验证线程。改 `vae_engine.py` / `vae.py` 的共用部分只在阶段 C 做；各组线程只加适配器文件和测试，需要改共用部分时先发给本线程。
 
