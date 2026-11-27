@@ -420,7 +420,7 @@ class _MemProbe:
     def __enter__(self):
         dev = self.device
         self.cuda = getattr(dev, "type", None) == "cuda" and torch.cuda.is_available()
-        self.selftests = len(vae_engine._SELFTEST)
+        self.selftests = _selftests_run()
         if self.cuda:
             mm.soft_empty_cache()
             self.base_res = torch.cuda.memory_reserved(dev)
@@ -451,7 +451,7 @@ class _MemProbe:
                 self.result["gtt_peak"] = self.peak_gtt - self.base_gtt
         if self.cuda:
             self.result["reserved_peak"] = torch.cuda.max_memory_reserved(self.device) - self.base_res
-        self.result["selftest"] = len(vae_engine._SELFTEST) > self.selftests
+        self.result["selftest"] = _selftests_run() > self.selftests
         return False
 
 
@@ -835,7 +835,8 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
 # again). Only real CUDA / ROCm measurements (_CudaPeak) are kept; the simulator's never.
 # MONOLOAD_PROBE_CACHE: a file path, or 0 / off to keep nothing on disk; default <ComfyUI user dir>/monoload/probe_cache.json.
 
-PROBE_CACHE_VERSION = 4   # 2: entries carry mf_ratio (DESIGN §9.35); 3: integer sample positions; 4: largest tensors only
+PROBE_CACHE_VERSION = 5   # 2: entries carry mf_ratio (DESIGN §9.35); 3: integer sample positions; 4: largest tensors only;
+                          # 5: passed layer-1 self-tests (DESIGN §9.47)
 PROBE_CACHE_MAX = 512              # entries; the oldest go first
 _PROBE_CACHE = {"path": None, "loaded": False, "entries": {}}
 _FINGERPRINTS = weakref.WeakKeyDictionary()   # first_stage_model -> hex digest of its weights
@@ -959,6 +960,61 @@ def _probe_cache_put(disk, p):
     entries[disk] = {"slope": p.mf_slope, "intercept": p.mf_intercept, "frag": p.mf_frag, "ratio": p.mf_ratio,
                      "out": p.out_numel_per_px,
                      "seconds": round(p.seconds, 2), "saved": int(time.time())}
+    _probe_cache_write(path)
+
+
+# passed layer-1 self-tests (DESIGN §9.47): the first decode of a structure in a process ran vae_engine.self_test (Wan 2.2
+# 5B video ~75 s on CT 700) before every ComfyUI restart's first layer-1 decode. A pass is kept in the probe cache file
+# under its own key: the structure (bound.key), the weights, the device, torch and Monoload's source (any code change
+# tests again). Failures are not kept: a failed structure is tested again in the next process.
+
+_SELFTEST_FROM_DISK = set()   # structure keys whose pass came from the cache file in this process
+
+
+def _selftests_run():
+    """Self-tests that ran in this process (not the passes read from the cache file)."""
+    return len(vae_engine._SELFTEST) - len(_SELFTEST_FROM_DISK & vae_engine._SELFTEST.keys())
+
+
+def _selftest_disk_key(vae, bound):
+    if _probe_cache_path() is None:
+        return None
+    try:
+        dev = vae.device
+        name = torch.cuda.get_device_name(dev) if dev.type == "cuda" else str(dev)
+        return json.dumps(["selftest", PROBE_CACHE_VERSION, _weights_fingerprint(vae.first_stage_model), str(bound.key),
+                           name, torch.__version__, _code_fingerprint()])
+    except Exception as e:
+        logging.debug("[Monoload] self-test cache key: %s: %s", type(e).__name__, e)
+        return None
+
+
+def _selftest_from_disk(vae, bound):
+    """Put a pass the cache file has for this structure into vae_engine._SELFTEST (not run again in this process)."""
+    if bound.key in vae_engine._SELFTEST:
+        return
+    disk = _selftest_disk_key(vae, bound)
+    if disk is None or _probe_cache_load() is None:
+        return
+    e = _PROBE_CACHE["entries"].get(disk)
+    if isinstance(e, dict) and e.get("selftest") == "ok":
+        _SELFTEST_FROM_DISK.add(bound.key)
+        vae_engine._SELFTEST[bound.key] = (True, "{} (passed before, {}s; cached)".format(e.get("detail", ""), e.get("seconds", "?")))
+
+
+def _selftest_to_disk(vae, bound, detail, seconds):
+    disk = _selftest_disk_key(vae, bound)
+    path = _probe_cache_load() if disk is not None else None
+    if path is None:
+        return
+    entries = _PROBE_CACHE["entries"]
+    entries.pop(disk, None)
+    entries[disk] = {"selftest": "ok", "detail": str(detail), "seconds": round(seconds, 2), "saved": int(time.time())}
+    _probe_cache_write(path)
+
+
+def _probe_cache_write(path):
+    entries = _PROBE_CACHE["entries"]
     while len(entries) > PROBE_CACHE_MAX:
         entries.pop(next(iter(entries)))
     try:
@@ -1259,14 +1315,17 @@ def layer2_room(vae):
 
 
 def _layer1_self_test(vae, bound):
+    _selftest_from_disk(vae, bound)
     hit = vae_engine._SELFTEST.get(bound.key)
     if hit is None:
         # the self-test copies the decoder's weights: they must be loaded
         need = bound.selftest_memory()
         _load_models(vae, need)
+        t0 = time.perf_counter()
         hit = vae_engine.self_test(bound, vae)
         _SELFTEST_IN_DECODE[0] = max(_SELFTEST_IN_DECODE[0], need)
         if hit[0]:
+            _selftest_to_disk(vae, bound, hit[1], time.perf_counter() - t0)
             logging.info(msg("vae.selftest_ok", name=bound.name, detail=hit[1]))
         else:
             logging.warning(msg("vae.selftest_failed", name=bound.name, detail=hit[1]))
@@ -1398,6 +1457,7 @@ def choose_budget(vae, samples_in, vae_options, bud, selftest=None):
     variants, failed = [], []
     if bound is not None:
         for v in bound.variants(scheme if bound.schemes else None):
+            _selftest_from_disk(vae, v)
             (failed if _selftest_failed(v) else variants).append(v)
         if not variants:
             l1_note = msg("vae.selftest_failed_short")
