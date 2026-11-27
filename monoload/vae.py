@@ -835,7 +835,7 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
 # again). Only real CUDA / ROCm measurements (_CudaPeak) are kept; the simulator's never.
 # MONOLOAD_PROBE_CACHE: a file path, or 0 / off to keep nothing on disk; default <ComfyUI user dir>/monoload/probe_cache.json.
 
-PROBE_CACHE_VERSION = 2   # 2: entries carry mf_ratio (the probes' reserved / allocated ratio, DESIGN §9.35)
+PROBE_CACHE_VERSION = 3   # 2: entries carry mf_ratio (DESIGN §9.35); 3: weight fingerprints sample integer positions
 PROBE_CACHE_MAX = 512              # entries; the oldest go first
 _PROBE_CACHE = {"path": None, "loaded": False, "entries": {}}
 _FINGERPRINTS = weakref.WeakKeyDictionary()   # first_stage_model -> hex digest of its weights
@@ -886,7 +886,10 @@ def _weights_fingerprint(fsm):
             if n == 0 or t.device.type == "meta":
                 continue
             flat = t.reshape(-1)
-            idx = torch.linspace(0, n - 1, steps=min(64, n), device=flat.device).long()
+            # integer positions: a float32 linspace rounds its last index up to n past 2**24 elements (HV1.5 has a
+            # 226M-element conv weight), and an out-of-range index_select is a hardware exception on ROCm
+            k = min(64, n)
+            idx = (torch.arange(k, dtype=torch.int64) * (n - 1) // max(k - 1, 1)).clamp_(0, n - 1).to(flat.device)
             h.update(flat.index_select(0, idx).float().cpu().numpy().tobytes())
     fp = h.hexdigest()[:32]
     _FINGERPRINTS[fsm] = fp
