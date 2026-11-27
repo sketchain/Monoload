@@ -293,6 +293,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | **video 分支**：第二层碎片按比例放大、`prefer_layer2` 路由、Wan 2.1 多帧第一层作后备、探测缓存存比例 | Merge video-l2-frag（`git log --first-parent video`） |
 | **video 分支**：GGUF 真机结果（Q8_0 / K-quant 逐层、Wan 2.2 整模型）、bench_lora 探测反量化 GGUF | Merge GGUF thread (baacfe0)（`git log --first-parent video`） |
 | **video 分支**：GGUF 其余 9 种量化类型逐层真机结果（共 12 种） | Merge GGUF thread (2109f38)（`git log --first-parent video`） |
+| **video 分支**：B 组 HV1.5 720p×81 真机行、自检上界复测（文档） | Merge B group (ee07355)（`git log --first-parent video`） |
 | **video 分支**：B 组 HV1.5 自检上界计入参照缓存、HV1.0 只走第二层 | Merge B group (9f48b35)（`git log --first-parent video`） |
 | **video 分支**：C 组 CogVideoX 第一层 / 第二层（`vae_cogvideo`） | Merge group C (6d7aa87)（`git log --first-parent video`） |
 | **video 分支**：D 组 Cosmos 1.0 / Mochi 逐帧流式第二层（`vae_cosmos`、`vae_mochi`） | Merge video-groupd（`git log --first-parent video`） |
