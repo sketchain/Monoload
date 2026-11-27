@@ -17,14 +17,14 @@ MIB = 1 << 20
 
 
 def main():
-    # two units; unit 0 keeps 2 carries of 1 MiB (its part 2 MiB), unit 1 one of 3 MiB
+    # two units, 1 KiB per carried row and channel factor k: stripe 0 gives unit 0 a 2 MiB part, unit 1 a 3 MiB one
     units = [types.SimpleNamespace(name="u0", k=2), types.SimpleNamespace(name="u1", k=3)]
     bound = types.SimpleNamespace(name="fake", unit_cache=lambda u, r, w, e: u.k * r * w * e)
-    plan = types.SimpleNamespace(widths=[256, 256, 256], elem=4, needs=[[(0, 512), (0, 1024), (0, 1024)], [(0, 256), (0, 512), (0, 512)]])
+    plan = types.SimpleNamespace(widths=[256, 256, 256], elem=4, needs=[[(0, 1024), (0, 1024), (0, 2048)], [(0, 512), (0, 512), (0, 1024)]])
     st = eng.CarryStore.make(bound, units, plan, torch.device("cpu"))
-    check("buffer = the largest stripe's carries (2 + 4 MiB)", st.buf.numel() == 6 * MIB, repr(st.buf.numel()))
+    check("buffer = the largest stripe's carries (2 + 3 MiB)", st.buf.numel() == 5 * MIB, repr(st.buf.numel()))
     st.stripe(plan.needs[0])
-    check("unit parts follow unit_cache", st.parts == [(0, 2 * MIB), (2 * MIB, 6 * MIB)], repr(st.parts))
+    check("unit parts follow unit_cache", st.parts == [(0, 2 * MIB), (2 * MIB, 5 * MIB)], repr(st.parts))
 
     def mb(n, v):
         return torch.full((n * MIB // 4,), float(v))
