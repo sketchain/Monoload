@@ -523,7 +523,7 @@ loop:
 | `MONOLOAD_DISABLE_VAE=1` | VAE 解码的全局默认改成原生（包装照装，§10），LoRA 部分照常；节点 `mode auto` 的 VAE 仍管理 |
 | `MONOLOAD_DISABLE_VAE_STRIPE=1` | 只关第一层（§9.13），所有受管理的解码走第二层 |
 | `MONOLOAD_VAE_BUDGET` | 第一层的峰值预算；不设时用默认策略（128 行条带的峰值内最高的条带，§9.13.4） |
-| `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（扫参、调试） |
+| `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（扫参、调试）；设了就算用户强制第一层，带 `prefer_layer2` 的适配器也不先试第二层 |
 | `MONOLOAD_EXACT=1` | VAE 的全局默认是原生：分块改变 GEMM 形状，不保证逐位一致（节点 `mode auto` 的 VAE 仍管理） |
 | `MONOLOAD=0` | VAE 的全局默认是原生（总开关，§10） |
 | `MONOLOAD_DISABLE=1` | 什么都不装 |
@@ -1825,7 +1825,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 * **估算换成实测**：§9.32 说过，8×8 的形状探测只看「最大的单个张量」，看不到每卷积缓存、carry、输出块列表和 `torch.cat`，多帧时不是上界；按类型一项项补（像 §9.27）每种 decoder 都要单独建模，而且 Wan 2.1 刚改过结构。所以多帧改成**实测峰值**（`vae._probe_mf`）：用同样的帧数、零 latent，在 `MF_PROBE_SIZES`（16、32）两个 latent 尺寸上各跑一次**和真解码同一条路**（`_decode_sample`，`OpChunking` 工作区 `MF_PROBE_WORKSPACE` = 64 MiB），记 allocated 峰值（开始前先清空分配器缓存；输出缓冲在开始前分配、不算在内）；两点连线得每 latent 像素的斜率和截距。再用**解码自己的工作区**把 32 那个尺寸跑一次，只取碎片：reserved 峰值比 allocated 峰值多出的部分（几次里取最大，记作 frag）。探测的卷积列在两个尺寸上都顶到 64 MiB，落在截距里、不进斜率（多算 ≤ 2 × 64 MiB，偏保守）。最早用 1 MiB（想让工作区完全不进测量），真机上 Wan 2.1 81 帧第一次解码多花约 85 s（行块太碎），改成 64 MiB。
 * 估算 = `MF_MARGIN`（1.25）× 斜率 × 像素 + 截距 + frag + 2 × 工作区 + 输出缓冲（整批，`--gpu-only` 时）+ 一个 latent 样本。1.25 是两点连线之外的余量。缓存按（通道、维数、dtype、帧数）。
 * **为什么单独测碎片（盘点模拟里试过三种）：** 只记 allocated、靠 1.25 盖碎片：Wan 的 reserved / allocated 是 1.2–1.3，够；LTX 0.9.0 的卷积 VAE（768×512×97）第二层 reserved 6.70、allocated 3.86 GiB，估算 4.97 不是上界。两点都改记 reserved：LTX 0.9.0 还差 60 MiB（碎片来自解码的 1 GiB 大块，64 MiB 的探测看不到）。整个探测改用解码的工作区：都成了上界，但工作区进了斜率，Wan 2.1 480p 估算 10.72（实际 5.32，比原生 8.72 还高）。现在的做法（线用 64 MiB、碎片用解码工作区）在模拟里：Wan 2.1 832×480×81 估算 5.99 / 实际 5.32，Wan 2.2 1280×704×121 11.96 / 10.61，LTX 0.9.0 7.96 / 6.70，LTX 2 10.62 / 4.97（碎片在 32×32 的探测里 5.09 GiB，偏保守）。
-* **碎片按比例放大（video-l2-frag，Nov 27）：** 满尺寸的碎片随解码变大，探测尺寸上量到的绝对碎片盖不住：CogVideoX 720p×77 allocated 18.4、reserved 25.9 GiB，旧估算 22.71。现在多帧估算 = max(allocated 上界 × 探测各次 reserved / allocated 的最大比例 `mf_ratio`，allocated 上界 + 最大绝对碎片 `mf_frag`)。真机：CogVideoX 720p×81 估 47.89 ≥ reserved 26.81，720p×77 估 33.06 ≥ 25.94（默认路由 `MONOLOAD_VAE_FIT_CAP=55G` 两档都走第二层，约 160 s）；Wan 2.1 720p×81 估 11.10 ≥ 9.92。探测落盘（§9.44）的条目也存 `mf_ratio`（缓存格式升到 2）。**偏松待查**：CogVideoX t=21 估/实 1.79、t=20 1.27，实测几乎一样，疑探测的碎片比例在 t=21 偏大。
+* **碎片按比例放大（video-l2-frag，Nov 27）：** 满尺寸的碎片随解码变大，探测尺寸上量到的绝对碎片盖不住：CogVideoX 720p×77 allocated 18.4、reserved 25.9 GiB，旧估算 22.71。现在多帧估算 = max(allocated 上界 × 探测各次 reserved / allocated 的最大比例 `mf_ratio`，allocated 上界 + 最大绝对碎片 `mf_frag`)。真机：CogVideoX 720p×81 估 47.89 ≥ reserved 26.81，720p×77 估 33.06 ≥ 25.94（默认路由 `MONOLOAD_VAE_FIT_CAP=55G` 两档都走第二层，约 160 s）；Wan 2.1 720p×81 估 11.10 ≥ 9.92。探测落盘（§9.44）的条目也存 `mf_ratio`（缓存格式升到 2）。**显式设了条带高度**（`MONOLOAD_VAE_STRIPE_ROWS` 或节点 / `set_stripe_rows`）视为用户强制第一层，`prefer_layer2` 不生效（协调者定，Nov 27）。**偏松待查**：CogVideoX t=21 估/实 1.79、t=20 1.27，实测几乎一样，疑探测的碎片比例在 t=21 偏大。
 * 探测失败（任何异常）：没有上界就交给 ComfyUI 原生解码（`_UnboundedDecode`，记录 strategy native、原因写探测失败），不报错。
 * `_CudaPeak` 会重置设备的峰值统计：`_MemProbe` 记的这次解码的 reserved 峰值从探测开始算（探测在加载权重之后、任何解码工作之前）。
 
@@ -2120,6 +2120,45 @@ Monoload 的目标是降峰值，「原生放得进 cap 就走原生」也不做
 两档的估算都成了上界，峰值和时间也都略降。估算变大是因为 B 组和 A 组各自把 carry 补进了 `unit_cache`。
 
 **没解决：** HunyuanVideo 1.5 首次自检的峰值仍高于它的上界：冷跑（含自检）reserved 改前 +5.20、改后 +5.46，自检上界 4.70。这是 B 组已知的自检上界问题（模拟器 5350 > 4814 MiB），归 B 组复核。（B 组已修，§9.41：上界计入参照解码留下的缓存段，真机自检 5396 ≤ 上界 5765 MiB。）**决定（Nov 27）：Wan 2.1 多帧打开第一层，只作后备**（`WAN21_ENABLED = True`，`Wan21Video.prefer_layer2 = True`，和 HunyuanVideo 1.5 / CogVideoX 一致）：放得下设备就走第二层，放不下才第一层。理由：有了 CarryStore，720p×81 的第一层估算已是上界（+3.57 对 4.12 GiB），§9.40 留着它的原因没了；第二层更快且到约 1440p 都在 55 GiB 内，所以仍排在前面。随 video-l2-frag 的 `prefer_layer2` 路由一起生效。
+
+### 9.46 CogVideoX 的多帧解码：第二层流式上采样 + 第一层逐行（C 组，`monoload/vae_cogvideo.py`）
+
+**原生做了什么（v0.46.3 `AutoencoderKLCogVideoX._decode_rolling`）：** split = log2(时间压缩 4) = 2。第一阶段整段视频：`conv_in` → mid → `up_blocks[0]`（4 个 resnet 在 H/8，`Upsample3D` 时间 2T−1、空间 ×2）→ `up_blocks[1]`（4 个 resnet 在 H/4，再一次时间上采样到 4T−3、空间 ×2）。第二阶段每 4 帧一块、块之间带 `conv_caches`：`up_blocks[2]`（H/2，空间 ×2）→ `up_blocks[3]`（H）→ `norm_out` → SiLU → `conv_out`，每块 `.cpu()`，最后 `torch.cat(...).to(device)`。
+
+**GroupNorm 不用另设计：** 每个 SpatialNorm3D 都对它拿到的那个张量求统计——第一阶段是整段视频，第二阶段是原生自己的 4 帧块。所以「整段统计跨时间块」只发生在第一阶段，第二阶段本来就是块内统计。照原生的块边界和顺序做，统计量就和原生一致，用不着统计遍。
+
+**原生峰值的大头：** `up_blocks[1]` 的 `Upsample3D` 输出——整段视频、H/2、256 通道（720p×81 帧 bf16 一份 9.6 GB），加上它里面的插值 / 拼接 / 卷积副本，并且一直活到第二阶段结束（§9.32 模拟：720p×81 原生 121 GiB，单靠第二层还要 45 GiB）。
+
+**第二层（`chunks()`，登记在 `vae_video._CHUNKS`，951868b）：** 第一阶段停在这次上采样之前（`up_blocks[1]` 的 resnet 照原生整段跑），上采样改成**按第二阶段的每个 4 帧块现算**：`Upsample3D` 除了时间上的最近邻插值（哪一帧复制到哪）都是逐帧的（空间最近邻 ×2，再一个 3×3 Conv2d），所以一块要的帧就是原生从整段上采样结果里切出来的那几帧。每个源帧只卷积一次（原生把复制出来的帧再卷一遍，一样的输入），复制按原生的内存布局（(b t) c h w → b c t h w）。第二阶段就是原生的循环：同样的模块、缓存、块边界，每块做完交给 vae.py 写进输出缓冲（不经主机、不 cat）。帧数规则：每个时间上采样 T → 2T−1（T 奇 > 1）、2T（T 偶）、1（T = 1）；sd.py 的 4t−3 只对奇数 t 成立，`output_frames` 用 decoder 自己的规则。数值：同样的模块调用、同样的帧；只有被复制的帧少卷了一次。真机上 `chunks()` 与原生 `decode()` 逐位相同（720×480，t = 13 / 12）。
+
+**第一层（`decode_rows`，`CogStripe` / `CogPlan`）：** 工作顺序与第二层相同（第一阶段整段、第二阶段原生的 4 帧块 + 缓存、`up_blocks[1]` 的上采样按块现算），区别是**每个模块都不再产生整份大小的临时量**。每个 ResnetBlock3D：
+
+* 统计：norm1 的 GroupNorm 统计在整个输入上（第一阶段整段、第二阶段这一块，正是原生归一化的那个张量），fp32、按行切片累加（`vae_engine.Moments`）。
+* conv1：输出行 [a, b) 只用输入行 [a−1, b+1) 现算的 norm1 → SiLU（冻结统计的 GroupNorm、SpatialNorm3D 的 `conv_y` / `conv_b` 在这几行上），每片拼上因果时间填充 / 卷积缓存，调模块自己的卷积（它在切片边上的零填充落在 halo 行上，裁掉）；新缓存（原生 clone 的「填充后输入的最后 kt−1 帧」）逐行填，**写回上一块的缓存缓冲**（同形状，整个解码每个卷积一块缓冲；下一片的 halo 要读的上一片已覆盖的 kh//2 行先存一份）。原来每块新开缓存时分配器碎片让 720p×81 的 reserved 比 live 峰值高 1.6 GiB（14.62 对 13.04），原地写后 12.05。
+* norm2：conv1 的输出整份存着（统计要全部），conv2 同样逐行。
+* 残差：conv2 的行 + shortcut（1×1，逐行）或输入本身；通道相同就**写回输入的存储**（conv2 只读 conv1 的输出，不读输入），否则写新张量。
+* 同时活着的：块的输入、conv1 的输出、（通道变时的输出）、缓存、行切片。原生是输入再加每个 SpatialNorm3D 周围三到五份整份副本（GroupNorm、conv_y、conv_b、乘积、和）。
+
+`Upsample3D` 按输出行切（3×3 卷积要源行 ±1），时间插值用上面的帧映射。`norm_out` → SiLU → `conv_out` 的行直接写进输出缓冲。数值与原生的差别只在 GroupNorm 统计（fp32 求和顺序不同）和归一化（一次 fp32 乘加、只舍入一次，同 `vae_engine.group_norm_frozen`）；SpatialNorm 的 `* conv_y + conv_b` 和 SiLU 照原生在 vae dtype 里做。单帧 latent（T = 1 会走原生的「单帧无缓存」求和核捷径）不进第一层，留给第二层。
+
+**计数（`cost()`）：** 第一阶段峰值 = 各 resnet 的（输入 + conv1 输出 + 通道变时的输出 + 插值后的 zq）与第一阶段上采样（输入 + 输出）取大；第二阶段峰值 = 存档（`up_blocks[1]` 的输出，整段 H/4）+ 全部缓存 + zq（整段时间插值 + 各级空间插值）+ 各步（上采样输出、resnet 的整份张量 + 它正在新建的缓存、`conv_out` 的输入 + 新缓存）取大；加上行切片临时量（`SLICE_TEMPS` × 工作区：fp32 归一化、bf16 乘积、拼好的卷积输入、卷积输出、卷积内部的第二层分块）、输出缓冲、latent、`MARGIN`。不预留 arena；第一、二阶段之间清一次缓存（第一阶段的块还回去，存档留着）。行高 `rows` 是输出分辨率的切片高度（按级缩放），和工作区一起限制切片；默认策略照 `choose_plan`（128 行的峰值为目标，取到这个峰值的最高行）。
+
+**自检（`self_test_run`，需要引擎的钩子）：** fp32 副本（按结构重建 Decoder3D、载入权重，不复制 encoder），16×16×4 帧 latent（偶数 t：输出 128×128×16 帧，第二阶段 4 块），参考是 `chunks()`（原生模块调用，第二层分块 32 MiB），被测是 24 行切片 + 8 MiB 工作区（四级分别 3 / 6 / 12 / 24 行，每级都多片），max|差| / max(1, max|参考|) ≤ 1e-4。
+
+**接入：** `vae.py` 的 `STRIPE_ADAPTERS` 登记 `vae_cogvideo`、`vae_engine.self_test` 用 bound 自己的 `self_test_run`（适配线程 05abc20）。`CogStripe.prefer_layer2`：默认策略下第二层的估计放得下（`layer2_room`，`MONOLOAD_VAE_FIT_CAP`）就走第二层，放不下才走第一层（第一层的首次自检只在选中时跑；video-l2-frag 784aca3）——第二层每个卷积只算一次，快约 45%。
+
+**真机（comfyui-latest，v0.46.3，bf16，`MONOLOAD=1`，冷跑；reserved 是相对解码前的增量，GiB）：**
+
+| 尺寸（latent t） | 原生 | 第二层（估算） | 第一层（估算） | 默认路由（`MONOLOAD_VAE_FIT_CAP`） |
+|---|---|---|---|---|
+| 720×480×49（13） | 35.10，35.5 s | 12.26（14.65），59.6 s | 4.64（5.44），60.4 s（含首次自检 9.3 s）| 2G → 第一层 |
+| 1280×720×77 → 80 帧（20） | 没跑（同 81 帧，超出 55） | 25.94（33.06），159 s | 11.86（13.27），226 s | 55G → 第二层 |
+| 1280×720×81（21） | 没跑（模拟 121，超出 55） | 26.81（47.89），163 s | 12.05（13.29），236–278 s | 55G → 第二层；20G → 第一层 |
+
+* 估算都盖住了 reserved。第二层的估算是 video-l2-frag 784aca3 按探测的 reserved / alloc 比放大后的（之前 24.97 / 22.71 盖不住 26.81 / 25.94）；t = 21 偏松（1.79×），t = 20 是 1.27×。
+* 精度（720×480×49 对原生）：第二层和第一层都是像素 PSNR 68.5 dB、px rmse 3.7e-4、px max 0.17 / 0.19（1599 个像素值 > 0.01，占 0.003%）。第二层不加算子分块时与原生逐位相同（`tests/check_cogvideo.py`，480×320，t = 13 / 12），这里的差应该来自 1 GiB 工作区下 267 个卷积按行分块、bf16 舍入顺序不同（推断，没单独验）；第一层和它同一量级。
+* `MONOLOAD=0`：装着 Monoload 的 `VAE.decode` 与卸掉时逐位相同（t = 13 / 12）。fp32 自检 5e-6（容差 1e-4）。
+* 第一层省一半峰值，第二层每个卷积只算一次、在 720p 快约 45%，所以 `prefer_layer2`：放得下第二层就走第二层。
 
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 

@@ -336,7 +336,7 @@ LDM_DDCONFIG = {'double_z': True, 'z_channels': 4, 'resolution': 256, 'in_channe
                 'ch_mult': [1, 2, 4, 4], 'num_res_blocks': 2, 'attn_resolutions': [], 'dropout': 0.0}
 # model name -> (latent channels, latent dims[, spatial ratio (default 8)])
 LATENT = {"qwen": (16, 5), "sdxl": (4, 4), "flux": (16, 4), "flux2": (128, 4, 16), "wan22": (48, 5, 16), "hy21": (64, 4, 32),
-          "hyr": (32, 5, 16), "hv15": (32, 5, 16)}
+          "hyr": (32, 5, 16), "hv15": (32, 5, 16), "cogvideo": (16, 5)}
 
 
 class _MetaVAE:
@@ -348,6 +348,11 @@ class _MetaVAE:
         self.device = self.output_device = torch.device("meta")
         self.vae_dtype = dtype
         self.process_output = lambda image: image.add_(1.0).div_(2.0).clamp_(0.0, 1.0)
+        self.output_channels = 3
+        self.latent_dim = 3
+
+    def spacial_compression_decode(self):
+        return 8
 
     def vae_output_dtype(self):
         import torch
@@ -365,6 +370,10 @@ def _build(model):
     if model == "wan22":
         import comfy.ldm.wan.vae2_2 as wan22
         return wan22.WanVAE(**WAN22)
+    if model == "cogvideo":
+        # CogVideoX (2B / 5B / 1.5) VAE, as sd.py builds it (latent 16 channels, x8, time x4: 4t - 3 frames)
+        import comfy.ldm.cogvideo.vae as cog
+        return cog.AutoencoderKLCogVideoX(latent_channels=16)
     from comfy.ldm.models.autoencoder import AutoencoderKL, AutoencodingEngine
     if model == "sdxl":
         return AutoencoderKL(ddconfig=dict(LDM_DDCONFIG), embed_dim=4)
@@ -454,6 +463,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     units   tag every allocation with the layer-1 unit / prefix module that made it (for --peak)
     output_in_arena  the layer-1 layout up to 6324592 (vae_engine.OUTPUT_IN_ARENA): no cache emptied before / after the
             decode, the output buffer allocated after the first prefix, in the arena (False: the current layout, DESIGN §9.22)
+    frames  output frames of a video latent (5D models; CogVideoX: (frames + 3) // 4 latent frames, Wan: (frames - 1) // 4 + 1)
     probe   run choose_budget's layer-2 shape probe (8 x 8) right before a layer-1 decode: the first decode with a
             budget (DESIGN §9.21). With output_in_arena (the code up to 6324592) its blocks stay cached (vae._probe);
             otherwise vae._shape_probe empties the cache after it (review 2026-10 item 21)
@@ -524,7 +534,11 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
             from monoload import vae_ldm
             es.enter_context(_patched(vae_ldm, "_SCHEME", [scheme]))
         if layer == 1:
-            bound, why = mvae._select_layer1(v, lat, {})
+            if model == "cogvideo":   # group C's layer 1, also before vae.py registers it
+                from monoload import vae_cogvideo
+                bound, why = vae_cogvideo.match(v, lat, {})
+            else:
+                bound, why = mvae._select_layer1(v, lat, {})
             assert bound is not None, why
             if units:
                 def tagged(fn, label):
@@ -778,7 +792,8 @@ def main():
     ap.add_argument("--rows", default=None)
     ap.add_argument("--dtype", default="bf16")
     ap.add_argument("--version", default="current", help="current / v1 / v2 / v3 / w128")
-    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux / flux2 / wan22 / hy21 / hyr / hv15")
+    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux / flux2 / wan22 / hy21 / hyr / hv15 / cogvideo")
+    ap.add_argument("--frames", type=int, default=1, help="output frames (video models)")
     ap.add_argument("--scheme", default=None, help="GroupNorm scheme of an LDM layer-1 decode: A / B / C / D")
     ap.add_argument("--layer", type=int, default=1)
     ap.add_argument("--ws", default=None, help="workspace MiB (layer 2: default 1024; layer 1: the layer-1 default)")
@@ -790,7 +805,8 @@ def main():
     if a.res:
         w, h = (int(x) for x in a.res.lower().split("x"))
         for r in ([int(x) for x in a.rows.split(",")] if a.rows else [None]):
-            kw = dict(_version(a.version), model=a.model, scheme=a.scheme, layer=a.layer, units=a.layer == 1)
+            kw = dict(_version(a.version), model=a.model, scheme=a.scheme, layer=a.layer, units=a.layer == 1 and a.model != "cogvideo",
+                      frames=a.frames)
             if a.probe:
                 kw["probe"] = True
             if a.ws:

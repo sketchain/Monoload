@@ -58,9 +58,12 @@
 |---|---|---|---|---|
 | `cogvideo/vae.py`（GroupNorm、`conv_caches`）| CogVideoX 2B / 5B、I2V、Inpaint | — | 53.12 → 19.28 | 121（OOM）→ 45.41 |
 
-* 原生：第一段**整段视频**一起过 `conv_in`、mid、前两级上采样（时间 ×2），第二段每 4 帧一块过后两级（`conv_caches`）；各块 `.cpu()` 存主机最后 `cat`——**这违反「不经过内存」**，Monoload 接管时第二段的输出要直接写设备上的输出（H3）。
-* L1：第一段的 GroupNorm 统计量跨整段视频 → 统计遍按「每行全部帧」（H2 平面数 = T）；第一段的低分辨率部分进存档；第二段条带为主、按 4 帧块推进、条带自己的 `conv_caches`。
-* L2 的探测现在会失败（读 meta 张量的值），H1 里要修。
+* 原生：第一段**整段视频**一起过 `conv_in`、mid、前两级上采样（时间 ×2 两次），第二段每 4 帧一块过后两级（`conv_caches`）；各块 `.cpu()` 存主机最后 `cat`。峰值由 up_blocks[1] 的 Upsample3D 输出（整段、H/2、256 通道）主导。
+* **实际做法（`monoload/vae_cogvideo.py`，DESIGN §9.46）**：
+  * L2：`chunks()` 流式——第一段停在 up_blocks[1] 的上采样之前，上采样按块只算该块要的源帧，第二段照原生循环逐块产出（经 `vae_video._CHUNKS`，H3 直接写设备上的输出，不经主机）。数值和原生同一套调用。
+  * L1：`match()` 接到 `vae.STRIPE_ADAPTERS`（05abc20）。各 resnet 按输出行切片、GroupNorm 用整张量统计（fp32 Moments），SpatialNorm→SiLU 现算、`conv_caches` 逐行填；第一段整段视频、第二段沿用原生 4 帧块；自检走 `self_test_run`（fp32 拷贝，对 `chunks()` 参考 ≤1e-4）。
+  * 帧数：latent t 奇数 → 4t−3，偶数 → 4t（sd.py 的 upscale_ratio 只对奇数对），`output_frames()` 先问本模块。
+  * 真机结果（DESIGN §9.46 表）：720p×81 第二层 26.81 GiB / 163 s，第一层 12.05 GiB / 236 s；720×480×49 原生 35.10 → 第二层 12.26 → 第一层 4.64，PSNR 68.5；估算都是上界；MONOLOAD=0 逐位。第一层保留，`prefer_layer2`：第二层估算放得下就走第二层，放不下才第一层。
 
 ### D 组：Cosmos 1.0、Mochi（整段一次、没有时间块）
 
@@ -122,6 +125,11 @@
 「≤」：这一轮的脚本在读峰值前把输出（`movedim` 过、不连续）在显存里拷了一份再算哈希，多出一份输出大小，所以长片段的数是上界（d3f7707 已改）；短片段的数不受影响（拷贝比解码本身的峰值小），由它可知工作量约 0.6 GiB（720p）/ 0.85 GiB（1080p），不随帧数涨。ComfyUI 自己的估算（`memory_used_decode`：720p 0.58–1.02、1080p 1.05–1.66 GiB）不含输出，只拿去 `load_models_gpu` 腾地方，不影响结果。单次峰值由 DiT / TE 决定（§3），VAE 不是瓶颈。上面 Sol、SeedVR2、RelayVSR 三行也是同一版脚本测的，带「≤」的数同样含这份拷贝。
 
 **GGUF VAE**：社区有 MiniMax H3 视频 VAE Q8_0（2.94 GB）和 SeedVR2 VAE F16（0.50 GB）的 GGUF，但 ComfyUI 核心的 `VAELoader` 不列 `.gguf`，ComfyUI-GGUF（kyuz0 H3）只有 UNet / CLIP 加载器——**没有能把它们当 VAE 加载的节点**（真机核实）。`bench_selftiled --gguf` 用 gguf 包读出来、反量化成 fp16 再构造 `comfy.sd.VAE`（SeedVR2 F16：250 个张量，正常构造），解码就是 fp16 VAE 的解码，峰值同 safetensors 版。
+
+两个文件都已真机验证（2026-11-27，`bench_selftiled --gguf`，1280×720×33，`--bf16-vae`；原生 = 卸掉 Monoload 的 VAE 包装，Monoload = `MONOLOAD=1` 装上）：
+* **SeedVR2 F16**（250 个张量全 F16）：正常构造 `VideoAutoencoderKLWrapper`，权重 0.47 GiB；解码 reserved 40.94 / alloc 22.90 GiB（增量 40.36），69 s，因果缓存放锁页内存；Monoload 路由「自带分块 IO，原生」，和原生逐位相同。
+* **MiniMax-H3 Q8_0**（562 个张量：417 F16、145 Q8_0）：社区转换器（gestura）把 35 个 5 维 Conv3d 权重压成 4 维（前两维合并），又没写 ComfyUI-GGUF 约定的 `comfy.gguf.orig_shape.<名字>`，直接构造会 size mismatch。**不是 ComfyUI 的问题，是文件不合约定**：将来就算有按 ComfyUI-GGUF 约定写的 GGUF VAE 加载器也读不了它。`--shapes-from minimax_h3_video_vae_fp16.safetensors`（只读头）按参考文件还原形状以后能加载，逐张量和 fp16 版比最差相对误差 6.1e-3（Q8_0 量化本身，`decoder.transformer_blocks.35.ff.w1`；还原错了会是 1 量级）；权重 4.85 GiB（反量化成 fp16），解码 22 帧 reserved 6.24 / alloc 5.77 GiB（增量 1.26），13 s；Monoload 原生透传，逐位相同。
+* 结论不变：核心和 ComfyUI-GGUF H3 都**不支持**把 GGUF 当 VAE 加载（工作流里用不了）；反量化后它们就是普通 fp16 VAE，路由和峰值同 safetensors 版，Monoload 不用为 GGUF VAE 做任何事。
 
 真机命令（在容器里另起进程、拿 GPU 锁、先让服务器卸模型；结果写进 `/srv/comfy-latest/results/native/`）：
 
