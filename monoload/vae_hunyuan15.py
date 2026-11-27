@@ -396,11 +396,10 @@ class HV15Stripe(eng.StripeAdapter):
         self._frames = 1                                   # latent frames of the latest time_chunks (the prefix's planes)
         self._planes = [1] * (len(self.units) + 1)         # planes at each level (the largest over the chunks), likewise
 
-    @property
-    def prefer_layer2(self):
-        """A video: layer 2 when its estimate fits the device, layer 1 only past that (vae.py's prefer_layer2 routing;
-        1.56x slower than layer 2 at 832x480x81). One frame (the Refiner): layer 1 as usual."""
-        return not self.single
+    # layer 2 when its estimate fits the device, layer 1 only past that (vae.py's prefer_layer2 routing, DESIGN §9.41):
+    # on the GPU layer 1 is slower than layer 2 both for a video (1.56x at 832x480x81, layer 2 10.43 GiB) and for the
+    # Refiner's one frame (1.51x at 2048x2048, layer 2 10.06 GiB)
+    prefer_layer2 = True
 
     # time axis
 

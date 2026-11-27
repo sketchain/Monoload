@@ -299,17 +299,22 @@ def main():
         v = hv15_vae(dtype=torch.float32)
         b5, _ = h15.match(v, lat_(4, 4, t=5), {})
         b1, _ = h15.match(v, lat_(4, 4), {})
-        check("video: layer 1 as the fallback (prefer_layer2), one frame: layer 1 as usual",
-              h15.MULTIFRAME_ENABLED and b5.prefer_layer2 is True and b1.prefer_layer2 is False)
+        check("video and one frame: layer 1 as the fallback (prefer_layer2)",
+              h15.MULTIFRAME_ENABLED and b5.prefer_layer2 is True and b1.prefer_layer2 is True)
         h15.MULTIFRAME_ENABLED = False
         b, why = h15.match(v, lat_(4, 4, t=5), {})
         h15.MULTIFRAME_ENABLED = True
         check("MULTIFRAME_ENABLED False: a video not matched ({})".format(why), b is None and "layer 1 off" in why)
-        recognition_tests(v)
-        single_tests(v)
-        multi_tests(v)
-        selftest_tests(v)
-        allocator_tests()
+        # the checks below are layer 1's: with vae.py's prefer_layer2 routing these small decodes would fit layer 2
+        h15.HV15Stripe.prefer_layer2 = False
+        try:
+            recognition_tests(v)
+            single_tests(v)
+            multi_tests(v)
+            selftest_tests(v)
+            allocator_tests()
+        finally:
+            h15.HV15Stripe.prefer_layer2 = True
     finish()
 
 
