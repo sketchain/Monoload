@@ -62,7 +62,7 @@
   * L2：`chunks()` 流式——第一段停在 up_blocks[1] 的上采样之前，上采样按块只算该块要的源帧，第二段照原生循环逐块产出（经 `vae_video._CHUNKS`，H3 直接写设备上的输出，不经主机）。数值和原生同一套调用。
   * L1：`match()` 接到 `vae.STRIPE_ADAPTERS`（05abc20）。各 resnet 按输出行切片、GroupNorm 用整张量统计（fp32 Moments），SpatialNorm→SiLU 现算、`conv_caches` 逐行填；第一段整段视频、第二段沿用原生 4 帧块；自检走 `self_test_run`（fp32 拷贝，对 `chunks()` 参考 ≤1e-4）。
   * 帧数：latent t 奇数 → 4t−3，偶数 → 4t（sd.py 的 upscale_ratio 只对奇数对），`output_frames()` 先问本模块。
-  * 待真机：720p×81 第一层对第二层、一个偶数帧档、自检、MONOLOAD=0 逐位；据此定第一层去留。
+  * 真机结果（DESIGN §9.41 表）：720p×81 第二层 26.81 GiB / 163 s，第一层 12.05 GiB / 236 s；720×480×49 原生 35.10 → 第二层 12.26 → 第一层 4.64，PSNR 68.5；估算都是上界；MONOLOAD=0 逐位。第一层保留，`prefer_layer2`：第二层估算放得下就走第二层，放不下才第一层。
 
 ### D 组：Cosmos 1.0、Mochi（整段一次、没有时间块）
 
