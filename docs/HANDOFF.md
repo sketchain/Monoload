@@ -24,6 +24,7 @@
   * 各种量化 safetensors（fp8 e4m3 / e5m2、int8_tensorwise、nvfp4、mxfp8、convrot_w4a4、asym_w4a8_int8、w6a8_int8；fp8 的三种来源：文件内 `comfy_quant` / 头部 `_quantization_metadata` / 旧 `scaled_fp8` 标记）：hotpatch 不用改，`tests/test_quant_formats.py`（66 项）锁住「在反量化临时权重上合并、不量化回去、无备份」。
   * ComfyUI-GGUF（UnetLoaderGGUF / CLIPLoaderGGUF，按结构找，`monoload/gguf.py`）：量化层合并进 GGMLLayer 反量化出的临时权重（exact = 原生 GGUF 的算法逐位一致，默认 fused），F16 / F32 层也运行时合并、不备份（原生会备份）；hook LoRA 也支持（原生 GGUF 对量化层不应用 hook）；保存 GGUF 模型报 `gguf_save`；Info 节点多一行 GGUF 统计。每个 prompt 开始重新找一次（自定义节点可能比 Monoload 后加载）。`tests/test_gguf_lora.py`（38 项）。
   * 不是 comfy.ops 层 weight / bias 的参数（Wan `modulation`、LTX `scale_shift_table` 等、纯 torch 层）：`MonoloadParamSwap`，所属模块 forward 期间换上合并好的临时参数，出来换回，无备份，原生算法逐位一致。**原生 v0.46.3 加载时静默丢弃这些 key**（`_load_list` 跳过非叶子模块），所以带这类 key 的 LoRA 和原生比 max|Δ| 不为 0（已定：不加「跟原生一样丢掉」的开关）。`tests/test_lora_param_swap.py`（44 项）；`test_lora_hot` 里原来的「纯 torch 层报错」改成「换参数」。
+  * 真机：`test_quant.py` GPU 复测默认 / `MONOLOAD_EXACT=1` 各 8 项全过、逐位一致，容差没放宽。之前 GPU 上的失败是测试参照的问题（fp8 参照在 CPU 反量化，CPU / GPU 的反量化 kernel 末位舍入不同），参照改成在计算设备上反量化（Merge video-quant-ref，GGUF 线程 611a7a6）；`bench_lora.py` 逐层探测像 `cast_bias_weight` 一样先反量化量化参数；新增 `tests/make_model_lora.py`。
   * K-quant 等云端造不出的 GGUF 类型：`tests/check_gguf_kquant.py`（真机逐层对原生），计划见 `docs/GGUF-QUANT.md` §6.2。GGUF VAE 没有加载器（H3 和核心都没有），H7 已取消。
   * `bench_lora.py` 加了 `--unet-gguf` / `--clip-gguf` / `--latent C,T,H,W` / `--batch`，每个组合报 GTT 峰值（20 ms 采样）。
 * **H1 / H3 / H6：多帧第二层入口（video-l2-entry，合并见 §7）**——Wan 2.1 / 2.2 和 LTX（0.9.x 卷积 VAE 的 chunked io、LTX 2.5 扩散 decoder `CausalDiffusionVAE`）的 5D latent 走第二层，峰值靠实测探测 `vae._probe_mf` 定上界（16、32 两个 latent 尺寸在 64 MiB 工作区上的 allocated 连线 × `MF_MARGIN` 1.25，加上在解码自己工作区上再跑一次量到的碎片），输出块直接写进预分配的输出缓冲；F 组的扩展点 `vae_ops.EXTRA_CHUNKERS`；C 组的 CogVideoX 登记（`vae_video`，可选导入 `vae_cogvideo`，没合进来时照旧原生）；`bench_vae --frames N`。真机：Wan 2.1 720p×81 原生 reserved 18.90 → 9.84 GiB，估算 13.77，像素 max 0.0166（PSNR 60.8），热解码慢 9%。最终探测的真机读数在排队（DESIGN §9.35 表）。
@@ -280,6 +281,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | **video 分支**：多帧探测按 latent 截断；LTX-2.5 扩散 decoder 等 F 组的 `vae_ltx` 再托管 | Merge video-probe-clip（`git log --first-parent video`） |
 | **video 分支**：A 组 `vae_wan_video` 注册进 `STRIPE_ADAPTERS`（可选 import），Wan 2.2 多帧走第一层 | Merge video-wan-reg（`git log --first-parent video`） |
 | **video 分支**：F 组 LTX（卷积只走第二层；扩散 decoder 由 `vae_ltx` 接管） | Merge claude/project-thread-b4e366（`git log --first-parent video`） |
+| **video 分支**：`test_quant` / `test_quant_formats` 的 fp8 参照改在计算设备反量化（GPU 逐位），`bench_lora` 逐层探测先反量化 | Merge video-quant-ref（`git log --first-parent video`） |
 | video：视频第一层 A 组 Wan 2.1 / 2.2 多帧（`vae_wan_video`） | 见 `git log --first-parent video`（Merge video-wan-l1） |
 | 本文件 | 本文件所在的提交（`git log --first-parent video` 最上面几条） |
 
