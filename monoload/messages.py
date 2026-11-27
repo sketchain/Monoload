@@ -315,6 +315,15 @@ M = {
         "[Monoload] VAE 解码 {shape} -> 第一层（{name}）：{plan}；{policy}，工作区 {ws}{retries}；arena {arena}，内存估算 {est}"
         "（原生 {native}），{secs:.2f}s；{note}"),
     "vae.retries": (", {n} OOM retries", "，OOM 重试 {n} 次"),
+    "vae.l2_preferred": (
+        "{name} prefers layer 2, and its estimate {est} fits the device ({room} once the other models are unloaded)",
+        "{name} 优先第二层，估算 {est} 放得下（卸完其他模型后设备可用 {room}）"),
+    "vae.l2_preferred_over": (
+        "[Monoload] {name} prefers layer 2, but it does not fit the device (estimate {est}, room {room}): layer 1",
+        "[Monoload] {name} 优先第二层，但放不下（估算 {est}，可用 {room}）：走第一层"),
+    "vae.env_fit_cap": (
+        "[Monoload] MONOLOAD_VAE_FIT_CAP={raw!r} is not a size (e.g. 55G); ignored",
+        "[Monoload] MONOLOAD_VAE_FIT_CAP={raw!r} 不是大小（例如 55G），忽略"),
     "vae.mf_probe_failed": (
         "[Monoload] multi-frame memory probe failed ({err}); without it the memory has no upper bound, this decode is native",
         "[Monoload] 多帧内存探测失败（{err}）；没有它内存就没有上界，这次解码走原生"),

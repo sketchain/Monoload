@@ -37,6 +37,7 @@
 
 * **L1 方案**：扩展现有的 `vae_wan` / `vae_wan22` 单帧适配器到多帧，走 H2 的条带为主。时间块：Wan 2.1 第一块 1 个 latent 帧、之后每块 2 帧，`Resample` 的时间上采样（`time_conv`）第一块跳过；Wan 2.2 每块 1 帧，第一块不做时间卷积、`DupUp3D` 丢掉多出的帧，缓存总是补成 2 帧（`clone`）。单元沿用单帧的划分（halo 不变：时间核不影响空间 halo），每个单元多一个「条带缓存」状态。注意 v0.46.3 的 Wan 2.2：`feat_cache is None` 时 `ResidualBlock` / 上采样 / `DupUp3D` 会自己按行分块（`strip_apply`），多帧路径总是带缓存，不触发；我们的单元调用时传缓存，也不触发。
 * 方案 G 已覆盖 Wan 2.2 的 1024 / 512 通道 RMS；Wan 2.1 最多 384 通道，不用分组。
+* **进度**：已做（`monoload/vae_wan_video.py`，DESIGN §9.40，分支 video-wan-l1）。用 H2 的引擎时间轴；和上面的差别：单帧适配器不动、另起一个只接 T > 1 的适配器；Wan 2.1 时间上采样之后不切 2 帧一片（引擎的链是线性的，数值相同）。真机：1280×704×121 第一层对第二层 Wan 2.2 3.54 对 8.91 GiB（不慢、估算是上界），Wan 2.1 4.34 对 8.00 GiB（慢 20%、720p 估算少算），所以只开 Wan 2.2，Wan 2.1 多帧留第二层（`WAN21_ENABLED`）。等改 `vae.py` 的线程注册到 `STRIPE_ADAPTERS`。
 * 预计 L1：与帧数基本无关的 1–2 GiB + 存档 + 输出（720p×81 fp32 输出 0.9 GiB）。
 
 ### B 组：Hunyuan VAE
@@ -57,7 +58,7 @@
 | `cogvideo/vae.py`（GroupNorm、`conv_caches`）| CogVideoX 2B / 5B、I2V、Inpaint | — | 53.12 → 19.28 | 121（OOM）→ 45.41 |
 
 * 原生：第一段**整段视频**一起过 `conv_in`、mid、前两级上采样（时间 ×2 两次），第二段每 4 帧一块过后两级（`conv_caches`）；各块 `.cpu()` 存主机最后 `cat`。峰值由 up_blocks[1] 的 Upsample3D 输出（整段、H/2、256 通道）主导。
-* **实际做法（`monoload/vae_cogvideo.py`，DESIGN §9.38）**：
+* **实际做法（`monoload/vae_cogvideo.py`，DESIGN §9.41）**：
   * L2：`chunks()` 流式——第一段停在 up_blocks[1] 的上采样之前，上采样按块只算该块要的源帧，第二段照原生循环逐块产出（经 `vae_video._CHUNKS`，H3 直接写设备上的输出，不经主机）。数值和原生同一套调用。
   * L1：`match()` 接到 `vae.STRIPE_ADAPTERS`（05abc20）。各 resnet 按输出行切片、GroupNorm 用整张量统计（fp32 Moments），SpatialNorm→SiLU 现算、`conv_caches` 逐行填；第一段整段视频、第二段沿用原生 4 帧块；自检走 `self_test_run`（fp32 拷贝，对 `chunks()` 参考 ≤1e-4）。
   * 帧数：latent t 奇数 → 4t−3，偶数 → 4t（sd.py 的 upscale_ratio 只对奇数对），`output_frames()` 先问本模块。

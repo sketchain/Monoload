@@ -1,5 +1,5 @@
 """CogVideoX VAE (comfy.ldm.cogvideo.vae.AutoencoderKLCogVideoX, ComfyUI v0.46.3): the multi-frame decode as
-pieces of output frames, with the last temporal upsampling streamed (group C, docs/PLAN-video.md; DESIGN §9.38).
+pieces of output frames, with the last temporal upsampling streamed (group C, docs/PLAN-video.md; DESIGN §9.41).
 
 What native decode does (AutoencoderKLCogVideoX._decode_rolling, v0.46.3). With split = log2(temporal ratio 4) = 2:
 
@@ -181,7 +181,7 @@ def chunks(fsm, z):
 
 
 # ---------------------------------------------------------------------------
-# layer 1: the same decode with every full-size temporary replaced by row slices (DESIGN §9.38)
+# layer 1: the same decode with every full-size temporary replaced by row slices (DESIGN §9.41)
 # ---------------------------------------------------------------------------
 #
 # The order of work is native's (phase 1 on the whole video, phase 2 in native's 4-frame chunks with the conv caches
