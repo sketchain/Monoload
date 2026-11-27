@@ -323,6 +323,12 @@ def layer_probe(model, clip, loras, reps=3):
         moved = _to_device(list(m.patches[key]), dev, cache, param.numel(), {"transient": False})
         items.append((key, param, f, moved, all(fused_factors(p) is not None for p in moved)))
 
+    def temporary(param):
+        # what cast_bias_weight hands the weight function: a private copy in the compute dtype, a quantized
+        # parameter (fp8 scaled, int8, ...: QuantizedTensor) dequantized into it
+        w = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
+        return w.dequantize() if hotpatch._is_quantized(w) else w
+
     def variant(kind, key, f, moved, w):
         if kind in ("exact", "default"):
             hotpatch.set_exact(kind == "exact")
@@ -345,8 +351,7 @@ def layer_probe(model, clip, loras, reps=3):
         t0 = time.perf_counter()
         for _ in range(reps):
             for key, param, f, moved, _fused in items:
-                w = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
-                w = variant(kind, key, f, moved, w)
+                w = variant(kind, key, f, moved, temporary(param))
                 del w
         _sync()
         return (time.perf_counter() - t0) / reps
@@ -361,7 +366,7 @@ def layer_probe(model, clip, loras, reps=3):
         err = {k: {"d_sq": 0.0, "max": 0.0} for k in ("default", "relaxed", "mm-add")}
         lora_sq = w_sq = bound_sq = 0.0
         for key, param, f, moved, _fused in items:
-            base = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
+            base = temporary(param)
             exact = variant("exact", key, f, moved, base.clone()).to(cmp).double()
             ch = float(((exact - base.to(cmp).double()) ** 2).sum())
             wn = float(exact.norm())
@@ -430,6 +435,7 @@ def main():
     src.add_argument("--unet-gguf", help="ComfyUI-GGUF UnetLoaderGGUF file (use with --clip / --clip-gguf)")
     p.add_argument("--clip", help="CLIPLoader file")
     p.add_argument("--clip-gguf", help="ComfyUI-GGUF CLIPLoaderGGUF file")
+    p.add_argument("--clip-checkpoint", help="take the text encoder of this checkpoint (e.g. SDXL clip_l + clip_g) for --unet")
     p.add_argument("--latent", help="empty latent shape without the batch: C,H,W or C,T,H,W (video); overrides --width/--height")
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--clip-type", default="stable_diffusion")
@@ -461,11 +467,18 @@ def main():
     if a.checkpoint:
         model, clip = load_checkpoint(a.checkpoint)
     else:
-        if not a.clip and not a.clip_gguf:
-            p.error("--unet / --unet-gguf need --clip or --clip-gguf")
+        if not a.clip and not a.clip_gguf and not a.clip_checkpoint:
+            p.error("--unet / --unet-gguf need --clip, --clip-gguf or --clip-checkpoint")
         pack = _gguf_pack() if (a.unet_gguf or a.clip_gguf) else None
+        if a.clip_checkpoint:
+            ck_model, clip = load_checkpoint(a.clip_checkpoint)
+            del ck_model
+            free_all()
+        elif a.clip_gguf:
+            clip = pack.nodes.CLIPLoaderGGUF().load_clip(a.clip_gguf, a.clip_type)[0]
+        else:
+            clip = load_clip(a.clip, a.clip_type)
         model = pack.nodes.UnetLoaderGGUF().load_unet(a.unet_gguf)[0] if a.unet_gguf else load_unet(a.unet)
-        clip = pack.nodes.CLIPLoaderGGUF().load_clip(a.clip_gguf, a.clip_type)[0] if a.clip_gguf else load_clip(a.clip, a.clip_type)
         hotpatch.find_subclass_adapters()
     print("model dtype {}  manual_cast {}".format(model.model.get_dtype(), model.model.manual_cast_dtype))
 

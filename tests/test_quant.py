@@ -4,7 +4,8 @@ Checked:
   * fp8 model + LoRA (Monoload) is bit-identical to the same model whose fp8
     weights were dequantized beforehand + LoRA (Monoload, same merge path:
     bit-exact with MONOLOAD_EXACT=1, otherwise the default fused/relaxed one).
-    "Dequantized beforehand" covers the layers the LoRA patches: fp8 layers
+    "Dequantized beforehand" (on the compute device, as the runtime merge does: the CPU and GPU dequantization
+    kernels differ in the last bit) covers the layers the LoRA patches: fp8 layers
     without a weight function never dequantize in native ComfyUI either (the
     QuantizedTensor goes straight into F.linear via comfy_kitchen, a different
     op order), so a fully dequantized model differs from the fp8 model even
@@ -23,6 +24,9 @@ import torch
 from common import (MODE_TAG, apply_loras, byte_view, check, diff_stats, encode, finish, free_all, load_clip, load_unet, sample,
                     set_runtime)
 from comfy.quant_ops import QuantizedTensor
+import comfy.model_management
+
+DEVICE = comfy.model_management.get_torch_device()
 
 COMBOS = {
     "duck": [("rubber_duck.safetensors", 0.8, 0.8)],
@@ -46,7 +50,10 @@ def dequantize_in_place(patcher, only_keys=None):
         if only_keys is not None and names[id(m)] + ".weight" not in only_keys:
             continue
         w = m.weight
-        m.weight = torch.nn.Parameter(w.dequantize(), requires_grad=False)
+        # dequantized on the device the model runs on: the runtime merge dequantizes there, and the CPU kernel
+        # (comfy_kitchen eager: fp8 -> orig dtype, times the scale rounded to orig dtype) and the GPU ones (HIP / CUDA:
+        # fp32 product, one rounding) differ in the last bit
+        m.weight = torch.nn.Parameter(w.to(DEVICE).dequantize().to(w.device), requires_grad=False)
         m.layout_type = None
         n += 1
     return n

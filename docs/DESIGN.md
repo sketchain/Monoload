@@ -1980,6 +1980,28 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 * **决定**：Wan 2.2 多帧走第一层（注册即生效）；Wan 2.1 多帧先留第二层（`vae_wan_video.WAN21_ENABLED = False`，`match` 返回原因，测试里打开）。理由：Wan 2.1 的第二层 720p 不到 10 GiB、1080p 按面积约 22 GiB，都在 55 GiB 以内且更快，第一层只在约 1440p 以上才有必要，而估算少算的原因还没查（可能和 Wan 2.1 顶层 96 通道全分辨率的块有关）。以后要开：用 `--mem-history` 跑一档 Wan 2.1 720p（测试会回放分配器轨迹，打印分配峰值时活着的块按分配位置分组、reserved 峰值时的段），补上代价模型后把开关打开。
 * 首次自检的开销按进程算一次（`_SELFTEST` 不落盘）：Wan 2.2 75 s，比第二层的整次解码省下的时间多；以后可以把 Wan 2.2 视频自检的 latent 缩到 12（和 Wan 2.1 一样 192 行输出、5 个条带）。
 
+### 9.42 视频 F 组：LTX（卷积 VAE 只走第二层；LTX-2.5 扩散 decoder 用 `vae_ltx`，分支 claude/project-thread-b4e366）
+
+（§9.41 留给 B 组的分支。）范围和逐项理由见 PLAN-video F 组，这里记结论和真机数。
+
+**卷积 VAE（LTX 0.9.x / LTX-2，`causal_video_autoencoder.VideoVAE`）：不做第一层。** H1 的第二层已把原生 reserved 的碎片消掉（ROCm 上 cudnn 关着，im2col 一次 5.8 GiB；原生 OOM 后清缓存才跑完）：LTX-2 1280×704×97 56.76 → 7.99 GiB，1920×1088×193 55.95 → 16.14 GiB，时间不变（11.7 → 11.4 s、51.5 → 52.4 s）。第一层（PixelNorm 空间条带）再省也只是几 GiB，不值。
+
+**扩散 decoder（`na_diffusion_decoder.CausalDiffusionVAE`）：算子级精确切分，不走条带。** 结构是 4 段确定性块 + 第 5 段 8 个扩散块，全是邻域注意力（`comfy_kitchen.na3d`，窗口 11³）和 SwiGLU，没有卷积可切。条带的光环要把各层窗口半径累加（第 5 段就 80 帧），比条带本身还大；而邻域注意力逐层就能精确切开：
+* NATTEN 窗口 `start = clamp(i − k//2, 0, L − k)`，离查询最远 k_t − 1 帧，所以查询块 [a, b) 配 n = (b − a) + 2(k_t − 1) 帧的段（贴边时整段往里挪）时窗口和整块相同；只切 T，RoPE 按全局位置切片。fp32 和原生比 ≤ 5.6e-6（`check_ltx_dd.py`）。
+* kernel 对段里每帧都算，所以块要大：4n 帧的 q/k/v/输出放进 max(工作区, 半份激活)，至少 2(k_t − 1) 帧，段的 T × H ≤ 65535（HIP grid）。第一版按 1 GiB 工作区定块，第 5 段只剩 1 帧（段 21 帧），慢 14 倍，段长不一把 reserved 碎到 alloc 的 3 倍；改成一次调用内等长段、共用一份 q/k/v、残差提前写回、进第 5 段前清一次缓存以后 reserved ≈ alloc + 0.2～1 GiB。
+* SwiGLU 按工作区限 token；decoder 的 forward 换成同样步骤的精简版（最后一次上采样只算保留的帧，`conv_in_x_t` / `norm_out` / `conv_out` 分块写结果，噪声整块同一 generator 生成）。
+* 峰值 ≈ x + context + 一段 + 挂起结果 + 像素，193 帧约 3 × S（S = 第 5 段一份激活），原生约 6 × S。
+
+**真机（CT 700，2026-11-27，`ltx-2.5-video-vae-bf16`，`--bf16-vae`，1 GiB 工作区）：**
+
+| 尺寸 | 原生 reserved / alloc / 时间 | Monoload reserved / alloc / 时间 | max\|d\| |
+|---|---|---|---|
+| 768×512×97，正常入口（探测 + `vae_ltx`） | 9.84 / 7.35 / 17.9 s | 冷 5.59 / 5.27 / 109.7 s，热 5.52 / 5.20 / 31.3 s | 0.0020 |
+| 1920×1088×97，直接装 `vae_ltx`（lean） | 50.15 / 38.82 / 106.3 s | 26.07 / 25.12 / 190.9 s（`plan` 估 25.17 → reserved 口径 26.68） | 0.027 |
+| 1920×1088×193，lean | — | 排队 | — |
+
+冷跑多出的约 78 s 是适配线程的两次探测解码（`vae._probe_mf`，每个模型和形状一次）。**定案：合**——峰值约减半，慢约 1.8 倍（光环帧的重复注意力；块已是预算内最大）。`plan()` 的总数改成 reserved 口径（allocated 上界 × 1.05 + 256 MiB；fp32 小尺寸实测 reserved 比 allocated 上界多 6–10 %，这一档 2.55 → 2.93 ≥ 2.70），路由仍用探测。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
