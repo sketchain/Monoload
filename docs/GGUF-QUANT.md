@@ -115,7 +115,17 @@ LoRA key 映射是 ComfyUI 自己的（`comfy/lora.py` `model_lora_keys_unet` + 
 
 ### 6.1 真机命令（给验证线程，容器 `comfyui-latest`）
 
-先释放服务器上的模型；GPU 任务用 `flock /srv/comfy/gpu.lock` 串行。文件名按 `/srv/comfy-latest/models-manifest.md` 里实际的填（下面 `<…>` 处）。每条输出里看：`step`（每步秒数）、`GTT peak`、`max|Δ|`（对 native）、`backups`（Monoload 必须是 0）、`GTT after` / `RSS`（和 native 比，不能多出常驻）。
+**在真机上跑某个分支（按 `/srv/comfy/GPU-LOCK.md`，验证线程维护）**：worktree 放 `/srv/monoload-wt/<名字>`（`/srv/monoload` 归验证线程，不在里面切分支或改文件）；用 GPU 一律 `/srv/comfy/gpulock run "<线程>: <在干什么>" <命令…>`，锁内用 `COMFY_MONOLOAD_SRC` 让容器把 worktree 挂成 `custom_nodes/monoload`，结束时 gpulock 自动恢复容器：
+
+```
+cd /srv/monoload && git fetch origin <分支> && git worktree add --detach /srv/monoload-wt/<名字> origin/<分支>
+/srv/comfy/gpulock run "gguf: <在干什么>" bash -c 'COMFY_MONOLOAD_SRC=/srv/monoload-wt/<名字> docker compose -f /opt/comfy-latest/compose.yaml up -d --force-recreate && docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/<脚本>.py …'
+/srv/comfy/gpulock status
+```
+
+本线程的包装脚本是 `/srv/monoload-wt/gguf-run/gq.sh <日志名> <容器内命令…>`（日志在同目录 `logs/`）。下面的命令都按「worktree 已挂成 `custom_nodes/monoload`」写，前面要套上面这层锁。缺 LoRA 的模型用 `tests/make_model_lora.py <模型文件> <输出>` 生成随机 LoRA（放 `/models/comfy/loras/_monoload_synth/`，只加不改）。
+
+先释放服务器上的模型；GPU 任务用 gpulock 串行（见上）。文件名按 `/srv/comfy-latest/models-manifest.md` 里实际的填（下面 `<…>` 处）。每条输出里看：`step`（每步秒数）、`GTT peak`、`max|Δ|`（对 native）、`backups`（Monoload 必须是 0）、`GTT after` / `RSS`（和 native 比，不能多出常驻）。
 
 ```
 docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest sh -c 'curl -s -X POST http://127.0.0.1:8190/free -d "{\"unload_models\":true,\"free_memory\":true}"; for t in test_quant_formats test_gguf_lora test_lora_param_swap test_dtype_paths; do python tests/$t.py 2>&1 | tail -1; done'
@@ -162,13 +172,13 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest sh -c 'curl -s 
 
 一个 Q4_K_M 文件里通常同时有 Q4_K 和 Q6_K（有的还有 Q5_K、F32），逐层脚本会按类型分别报。
 
-**命令**（GPU 任务用 flock 串行）：
+**命令**（每条套 gpulock，见 §6.1 开头）：
 
 ```
-docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comfy/gpu.lock python tests/check_gguf_kquant.py --gguf <wan2.1-t2v-14b-Q4_K_M.gguf>
-docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comfy/gpu.lock python tests/check_gguf_kquant.py --gguf <某 Q3_K_M / Q5_K_M / Q6_K / Q8_0 文件>
-docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comfy/gpu.lock python tests/check_gguf_kquant.py --gguf <umt5 TE .gguf>
-docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comfy/gpu.lock python tests/bench_lora.py --unet-gguf <wan2.1-t2v-14b-Q4_K_M.gguf> --clip-gguf <umt5 .gguf> --clip-type wan --latent 16,9,60,104 --steps 4 --cfg 1 --combo <不含小参数 key 的 Wan LoRA> --combo none --modes native,monoload,monoload-exact
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/check_gguf_kquant.py --gguf <wan2.1-t2v-14b-Q4_K_M.gguf>
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/check_gguf_kquant.py --gguf <某 Q3_K_M / Q5_K_M / Q6_K / Q8_0 文件>
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/check_gguf_kquant.py --gguf <umt5 TE .gguf>
+docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/bench_lora.py --unet-gguf <wan2.1-t2v-14b-Q4_K_M.gguf> --clip-gguf <umt5 .gguf> --clip-type wan --latent 16,9,60,104 --steps 4 --cfg 1 --combo <不含小参数 key 的 Wan LoRA> --combo none --modes native,monoload,monoload-exact
 ```
 
 **看哪里**：逐层脚本最后的 `== N checks, 0 failed` 和每类型三行 PASS；表里 exact / fused 的毫秒数和原生同量级。整模型看 summary 的 max|Δ| 列（monoload-exact 那段应为 0）、backups 列、GTT peak 表。
@@ -195,3 +205,4 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest flock /srv/comf
 * 2026-11-26：阶段 A 合进 video（8d89069）后，从 video 拉 lora-quant-formats / lora-gguf / lora-video-models 依次搬过去（hotpatch 一处冲突：`_load` 的 force_patch 注释），每个分支复跑测试后 `--no-ff` 合回 video。GGUF 加了 hook LoRA 测试（原生 GGUF 对量化层不应用 hook；参照 = 原生 ComfyUI 在反量化模型上的 hook，逐位一致）和 Info 一行；`bench_lora.py` 加 GGUF 加载、视频 latent、GTT 峰值。核实：H3 6d33de2 和 ComfyUI v0.46.3 都没有 GGUF VAE 的加载节点（H3 只注册 unet_gguf / clip_gguf）。
 * 2026-11-26：视频小参数（§5）：发现原生 v0.46.3 的 `_load_list` 跳过非叶子模块，Wan modulation / LTX scale_shift_table 上的 LoRA 被原生静默丢弃（CPU 实测，见 §5）。实现 `MonoloadParamSwap`（所属模块 forward 前后换参数，原生算法逐位一致，无备份），`_load` 后对原生不调用的 key 统一装上；根模型自己的参数（无点号 key）也支持；`gguf.dequantize` 给量化 GGML 参数用。`tests/test_lora_param_swap.py` 44 项全过（fp32 / bf16 × 全量 / lowvram × exact / fused + hook LoRA）；`test_gguf_lora` 加非叶子 F32 modulation，35 项全过；`test_lora_hot` 里「纯 torch 层报错」改成「装上换参数、卸载后拆掉」（真机测试，云端没跑）。回归 test_dtype_paths 198、test_quant_formats 66、test_lora_lowvram_hook 14、test_master_switch 19、test_messages 15 全过。
 * 2026-11-26：协调者回复：video 由适配线程推送（快进到 10b0392）；视频小参数不加开关；H7 取消。补 §3.8（GGUF VAE 不存在）、§6.2（K-quant 真机计划）和 `tests/check_gguf_kquant.py`（逐层对原生，云端用 Q8_0 / Q4_0 / Q5_1 小文件跑通 10 项）。
+* 2026-11-26：规则改为不跑云端 CPU 测试、直接上真机（DC）。真机流程按 `/srv/comfy/GPU-LOCK.md`（§6.1 开头）：worktree `/srv/monoload-wt/gguf-quant`，包装脚本 `/srv/monoload-wt/gguf-run/gq.sh`，日志在 `/srv/monoload-wt/gguf-run/logs/`。注意 `tests/test_*.py` 用 `common.py` 的默认参数 `--cpu`，在容器里跑也是 CPU，所以真机只跑 `bench_lora.py` / `check_gguf_kquant.py` 这类读 PID 1 参数（GPU）的脚本。容器里跑过一遍单元测试（CPU）：test_quant_formats 66、test_gguf_lora 38、test_lora_param_swap 44、test_dtype_paths 198、test_master_switch 19、test_lora_lowvram_hook 14、test_lora_clone_binding 13 全过；test_lora_hot 要 `--checkpoint/--unet/--clip` 参数，没跑。下载线程的视频 GGUF / LoRA 大多还在排队，先用 `tests/make_model_lora.py` 给现有模型生成随机 LoRA（`/models/comfy/loras/_monoload_synth/`）。GPU 排队按协调者要求精简为三项：Hunyuan I2V Q8_0 逐层、Wan 2.2 T2V 14B fp8_scaled 视频整模型（随机 LoRA + 带 modulation 的随机 LoRA，一次加载）、noctQ（Krea 2）int8 整模型；Flux 2 fp8mixed 和 SDXL 旧 scaled_fp8 走的是同一条 fp8 `QuantizedTensor` 路径，撤掉。17:40 起 DC 断线，排队任务在 LXC 上 nohup 跑，结果待取。

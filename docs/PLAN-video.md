@@ -83,12 +83,18 @@
 |---|---|---|
 | LTX 0.9.0 卷积 VAE（`causal_video_autoencoder`，`comfy_has_chunked_io`，PixelNorm）| LTX-Video 0.9.0 | 51.35 → 6.40 |
 | LTX 0.9.5+ / LTX-2 卷积 VAE（version 2）| LTX-Video 0.9.5+、LTX-2（LTXAV 的视频部分）| 59.33 → 6.94 |
-| **LTX 2.4 扩散 decoder**（`na_diffusion_decoder.CausalDiffusionVAE`，v0.46.3 新增）| LTX-2.4（及沿用它的后续版本）| 未模拟 |
+| **LTX 2.4 扩散 decoder**（`na_diffusion_decoder.CausalDiffusionVAE`，v0.46.3 新增；就是 LTX-2.5 官方视频 VAE，sd.py 叫它 2.4，加它的提交叫 2.5）| LTX-2.5（官方 VAE `ltx-2.5-video-vae`；`ltx-2.5-video-vae-conv` 是卷积 VideoVAE，归上一行）| 未模拟（真机见 HANDOFF §4）|
 | LTX-2 音频 VAE | LTXAV 的音频 | 原生（音频不管）|
 
-* 卷积 VAE：原生按**总**显存定块大小（32–128 MiB）沿 T 切块递归、写进 `output_buffer`；模拟的原生 reserved 远大于 alloc（30–59  对 6–10 GiB），是碎片——**先上真机确认原生基线**（H6 的 `--frames`）。L2：`_run` 把 `output_buffer` 传进去（H3）。L1：PixelNorm 每位置独立、没有统计量 → 空间条带精确；reflect 空间补边同 Mochi 要区分边缘和内部边界；时间块交给原生的递归（块内条带）。
-* **LTX 2.4 扩散 decoder**：没有卷积和已知注意力（邻域注意力 `comfy_kitchen.na3d` + SwiGLU MLP，自带 MLP 按 token 分块），L2 无从套；单步 x0，但要一份像素大小的噪声（`generator`）。L1 方案：邻域注意力窗口固定 → 时空条带的 halo = 各级窗口半径之和（按级倒推）；噪声整幅生成一次（与输出同大小，进估算）再按条带切片，保证与原生逐位相同。**先测原生峰值**，够低就不做 L1。
-* H4：PixelNorm 的 1024 通道 `mean(x²)` 按道理也触发 ROCm 归约缓冲，跟踪器要先模拟、真机核实。
+* 卷积 VAE（**定案：只走第二层，不做第一层**）：原生按**总**显存定块大小（32–128 MiB）沿 T 切块递归、写进 `output_buffer`。真机 LTX-2（2026-11-26，`tests/bench_ltx.py`，基线在 `results/native/`）：1280×704×97 原生 reserved 56.76 / alloc 9.93 GiB → 第二层 7.99 / 7.40，11.7 → 11.4 s；1920×1088×193 原生 55.95 / 18.56 → 第二层 16.14 / 13.50，51.5 → 52.4 s。原生的 reserved 是碎片（ROCm 上 cudnn 关着，im2col 一次要 5.8 GiB，OOM 后清缓存才跑完），第二层的卷积行块把它消掉了，时间不变；第二层已经比要求的低得多，第一层（PixelNorm 空间条带）收益不值，不做。和原生的 max|d| 0.014 / 0.033 来自 GEMM 分组和 batch>1 时解码噪声的已知差别。
+* **LTX 2.4 扩散 decoder（定案：算子级 NA3D 按 T 切块 + 光环 kernel−1，不走条带引擎）**：没有卷积和已知注意力（邻域注意力 `comfy_kitchen.na3d` + SwiGLU MLP），第 5 段（256 通道、像素 1/4 分辨率、8 个块、窗口 11³）原生峰值约 6 × S（S = 第 5 段一份激活；整份 q/k/v/注意力输出 + x + context），随帧数和分辨率线性涨。做法在 `monoload/vae_ltx.py`，经 `vae_ops.EXTRA_CHUNKERS` 由第二层的 `OpChunking` 装上：
+  * 每个 `NeighborhoodAttention3D` 按 T 分段：一段查询帧 [a, b) 配一段 n = (b − a) + 2(k_t − 1) 帧的 q/k/v，贴边时整段往里挪（不截短）。NATTEN 语义是窗口正好 k_t 帧、居中、在边界处往里挪，窗口离它的查询最远 k_t − 1 帧，所以查询块两边各有 k_t − 1 帧（或碰到边界）时每个查询在段里的窗口和整块里的完全相同。一次调用的所有段等长、共用一份 q/k/v（分配器反复用同一块，不碎）。只切 T、H/W 不切 → RoPE 直接用全局位置表按 T 切片；HIP 的 na3d 是融合 WMMA kernel，自己没有大 workspace，段的 T × H 还要 ≤ 65535（kernel 的 grid 上限）。kernel 对段里每一帧都算注意力，光环那部分算完扔掉，所以查询块取「4n 帧的 q/k/v/输出放得进 max(工作区, 半份激活)」的最大值、且至少 2(k_t − 1) 帧（注意力最多是原生的两倍）——第一版按 1 GiB 工作区定块，第 5 段只剩 1 帧、段 21 帧，真机慢了约 14 倍，段长不一还把 reserved 碎到 alloc 的 3 倍。残差原地写回 x：一段读完它的帧以后，下一段起点之前的结果立刻写，剩下的挂起。进第 5 段前清一次缓存。
+  * SwiGLU 按 workspace 限 token 数（原生最少一整帧）；`NADiffusionDecoder.forward` 换成同样步骤的精简版：最后一次上采样只算原生保留的帧（原生用视图丢掉开头重复帧和末尾 16 个 padding 帧，整块仍被拖着），`conv_in_x_t` / `norm_out` / `conv_out` 按 T 分块直接写结果，最后一步的块跑完就放掉 context；`x_t` 噪声仍整块用同一个 generator 生成，和原生逐位相同。
+  * 峰值 ≈ x + context + 一段 q/k/v/输出 + 挂起结果 + 像素张量，193 帧约 3 × S。和原生的差别只来自 GEMM 行分组不同（fp32 自测 ≤ 1e-4，`tests/check_ltx_dd.py`）。
+  * **为什么不走条带引擎**：条带的光环要把各层窗口半径累加——第 5 段 8 层 × 每层 10 帧（k_t − 1）= 80 帧，加上前 4 段，一个条带的重算量比它本身还大；而注意力本身逐层就能精确切开（每层只要 k_t − 1 帧光环、不累加），切完以后剩下的整份张量只有 x 和 context 两份，按估算能把 1920×1088×193 压进 55 GiB 主线（真机在排队）。真要更大（x + context 本身超了）才需要跨层流式，到时再议。
+  * **真机（2026-11-27，`tests/bench_ltx.py`，`ltx-2.5-video-vae-bf16`，`--bf16-vae`，1 GiB 工作区）**：768×512×97 走 Monoload 正常入口（适配线程的探测定上界 + `vae_ltx`）reserved 9.84 → 5.59（冷）/ 5.52（热），热跑 17.9 → 31.3 s，冷跑 109.7 s（多出来的约 78 s 是两次探测解码）；1920×1088×97 直接装 `vae_ltx`（lean）reserved 50.15 → 26.07（alloc 38.82 → 25.12），106.3 → 190.9 s。和原生 max|d| 0.002 / 0.027（bf16 的 GEMM 分组差别；fp32 自测 ≤ 5.6e-6）。**定案：合，扩散 decoder 交给 `vae_ltx`**（峰值约减半，慢约 1.8 倍：多出来的是光环帧的重复注意力，块已取到预算内最大）。1920×1088×193 在排队。
+  * `plan()` 的总数是 reserved 口径：allocated 上界 × 1.05 + 256 MiB（1920×1088×97 估 25.17 → 26.68 ≥ 实测 26.07；fp32 小尺寸 2.55 → 2.93 ≥ 2.70）。路由用的仍是适配线程的探测，`plan()` 给诊断和 `check_ltx_dd.py` 对照。
+* H4：PixelNorm 的分组归约已在第二层里（video-norm-g）。
 
 ### G 组：本来就自己分块的 transformer VAE（结论：原生已够，Monoload 只透传，不做 L1 / L2）
 

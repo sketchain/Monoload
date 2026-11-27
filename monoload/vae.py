@@ -472,6 +472,11 @@ try:   # group C's CogVideoX layer 1 (its match() takes CogVideoX latents of 2+ 
     STRIPE_ADAPTERS.append(vae_cogvideo)
 except ImportError:
     pass
+try:   # group A's multi-frame Wan layer 1 (its match() takes Wan 2.1 / 2.2 latents of 2+ frames; Wan 2.1 off by
+    from . import vae_wan_video   # vae_wan_video.WAN21_ENABLED until its estimate holds, DESIGN §9.40)
+    STRIPE_ADAPTERS.append(vae_wan_video)
+except ImportError:
+    pass
 
 _L1_NOTED = weakref.WeakKeyDictionary()   # first_stage_model -> last logged layer-1 reason
 
