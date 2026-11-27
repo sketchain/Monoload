@@ -213,7 +213,9 @@ SLICE_TEMPS = 6          # row-slice temporaries bounded by this many workspaces
 SELFTEST_N = 16          # self-test latent rows / cols (128 x 128 output)
 SELFTEST_T = 4           # self-test latent frames (even: 4t = 16 output frames, 4 phase-2 chunks)
 SELFTEST_ROWS = 24       # self-test output rows per slice (3 / 6 / 12 / 24 rows at the four levels)
-MARGIN = 256 * MIB       # allocator rounding on top of the counted tensors (calibrated on the real machine, PLAN-video C)
+MARGIN = 256 * MIB       # allocator rounding on top of the counted tensors
+FRAG = 0.125             # what the allocator reserves beyond the live peak (no arena: the slices' sizes vary), as a
+                         # fraction of it; real machine 720p x 81 (PLAN-video C): reserved 14.62 GiB at live peak 13.04
 
 
 def _conv_ok(cc):
@@ -323,20 +325,29 @@ def _causal_rows(cc, src, shape, cache, write, rows, ws, want_cache, like):
     ci, T, H, W = shape
     kt = cc.time_kernel_size
     hp = cc.conv.kernel_size[1] // 2
+    r = _rows((T + kt - 1) * ci * W * 4, rows, ws)
     new = None
     if kt > 1 and want_cache:
-        new = torch.empty((1, ci, kt - 1, H, W), dtype=like.dtype, device=like.device)
-    r = _rows((T + kt - 1) * ci * W * 4, rows, ws)
+        cshape = (1, ci, kt - 1, H, W)
+        if cache is not None and tuple(cache.shape) == cshape and cache.dtype == like.dtype and r >= hp:
+            new = cache   # written in place (the same buffer every chunk: no allocator churn, PLAN-video C)
+        else:
+            new = torch.empty(cshape, dtype=like.dtype, device=like.device)
+    kept = None   # the old cache's rows [a - hp, a), overwritten by the previous slice and read by this one's halo
     for a in range(0, H, r):
         b = min(H, a + r)
         r0, r1 = max(0, a - hp), min(H, b + hp)
         s = src(r0, r1)
         if kt > 1:
             if cache is not None:
-                s = torch.cat([cache[:, :, :, r0:r1], s], dim=2)
+                old = cache[:, :, :, r0:r1] if kept is None else torch.cat([kept, cache[:, :, :, a:r1]], dim=3)
+                s = torch.cat([old, s], dim=2)
+                del old
             else:
                 s = torch.cat([s[:, :, :1]] * (kt - 1) + [s], dim=2)
             if new is not None:
+                if new is cache:
+                    kept = cache[:, :, :, max(a, b - hp):b].clone() if hp and b < H else None
                 new[:, :, :, a:b].copy_(s[:, :, -(kt - 1):, a - r0:b - r0])
         o = cc.conv(s)
         del s
@@ -568,7 +579,7 @@ class CogPlan:
         self.prefix_bytes, self.stripe_bytes, self.ckpt_bytes, self.persistent = p1, p2, arch, caches
         self.out_segment = out_bytes
         self.live_peak = lat_bytes + out_bytes + max(p1, p2) + temps
-        self.estimate = self.live_peak + MARGIN
+        self.estimate = int(self.live_peak * (1 + FRAG)) + MARGIN
         self.arena = self.estimate          # no arena: what is reserved is the estimate (the default policy's measure)
         self.stripes = [(a, min(self.h_out, a + self.rows)) for a in range(0, self.h_out, self.rows)]
         self.order = list(range(len(self.stripes)))
