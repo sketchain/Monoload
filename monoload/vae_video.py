@@ -10,7 +10,8 @@ docs/DESIGN.md §9.35).
                  measured probe (vae._probe_mf), a single frame included: LTX's convolutional VideoVAE (0.9.x /
                  LTX-2 / 2.5; it has chunked output, comfy_has_chunked_io, and writes into the output buffer itself)
                  and LTX's diffusion decoder (CausalDiffusionVAE / NADiffusionDecoder; sd.py: decoder.conv_in_x_t.weight).
-                 Group F (docs/PLAN-video.md) adds their own op handling through vae_ops.EXTRA_CHUNKERS.
+                 The diffusion decoder is managed only with group F's module (vae_ltx, optional import here: its op
+                 handling through vae_ops.EXTRA_CHUNKERS); without it it stays native at T > 1.
   chunks()       the decode of one sample as a generator of output pieces in the final layout, [1, C, f, H, W],
                  consecutive along the frames: for the decoders below the pieces the decoder already produces
                  (ComfyUI keeps them in a list and torch.cat's them at the end: two copies of the output in the VAE
@@ -45,6 +46,10 @@ try:
     from . import vae_cosmos
 except ImportError:
     vae_cosmos = None
+try:   # group F: the LTX-2.5 diffusion decoder's op handling (vae_ops.EXTRA_CHUNKERS); until merged it stays native
+    from . import vae_ltx
+except ImportError:
+    vae_ltx = None
 
 
 def _wan21_chunks(fsm, z):
@@ -173,7 +178,10 @@ _BY_DECODER = (
     (_hv15, _hv15_chunks, "HunyuanVideo 1.5 (AutoencodingEngine + vae_refiner.Decoder)"),
 )
 
-WHOLE = frozenset((ltx.VideoVAE, ltx_diffusion.CausalDiffusionVAE))
+# the diffusion decoder only with group F's chunker: without it layer 2 chunks none of its ops (no conv, its attention is
+# NA3D), so it only adds the probe's three decodes and an estimate above native's (real machine 768x512x97: 19.1 GiB
+# against native's 8.1, DESIGN §9.35)
+WHOLE = frozenset((ltx.VideoVAE,) + ((ltx_diffusion.CausalDiffusionVAE,) if vae_ltx is not None else ()))
 
 MULTIFRAME = frozenset(_CHUNKS) | WHOLE
 

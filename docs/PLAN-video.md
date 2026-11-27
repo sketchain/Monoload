@@ -37,6 +37,7 @@
 
 * **L1 方案**：扩展现有的 `vae_wan` / `vae_wan22` 单帧适配器到多帧，走 H2 的条带为主。时间块：Wan 2.1 第一块 1 个 latent 帧、之后每块 2 帧，`Resample` 的时间上采样（`time_conv`）第一块跳过；Wan 2.2 每块 1 帧，第一块不做时间卷积、`DupUp3D` 丢掉多出的帧，缓存总是补成 2 帧（`clone`）。单元沿用单帧的划分（halo 不变：时间核不影响空间 halo），每个单元多一个「条带缓存」状态。注意 v0.46.3 的 Wan 2.2：`feat_cache is None` 时 `ResidualBlock` / 上采样 / `DupUp3D` 会自己按行分块（`strip_apply`），多帧路径总是带缓存，不触发；我们的单元调用时传缓存，也不触发。
 * 方案 G 已覆盖 Wan 2.2 的 1024 / 512 通道 RMS；Wan 2.1 最多 384 通道，不用分组。
+* **进度**：已做（`monoload/vae_wan_video.py`，DESIGN §9.41，分支 video-wan-l1）。用 H2 的引擎时间轴；和上面的差别：单帧适配器不动、另起一个只接 T > 1 的适配器；Wan 2.1 时间上采样之后不切 2 帧一片（引擎的链是线性的，数值相同）。真机：1280×704×121 第一层对第二层 Wan 2.2 3.54 对 8.91 GiB（不慢、估算是上界），Wan 2.1 4.34 对 8.00 GiB（慢 20%、720p 估算少算），所以只开 Wan 2.2，Wan 2.1 多帧留第二层（`WAN21_ENABLED`）。等改 `vae.py` 的线程注册到 `STRIPE_ADAPTERS`。
 * 预计 L1：与帧数基本无关的 1–2 GiB + 存档 + 输出（720p×81 fp32 输出 0.9 GiB）。
 
 ### B 组：Hunyuan VAE
@@ -49,7 +50,7 @@
 * **难点：mid 的全局注意力跨全部帧**（tokens = T·h·w），在全部 latent 帧上一次算完，然后 `torch.split` 成 2 帧一块跑上采样路径。L1：前缀 = `conv_in` + mid（整段视频，latent 分辨率；注意力用第二层的 query 分块）+ 存档；之后条带为主跑各块。
 * HunyuanVideo 1.0 的 GroupNorm：原生是**每个时间块各自统计**（块内全部帧、整幅空间）→ L1 要每块一个统计遍（LDM 的方案 B 机制按块做，H2 的平面数正好描述「每行 2 帧」）。HunyuanVideo 1.5 是 RMS norm，没有统计遍（像 Wan 2.2），但要 H4（方案 G 扩到 `vae_refiner.RMS_norm`）。
 * 顺带：HunyuanImage 2.1 Refiner 官方文件的单帧第一层（DESIGN §9.31，和 Wan 2.2 单帧同类）在这一组做掉。分支 vae-refiner-layer1 的 `refiner_vae=False` 适配器仍不合（官方文件用不上）。
-* **进度（分支 claude/project-thread-glsomb）：** 两种 decoder 的多帧第二层入口（`vae_video` 按 decoder 结构认，逐块交出）；HunyuanVideo 1.5 / Refiner 第一层 `vae_hunyuan15.py`（前缀整段到 `up[0]`，条带为主 2 帧一块，carry 每条带每单元一份，单帧没有时间块；方案 G 的临时量在每个 norm 的计数里）。待注册、待真机。HunyuanVideo 1.0 的第一层先看第二层真机数，够就写「第二层已够」（DESIGN §9.40）。
+* **进度（分支 claude/project-thread-glsomb）：** 两种 decoder 的多帧第二层入口（`vae_video` 按 decoder 结构认，逐块交出）；HunyuanVideo 1.5 / Refiner 第一层 `vae_hunyuan15.py`（前缀整段到 `up[0]`，条带为主 2 帧一块，carry 每条带每单元一份，单帧没有时间块；方案 G 的临时量在每个 norm 的计数里）。待注册、待真机。HunyuanVideo 1.0 的第一层先看第二层真机数，够就写「第二层已够」（DESIGN §9.41）。
 
 ### C 组：CogVideoX
 
@@ -99,10 +100,10 @@
 | VAE（类） | 自己怎么分块 | 原生峰值（CT 700 实测，reserved） | 结论 |
 |---|---|---|---|
 | MiniMax H3 视频，原版 decoder（`MiniMaxH3VideoVAE` + `ViT3DDecoder`） | 时间上 5 + 2 个 latent 一块，空间 256 px tile（一次最多 4 块），边解边写输出 | 见下表：1080p 107 帧总共 11.8 GiB（权重 4.85 + 输出 2.5 + 工作量 < 2.5）| 原生已够，只透传 |
-| MiniMax H3 视频，Sol decoder（`NonCausalViT3DDecoder`） | 整段的残差流 + 5 个 latent 一块的 q/k/v 环（ring 2）| 待测（已排队）。按代码算：残差流每输出像素·帧 4 B（2048 维 bf16 ÷ 16×16×4 像素），只有 fp32 输出（12 B）的三分之一；q/k/v/注意力输出的环 1080p 约 1.3 GiB、单块 qkv / MLP 临时量约 1 GiB，与帧数无关。1080p 107 帧估 ≈ 权重 + 输出 2.5 + 残差 1.1 + 2.5 | 只透传：随帧数涨的部分以 ComfyUI 预分配的输出为主，第一层省不掉它；残差流整段在显存里是这个 decoder 的设计（不重算时间重叠），拆开就不是同一个结果 |
+| MiniMax H3 视频，Sol decoder（`NonCausalViT3DDecoder`） | 整段的残差流 + 5 个 latent 一块的 q/k/v 环（ring 2）| 1080p 73 帧 ≤ 12.73 GiB、107 帧 ≤ 14.63 GiB（权重 3.35 + 输出 1.70 / 2.50 + 工作量；alloc 多占 ≤ 6.32 / ≤ 7.44）。按代码：残差流每输出像素·帧 4 B（2048 维 bf16 ÷ 16×16×4 像素），只有 fp32 输出（12 B）的三分之一；q/k/v/注意力输出的环 1080p 约 1.3 GiB、单块 qkv / MLP 临时量约 1 GiB，与帧数无关——实测 34 帧多出的 1.1 GiB alloc 就是输出 0.8 + 残差流 0.3 | 只透传：随帧数涨的部分以 ComfyUI 预分配的输出为主，第一层省不掉它；残差流整段在显存里是这个 decoder 的设计（不重算时间重叠），拆开就不是同一个结果 |
 | MiniMax H3 Image / P-H3 Image（`H3ImageVAE` 子类） | 同原版的 256 px tile | 没有单独的 Image 模型文件（Comfy-Org/MiniMax-H3 只有 fl2va / ref2va），按原版的数推 | 只透传 |
-| SeedVR2（`VideoAutoencoderKLWrapper`） | 按空闲显存定每片几个 latent 帧；卷积 / GroupNorm 0.5 GiB 一块；放不下时把因果缓存放到锁页内存（`CausalMemoryCache(offload=True)`，每输出像素 6200 B）| 待测（已排队）。它自己的估算（`comfy_memory_used_decode`，按实测拟合，`comfy_decode_estimate_is_reliable`）：每输出像素 3150 B，**bf16 再 ×5**（只有 fp16 channels-last 走拟合的快路径）——1080p 一帧约 30 GiB、4K 约 120 GiB，4K 直接走它自己的空间分块（`preferred_decode_tile`，最大 768 px） | 只透传：峰值由它自己按空闲显存规划、估算可靠、放不下自动分块，第一层要重写它的因果缓存机制（4a 盘点就不建议）。能省的是精度：SeedVR2 VAE 用 fp16 比 bf16 少约 5 倍，这是用户侧的选择，不是 Monoload 的事 |
-| RelayVSR Flash（`RelayFlash`） | 逐帧解码，窗口注意力 48×48 / 24×24，`HostWriter` 直接写输出 | 待测（已排队）。按代码：一帧的工作量，和帧数无关 | 只透传 |
+| SeedVR2（`VideoAutoencoderKLWrapper`） | 按空闲显存定每片几个 latent 帧；卷积 / GroupNorm 0.5 GiB 一块；放不下时把因果缓存放到锁页内存（`CausalMemoryCache(offload=True)`，每输出像素 6200 B）| 1080p 33 帧：alloc 31.35 GiB、reserved 43.11 GiB（GGUF F16 反量化后按 `--bf16-vae` 跑，权重 0.47，输出 0.76，耗时 160 s；因果缓存放到了锁页内存）。4K 33 帧：原生估算 123.5 GiB，ComfyUI 直接改走分块解码（`preferred_decode_tile`，最大 768 px），分块峰值没测（Monoload 不改这条路）。估算来源：`comfy_memory_used_decode` 按实测拟合（`comfy_decode_estimate_is_reliable`），每输出像素 3150 B，**bf16 再 ×5**（只有 fp16 channels-last 走拟合的快路径） | 只透传：峰值由它自己按空闲显存规划、估算可靠、放不下自动分块，第一层要重写它的因果缓存机制（4a 盘点就不建议）。能省的是精度：SeedVR2 VAE 用 fp16 比 bf16 少约 5 倍，这是用户侧的选择，不是 Monoload 的事 |
+| RelayVSR Flash（`RelayFlash`） | 逐帧解码，窗口注意力 48×48 / 24×24，`HostWriter` 直接写输出 | x4：1080p 31 帧 2.02 GiB、4K 31 帧 ≤ 7.70 GiB（权重 0.06，输出 0.72 / 2.87，4K 耗时 21 s）。按代码：一帧的工作量，和帧数无关 | 只透传 |
 
 **MiniMax H3 原版 decoder 实测**（`minimax_h3_video_vae_fp16.safetensors`，`--gpu-only --bf16-vae`，权重 4.85 GiB；随机 latent；`tests/bench_selftiled.py`；原生和装了 Monoload 的输出逐位相同）：
 
@@ -113,7 +114,7 @@
 | 1920×1088 | 22（7） | 28 s | 1.35 / 2.40 | 0.51 | 7.38 |
 | 1920×1088 | 107（32） | 159 s | ≤ 5.00 / ≤ 6.79 | 2.50 | ≤ 11.77 |
 
-「≤」：这一轮的脚本在读峰值前把输出（`movedim` 过、不连续）在显存里拷了一份再算哈希，多出一份输出大小，所以长片段的数是上界（d3f7707 已改）；短片段的数不受影响（拷贝比解码本身的峰值小），由它可知工作量约 0.6 GiB（720p）/ 0.85 GiB（1080p），不随帧数涨。ComfyUI 自己的估算（`memory_used_decode`：720p 0.58–1.02、1080p 1.05–1.66 GiB）不含输出，只拿去 `load_models_gpu` 腾地方，不影响结果。单次峰值由 DiT / TE 决定（§3），VAE 不是瓶颈。
+「≤」：这一轮的脚本在读峰值前把输出（`movedim` 过、不连续）在显存里拷了一份再算哈希，多出一份输出大小，所以长片段的数是上界（d3f7707 已改）；短片段的数不受影响（拷贝比解码本身的峰值小），由它可知工作量约 0.6 GiB（720p）/ 0.85 GiB（1080p），不随帧数涨。ComfyUI 自己的估算（`memory_used_decode`：720p 0.58–1.02、1080p 1.05–1.66 GiB）不含输出，只拿去 `load_models_gpu` 腾地方，不影响结果。单次峰值由 DiT / TE 决定（§3），VAE 不是瓶颈。上面 Sol、SeedVR2、RelayVSR 三行也是同一版脚本测的，带「≤」的数同样含这份拷贝。
 
 **GGUF VAE**：社区有 MiniMax H3 视频 VAE Q8_0（2.94 GB）和 SeedVR2 VAE F16（0.50 GB）的 GGUF，但 ComfyUI 核心的 `VAELoader` 不列 `.gguf`，ComfyUI-GGUF（kyuz0 H3）只有 UNet / CLIP 加载器——**没有能把它们当 VAE 加载的节点**（真机核实）。`bench_selftiled --gguf` 用 gguf 包读出来、反量化成 fp16 再构造 `comfy.sd.VAE`（SeedVR2 F16：250 个张量，正常构造），解码就是 fp16 VAE 的解码，峰值同 safetensors 版。
 
