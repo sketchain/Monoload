@@ -2180,6 +2180,52 @@ Monoload 的目标是降峰值，「原生放得进 cap 就走原生」也不做
 
 **自检规模不缩：** 已经是最小的覆盖（24×24 latent、3 个时间块让缓存跨 2 个块边界、8 MiB 工作区让条带里的卷积也走第二层分块，930 次分块卷积）。慢主要是 fp32 加小分块，缩小会丢覆盖。落盘之后每个（权重、代码版本）只测一次，不值得动。
 
+### 9.48 图片家族全覆盖：0.46.3 真机（I 组，2026-11-27）
+
+**范围：** ComfyUI v0.46.3 支持的图片家族里，盘上已经有文件的都在 comfyui-latest 上跑了一遍（`MONOLOAD_VAE_FIT_CAP=55G`，Monoload 用 video 2302cd9 的副本）。没下载的家族这次不补（盘留给 ROCm 底座），见文末。
+
+**做法：**
+
+* **VAE：** `tests/bench_vae.py --modes native,monoload,native2 --warm 1`，每个 VAE 两个尺寸（1344×768 和 4K）。数字是 peak reserved 增量（GiB），PSNR 是 Monoload 对原生。
+* **出图：** `verify.sh` 跑 off / zero / on / on2（off = `MONOLOAD_DISABLE=1`，zero = `MONOLOAD=0`，on 第一次清探测缓存），workflow 由脚本生成：seed 42、1024²（SD1.5 是 768²）、各家族官方模板的采样设置。有现成 LoRA 的用现成的（SD1.5 Rubber Duck 0.9 走 `LoraLoader`，Krea 2 darkbrush 0.8，Anima turbo LoRA），没有的用 `tests/make_model_lora.py` 生成随机 rank 16（每 4 个 linear 一层）。另跑一遍不带 LoRA 的 on，确认 LoRA 生效。
+
+**VAE（peak reserved，原生 → Monoload）：**
+
+| VAE | 路径 | 1344×768 | 4K | PSNR | 4K 耗时 |
+|---|---|---|---|---|---|
+| Flux `ae`（含 SD1.5 checkpoint 内置的 LDM VAE） | 第一层 `vae_ldm` | 8.36 → 0.62（估 0.76） | 52.50 → 2.17（估 2.68） | 61.5（SD1.5 58.8） | 12.3 → 43.4 s |
+| `flux2-vae` | 第一层 `vae_ldm` | 8.37 → 0.62 | 52.52 → 2.18 | 64.6 / 64.5 | 12.3 → 44.0 s |
+| `qwen_image_vae` / `wan_2.1_vae` | 第一层 `vae_wan` | 6.10 → 0.38（估 0.50） | 59.14 → 0.87（估 1.16） | 60.3 / 59.9 | 8.4 → 9.1 s |
+| HunyuanImage 2.1 | 第一层 `vae_hunyuan` | 4.68 → 0.54（冷启动含自检 1.43） | 3840×2176：38.12 → 2.13 | 59.5 / 57.9 | 6.3 → 46.3 s |
+| HunyuanImage 2.1 Refiner | 第二层（HunyuanVideo 1.5 单帧） | 13.32 → 3.31（估 5.06） | 2560×1440：46.18 → 7.28（估 12.92） | 62.2 / 61.0 | — |
+| SDXL（WAI Illustrious checkpoint 内置） | 第一层 `vae_ldm` | 8.36 → 0.62（估 0.76） | 52.48 → 2.17（估 2.68） | 62.3 / 61.2 | 12.7 → 50.1 s |
+| `flux2-vae_small` / `full_encoder_small_decoder`（Klein 小 decoder） | 第一层 `vae_ldm` | 6.10 → 0.52（估 0.66） | 59.19 → 1.72（估 2.11） | 64.2 / 63.8 | 8.2 → 32.5 s |
+| `ming_image_vae_bf16` | 第一层 `vae_wan` | 6.10 → 0.40（估 0.51） | 59.14 → 0.90（估 1.19） | 60.4 / 59.9 | 8.1 → 8.9 s |
+| `mage_flow_vae_bf16` | 第二层（不认作 Wan） | 0.62 → 0.62 | 4.93 → 4.93 | 与原生逐位一致 | 1.4 → 1.3 s |
+| `minimax_h3_image_vae_fp16` | 原生透传（`comfy_has_chunked_io`） | 0.07 → 0.07 | 0.29 → 0.29 | 与原生逐位一致 | 2.7 → 2.7 s |
+
+native2 和 native 全部逐位一致。原生 4K 都会打出 HIP allocator 的 OOM 警告再重试，Monoload 没有。两个 Klein 小 decoder 文件的 decoder 相同，数字完全一样。Mage 的 decoder 本来就小（4K 原生只 4.93），第二层 145 次卷积一次都不用分块，只把 2 次 attention 按 1024 个 token 分块，输出和原生逐位一致；它的估算 8.22（原生估算 15.45）偏松，只影响 `load_models_gpu` 腾出多少空间。
+
+**出图（peak reserved GiB：off / zero / on / on2；无 LoRA 的 on）：**
+
+| 家族 | 文件 | LoRA | off | zero | on | on2 | 无 LoRA |
+|---|---|---|---|---|---|---|---|
+| SD1.5 | v1-5-pruned-emaonly-fp16 | Rubber Duck 0.9 | 7.59 | 7.59 | 2.57 | 2.57 | 2.55 |
+| Z-Image | luciddreamerZ_v083 | 随机 r16 | 31.55 | 31.55 | 20.05 | 20.05 | 20.03 |
+| Krea 2 | krea2_turbo_bf16 | darkbrush 0.8 | 61.06 | 61.06 | 33.39 | 33.39 | 32.95 |
+| Anima | anima-base-v1.0 | turbo LoRA v0.2 | 15.39 | 15.39 | 5.90 | 5.85 | 5.77 |
+| Flux 2 Klein 4B | flux-2-klein-4b | 随机 r16 | 24.97 | 24.97 | 15.62 | 15.62 | 15.61 |
+| Flux 1 dev | flux1-dev（bf16） | 随机 r16 | 41.48 | 41.48 | 27.82 | 27.82 | 27.79 |
+| Chroma | Chroma1-HD-fp8mixed | 随机 r16 | 23.96 | 23.96 | 14.1 | 14.1 | 14.08 |
+| LongCat-Image | longcat_image_bf16 | 随机 r16 | 32.15 | 32.15 | 20.4 | 20.4 | 20.38 |
+
+* 全部 OK。8 个家族 off 与 zero 逐位一致；on 与 on2 逐位一致（Chroma、LongCat 的 on2 是另一个进程、冷探测缓存跑的，也一致）；带 LoRA 的 on 与不带的不同，LoRA 生效。
+* on 对 off 不逐位，是默认的融合合并（§3），要逐位用 `MONOLOAD_EXACT=1`。
+* 降的峰值来自两处：LoRA 不再留备份、VAE 解码走第一层。不带 LoRA 的 on 和带 LoRA 的 on 差不到 0.5 GiB。
+* 耗时：热启动下 on 和 zero 接近（Flux 1 51.7 / 47.5 s，Klein 18.5 / 16.5 s，LongCat 66.5 / 63.6 s）；每批第一个模式要加载模型，数字偏大，不比。
+
+**没测（没下载，盘留给 ROCm）：** SD3.5 Medium、SD x4 放大、Stable Cascade、PixArt、AuraFlow、HunyuanDiT、Cosmos Predict2 T2I、HiDream、HunyuanImage 2.1 扩散模型、Kandinsky 5 Lite T2I、OmniGen2、Mage（int8）、Ernie-Image、Lens、MiniMax-H3-Image（int8）、NetaYume、Radiance。其中 Ernie-Image、Lens 用 `flux2-vae`，Mage、MiniMax-H3-Image 和 HunyuanImage 2.1 的 VAE 上面单独测过；LoRA 热合并走的是通用路径，没有家族专用代码。Flux 2 dev、SDXL、Qwen Image（含 2.1 和 GGUF）在 video 回归和 qi21 那轮测过（README 图片表）。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。

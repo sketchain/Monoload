@@ -14,23 +14,23 @@
 
 ### 图片模型一览（2026-11-27，video 分支）
 
-「真机」一列写哪个 ComfyUI 版本上验证过、在哪里有记录。0.31.0 是 CT 700 的旧镜像（§10），0.46.3 是 comfyui-latest（`MONOLOAD_VAE_FIT_CAP=55G`）。0.46.3 的回归是 video 92cbd3d 上的 5 个 workflow（verify run `1127_1418_video_regr`）：全部 OK，`MONOLOAD=0` 与原生逐位一致；括号里是 peak reserved，Monoload 开 / 原生，单位 GiB。视频模型见 docs/PLAN-video.md 和 HANDOFF §0。
+「真机」一列写哪个 ComfyUI 版本上验证过、在哪里有记录。0.31.0 是 CT 700 的旧镜像（§10），0.46.3 是 comfyui-latest（`MONOLOAD_VAE_FIT_CAP=55G`）。0.46.3 的回归是 video 92cbd3d 上的 5 个 workflow（verify run `1127_1418_video_regr`）：全部 OK，`MONOLOAD=0` 与原生逐位一致；括号里是 peak reserved，Monoload 开 / 原生，单位 GiB。I 组的图片家族（DESIGN §9.48）每个都是 off / zero / on / on2：off = zero 逐位、on = on2 逐位、LoRA 生效；没下载的家族列在那一节末尾。视频模型见 docs/PLAN-video.md 和 HANDOFF §0。
 
 | 家族（VAE） | LoRA 运行时合并 | VAE 解码 | 真机 |
 |---|---|---|---|
-| SDXL（checkpoint 内置 LDM VAE） | 支持；LoRA / LoCon 融合 addmm，其余类型走 `calculate_weight` | 第一层（`vae_ldm`） | 0.31.0：LoRA 和 VAE 都测过（§10 的 9.1–9.5、§10.3）；0.46.3：`sdxl`（7.44 / 15.94）、`sdxl_lora`（7.65 / 21.64） |
-| SD1.5 / SD3（LDM VAE） | 支持（CPU 测试套件含 LoRA / LyCORIS / LoHa / LoKr） | 第一层（`vae_ldm`） | 只有 CPU 测试，真机无单独记录 |
-| Flux 1 / Z-Image（Flux `ae`） | 支持 | 第一层（`vae_ldm`） | 0.31.0：VAE（§10.3）；LoRA 无单独记录 |
-| Flux 2（`flux2-vae`；Ideogram 4、Lens、Ernie-Image 同一个 VAE） | 支持 | 第一层（`vae_ldm`） | 0.31.0：VAE（§10.5、§10.6）；0.46.3：`flux2`（fp8mixed UNet，不带 LoRA；50.51 / 55.28）。Flux 2 fp8 的 GPU LoRA 项已撤 |
-| Qwen Image / Krea 2 / Anima（`qwen_image_vae`，即 Wan 2.1 VAE 单帧） | 支持 | 第一层（`vae_wan`） | 0.31.0：VAE（§10.1、§10.2）；0.46.3：`qwen_aio`（AIO checkpoint，不带 LoRA；46.16 / 52.61）。Krea 2 int8 的 GPU 项已撤 |
+| SDXL（checkpoint 内置 LDM VAE） | 支持；LoRA / LoCon 融合 addmm，其余类型走 `calculate_weight` | 第一层（`vae_ldm`） | 0.31.0：LoRA 和 VAE 都测过（§10 的 9.1–9.5、§10.3）；0.46.3：`sdxl`（7.44 / 15.94）、`sdxl_lora`（7.65 / 21.64）；VAE 4K 52.5 → 2.2（DESIGN §9.48） |
+| SD1.5 / SD3（LDM VAE） | 支持（CPU 测试套件含 LoRA / LyCORIS / LoHa / LoKr） | 第一层（`vae_ldm`） | 0.46.3（DESIGN §9.48）：SD1.5 + Rubber Duck LoRA 768²（2.57 / 7.59），VAE 4K 52.5 → 2.2；SD3 没测 |
+| Flux 1 / Z-Image / Chroma / LongCat-Image（Flux `ae`） | 支持 | 第一层（`vae_ldm`） | 0.31.0：VAE（§10.3）；0.46.3（DESIGN §9.48，带 LoRA）：Flux 1 dev（27.82 / 41.48）、Z-Image（20.05 / 31.55）、Chroma HD fp8mixed（14.1 / 23.96）、LongCat（20.4 / 32.15）；`ae` 4K 52.5 → 2.2 |
+| Flux 2 / Klein（`flux2-vae`；Ideogram 4、Lens、Ernie-Image 同一个 VAE） | 支持 | 第一层（`vae_ldm`） | 0.31.0：VAE（§10.5、§10.6）；0.46.3：`flux2`（fp8mixed UNet，不带 LoRA；50.51 / 55.28），Klein 4B 带 LoRA（15.62 / 24.97，DESIGN §9.48），Klein 小 decoder（`flux2-vae_small`）4K 59.2 → 1.7。Flux 2 fp8 的 GPU LoRA 项已撤 |
+| Qwen Image / Krea 2 / Anima（`qwen_image_vae`，即 Wan 2.1 VAE 单帧） | 支持 | 第一层（`vae_wan`） | 0.31.0：VAE（§10.1、§10.2）；0.46.3：`qwen_aio`（AIO checkpoint，不带 LoRA；46.16 / 52.61）；带 LoRA（DESIGN §9.48）：Krea 2 bf16（33.39 / 61.06）、Anima（5.90 / 15.39）；VAE 4K 59.1 → 0.87；同结构的 `ming_image_vae` 也走第一层（4K 59.1 → 0.90）。Krea 2 int8 的 GPU 项已撤 |
 | Qwen Image 2.1 VAE（Wan 2.2 结构，patch_size 1、RGBA） | 支持 | 第一层（`vae_wan22`） | 0.46.3（verify run `1127_1634_video_qi21`，全部 OK）：仅 VAE 2048² 峰值 alloc 12.06 → 1.67 GiB、on = on2 逐位；t2i 25 步 19.01 → 16.72、69.2 / 69.8 s；官方 8 步 LoRA（`p_q_image_2.1_8_steps_v0.1`）off 103.2 s → on 39.7 s、峰值 25.52 → 18.98，LoRA 生效，on = on2 逐位（对 off 不逐位：默认融合合并） |
 | Wan 2.2 5B 单帧（`wan2.2_vae`） | 支持 | 第一层（`vae_wan22`） | 0.31.0：§10.10、§10.13 |
-| HunyuanImage 2.1 | 支持 | 第一层（`vae_hunyuan`） | 0.31.0：§10.9 |
-| HunyuanImage 2.1 Refiner | 支持 | 第二层（第一层分支没合） | 无 |
+| HunyuanImage 2.1 | 支持 | 第一层（`vae_hunyuan`） | 0.31.0：§10.9；0.46.3 仅 VAE：3840×2176 38.1 → 2.1（DESIGN §9.48）；扩散模型没下载 |
+| HunyuanImage 2.1 Refiner | 支持 | 第二层（第一层分支没合） | 0.46.3 仅 VAE：2560×1440 46.2 → 7.3（DESIGN §9.48） |
 | 图片 GGUF 整模型（ComfyUI-GGUF） | 支持；12 种量化逐层 exact 逐位、0 备份（docs/GGUF-QUANT.md §8） | 跟所用 VAE 一致；GGUF VAE 没有加载器 | 0.46.3：逐层真机已过；Qwen-Image Q4_K_M + Lightning V2.0 整模型（verify run `1127_1608_video_qwengguf`）：打补丁 64.7 s → 0.15 s（720 层全融合、0 备份），exact 下最终 latent 与原生逐位一致；出图 37.1 → 31.5 s、峰值 alloc 24.32 → 21.48 GiB，LoRA 生效，on = on2 逐位 |
 | 量化 safetensors（fp8 e4m3 / e5m2、int8、nvfp4、mxfp8 等） | 支持，合并在反量化出的临时权重上、不量化回去 | 跟所用 VAE 一致 | 0.31.0：WAI fp8 UNet（§10 的 9.5）；0.46.3：`test_quant` GPU 8 项逐位；Qwen Image 2.1 的 int8_convrot（ComfyUI 按 int8_tensorwise 加载）上 LoRA 热合并生效，exact 是否与原生逐位一致**未验证**（`bench_lora` 驱动不了 2.1 的专用节点） |
-| TAE 系列（TAESD 等）、Stable Cascade Stage A / C、Mage | 支持 | 第二层（不做第一层） | 没测 |
-| MiniMax-H3-Image、SeedVR2 | 支持 | 原生透传（`comfy_has_chunked_io`，Monoload 不管） | SeedVR2 原生峰值测过（PLAN-video G 组）；MiniMax-H3-Image 没测 |
+| TAE 系列（TAESD 等）、Stable Cascade Stage A / C、Mage | 支持 | 第二层（不做第一层） | 0.46.3：Mage VAE 4K 峰值和原生一样（4.93，decoder 本来就小）、输出与原生逐位一致（DESIGN §9.48）；其余没测 |
+| MiniMax-H3-Image、SeedVR2 | 支持 | 原生透传（`comfy_has_chunked_io`，Monoload 不管） | SeedVR2 原生峰值测过（PLAN-video G 组）；MiniMax-H3-Image VAE 0.46.3 透传、与原生逐位一致（DESIGN §9.48） |
 
 ---
 
