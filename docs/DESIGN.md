@@ -2068,6 +2068,33 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 **测试：** `tests/test_vae_stream.py`（随机权重、真实尺寸、真机 GPU）：流式拼起来对原生 fp32 相对误差 ≤ 1e-5（单纯流式和 1 MiB 工作区的 OpChunking 两种），bf16 误差不超过原生的 2 倍，用户 hook / Cosmos 单帧 / 别的类整段解码，模块上不留东西。真机结果见上。
 
 **接入：** 登记在 `vae_video.py`，适配线程按 951868b 的写法合进 video（855469a，可选导入：没有这两个模块时照旧原生）。`tests/group_d_reg.py` 再登记一次也无害（`setdefault`），`tests/sim_group_d.py`、`tests/bench_group_d.py`（包一层 `bench_vae`，例：`python tests/bench_group_d.py --vae mochi_vae.safetensors --res 848x480 --frames 85 --modes native,monoload`）用它。
+
+### 9.44 多帧探测结果落盘；LTX-2.5 扩散 decoder 不探测；不按原生估计放弃第二层（分支 video-probe-cache）
+
+**为什么要缓存。** 第二层的多帧估计来自 `_probe_mf`：在两个小尺寸上真解码两次，必要时在本次 workspace 下再解码一次量碎片。结果原先只存在进程内存里（`_PROBES`），ComfyUI 每次重启以后，每个模型和 latent 布局第一次解码都要再冷跑一遍：Wan 2.2 5B 9 帧约 40 s，LTX-2.5 768×512×97 约 78 s（CT 700）。verify 每一档都重建容器，所以每档都要付这笔时间。
+
+**做法。** 结果（斜率、截距、碎片、每像素输出元素数）写进 JSON 文件。路径由 `MONOLOAD_PROBE_CACHE` 指定，设成 0 / off 就不落盘；默认是 `<ComfyUI user 目录>/monoload/probe_cache.json`。key 由以下几项组成：
+* 权重指纹：类名，加上每个参数 / buffer 的名字、形状、dtype，以及在它所在的设备上均匀取的 64 个值；
+* 原来内存里的 key：通道数、维数、dtype、帧数、两个探测尺寸；
+* workspace；
+* 显卡名和 torch 版本；
+* Monoload 全部 `*.py` 的哈希。分块代码一改，峰值就可能变，旧结果自动作废。
+
+只保存真卡上量出来的结果（`_CudaPeak`）。模拟器（`tests/vae_inventory.py` 的 `_SimMeter`）和单帧的形状探测都不落盘。文件最多 512 条，满了先丢最旧的；写的时候先写临时文件再 `os.replace`。
+
+**LTX-2.5 扩散 decoder 不探测。** `vae_video.analytic_estimate` 直接取 `vae_ltx.plan()` 的 total（已经是 reserved 口径，见 §9.42），加上输出缓冲，作为第二层估计；`_layer2_estimate` 在查探测之前先走这一条。
+
+**真机（CT 700，2026-11-27，`l2_pcache`）：**
+* Wan 2.1 VAE 832×480×33 走第二层，两个独立进程各跑一次。第一次冷跑 21.0 s，含探测，结果写进缓存文件；第二次冷跑 14.3 s，和热跑的 13.9 s 一样，没有再探测；两次估算都是 5.12 GiB。这一档 reserved +5.22，比估算多 0.1，是 video-l2-frag 修的碎片问题，和缓存无关。
+* LTX-2.5 扩散 decoder 768×512×97 走正常入口：冷跑 29.9 s（以前 109.7 s，两次探测解码省掉了），热跑 29.6 s；估算 6.10 GiB ≥ reserved 5.59，原生估算 8.09。
+
+**否决：「第二层估计 ≥ 原生估计就走原生」。** 这条本来是想在 Monoload 估计比原生还大的时候省掉分块的时间，但原生估计（`memory_used_decode`）在视频 VAE 上会低好几倍，按它判断会选中峰值更高的那条路：
+* LTX-2 768×512×97：原生估计 5.71 GiB，第二层估计 9.29，规则会选原生；可原生实测 reserved +59.29 GiB，超过 55 G 的 cap（ROCm 上 cudnn 关着，im2col 很大，§9.42）。
+* Wan 2.2 5B 1×48×9×22×40（verify 1126_2301，855469a）：原生估计 3.36，第二层估计 4.77，规则会选原生；可整个 workflow 的峰值 off 档 24.49 GiB、on 档（第二层）20.06，采样两档一样，第二层其实降了约 4.4 GiB。
+* Wan 2.2 1280×704×121：原生估计 13.43，原生实测 reserved 39.68。
+
+Monoload 的目标是降峰值，「原生放得进 cap 就走原生」也不做（sdxl 1024² 用每张约 +6 s 换 15.8 → 7.4 GiB，这是设计内的取舍）。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
