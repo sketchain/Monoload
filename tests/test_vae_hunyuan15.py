@@ -67,7 +67,18 @@ def lat_(h, w, t=1, b=1, seed=4):
 
 
 def err(a, b):
-    return float((a.float() - b.float()).abs().max())
+    return float((a.detach().float().cpu() - b.detach().float().cpu()).abs().max())
+
+
+# fp32 test model; on the GPU the summation order inside a conv differs with its row extent, so the stripes match the
+# whole decode to 1e-4 (the self-test's tolerance), on the CPU to 1e-5
+TOL = 1e-4 if torch.cuda.is_available() else 1e-5
+
+
+def _on_model(fsm, lat):
+    """lat on the device (and in the dtype) of the decoder's weights: fsm.decode called directly does not move it."""
+    p = next(fsm.decoder.parameters())
+    return lat.to(p.device, p.dtype)
 
 
 class registered:
@@ -120,7 +131,7 @@ def recognition_tests(v):
 # 2. single frame (the Refiner), managed decode
 # ---------------------------------------------------------------------------
 
-def compare(label, v, latent, rows=None, tol=1e-5):
+def compare(label, v, latent, rows=None, tol=TOL):
     mvae.set_stripe_rows(rows)
     try:
         with Spy() as spy:
@@ -152,7 +163,7 @@ def single_tests(v):
     out = managed_decode(v, lat)
     ref = native_decode(v, lat)
     check("with process_output: shape {} (native {}), max|Δ| {:.2g}".format(tuple(out.shape), tuple(ref.shape), err(out, ref)),
-          out.shape == ref.shape and err(out, ref) <= 1e-5)
+          out.shape == ref.shape and err(out, ref) <= TOL)
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +192,11 @@ def multi_tests(v):
         finally:
             v.process_output = po
         with torch.inference_mode():
-            ref = fsm.decode(lat.to(v.vae_dtype)).float()
+            ref = fsm.decode(_on_model(fsm, lat)).float()
         e = err(out, ref)
         check("T = {} latent {}x{}, rows {}: {} stripes x {} time chunks, {} frames (4T - 3 = {}); max|Δ| {:.2g} vs native".format(
             t, h, w, rows, len(plan.stripes), len(plan.chunks), out.shape[2], 4 * t - 3, e),
-            out.shape == ref.shape and out.shape[2] == 4 * t - 3 and e <= 1e-5)
+            out.shape == ref.shape and out.shape[2] == 4 * t - 3 and e <= TOL)
     lat = lat_(6, 5, t=5, seed=21)
     v.process_output = lambda image: image
     try:
@@ -193,9 +204,9 @@ def multi_tests(v):
     finally:
         v.process_output = po
     with torch.inference_mode():
-        ref = fsm.decode(lat).float()
+        ref = fsm.decode(_on_model(fsm, lat)).float()
     check("T = 5, workspace 16 KiB: {} conv calls in row blocks, max|Δ| {:.2g}".format(stats.conv_chunked, err(out, ref)),
-          stats.conv_chunked > 0 and err(out, ref) <= 1e-5)
+          stats.conv_chunked > 0 and err(out, ref) <= TOL)
     bound, _ = h15.match(v, lat, {})
     p = bound.plan(v, lat, 0, mvae.layer1_workspace(), rows=16)
     check("plan planes per level {} (the largest chunk: 2 latent frames -> 4 -> 8)".format(p.planes),
@@ -247,7 +258,7 @@ def selftest_tests(v):
             ref = native_decode(v, lat1, raw=True)
             note = last.get("layer1") or ""
             check("  ... the decode goes to layer 2, == native (max|Δ| {:.2g})".format(err(out, ref)),
-                  last.get("strategy") == "layer2" and "self-test failed" in note and err(out, ref) <= 1e-5 and spy.tiled == 0)
+                  last.get("strategy") == "layer2" and "self-test failed" in note and err(out, ref) <= TOL and spy.tiled == 0)
     eng._SELFTEST.clear()
 
 
@@ -275,7 +286,7 @@ def main():
     if not mvae.is_installed():
         check("vae.install() on this ComfyUI", mvae.install())
     with registered():
-        v = hv15_vae()
+        v = hv15_vae(dtype=torch.float32)
         recognition_tests(v)
         single_tests(v)
         multi_tests(v)
