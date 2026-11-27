@@ -2002,6 +2002,30 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 
 冷跑多出的约 78 s 是适配线程的两次探测解码（`vae._probe_mf`，每个模型和形状一次）。**定案：合**——峰值约减半，慢约 1.8 倍（光环帧的重复注意力；块已是预算内最大）。`plan()` 的总数改成 reserved 口径（allocated 上界 × 1.05 + 256 MiB；fp32 小尺寸实测 reserved 比 allocated 上界多 6–10 %，这一档 2.55 → 2.93 ≥ 2.70），路由仍用探测。
 
+### 9.44 多帧探测结果落盘；LTX-2.5 扩散 decoder 不探测；不按原生估计放弃第二层（分支 video-probe-cache）
+
+（§9.43 留给 video-carry-store。）
+
+**为什么要缓存。** 第二层的多帧估计来自 `_probe_mf`：在两个小尺寸上真解码两次，必要时在本次 workspace 下再解码一次量碎片。结果原先只存在进程内存里（`_PROBES`），ComfyUI 每次重启以后，每个模型和 latent 布局第一次解码都要再冷跑一遍：Wan 2.2 5B 9 帧约 40 s，LTX-2.5 768×512×97 约 78 s（CT 700）。verify 每一档都重建容器，所以每档都要付这笔时间。
+
+**做法。** 结果（斜率、截距、碎片、每像素输出元素数）写进 JSON 文件。路径由 `MONOLOAD_PROBE_CACHE` 指定，设成 0 / off 就不落盘；默认是 `<ComfyUI user 目录>/monoload/probe_cache.json`。key 由以下几项组成：
+* 权重指纹：类名，加上每个参数 / buffer 的名字、形状、dtype，以及在它所在的设备上均匀取的 64 个值；
+* 原来内存里的 key：通道数、维数、dtype、帧数、两个探测尺寸；
+* workspace；
+* 显卡名和 torch 版本；
+* Monoload 全部 `*.py` 的哈希。分块代码一改，峰值就可能变，旧结果自动作废。
+
+只保存真卡上量出来的结果（`_CudaPeak`）。模拟器（`tests/vae_inventory.py` 的 `_SimMeter`）和单帧的形状探测都不落盘。文件最多 512 条，满了先丢最旧的；写的时候先写临时文件再 `os.replace`。
+
+**LTX-2.5 扩散 decoder 不探测。** `vae_video.analytic_estimate` 直接取 `vae_ltx.plan()` 的 total（已经是 reserved 口径，见 §9.42），加上输出缓冲，作为第二层估计；`_layer2_estimate` 在查探测之前先走这一条。
+
+**否决：「第二层估计 ≥ 原生估计就走原生」。** 这条本来是想在 Monoload 估计比原生还大的时候省掉分块的时间，但原生估计（`memory_used_decode`）在视频 VAE 上会低好几倍，按它判断会选中峰值更高的那条路：
+* LTX-2 768×512×97：原生估计 5.71 GiB，第二层估计 9.29，规则会选原生；可原生实测 reserved +59.29 GiB，超过 55 G 的 cap（ROCm 上 cudnn 关着，im2col 很大，§9.42）。
+* Wan 2.2 5B 1×48×9×22×40（verify 1126_2301，855469a）：原生估计 3.36，第二层估计 4.77，规则会选原生；可整个 workflow 的峰值 off 档 24.49 GiB、on 档（第二层）20.06，采样两档一样，第二层其实降了约 4.4 GiB。
+* Wan 2.2 1280×704×121：原生估计 13.43，原生实测 reserved 39.68。
+
+Monoload 的目标是降峰值，「原生放得进 cap 就走原生」也不做（sdxl 1024² 用每张约 +6 s 换 15.8 → 7.4 GiB，这是设计内的取舍）。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
