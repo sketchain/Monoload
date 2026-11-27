@@ -464,6 +464,9 @@ class Wan21Video(WanVideoStripe):
     name = "Wan 2.1 video stripes"
     version = "2.1"
     clone_cache = False
+    # layer 2 when its estimate fits the device, layer 1 only past that (vae.py's prefer_layer2 routing, DESIGN §9.45):
+    # Wan 2.1's layer 2 is faster and stays under 55 GiB up to about 1440p
+    prefer_layer2 = True
 
     def chunks(self, t):
         return [(0, 1)] + [(c, min(2, t - c)) for c in range(1, t, 2)]
@@ -586,9 +589,10 @@ class Wan22Video(WanVideoStripe):
 # matching
 # ---------------------------------------------------------------------------
 
-# Wan 2.1's multi-frame plan is under its reserved growth on the GPU (DESIGN §9.40: +0.65 to +1.0 GiB at 720p),
-# so until the cost model covers it a Wan 2.1 video goes to layer 2 (the tests switch it on to measure it).
-WAN21_ENABLED = False
+# Wan 2.1's multi-frame plan was under its reserved growth on the GPU (DESIGN §9.40: +0.65 to +1.0 GiB at 720p);
+# with the CarryStore it is an upper bound (DESIGN §9.45: 720p x 81 +3.57 vs 4.12 GiB), so layer 1 is on, as the
+# fallback behind layer 2 (Wan21Video.prefer_layer2).
+WAN21_ENABLED = True
 
 
 def match(vae, samples, vae_options):

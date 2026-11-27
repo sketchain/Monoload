@@ -474,8 +474,8 @@ try:   # group C's CogVideoX layer 1 (its match() takes CogVideoX latents of 2+ 
     STRIPE_ADAPTERS.append(vae_cogvideo)
 except ImportError:
     pass
-try:   # group A's multi-frame Wan layer 1 (its match() takes Wan 2.1 / 2.2 latents of 2+ frames; Wan 2.1 off by
-    from . import vae_wan_video   # vae_wan_video.WAN21_ENABLED until its estimate holds, DESIGN §9.40)
+try:   # group A's multi-frame Wan layer 1 (its match() takes Wan 2.1 / 2.2 latents of 2+ frames; a Wan 2.1 video
+    from . import vae_wan_video   # prefers layer 2 and falls back to layer 1, DESIGN §9.45)
     STRIPE_ADAPTERS.append(vae_wan_video)
 except ImportError:
     pass
@@ -625,17 +625,19 @@ def _native_reason(vae, samples):
 class _Probe:
     """act_bytes_per_px: the largest single activation per latent pixel (the shape probe). A multi-frame probe
     (_probe_mf) has mf_slope / mf_intercept instead: the peak allocated by one sample's layer-2 decode, bytes per
-    latent pixel and the constant part, from two measured sizes (act_bytes_per_px is the slope then), and mf_frag: the
-    most the allocator reserved beyond that peak (fragmentation) at either size."""
-    __slots__ = ("act_bytes_per_px", "out_numel_per_px", "seconds", "mf_slope", "mf_intercept", "mf_frag")
+    latent pixel and the constant part, from two measured sizes (act_bytes_per_px is the slope then), mf_frag: the
+    most the allocator reserved beyond that peak (fragmentation) in any probe run, and mf_ratio: the largest reserved /
+    allocated peak of a probe run (fragmentation grows with the decode: DESIGN §9.35)."""
+    __slots__ = ("act_bytes_per_px", "out_numel_per_px", "seconds", "mf_slope", "mf_intercept", "mf_frag", "mf_ratio")
 
-    def __init__(self, act, out, seconds, mf_slope=None, mf_intercept=0, mf_frag=0):
+    def __init__(self, act, out, seconds, mf_slope=None, mf_intercept=0, mf_frag=0, mf_ratio=1.0):
         self.act_bytes_per_px = act
         self.out_numel_per_px = out
         self.seconds = seconds
         self.mf_slope = mf_slope
         self.mf_intercept = mf_intercept
         self.mf_frag = mf_frag
+        self.mf_ratio = mf_ratio
 
 
 class _UnboundedDecode(Exception):
@@ -785,7 +787,7 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
         per_model[key] = hit
         return hit
     t0 = time.perf_counter()
-    peaks, frags = [], []
+    peaks, frags, ratios = [], [], []
     devs = [vae.device.index or 0] if vae.device.type == "cuda" else []
     ws = max(MF_PROBE_WORKSPACE, int(workspace))
     # the two sizes at MF_PROBE_WORKSPACE (the line: allocated bytes, the workspace capped at both sizes, so in the
@@ -803,9 +805,11 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
             with OpChunking(fsm, run_ws, OpStats()):
                 meter.start()
                 _decode_sample(vae, z, vae_options, buf)
+                pk, fr = meter.peak(), meter.frag()
                 if len(peaks) < len(sizes):
-                    peaks.append(meter.peak())
-                frags.append(meter.frag())
+                    peaks.append(pk)
+                frags.append(fr)
+                ratios.append((pk + fr) / pk if pk > 0 else 1.0)
             del z, buf
         mm.soft_empty_cache(True)
     a, b = (h * w for h, w in sizes)
@@ -813,7 +817,8 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
     intercept = max(0.0, peaks[1] - slope * b)
     r = vae.spacial_compression_decode()
     out_numel = getattr(vae, "output_channels", 3) * r * r * (vae_video.output_frames(vae, int(samples.shape[2])) or 1)
-    p = _Probe(slope, out_numel, time.perf_counter() - t0, mf_slope=slope, mf_intercept=intercept, mf_frag=max(frags))
+    p = _Probe(slope, out_numel, time.perf_counter() - t0, mf_slope=slope, mf_intercept=intercept, mf_frag=max(frags),
+               mf_ratio=max(ratios))
     per_model[key] = p
     _probe_cache_put(disk, p)
     return p
@@ -830,7 +835,7 @@ def _probe_mf(vae, samples, vae_options, workspace=MF_PROBE_WORKSPACE):
 # again). Only real CUDA / ROCm measurements (_CudaPeak) are kept; the simulator's never.
 # MONOLOAD_PROBE_CACHE: a file path, or 0 / off to keep nothing on disk; default <ComfyUI user dir>/monoload/probe_cache.json.
 
-PROBE_CACHE_VERSION = 1
+PROBE_CACHE_VERSION = 2   # 2: entries carry mf_ratio (the probes' reserved / allocated ratio, DESIGN §9.35)
 PROBE_CACHE_MAX = 512              # entries; the oldest go first
 _PROBE_CACHE = {"path": None, "loaded": False, "entries": {}}
 _FINGERPRINTS = weakref.WeakKeyDictionary()   # first_stage_model -> hex digest of its weights
@@ -929,7 +934,7 @@ def _probe_cache_get(disk):
         return None
     try:
         return _Probe(float(e["slope"]), float(e["out"]), 0.0, mf_slope=float(e["slope"]),
-                      mf_intercept=float(e["intercept"]), mf_frag=float(e["frag"]))
+                      mf_intercept=float(e["intercept"]), mf_frag=float(e["frag"]), mf_ratio=float(e["ratio"]))
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -940,7 +945,8 @@ def _probe_cache_put(disk, p):
         return
     entries = _PROBE_CACHE["entries"]
     entries.pop(disk, None)
-    entries[disk] = {"slope": p.mf_slope, "intercept": p.mf_intercept, "frag": p.mf_frag, "out": p.out_numel_per_px,
+    entries[disk] = {"slope": p.mf_slope, "intercept": p.mf_intercept, "frag": p.mf_frag, "ratio": p.mf_ratio,
+                     "out": p.out_numel_per_px,
                      "seconds": round(p.seconds, 2), "saved": int(time.time())}
     while len(entries) > PROBE_CACHE_MAX:
         entries.pop(next(iter(entries)))
@@ -981,8 +987,12 @@ def estimate(vae, samples, budget, probe=None, retained=0, copies=ACTIVATION_COP
                                _decoder_terms; Wan 2.2's feat_cache clones, DESIGN §9.23)"""
     px = _latent_px(samples)
     if probe is not None and probe.mf_slope is not None:
-        # multi-frame (DESIGN §9.35): the measured peak of one sample's decode, everything it keeps alive included
-        act = MF_MARGIN * probe.mf_slope * px + probe.mf_intercept + probe.mf_frag
+        # multi-frame (DESIGN §9.35): the measured peak of one sample's decode, everything it keeps alive included,
+        # and the allocator's fragmentation on top: it grows with the decode (CogVideoX 720p x 77: allocated 18.4,
+        # reserved 25.9 GiB; a constant measured at the probe sizes misses it), so the probes' reserved / allocated
+        # ratio scales the allocated bound; at least the largest absolute fragmentation a probe saw
+        alloc = MF_MARGIN * probe.mf_slope * px + probe.mf_intercept
+        act = max(alloc * probe.mf_ratio, alloc + probe.mf_frag)
         out_numel = probe.out_numel_per_px * px
         copies, retained = 1, 0
     elif probe is not None:
@@ -1177,6 +1187,22 @@ def _managed_decode(self, samples_in, vae_options):
             if bud:
                 return _decode_budget(self, samples_in, vae_options, t0, bud)
             bound, why = _select_layer1(self, samples_in, vae_options)
+            if bound is not None and getattr(bound, "prefer_layer2", False):
+                # an adapter whose layer 1 is the fallback (CogVideoX): layer 2 when its bound fits the device, and
+                # only then layer 1 (its first-use self-test runs only when layer 1 is really chosen)
+                est = probe = None
+                try:
+                    est, probe = _layer2_estimate(self, samples_in, vae_options, workspace())
+                except _UnboundedDecode as e:
+                    room, why2 = None, str(e)
+                else:
+                    room = layer2_room(self)
+                if est is not None and est["total"] <= room:
+                    return _decode_layer2(self, samples_in, vae_options, t0,
+                                          msg("vae.l2_preferred", name=bound.name, est=fmt_bytes(est["total"]), room=fmt_bytes(room)),
+                                          est=est, probe=probe)
+                logging.info(msg("vae.l2_preferred_over", name=bound.name, est=fmt_bytes(est["total"]) if est else why2,
+                                 room=fmt_bytes(room) if room else "-"))
             if bound is not None:
                 ok, detail = _layer1_self_test(self, bound)
                 if ok:
@@ -1191,6 +1217,33 @@ def _managed_decode(self, samples_in, vae_options):
         out = _ORIG["decode"](self, samples_in, vae_options)
         _LAST["seconds"] = time.perf_counter() - t0
         return out
+
+
+def _fit_cap_from_env():
+    raw = os.environ.get("MONOLOAD_VAE_FIT_CAP", "").strip()
+    if not raw:
+        return None
+    try:
+        return parse_size(raw)
+    except ValueError:
+        logging.warning(msg("vae.env_fit_cap", raw=raw))
+        return None
+
+
+def layer2_room(vae):
+    """What a layer-2 decode can have on the VAE's device once ComfyUI unloads the other models: the device's memory
+    (capped by MONOLOAD_VAE_FIT_CAP: a unified-memory APU reports more than it can give, CT 700 62.5 of a stable
+    55 GiB) minus the VAE's weights and ComfyUI's reserve (--reserve-vram). For an adapter with prefer_layer2."""
+    dev = vae.device
+    total = mm.get_total_memory(dev)
+    cap = _fit_cap_from_env()
+    if cap:
+        total = min(total, cap)
+    try:
+        weights = vae.patcher.model_size()
+    except Exception:
+        weights = 0
+    return max(0, int(total - weights - mm.extra_reserved_memory()))
 
 
 def _layer1_self_test(vae, bound):

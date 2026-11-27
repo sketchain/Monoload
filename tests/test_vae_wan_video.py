@@ -64,7 +64,9 @@ import comfy.ldm.wan.vae2_2 as wan22  # noqa: E402
 from monoload import vae as mvae  # noqa: E402
 from monoload import vae_engine as eng  # noqa: E402
 from monoload import vae_wan, vae_wan22, vae_wan_video as wv  # noqa: E402
-wv.WAN21_ENABLED = True   # measure Wan 2.1 here although a decode leaves it to layer 2 for now (DESIGN §9.40)
+WAN21_DEFAULT = (wv.WAN21_ENABLED, wv.Wan21Video.prefer_layer2)   # Wan 2.1: layer 1 on, behind layer 2 (DESIGN §9.45)
+wv.WAN21_ENABLED = True
+wv.Wan21Video.prefer_layer2 = False   # the checks here are layer 1's: prefer_layer2 would send these sizes to layer 2
 from monoload.vae_ops import MIB, OpStats, fmt_bytes  # noqa: E402
 
 torch.manual_seed(0)
@@ -132,6 +134,8 @@ def lat22(t, h, w, b=1, seed=3):
 
 
 def recognition_tests(v21, v22):
+    check("Wan 2.1 video: layer 1 on as the fallback behind layer 2 (WAN21_ENABLED, prefer_layer2), Wan 2.2 layer 1 first",
+          WAN21_DEFAULT == (True, True) and not getattr(wv.Wan22Video, "prefer_layer2", False))
     for label, v, lat_fn, cls, img in (("Wan 2.1", v21, lat21, wv.Wan21Video, vae_wan), ("Wan 2.2", v22, lat22, wv.Wan22Video, vae_wan22)):
         b, why = wv.match(v, lat_fn(5, 6, 5), {})
         check("{} T=5 -> '{}' ({} units, kt {})".format(label, b.name if b else why, len(b.units) if b else 0, b.kt if b else "-"),
