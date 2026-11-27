@@ -433,7 +433,7 @@ def _patched(obj, name, value):
 
 def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, order="largest", conv2d=True, arena=None, batch=1, out_first=True,
                  layer1_ws=None, contiguous=True, model="qwen", scheme=None, arena_need=False, units=False, output_in_arena=False,
-                 probe=False):
+                 probe=False, frames=1):
     """alloc / reserved deltas (bytes) of one decode of a w x h image, as bench_vae measures them
     (cache emptied and peaks reset right before the decode, the weights already loaded).
 
@@ -459,6 +459,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
             otherwise vae._shape_probe empties the cache after it (review 2026-10 item 21)
     info["stays"]  reserved after the decode with its output still alive and the cache emptied (check_selftest_mem's
             "stays reserved after empty_cache")
+    frames  output frames of a 5D (video) latent: (frames + 3) // 4 latent frames (HunyuanVideo 1.5's 4x; default 1)
     arena_need  run in an arena 4x the plan's live peak and report (info["arena_need"]) the highest offset any
             block reached in it: the smallest arena with the same placements (best fit keeps choosing the same
             blocks while the arena's tail is the largest free block), i.e. the arena this plan needs
@@ -483,7 +484,8 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     # the bench's latent is on the CPU: not counted, its copy is. float64, so that the decode's .to(device, dtype) is a
     # real copy for every decode dtype (an fp32 latent on meta would be returned as is by .to(meta, fp32): review
     # 2026-10 item 15, the fp32 configurations missed the latent's copy)
-    lat = torch.empty((batch, zc, 1, h // r, w // r) if nd == 5 else (batch, zc, h // r, w // r), device="meta", dtype=torch.float64)
+    lt = (frames + 3) // 4 if frames > 1 else 1
+    lat = torch.empty((batch, zc, lt, h // r, w // r) if nd == 5 else (batch, zc, h // r, w // r), device="meta", dtype=torch.float64)
     tracer = make_tracer(sim)
     tracer.static.update(t.untyped_storage()._cdata for t in itertools.chain(fsm.parameters(), fsm.buffers(), [lat]))
     events = {"empty_cache": 0}
@@ -540,7 +542,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
                         if nr.partial is not None:
                             nr.partial.module = tagged(nr.partial.module, nr.partial.name.replace("decoder.", ""))
                 bound.prefix_pass = tagged(bound.prefix_pass, "prefix")
-            outb = batch * 3 * h * w * 4
+            outb = batch * 3 * h * w * 4 * (4 * lt - 3)   # output frames of a 4x video latent (1 for an image)
             if rows:
                 ws_ = ws or mvae.layer1_workspace()
                 plan = bound.plan(v, lat, 0, ws_, rows=rows, out_bytes=outb)
@@ -592,7 +594,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     return info
 
 
-def selftest_trace(model, dtype="bf16", tail=True, info=None, probe=False):
+def selftest_trace(model, dtype="bf16", tail=True, info=None, probe=False, latent_frames=1):
     """Reserved peak (bytes) of the first-use layer-1 self-test on the full-size decoder (meta device), the steps
     of vae_engine._self_test_run: the fp32 copy, the reference whole-image decode under layer-2 chunking
     (SELFTEST_REF_WORKSPACE), the forced small stripes (SELFTEST_ROWS, SELFTEST_WORKSPACE); the VAE's own weights
@@ -609,8 +611,8 @@ def selftest_trace(model, dtype="bf16", tail=True, info=None, probe=False):
     v = meta_vae(dt, model)
     fsm = v.first_stage_model
     zc, nd, r = (LATENT[model] + (8,))[:3]
-    lat = torch.empty((1, zc, 1, 64, 64) if nd == 5 else (1, zc, 64, 64), device="meta")
-    bound, why = mvae._select_layer1(v, lat, {})
+    lat = torch.empty((1, zc, latent_frames, 64, 64) if nd == 5 else (1, zc, 64, 64), device="meta")   # latent_frames > 1: a video adapter's
+    bound, why = mvae._select_layer1(v, lat, {})                                                        # multi-frame self-test
     assert bound is not None, why
     sim = AllocatorSim()
     sim.tag = "weights"
