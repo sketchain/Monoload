@@ -43,6 +43,7 @@ import torch
 import torch.nn.functional as F
 
 import comfy.ldm.hunyuan_video.vae_refiner as hyr
+import comfy.model_management as mm
 from comfy.ldm.models import autoencoder as ae
 from comfy.ldm.modules.diffusionmodules import model as ldm
 
@@ -535,7 +536,20 @@ class HV15Stripe(eng.StripeAdapter):
             n += _carry_bytes(u.extra["carried"], hh, ww, e)
             hh, ww = hh * u.scale, ww * u.scale
         frames = 4 * self._frames - 3
-        return n + self.out_channels * hh * ww * frames * e
+        return n + self.out_channels * hh * ww * frames * e + self.reference_cached(h, w, e)
+
+    def reference_cached(self, h, w, e):
+        """What the reference decode keeps reserved, empty, below its peak (real machine, DESIGN §9.41): its tensors
+        grow level by level (4x the pixels, half the channels), so the blocks freed at a level are too small for the next
+        one and their segments stay in the allocator's cache. Per resolution below the output's: activation_copies x
+        its largest activation, padded as the carried convs pad it (1 row / col each side, 2 frames before)."""
+        per, hh, ww = {}, h, w
+        for i, u in enumerate(self.units):
+            hh, ww = hh * u.scale, ww * u.scale
+            p = self._planes[i + 1]
+            per[hh] = max(per.get(hh, 0), u.cout * (hh + 2) * (ww + 2) * (p + 2) * e)
+        per.pop(hh, None)   # the output's resolution: the peak itself, in the reference's terms
+        return self.activation_copies * sum(per.values())
 
     def output_shape(self, samples):
         t = int(samples.shape[2])
@@ -571,7 +585,10 @@ class HV15Stripe(eng.StripeAdapter):
         return HV15Stripe(shim, self.single, module=holder)
 
     def reference_decode(self, z):
-        return self.module.decoder(z)
+        out = self.module.decoder(z)
+        # its cached segments (reference_cached) released before the stripe pass, so the two do not add up
+        mm.soft_empty_cache(True)
+        return out
 
 
 def decoder_terms(vae, samples):

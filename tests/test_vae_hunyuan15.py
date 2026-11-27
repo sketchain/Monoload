@@ -17,9 +17,9 @@ registration in vae.py is the adapter thread's).
   4. the self-test passes (single and multi-frame cached apart); injected bugs (halos too small, the carries
      dropped between chunks) -> self-test fails, layer 2, == native;
   5. caching allocator (tests/alloc_sim.py, full size on the meta device): layer-1 reserved <= estimate for the
-     Refiner (1344x768, 2048x2048, 3072x3072, bf16 / fp16 / fp32), and the estimate far below layer 2's; the
-     HunyuanVideo 1.5 video plans (832x480x81, 1280x720x121) and the multi-frame self-test bound are printed, not
-     checked: they are under the simulated reserved (DESIGN §9.41; a video takes layer 1 only past layer 2's room).
+     Refiner (1344x768, 2048x2048, 3072x3072, bf16 / fp16 / fp32), and the estimate far below layer 2's, and for the
+     HunyuanVideo 1.5 video plans (832x480x81, 1280x720x121: the carries in one buffer, vae_engine.CarryStore); the
+     self-test (single and multi-frame) <= selftest_memory (the reference decode's cached segments, DESIGN §9.41).
 
     python tests/test_vae_hunyuan15.py
 """
@@ -278,18 +278,12 @@ def allocator_tests():
         msg = "{} {}x{}x{} layer 1: {}, {} x {} rows, simulated reserved {:.2f} GiB <= estimate {:.2f} GiB{}".format(
             "Refiner" if frames == 1 else "HunyuanVideo 1.5", w, h, frames, dt, i["stripes"], i["rows"], i["reserved"] / G, i["estimate"] / G,
             "" if l2 is None else " (layer 2 reserves {:.2f})".format(l2["reserved"] / G))
-        if frames == 1:
-            check(msg, i["reserved"] <= i["estimate"] and (l2 is None or i["estimate"] < l2["reserved"]))
-        else:
-            print("[INFO] {} ({})".format(msg, "holds" if i["reserved"] <= i["estimate"] else "does not hold: the arena fragmentation of the carries"))
+        check(msg, i["reserved"] <= i["estimate"] and (l2 is None or i["estimate"] < l2["reserved"]))
     for dt, t in (("bf16", 1), ("fp32", 1), ("bf16", 5)):
         pk, left, bound = alloc_sim.selftest_trace("hv15", dt, latent_frames=t)
         msg = "self-test ({}, {}): simulated reserved peak {:.0f} MiB <= selftest_memory {:.0f} MiB, nothing left".format(
             dt, "single frame" if t == 1 else "multi-frame", pk / 2 ** 20, bound / 2 ** 20)
-        if t == 1:
-            check(msg, pk <= bound and left == 0)
-        else:
-            print("[INFO] {} ({})".format(msg, "holds" if pk <= bound and left == 0 else "does not hold"))
+        check(msg, pk <= bound and left == 0)
 
 
 def main():
