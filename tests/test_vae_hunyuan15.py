@@ -17,8 +17,10 @@ registration in vae.py is the adapter thread's).
   4. the self-test passes (single and multi-frame cached apart); injected bugs (halos too small, the carries
      dropped between chunks) -> self-test fails, layer 2, == native;
   5. caching allocator (tests/alloc_sim.py, full size on the meta device): layer-1 reserved <= estimate for the
-     Refiner (1344x768, 2048x2048, 3072x3072, bf16 / fp16 / fp32) and HunyuanVideo 1.5 (832x480x81, 1280x720x121), and
-     the estimate far below layer 2's.
+     Refiner (1344x768, 2048x2048, 3072x3072, bf16 / fp16 / fp32), and the estimate far below layer 2's; the
+     HunyuanVideo 1.5 video plans (832x480x81, 1280x720x121) and the multi-frame self-test bound are printed, not
+     checked: they are under the simulated reserved, which is why a video stays on layer 2 (MULTIFRAME_ENABLED off,
+     DESIGN §9.41; switched on here for the other tests).
 
     python tests/test_vae_hunyuan15.py
 """
@@ -274,14 +276,21 @@ def allocator_tests():
                              (832, 480, 81, "fp16"), (1280, 720, 121, "bf16")):
         i = alloc_sim.decode_trace(w, h, dt, None, model="hv15", frames=frames)
         l2 = alloc_sim.decode_trace(w, h, dt, None, layer=2, model="hv15", frames=frames) if frames == 1 else None
-        check("{} {}x{}x{} layer 1: {}, {} x {} rows, simulated reserved {:.2f} GiB <= estimate {:.2f} GiB{}".format(
+        msg = "{} {}x{}x{} layer 1: {}, {} x {} rows, simulated reserved {:.2f} GiB <= estimate {:.2f} GiB{}".format(
             "Refiner" if frames == 1 else "HunyuanVideo 1.5", w, h, frames, dt, i["stripes"], i["rows"], i["reserved"] / G, i["estimate"] / G,
-            "" if l2 is None else " (layer 2 reserves {:.2f})".format(l2["reserved"] / G)),
-            i["reserved"] <= i["estimate"] and (l2 is None or i["estimate"] < l2["reserved"]))
+            "" if l2 is None else " (layer 2 reserves {:.2f})".format(l2["reserved"] / G))
+        if frames == 1:
+            check(msg, i["reserved"] <= i["estimate"] and (l2 is None or i["estimate"] < l2["reserved"]))
+        else:
+            print("[INFO] {} ({}; multi-frame layer 1 is off)".format(msg, "holds" if i["reserved"] <= i["estimate"] else "does not hold"))
     for dt, t in (("bf16", 1), ("fp32", 1), ("bf16", 5)):
         pk, left, bound = alloc_sim.selftest_trace("hv15", dt, latent_frames=t)
-        check("self-test ({}, {}): simulated reserved peak {:.0f} MiB <= selftest_memory {:.0f} MiB, nothing left".format(
-            dt, "single frame" if t == 1 else "multi-frame", pk / 2 ** 20, bound / 2 ** 20), pk <= bound and left == 0)
+        msg = "self-test ({}, {}): simulated reserved peak {:.0f} MiB <= selftest_memory {:.0f} MiB, nothing left".format(
+            dt, "single frame" if t == 1 else "multi-frame", pk / 2 ** 20, bound / 2 ** 20)
+        if t == 1:
+            check(msg, pk <= bound and left == 0)
+        else:
+            print("[INFO] {} ({}; multi-frame layer 1 is off)".format(msg, "holds" if pk <= bound and left == 0 else "does not hold"))
 
 
 def main():
@@ -289,6 +298,10 @@ def main():
         check("vae.install() on this ComfyUI", mvae.install())
     with registered():
         v = hv15_vae(dtype=torch.float32)
+        b, why = h15.match(v, lat_(4, 4, t=5), {})
+        check("multi-frame off by default (MULTIFRAME_ENABLED False): not matched ({})".format(why),
+              not h15.MULTIFRAME_ENABLED and b is None and "layer 1 off" in why and h15.match(v, lat_(4, 4), {})[0] is not None)
+        h15.MULTIFRAME_ENABLED = True   # the remaining tests measure the multi-frame path too
         recognition_tests(v)
         single_tests(v)
         multi_tests(v)
