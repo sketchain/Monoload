@@ -1,14 +1,14 @@
 # GGUF / 量化格式上的运行时 LoRA（设计与进度）
 
-> 这份是「GGUF / 量化 LoRA 支持」线程的工作文档，随做随写，换新会话从这里接上。合并到 `video` 时再把结论并进 HANDOFF / DESIGN。最后更新：2026-11-26。
+> 这份是「GGUF / 量化 LoRA 支持」线程的工作文档，随做随写，换新会话从这里接上。合并到 `video` 时再把结论并进 HANDOFF / DESIGN。最后更新：2026-11-27。
 
 ## 0. 状态一览
 
 | 项 | 分支 | 状态 |
 |---|---|---|
 | 调研 + 设计（本文件） | 随各分支进 `video` | 完成 |
-| 1 GGUF（ComfyUI-GGUF 的 Unet / CLIP 加载器） | `lora-gguf` → `video` | 已合并；`tests/test_gguf_lora.py` 38 项全过（含 hook LoRA、Info 一行、非叶子 F32 modulation）；待真机（含 K-quant） |
-| 2 safetensors 各量化格式 | `lora-quant-formats` → `video` | 已合并；`tests/test_quant_formats.py` 66 项全过（hotpatch 不用改）；待真机 |
+| 1 GGUF（ComfyUI-GGUF 的 Unet / CLIP 加载器） | `lora-gguf` → `video` | 已合并；`tests/test_gguf_lora.py` 38 项全过（含 hook LoRA、Info 一行、非叶子 F32 modulation）；真机 Q8_0 逐层过（§8），K-quant 在跑 |
+| 2 safetensors 各量化格式 | `lora-quant-formats` → `video` | 已合并；`tests/test_quant_formats.py` 66 项全过（hotpatch 不用改）；真机 test_quant（fp8）默认 / exact 全过，Wan 2.2 14B fp8 整模型 0 备份、每步 1.01x（§8） |
 | 3 视频模型（Wan / HunyuanVideo / LTX，含 GGUF） | `lora-video-models` → `video` | 已合并；小参数运行时换参数（§5），`tests/test_lora_param_swap.py` 44 项全过；发现原生 0.46.3 静默丢弃这类 key；视频 LoRA 下完后真机复核 |
 | 4 合成小模型测试 + 真机命令 | 各分支各自带 | CPU 测试完成；真机命令见 §6.1（`bench_lora.py` 加了 GGUF / 视频 latent / GTT 峰值） |
 
@@ -206,3 +206,8 @@ docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/be
 * 2026-11-26：视频小参数（§5）：发现原生 v0.46.3 的 `_load_list` 跳过非叶子模块，Wan modulation / LTX scale_shift_table 上的 LoRA 被原生静默丢弃（CPU 实测，见 §5）。实现 `MonoloadParamSwap`（所属模块 forward 前后换参数，原生算法逐位一致，无备份），`_load` 后对原生不调用的 key 统一装上；根模型自己的参数（无点号 key）也支持；`gguf.dequantize` 给量化 GGML 参数用。`tests/test_lora_param_swap.py` 44 项全过（fp32 / bf16 × 全量 / lowvram × exact / fused + hook LoRA）；`test_gguf_lora` 加非叶子 F32 modulation，35 项全过；`test_lora_hot` 里「纯 torch 层报错」改成「装上换参数、卸载后拆掉」（真机测试，云端没跑）。回归 test_dtype_paths 198、test_quant_formats 66、test_lora_lowvram_hook 14、test_master_switch 19、test_messages 15 全过。
 * 2026-11-26：协调者回复：video 由适配线程推送（快进到 10b0392）；视频小参数不加开关；H7 取消。补 §3.8（GGUF VAE 不存在）、§6.2（K-quant 真机计划）和 `tests/check_gguf_kquant.py`（逐层对原生，云端用 Q8_0 / Q4_0 / Q5_1 小文件跑通 10 项）。
 * 2026-11-26：规则改为不跑云端 CPU 测试、直接上真机（DC）。真机流程按 `/srv/comfy/GPU-LOCK.md`（§6.1 开头）：worktree `/srv/monoload-wt/gguf-quant`，包装脚本 `/srv/monoload-wt/gguf-run/gq.sh`，日志在 `/srv/monoload-wt/gguf-run/logs/`。注意 `tests/test_*.py` 用 `common.py` 的默认参数 `--cpu`，在容器里跑也是 CPU，所以真机只跑 `bench_lora.py` / `check_gguf_kquant.py` 这类读 PID 1 参数（GPU）的脚本。容器里跑过一遍单元测试（CPU）：test_quant_formats 66、test_gguf_lora 38、test_lora_param_swap 44、test_dtype_paths 198、test_master_switch 19、test_lora_lowvram_hook 14、test_lora_clone_binding 13 全过；test_lora_hot 要 `--checkpoint/--unet/--clip` 参数，没跑。下载线程的视频 GGUF / LoRA 大多还在排队，先用 `tests/make_model_lora.py` 给现有模型生成随机 LoRA（`/models/comfy/loras/_monoload_synth/`）。GPU 排队按协调者要求精简为三项：Hunyuan I2V Q8_0 逐层、Wan 2.2 T2V 14B fp8_scaled 视频整模型（随机 LoRA + 带 modulation 的随机 LoRA，一次加载）、noctQ（Krea 2）int8 整模型；Flux 2 fp8mixed 和 SDXL 旧 scaled_fp8 走的是同一条 fp8 `QuantizedTensor` 路径，撤掉。17:40 起 DC 断线，排队任务在 LXC 上 nohup 跑，结果待取。
+* 2026-11-26 ~ 27：真机结果（ComfyUI v0.46.3，`comfyui-latest`，gfx1151，全部走 gpulock）。
+  * **Q8_0 逐层**（`check_gguf_kquant.py --gguf hunyuan-video-i2v-720p-Q8_0.gguf`）：exact 对原生 ComfyUI-GGUF max|Δ| = 0，fused max|Δ| 0.0625（界 0.369 / 0.203），backups 0，常驻多出 0。img_mod [18432, 3072]：不带 LoRA 3.65 ms / 216 MiB，原生 9.73 ms / 648 MiB，exact 9.76 ms / 648 MiB，fused 4.85 ms / 216 MiB；img_attn_qkv [9216, 3072]：1.94 / 108、5.05 / 324、5.06 / 324、2.49 / 108。fused 的峰值和不带 LoRA 一样（`addmm_` 原地合并，不多一份 fp32 中间量）。
+  * **test_quant 在 GPU 上「fp8 + LoRA == 先反量化 + LoRA」不逐位一致（验证线程发现）**：不是实现 bug。参照模型是在 CPU 上反量化的（comfy_kitchen eager：fp8 → 原 dtype，再乘舍入到原 dtype 的 scale），运行时在 GPU 上反量化（HIP kernel：fp32 乘积，一次舍入），两者末位不同；诊断脚本实测 SD1.5 fp8 的 184 个量化权重里 171 个 CPU ≠ GPU，最大差 0.00098。修法（611a7a6，已合进 video a82191c）：`test_quant.py` / `test_quant_formats.py` 的参照改在计算设备上反量化，仍要求逐位一致，不放宽容差；`bench_lora.py` 逐层探测里量化参数先按 `cast_bias_weight` 的方式反量化（原来对 `QuantizedTensor` 调 `.double()` 报 `KeyError: torch.float64`）。GPU 复测（`COMFY_ARGS="--gpu-only --bf16-vae"`）默认 / exact 各 8 项全过，duck / locon 两种 LoRA 都 max|Δ| = 0。
+  * **Wan 2.2 T2V 14B fp8_scaled 整模型**（`--latent 16,9,60,104 --steps 4`，合成 r16 LoRA 102 key + 带小参数的 143 key）：Monoload 默认 / exact 都 0 备份，GTT 峰值 26.30 / 26.32 GiB（原生 26.29）；每步原生 21.41 s、默认 21.67 s（1.01x）、exact 21.93 s（1.02x）；打补丁原生 51.8 s（合并后量化回 fp8 + 备份）、Monoload 0.05 s。latent 对原生 max|Δ| 0.62 / mean 0.031（LoRA 效果 max 3.24 / mean 0.389）：原生把合并结果量化回 fp8，Monoload 按硬性要求不量化回去，所以 fp8 模型上 exact 也不会和原生逐位一致（§1）；带小参数的 LoRA 差 max 1.53 / mean 0.151，多出来的是原生丢掉的 modulation key（§5）。逐层探测：默认路径对逐位路径 ‖Δw‖ / ‖ΔW_lora‖ = 0.000565（容差 0.0109）；每次模型调用合并耗时默认 0.077 s、exact 0.381 s。
+  * **noctQ（Krea 2）int8 整模型撤掉**：配的文本编码器不对（QwenImage21 配 qwen3vl_4b，rms_norm 形状 30720 vs 4096，原生模式也挂）；int8 合并已由 `test_quant_formats.py` 的 int8_tensorwise 覆盖。
