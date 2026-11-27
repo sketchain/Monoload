@@ -1865,7 +1865,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 * **探测比解码本身大。** 两个探测尺寸固定 16 × 16 和 32 × 32 latent；768×512 的 latent 只有 16 × 24，32 × 32 的那次探测解得比真解码还多。LTX-2 冷跑 reserved 8.33 高过估算 7.86（热跑 7.84 在估算内：多出的是探测自己）；LTX-2.5 扩散 decoder 冷跑 reserved 28.14，是原生的 3 倍。改成每个探测尺寸按解码自己的 latent 截断（`_mf_probe_shapes`：大的取 min(行, 32) × min(列, 32)，小的取 min(·, 16)，截断后两者一样大就取大的一半），截断后的形状进探测缓存的 key，之后更大的解码会重新探测；不截断（latent 两边都 ≥ 32）时 key 和行为与原来一样，Wan 2.2 704 那行不受影响。
 * **扩散 decoder 在 F 组的模块合进来之前没有可切的算子。** 第二层对它切了 0 个卷积（它的注意力是 NA3D，卷积也不在可切范围），只多了探测的三次解码，估算 19.10 比原生的 8.09 还高（会多挤掉别的模型），没有任何好处。改成只有 `vae_ltx`（F 组，可选导入，挂在 `vae_ops.EXTRA_CHUNKERS` 上）在时才把 `CausalDiffusionVAE` 放进 `vae_video.WHOLE`；没有时多帧照旧原生。F 组合入时 `vae.py` 的 import 行不用再加 `vae_ltx`（加了也无害）。
 
-改后的回归：CT 700 容器里 `--cpu` 跑 `test_vae` 136 项、`test_vae_selftiled` 19 项、`test_vae_stripe` 79 项全过。LTX-2 卷积 VAE 768×512×97（截断后探测 16 × 16 / 16 × 24）和 1280×704×97（16 × 16 / 22 × 32）的真机复测在排队，测完补在这里。
+改后的回归：CT 700 容器里 `--cpu` 跑 `test_vae` 136 项、`test_vae_selftiled` 19 项、`test_vae_stripe` 79 项全过。LTX-2 卷积 VAE 截断后的真机复测（第二层，`MONOLOAD_VAE_FIT_CAP=55G`）：768×512×97（探测 16 × 16 / 16 × 24）估算 9.29 ≥ reserved +4.97 GiB（GTT +6.93），冷跑 24.7 s；1280×704×97（16 × 16 / 22 × 32）估算 12.67 ≥ reserved +8.32（冷 42.7 s）/ +8.24（热 11.4 s），GTT +8.43，原生估算 13.09。两档估算都是上界，冷跑不再超。截断后 LTX-2 的精度降到 PSNR 54.9（px max 0.045），怀疑是 H4 分组 PixelNorm 的 bf16 舍入，fp32 对照在排队。
 
 ### 9.36 引擎的时间轴（钩子 H2 + H5，分支 video-engine-time）
 
