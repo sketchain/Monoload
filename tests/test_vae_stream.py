@@ -1,5 +1,5 @@
 """Group D: the streamed multi-frame decodes of Mochi (monoload/vae_mochi.py) and Cosmos 1.0 (monoload/vae_cosmos.py)
-against the whole-video native decode (DESIGN §9.40).
+against the whole-video native decode (DESIGN §9.43).
 
 Random weights at the real sizes (sd.py's configs), no model files. On a CUDA / HIP device when there is one (the
 real machine), else the CPU.

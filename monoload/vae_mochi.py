@@ -1,5 +1,5 @@
 """Mochi VAE (comfy.ldm.genmo.vae.model.VideoVAE, ComfyUI v0.46.3): the multi-frame decode streamed one frame at a
-time through the decoder, causal-conv caches carried between pieces (group D, docs/PLAN-video.md; DESIGN §9.40).
+time through the decoder, causal-conv caches carried between pieces (group D, docs/PLAN-video.md; DESIGN §9.43).
 
 What native decode does (VideoVAE.decode -> Decoder.forward): the whole video at once through
 

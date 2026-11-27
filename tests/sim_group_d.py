@@ -1,6 +1,6 @@
 """Group D (Mochi, Cosmos 1.0): simulated peaks of the streamed multi-frame layer 2 (monoload/vae_mochi.py,
 monoload/vae_cosmos.py) against native and the whole-video layer 2, with the H1 estimate measured on the simulator
-(tests/vae_inventory.py's tracer, CT 700 backends, bf16, 60 GiB cap; DESIGN §9.40).
+(tests/vae_inventory.py's tracer, CT 700 backends, bf16, 60 GiB cap; DESIGN §9.43).
 
 Until the registration is in monoload/vae_video.py (an optional import, the adaptation thread's file), this script
 registers the two chunk generators itself (--whole: leaves them out, the whole-video layer 2 as in §9.39).

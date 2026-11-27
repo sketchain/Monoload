@@ -1,5 +1,5 @@
 """Group D: registers the streamed multi-frame decodes of Mochi and Cosmos 1.0 in monoload/vae_video.py at run time
-(what the optional import there will do once merged; DESIGN §9.40). Import after ComfyUI is set up (common)."""
+(what the optional import there will do once merged; DESIGN §9.43). Import after ComfyUI is set up (common)."""
 
 import comfy.ldm.cosmos.vae as cvae
 import comfy.ldm.genmo.vae.model as genmo

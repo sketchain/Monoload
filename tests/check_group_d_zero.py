@@ -1,5 +1,5 @@
 """Group D on the real machine: MONOLOAD=0 (master switch off) decodes Mochi and Cosmos 1.0 bit for bit like native
-(the unwrapped VAE.decode), and with the switch on the same decode goes through the streamed layer 2 (DESIGN §9.40).
+(the unwrapped VAE.decode), and with the switch on the same decode goes through the streamed layer 2 (DESIGN §9.43).
 
 Real files (models/vae/mochi_vae.safetensors, cosmos_cv8x8x8_1.0.safetensors), bf16, small random latents so native
 fits: Mochi 424x240x31, Cosmos 640x352x33. A missing file is skipped.

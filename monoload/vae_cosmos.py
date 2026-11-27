@@ -1,6 +1,6 @@
 """Cosmos 1.0 VAE (comfy.ldm.cosmos.vae.CausalContinuousVideoTokenizer, the CV8x8x8 tokenizer, ComfyUI v0.46.3): the
 multi-frame decode with everything after the first time upsampling streamed one frame at a time, causal-conv caches
-carried between pieces (group D, docs/PLAN-video.md; DESIGN §9.40).
+carried between pieces (group D, docs/PLAN-video.md; DESIGN §9.43).
 
 What native decode does (CausalContinuousVideoTokenizer.decode): un-normalise the latent (per latent frame index),
 post_quant_conv (1x1x1), then DecoderFactorized on the whole video. With sd.py's config (channels 128, mult [2, 4, 4],
