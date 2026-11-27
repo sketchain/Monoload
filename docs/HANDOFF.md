@@ -294,6 +294,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | **video 分支**：权重指纹只取最大 16 个张量、整数下标，探测缓存格式 4（HunyuanVideo 1.5 不再崩、跨进程命中） | Merge video-fp-fix（`git log --first-parent video`） |
 | **video 分支**：第一层自检的通过结果写进探测缓存文件，格式 5 | Merge video-selftest-cache（`git log --first-parent video`） |
 | **video 分支**：多帧探测的碎片比例不再取大工作区那次，缓存格式 6 | Merge video-cog-ratio（`git log --first-parent video`） |
+| **video 分支**：README 图片模型汇总表；HANDOFF 记 0.46.3 上 video 回归 5 个 workflow 全过 | Merge video-image-table（`git log --first-parent video`） |
 | **video 分支**：GGUF 真机结果（Q8_0 / K-quant 逐层、Wan 2.2 整模型）、bench_lora 探测反量化 GGUF | Merge GGUF thread (baacfe0)（`git log --first-parent video`） |
 | **video 分支**：GGUF 其余 9 种量化类型逐层真机结果（共 12 种） | Merge GGUF thread (2109f38)（`git log --first-parent video`） |
 | **video 分支**：B 组 HV1.5 720p×81 真机行、自检上界复测（文档） | Merge B group (ee07355)（`git log --first-parent video`） |
