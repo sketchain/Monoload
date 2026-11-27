@@ -596,6 +596,9 @@ class CogStripe:
     """The layer-1 bound of one CogVideoX VAE (the interface vae.py uses of a vae_engine.StripeAdapter)."""
 
     name = "cogvideox"
+    # layer 2 when its estimate fits, layer 1 only when it does not (read by vae.py's default policy): layer 2 runs
+    # every conv once and is ~45% faster (real machine 720p x 81: 163 s / 26.8 GiB reserved vs 236 s / 12.1 GiB)
+    prefer_layer2 = True
     schemes = ()
     gn_scheme = None
     units = ()
