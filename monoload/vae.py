@@ -477,6 +477,11 @@ try:   # group A's multi-frame Wan layer 1 (its match() takes Wan 2.1 / 2.2 late
     STRIPE_ADAPTERS.append(vae_wan_video)
 except ImportError:
     pass
+try:   # group B's HunyuanVideo 1.5 / HunyuanImage 2.1 Refiner layer 1 (its match() takes 5D latents of that decoder; a
+    from . import vae_hunyuan15   # video prefers layer 2 and falls back to layer 1, DESIGN §9.41)
+    STRIPE_ADAPTERS.append(vae_hunyuan15)
+except ImportError:
+    pass
 
 _L1_NOTED = weakref.WeakKeyDictionary()   # first_stage_model -> last logged layer-1 reason
 
