@@ -454,6 +454,10 @@ def configure(mode):
 
 def mono_line(m):
     """One line on what Monoload did in a run."""
+    if not m or m.get("estimate") is None:
+        # MONOLOAD=0 (or a decode Monoload left to ComfyUI): no record of this run
+        return "no Monoload decode recorded{}".format(
+            " ({})".format(m.get("reason") or m.get("strategy")) if m and (m.get("reason") or m.get("strategy")) else " (MONOLOAD=0?)")
     if m.get("strategy") == "layer1":
         e = m["estimate"]
         st = m.get("stats", {})
@@ -493,6 +497,8 @@ def run_mode(vae, latent, mode, a, label):
     total = 1 + a.warm
     for i in range(total):
         capture = (i == total - 1) or a.warm == 0
+        if mode.startswith("monoload"):
+            mvae._LAST.clear()   # with MONOLOAD=0 the wrapper records nothing: do not show the previous run's record
         row, r, p = decode_once(vae, latent, capture, a.sample_ms / 1000.0)
         row["run"] = "cold" if i == 0 else "warm{}".format(i)
         if mode.startswith("monoload"):

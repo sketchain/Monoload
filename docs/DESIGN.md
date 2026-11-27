@@ -523,7 +523,7 @@ loop:
 | `MONOLOAD_DISABLE_VAE=1` | VAE 解码的全局默认改成原生（包装照装，§10），LoRA 部分照常；节点 `mode auto` 的 VAE 仍管理 |
 | `MONOLOAD_DISABLE_VAE_STRIPE=1` | 只关第一层（§9.13），所有受管理的解码走第二层 |
 | `MONOLOAD_VAE_BUDGET` | 第一层的峰值预算；不设时用默认策略（128 行条带的峰值内最高的条带，§9.13.4） |
-| `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（扫参、调试） |
+| `MONOLOAD_VAE_STRIPE_ROWS` | 强制第一层的条带核心高度（扫参、调试）；设了就算用户强制第一层，带 `prefer_layer2` 的适配器也不先试第二层 |
 | `MONOLOAD_EXACT=1` | VAE 的全局默认是原生：分块改变 GEMM 形状，不保证逐位一致（节点 `mode auto` 的 VAE 仍管理） |
 | `MONOLOAD=0` | VAE 的全局默认是原生（总开关，§10） |
 | `MONOLOAD_DISABLE=1` | 什么都不装 |
@@ -1825,7 +1825,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 * **估算换成实测**：§9.32 说过，8×8 的形状探测只看「最大的单个张量」，看不到每卷积缓存、carry、输出块列表和 `torch.cat`，多帧时不是上界；按类型一项项补（像 §9.27）每种 decoder 都要单独建模，而且 Wan 2.1 刚改过结构。所以多帧改成**实测峰值**（`vae._probe_mf`）：用同样的帧数、零 latent，在 `MF_PROBE_SIZES`（16、32）两个 latent 尺寸上各跑一次**和真解码同一条路**（`_decode_sample`，`OpChunking` 工作区 `MF_PROBE_WORKSPACE` = 64 MiB），记 allocated 峰值（开始前先清空分配器缓存；输出缓冲在开始前分配、不算在内）；两点连线得每 latent 像素的斜率和截距。再用**解码自己的工作区**把 32 那个尺寸跑一次，只取碎片：reserved 峰值比 allocated 峰值多出的部分（几次里取最大，记作 frag）。探测的卷积列在两个尺寸上都顶到 64 MiB，落在截距里、不进斜率（多算 ≤ 2 × 64 MiB，偏保守）。最早用 1 MiB（想让工作区完全不进测量），真机上 Wan 2.1 81 帧第一次解码多花约 85 s（行块太碎），改成 64 MiB。
 * 估算 = `MF_MARGIN`（1.25）× 斜率 × 像素 + 截距 + frag + 2 × 工作区 + 输出缓冲（整批，`--gpu-only` 时）+ 一个 latent 样本。1.25 是两点连线之外的余量。缓存按（通道、维数、dtype、帧数）。
 * **为什么单独测碎片（盘点模拟里试过三种）：** 只记 allocated、靠 1.25 盖碎片：Wan 的 reserved / allocated 是 1.2–1.3，够；LTX 0.9.0 的卷积 VAE（768×512×97）第二层 reserved 6.70、allocated 3.86 GiB，估算 4.97 不是上界。两点都改记 reserved：LTX 0.9.0 还差 60 MiB（碎片来自解码的 1 GiB 大块，64 MiB 的探测看不到）。整个探测改用解码的工作区：都成了上界，但工作区进了斜率，Wan 2.1 480p 估算 10.72（实际 5.32，比原生 8.72 还高）。现在的做法（线用 64 MiB、碎片用解码工作区）在模拟里：Wan 2.1 832×480×81 估算 5.99 / 实际 5.32，Wan 2.2 1280×704×121 11.96 / 10.61，LTX 0.9.0 7.96 / 6.70，LTX 2 10.62 / 4.97（碎片在 32×32 的探测里 5.09 GiB，偏保守）。
-* **碎片按比例放大（video-l2-frag，Nov 27）：** 满尺寸的碎片随解码变大，探测尺寸上量到的绝对碎片盖不住：CogVideoX 720p×77 allocated 18.4、reserved 25.9 GiB，旧估算 22.71。现在多帧估算 = max(allocated 上界 × 探测各次 reserved / allocated 的最大比例 `mf_ratio`，allocated 上界 + 最大绝对碎片 `mf_frag`)。真机：CogVideoX 720p×81 估 47.89 ≥ reserved 26.81，720p×77 估 33.06 ≥ 25.94（默认路由 `MONOLOAD_VAE_FIT_CAP=55G` 两档都走第二层，约 160 s）；Wan 2.1 720p×81 估 11.10 ≥ 9.92。探测落盘（§9.44）的条目也存 `mf_ratio`（缓存格式升到 2）。**偏松待查**：CogVideoX t=21 估/实 1.79、t=20 1.27，实测几乎一样，疑探测的碎片比例在 t=21 偏大。
+* **碎片按比例放大（video-l2-frag，Nov 27）：** 满尺寸的碎片随解码变大，探测尺寸上量到的绝对碎片盖不住：CogVideoX 720p×77 allocated 18.4、reserved 25.9 GiB，旧估算 22.71。现在多帧估算 = max(allocated 上界 × 探测各次 reserved / allocated 的最大比例 `mf_ratio`，allocated 上界 + 最大绝对碎片 `mf_frag`)。真机：CogVideoX 720p×81 估 47.89 ≥ reserved 26.81，720p×77 估 33.06 ≥ 25.94（默认路由 `MONOLOAD_VAE_FIT_CAP=55G` 两档都走第二层，约 160 s）；Wan 2.1 720p×81 估 11.10 ≥ 9.92。探测落盘（§9.44）的条目也存 `mf_ratio`（缓存格式升到 2）。**显式设了条带高度**（`MONOLOAD_VAE_STRIPE_ROWS` 或节点 / `set_stripe_rows`）视为用户强制第一层，`prefer_layer2` 不生效（协调者定，Nov 27）。**偏松待查**：CogVideoX t=21 估/实 1.79、t=20 1.27，实测几乎一样，疑探测的碎片比例在 t=21 偏大。
 * 探测失败（任何异常）：没有上界就交给 ComfyUI 原生解码（`_UnboundedDecode`，记录 strategy native、原因写探测失败），不报错。
 * `_CudaPeak` 会重置设备的峰值统计：`_MemProbe` 记的这次解码的 reserved 峰值从探测开始算（探测在加载权重之后、任何解码工作之前）。
 
