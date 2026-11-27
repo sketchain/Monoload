@@ -1,4 +1,4 @@
-"""vae_engine.CarryStore (DESIGN §9.43): a video stripe's carries live in one buffer.
+"""vae_engine.CarryStore (DESIGN §9.45): a video stripe's carries live in one buffer.
 
 After each call_unit the engine copies every new device tensor of the stripe's state into the unit's part of the
 buffer and puts the view in its place; views the state still holds stay where they are, a tensor that does not fit
