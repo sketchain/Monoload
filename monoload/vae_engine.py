@@ -55,7 +55,12 @@ The adapter interface (StripeAdapter):
   stripe_state()       a fresh per-stripe state (the caches), passed to call_unit
   call_unit(u, x, state, k)  unit u on x during chunk k (default u.module(x))
   unit_cache(u, r, w, elem)  bytes unit u keeps in a stripe's state between chunks when it
-                       receives r rows of width w (default 0): live for the whole stripe
+                       receives r rows of width w (default 0): live for the whole stripe.
+                       The engine moves those carries into one buffer (CarryStore): after
+                       each call_unit, every device tensor >= SMALL_ALLOC in the state
+                       (dicts / lists, nested) that is not already in it is copied into
+                       the unit's part of that buffer (unit_cache bytes) and replaced
+                       there; the adapter's own clones die right after the call
   decoder_hw(samples)  rows / cols the decoder works at below the prefix (the plan's
                        h8 x w8): the latent's, unless the first prefix step changes the
                        resolution (Flux 2's 2x2 un-patchify of the latent)
@@ -79,8 +84,10 @@ The adapter interface (StripeAdapter):
                        (its reference is that decode) and of the layer-2 estimate
 """
 
+import bisect
 import contextlib
 import gc
+import logging
 import os
 import time
 
@@ -228,6 +235,7 @@ ESTIMATE_PAD = 16 * MIB      # small-block pool (<= 1 MiB requests come from the
                              # what the model leaves out: place() always splits a free block (the allocator keeps a
                              # remainder <= 1 MiB attached), a bf16 latent's CPU -> GPU copy may stage an fp32 temporary
 CONTIGUOUS_INPUT = (UP,)     # units whose row slice is made contiguous before the call
+CARRY_STORE = True           # video stripes: the carries live in one buffer (CarryStore) instead of scattered over the arena
 ARENA_ENABLED = True         # bench --no-arena: off, to measure the tensors' own peak (the arena block counts as allocated)
 CKPT_LOW = True              # a checkpoint that is not at the front of the arena moves into a free block below it if one fits
 OUTPUT_IN_ARENA = False      # True: the layout up to 6324592 (tests/alloc_sim.py replays the readings of those versions):
@@ -418,6 +426,7 @@ class Plan:
         self.rows = rows
         self.chunks = list(chunks) if chunks else None
         self.workspace = ws
+        self.elem = elem
         self.hdim = bound.hdim
         units = bound.units
         heights = [h8]
@@ -723,25 +732,144 @@ def run_stripes(units, plan, ckpt, write, bound=None):
     its own state (bound.stripe_state / call_unit); write(o0, o1, rows, t0, t1)."""
     if plan.chunks:
         tdim = plan.tdim
+        store = CarryStore.make(bound, units, plan, ckpt.device) if CARRY_STORE else None
+        index = {id(u): i for i, u in enumerate(units)}
         for k in plan.order:
             (o0, o1), needs = plan.stripes[k], plan.needs[k]
             state = bound.stripe_state()
+            if store is not None:
+                store.stripe(needs)
+
+            def call(u, y, ci, state=state):
+                out = bound.call_unit(u, y, state, ci)
+                if store is not None:
+                    store.settle(state, index[id(u)])
+                return out
             for ci, c in enumerate(plan.chunks):
                 src = ckpt.narrow(tdim, c.ct0, c.ct1 - c.ct0)
                 x = run_chain(units, plan.final_heights, src, needs, plan.hdim, "stripe [{}, {}) chunk {}".format(o0, o1, ci),
-                              call=lambda u, y, ci=ci: bound.call_unit(u, y, state, ci))
+                              call=lambda u, y, ci=ci: call(u, y, ci))
                 del src
                 if x.shape[tdim] != c.ot1 - c.ot0:
                     raise StripeError("[Monoload] internal error: chunk {} gave {} frames for [{}, {})".format(ci, x.shape[tdim], c.ot0, c.ot1))
                 write(o0, o1, x, c.ot0, c.ot1)
                 del x
             del state
+        if store is not None:
+            store.done()
         return
     for k in plan.order:
         (o0, o1), needs = plan.stripes[k], plan.needs[k]
         x = run_chain(units, plan.final_heights, ckpt, needs, plan.hdim, "stripe [{}, {})".format(o0, o1))
         write(o0, o1, x)
         del x
+
+
+class CarryStore:
+    """The carries of a video stripe (DESIGN §9.45), in one buffer.
+
+    An adapter keeps each unit's per-conv caches in the stripe's state and
+    replaces them every chunk with fresh tensors (a clone, or a slice of the
+    conv's padded input). Left where the allocator put them, those long-lived
+    blocks end up scattered over the arena between the chunk's temporaries:
+    the holes they leave are smaller than the next chunk's large requests,
+    and more than one request lands outside the arena (B group's HunyuanVideo
+    1.5 diagnosis: a 277 MiB padded input and a 228 MiB carry, the estimate
+    only has room for one). Here one buffer of the largest stripe's carries
+    (sum of unit_cache, what the plan already counts as alive for the whole
+    stripe) is allocated once per stripe pass; unit i owns the part
+    [lo_i, lo_i + unit_cache_i) of it for the current stripe. After each
+    call_unit, settle() copies every new device tensor of the state into a
+    free gap of that unit's part (the views of the buffer the state still
+    holds are busy, everything else in it is dead) and puts the view in its
+    place, so the adapter's own copy dies right after the call like any other
+    temporary. A tensor that does not fit (an adapter keeping more than its
+    unit_cache) stays where it is, as before."""
+
+    __slots__ = ("bound", "units", "widths", "elem", "buf", "key", "parts", "moved", "left")
+
+    def __init__(self, bound, units, widths, elem):
+        self.bound, self.units, self.widths, self.elem = bound, units, widths, elem
+        self.buf = self.key = None
+        self.parts = []
+        self.moved = self.left = 0
+
+    def caps(self, needs):
+        """Bytes of each unit's part for a stripe with these row intervals (unit_cache, rounded like the allocator)."""
+        uc = self.bound.unit_cache
+        return [-(-int(uc(u, needs[i][1] - needs[i][0], self.widths[i], self.elem)) // ALLOC_ROUND) * ALLOC_ROUND
+                for i, u in enumerate(self.units)]
+
+    @classmethod
+    def make(cls, bound, units, plan, device):
+        """The store of a stripe pass of `plan`, its buffer allocated; None when the adapter keeps no carries."""
+        if getattr(bound, "unit_cache", None) is None:
+            return None
+        self = cls(bound, units, plan.widths[-len(units) - 1:], plan.elem)
+        total = max(sum(self.caps(needs)) for needs in plan.needs)
+        if total <= 0:
+            return None
+        self.buf = torch.empty(int(total), dtype=torch.uint8, device=device)
+        self.key = self.buf.untyped_storage()._cdata
+        return self
+
+    def stripe(self, needs):
+        """A new stripe (its state is fresh: the whole buffer is free)."""
+        lo, self.parts = 0, []
+        for c in self.caps(needs):
+            self.parts.append((lo, lo + c))
+            lo += c
+
+    def _span(self, t):
+        a = t.storage_offset() * t.element_size()
+        n = 1 + sum((d - 1) * st for d, st in zip(t.shape, t.stride()) if d > 0) if t.numel() else 0
+        return a, a + n * t.element_size()
+
+    def settle(self, state, i):
+        """After unit i ran: move the new carries of `state` into unit i's part."""
+        lo, hi = self.parts[i]
+        busy, new = [], []
+        dev = self.buf.device
+        # an explicit stack, not a recursive closure: a nested function that calls itself is a reference cycle
+        # holding `new` (the adapter's own copies) until the garbage collector runs
+        stack = [state]
+        while stack:
+            c = stack.pop()
+            items = c.items() if isinstance(c, dict) else enumerate(c) if isinstance(c, list) else ()
+            for k, v in items:
+                if isinstance(v, torch.Tensor):
+                    if v.device != dev or v.numel() * v.element_size() < SMALL_ALLOC:
+                        continue
+                    if v.untyped_storage()._cdata == self.key:
+                        busy.append(self._span(v))
+                    else:
+                        new.append((c, k, v))
+                elif isinstance(v, (dict, list)):
+                    stack.append(v)
+        del stack
+        busy = sorted(b for b in busy if b[1] > lo and b[0] < hi)
+        for c, k, v in new:
+            n = -(-v.numel() * v.element_size() // ALLOC_ROUND) * ALLOC_ROUND
+            at, pos = None, lo
+            for a, b in busy + [(hi, hi)]:
+                if a - pos >= n:
+                    at = pos
+                    break
+                pos = max(pos, b)
+            if at is None:
+                self.left += 1
+                continue
+            dst = self.buf.narrow(0, at, v.numel() * v.element_size()).view(v.dtype).view(v.shape)
+            dst.copy_(v)
+            c[k] = dst
+            bisect.insort(busy, (at, at + n))
+            self.moved += 1
+        new.clear()
+
+    def done(self):
+        if self.left:
+            logging.debug("[Monoload] %s: %d carries did not fit the carry buffer (%d moved)", self.bound.name, self.left, self.moved)
+        self.buf = None
 
 
 # ---------------------------------------------------------------------------
