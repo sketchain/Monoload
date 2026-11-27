@@ -12,6 +12,26 @@
 
 参考环境：`docker.io/kyuz0/amd-strix-halo-comfyui@sha256:384aa1fecef6a841832e0d5552949977330308d8c25e212a94f5e8dfcc061cae`（ComfyUI 0.31.0，commit `62b3c94b`）。
 
+### 图片模型一览（2026-11-27，video 分支）
+
+「真机」一列写哪个 ComfyUI 版本上验证过、在哪里有记录。0.31.0 是 CT 700 的旧镜像（§10），0.46.3 是 comfyui-latest（`MONOLOAD_VAE_FIT_CAP=55G`）。0.46.3 的回归是 video 92cbd3d 上的 5 个 workflow（verify run `1127_1418_video_regr`）：全部 OK，`MONOLOAD=0` 与原生逐位一致；括号里是 peak reserved，Monoload 开 / 原生，单位 GiB。视频模型见 docs/PLAN-video.md 和 HANDOFF §0。
+
+| 家族（VAE） | LoRA 运行时合并 | VAE 解码 | 真机 |
+|---|---|---|---|
+| SDXL（checkpoint 内置 LDM VAE） | 支持；LoRA / LoCon 融合 addmm，其余类型走 `calculate_weight` | 第一层（`vae_ldm`） | 0.31.0：LoRA 和 VAE 都测过（§10 的 9.1–9.5、§10.3）；0.46.3：`sdxl`（7.44 / 15.94）、`sdxl_lora`（7.65 / 21.64） |
+| SD1.5 / SD3（LDM VAE） | 支持（CPU 测试套件含 LoRA / LyCORIS / LoHa / LoKr） | 第一层（`vae_ldm`） | 只有 CPU 测试，真机无单独记录 |
+| Flux 1 / Z-Image（Flux `ae`） | 支持 | 第一层（`vae_ldm`） | 0.31.0：VAE（§10.3）；LoRA 无单独记录 |
+| Flux 2（`flux2-vae`；Ideogram 4、Lens、Ernie-Image 同一个 VAE） | 支持 | 第一层（`vae_ldm`） | 0.31.0：VAE（§10.5、§10.6）；0.46.3：`flux2`（fp8mixed UNet，不带 LoRA；50.51 / 55.28）。Flux 2 fp8 的 GPU LoRA 项已撤 |
+| Qwen Image / Krea 2 / Anima（`qwen_image_vae`，即 Wan 2.1 VAE 单帧） | 支持 | 第一层（`vae_wan`） | 0.31.0：VAE（§10.1、§10.2）；0.46.3：`qwen_aio`（AIO checkpoint，不带 LoRA；46.16 / 52.61）。Krea 2 int8 的 GPU 项已撤 |
+| Qwen Image 2.1 VAE（Wan 2.2 结构，patch_size 1、RGBA） | 支持 | 第一层（`vae_wan22`） | CPU 测试（`test_vae_wan22` 第 9 节）；0.46.3 真机验证线程在补测 |
+| Wan 2.2 5B 单帧（`wan2.2_vae`） | 支持 | 第一层（`vae_wan22`） | 0.31.0：§10.10、§10.13 |
+| HunyuanImage 2.1 | 支持 | 第一层（`vae_hunyuan`） | 0.31.0：§10.9 |
+| HunyuanImage 2.1 Refiner | 支持 | 第二层（第一层分支没合） | 无 |
+| 图片 GGUF 整模型（ComfyUI-GGUF） | 支持；12 种量化逐层 exact 逐位、0 备份（docs/GGUF-QUANT.md §8） | 跟所用 VAE 一致；GGUF VAE 没有加载器 | 0.46.3：逐层真机已过；整模型 + LoRA 验证线程在补测 |
+| 量化 safetensors（fp8 e4m3 / e5m2、int8、nvfp4、mxfp8 等） | 支持，合并在反量化出的临时权重上、不量化回去 | 跟所用 VAE 一致 | 0.31.0：WAI fp8 UNet（§10 的 9.5）；0.46.3：`test_quant` GPU 8 项逐位 |
+| TAE 系列（TAESD 等）、Stable Cascade Stage A / C、Mage | 支持 | 第二层（不做第一层） | 没测 |
+| MiniMax-H3-Image、SeedVR2 | 支持 | 原生透传（`comfy_has_chunked_io`，Monoload 不管） | SeedVR2 原生峰值测过（PLAN-video G 组）；MiniMax-H3-Image 没测 |
+
 ---
 
 ## 1. 原理（一段话版）
