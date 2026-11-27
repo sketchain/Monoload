@@ -2061,7 +2061,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 | Cosmos 1.0（bf16），1280×704×121 | 30.18 | **2.96** | 4.58 | 8.5 → 10.4 s | 像素 max 0.0215，PSNR 54.8（bf16 噪声级：fp32 下流式对原生 ≤ 2e-6） |
 | Mochi（fp16），848×480×85 | OOM → tiled（到 OOM 为止 36.49） | **5.16** | 6.83 | tiled 29 s（含 OOM）→ 67 s | 原生放不下，没有参照（小尺寸见下） |
 
-估算都是上界，0 次 OOM 重试。`tests/check_group_d_zero.py`（真实权重，Mochi 424×240×31、Cosmos 640×352×33）：MONOLOAD=0 对原生逐位一致；Monoload 开着对原生像素 max Mochi 0.0005、Cosmos 0.0176。`tests/test_vae_stream.py` 真机 22/22（fp32 相对误差 Mochi 3.4e-6、Cosmos 1.9e-6）。Mochi 慢在每帧一遍的 1020 次分块卷积（1 GiB 工作区）；峰值优先，先不管。
+估算都是上界，0 次 OOM 重试。`tests/check_group_d_zero.py`（真实权重，Mochi 424×240×31、Cosmos 640×352×33）：MONOLOAD=0 对原生逐位一致；Monoload 开着对原生像素 max Mochi 0.0005、Cosmos 0.0176。`tests/test_vae_stream.py` 真机 22/22（fp32 相对误差 Mochi 3.4e-6、Cosmos 1.9e-6）。Mochi 慢在每帧一遍的 1020 次分块卷积（1 GiB 工作区）。**透传原生（退到 tiled）不选：** 原生那一次（先整段试、OOM 后 ComfyUI 自己退到 tiled，共 29.2 s）的峰值 reserved Δ 36.49 / GTT Δ 36.54 GiB，是 Monoload 5.16 的 7 倍；tiled 的输出也不等于原生（瓦片接缝）。峰值优先，保持流式第二层。
 
 **第一层：两种都不做。** 流式第二层已经远低于 55 GiB，也低于各自 DiT 的峰值；第一层（按行条带）只能再压缓存或前缀，换不来决定性的差别（按「和第二层比」的规矩）。
 
