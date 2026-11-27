@@ -33,6 +33,9 @@
 * **盘点（video-inventory，合并见 §7）**——`tests/vae_inventory.py` 跟到 v0.46.3（新 VAE 四种、托管多帧走 Monoload 自己的路和 H1 估算），结果 DESIGN §9.39：托管的 Wan 2.1 / 2.2、LTX 0.9.0 / 2 的估算都是上界；LTX 扩散 decoder、RelayFlash 在 meta 上追踪不了，要真机。
 * **E 组 SVD：整批第二层不合，保持原生**——模拟里只省 20%（25.71 → 20.72 GiB），而且探测估算 20.03 给不出上界（整批时碎片随尺寸涨）。代码留在分支 video-svd-l2（DESIGN §9.38）。
 * **G 组：自带分块的 transformer VAE（video-g-selftiled）**——MiniMax H3（视频原版 `ViT3DDecoder`、Sol `NonCausalViT3DDecoder`、MiniMax-H3-Image / P-H3-Image）、SeedVR2、RelayVSR Flash 都声明 `comfy_has_chunked_io`，`_native_reason` 先判这一条，一律原生，Monoload 只透传，**不做第一层 / 第二层**。理由和真机数据在 `docs/PLAN-video.md` G 组：MiniMax 原版 1080p×107 帧总 reserved 11.77 GiB（权重 4.85、输出 2.50，块内工作量 <1 GiB 且不随帧数涨），开/关 Monoload 逐位相同。新增 `tests/test_vae_selftiled.py`（锁路由，含 H1 放开 5D 以后；真机 19 项全过）、`tests/bench_selftiled.py`（原生峰值、RSS/GTT、SeedVR2 的缓存放哪、`--gguf` 反量化加载 GGUF VAE、`--relay`）。Sol、SeedVR2、RelayVSR 也已真机测过原生峰值，结论不变：Sol 1080p×107 帧 ≤ 14.63 GiB，SeedVR2（bf16）1080p×33 帧 reserved 43.11 GiB、4K 由 ComfyUI 直接改走它自己的分块，RelayVSR x4 4K ≤ 7.70 GiB。现在 `_native_reason` 里 `chunked_io` 的判断排在多帧白名单之前，只有 `chunked_io_managed`（LTX `VideoVAE`，按类型精确匹配）放行；**以后改这里要保持这几个类不被放行**，路由测试会拦。
+* **视频第一层 A 组：Wan 2.1 / 2.2 多帧（video-wan-l1，合并见 §7；DESIGN §9.40）**——`monoload/vae_wan_video.py`：T > 1 的 Wan 2.1 VAE（16 ch、8×）和 Wan 2.2 VAE（48 ch、16×）走第一层，条带为主：`conv2` 和前缀按时间块整段算进存档 `[1, C, T, h, w]`，每个输出行条带带着自己的 `feat_cache` 依次跑全部时间块（原生的模块实例和调用方式，Wan 2.1 的 2 帧切片照做），每块直接写进预分配的 5D 输出。用引擎的时间轴（H2：`time_chunks` / `chunk_planes` / `stripe_state` / `call_unit` / `unit_cache`，引擎的 `Plan` 和条带），单元 / halo / 条带划分沿用单帧适配器；Wan 2.1 时间上采样之后不再切 2 帧一片（引擎的链是线性的，数值相同，计划按 8 帧算）。自检跑真正的视频路径（fp32、3 个时间块）。小测试 57 项全过（对原生相对误差 ≤ 1.7e-6，自检、注入错误、未注册时逐位一致）。真机（DESIGN §9.40 有表）：第一层对第二层，Wan 2.2 在 1280×704×121 上 3.54 对 8.91 GiB、不慢，估算全是上界；Wan 2.1 同档 4.34 对 8.00 GiB，但慢 20%，720p 估算少算 0.65–1.0 GiB。81 → 121 帧第一层只涨 0.1 GiB 以内。**决定**：Wan 2.2 多帧走第一层，Wan 2.1 多帧先留第二层（`WAN21_ENABLED = False`；第二层 1080p 约 22 GiB 也够，查清估算之后再开，办法见 §9.40）。
+  * **已注册（video-wan-reg，合并见 §7）**：`vae.py` 照 C 组的可选 import 把 `vae_wan_video` 加进 `STRIPE_ADAPTERS`（只接 T > 1）。真机冒烟 Wan 2.2 1280×704×121（`MONOLOAD_VAE_FIT_CAP=55G`）：走第一层，6 条 × 118 行、3 个时间块，首次自检 5.4e-06 通过（75.7 s）；冷跑含自检 alloc +4.32 / reserved +4.93 GiB，低于自检上界 7.83（不含自检的估算 4.03），原生估算 13.43。Wan 2.1 多帧仍关（`WAN21_ENABLED=False`）。
+  * 真机命令：`docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/test_vae_wan_video.py --wan21 /opt/ComfyUI/models/vae/wan_2.1_vae.safetensors --wan22 /opt/ComfyUI/models/vae/wan2.2_vae.safetensors --sizes 832x480,1280x720 --frames 81,121 --native-dir /srv/comfy-latest/results/native --no-native --no-small --route 1280x704x121 --route-l2 2.1,2.2`（`--mem-history` 打印分配器轨迹）。预期：Wan 2.2 全部 PASS；Wan 2.1 的 720p 估算现在会 FAIL（已知，所以默认关着）。
 * **阶段 B**：**`docs/PLAN-video.md` 已写（合并见 §7）**——共用钩子 H1–H7、各 VAE 的第一层方案和 A–H 分组、模型清单与单次峰值（> 55 只有 MiniMax H3 完整版 bf16 DiT）、开工顺序。`docs/PLAN-video.md`（每种视频 VAE + 新图像 VAE 的第一层方案，分组可并行，含 safetensors / GGUF；覆盖 v0.46.3 里量化能跑的全部视频模型，扩散模型和文本编码器分开算；单次峰值 ≤ 55G 为主线，> 55G 单列「等宿主机调 ttm 后再验」；超大模型不分批会 OOM 时才把 TE 和视频模型分开加载；不做 MAGI-2）。
 * **阶段 C（进行中）**：多帧第二层入口已合（上面 H1）；剩下feat_cache 和因果时间卷积；SVD 整批第二层；LTX 分块 IO 的输出缓冲（音频仍原生）；`bench_vae --frames`；共用的第一层视频钩子（参考 vae-refiner-layer1 f51a6bc）。每项一个功能分支。
 
@@ -171,7 +174,9 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | HunyuanImage 2.1（`AutoencodingEngine` + `hunyuan_video.vae.Decoder`，4D，32x） | 第一层（`vae_hunyuan`） |
 | 其他 2D 图像 VAE（带注意力的 up 级、TAESD、Stable Cascade Stage A / C、Mage-VAE 等） | 第二层（逐算子分块），或第一层识别不通过时第二层 |
 | 3D VAE 的单帧 latent（5D，T=1）：Hunyuan 系（含 HunyuanImage 2.1 Refiner）、Mochi、Cosmos、CogVideoX、TAEHV 等，Wan 2.1 / 2.2 以外 | 第二层（SeedVR2 在 v0.46.3 声明了 `comfy_has_chunked_io`，单帧也走原生，见下面一行） |
-| 多帧视频 latent（T>1）：Wan 2.1 / 2.2、Hunyuan 系（3D 卷积 `AutoencoderKL` / `AutoencodingEngine`）、Mochi、Cosmos、CogVideoX、TAEHV 等 | **原生**（`_native_reason`：multi-frame video latent，第一阶段暂不做） |
+| 多帧 Wan 2.1 / 2.2（T>1，`wan.WanVAE` / `vae2_2.WanVAE`） | 第一层（`vae_wan_video`，**注册到 `STRIPE_ADAPTERS` 之后**）；没注册时第二层（H1，`vae_video.MULTIFRAME`，实测探测定上界） |
+| 多帧 LTX（0.9.x 卷积 VAE、LTX 2.5 扩散 decoder） | 第二层（H1） |
+| 多帧视频 latent（T>1），`vae_video.MULTIFRAME` 之外：Hunyuan 系（3D 卷积 `AutoencoderKL` / `AutoencodingEngine`）、Mochi、Cosmos、CogVideoX、MiniMax H3、TAEHV 等 | **原生**（`_native_reason`：multi-frame video latent，第一阶段暂不做） |
 | 自己往预分配输出写的（`comfy_has_chunked_io`）：MiniMax H3 视频 / Sol / 图像、SeedVR2（`VideoAutoencoderKLWrapper`）、RelayVSR Flash | 原生，单帧也不管（`tests/test_vae_selftiled.py`；G 组，PLAN-video）。例外：LTX 卷积 VAE（`ltx.VideoVAE`）由 H1 接管（`vae_video.chunked_io_managed`，按类型精确匹配） |
 | 1D / 音频（Stable Audio、ACE、MMAudio、LTX Audio 等） | 原生 |
 
@@ -270,6 +275,8 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | **video 分支**：H4 方案 G（Refiner RMS_norm、LTX PixelNorm） | Merge video-norm-g（`git log --first-parent video`） |
 | video：G 组（自带分块的 transformer VAE）保持原生、路由测试、bench_selftiled | 见 `git log --first-parent video`（Merge video-g-selftiled） |
 | **video 分支**：多帧探测按 latent 截断；LTX-2.5 扩散 decoder 等 F 组的 `vae_ltx` 再托管 | Merge video-probe-clip（`git log --first-parent video`） |
+| **video 分支**：A 组 `vae_wan_video` 注册进 `STRIPE_ADAPTERS`（可选 import），Wan 2.2 多帧走第一层 | Merge video-wan-reg（`git log --first-parent video`） |
+| video：视频第一层 A 组 Wan 2.1 / 2.2 多帧（`vae_wan_video`） | 见 `git log --first-parent video`（Merge video-wan-l1） |
 | 本文件 | 本文件所在的提交（`git log --first-parent video` 最上面几条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。
