@@ -1,4 +1,4 @@
-"""vae_engine.CarryStore (DESIGN §9.42): a video stripe's carries live in one buffer.
+"""vae_engine.CarryStore (DESIGN §9.43): a video stripe's carries live in one buffer.
 
 After each call_unit the engine copies every new device tensor of the stripe's state into the unit's part of the
 buffer and puts the view in its place; views the state still holds stay where they are, a tensor that does not fit
@@ -22,7 +22,7 @@ def main():
     bound = types.SimpleNamespace(name="fake", unit_cache=lambda u, r, w, e: u.k * r * w * e)
     plan = types.SimpleNamespace(widths=[256, 256, 256], elem=4, needs=[[(0, 512), (0, 1024), (0, 1024)], [(0, 256), (0, 512), (0, 512)]])
     st = eng.CarryStore.make(bound, units, plan, torch.device("cpu"))
-    check("buffer = the largest stripe's carries (2 + 4 MiB)", st.buf.numel() == 6 * MIB, st.buf.numel())
+    check("buffer = the largest stripe's carries (2 + 4 MiB)", st.buf.numel() == 6 * MIB, repr(st.buf.numel()))
     st.stripe(plan.needs[0])
     check("unit parts follow unit_cache", st.parts == [(0, 2 * MIB), (2 * MIB, 6 * MIB)], repr(st.parts))
 
@@ -52,7 +52,7 @@ def main():
     huge = mb(5, 3)
     state["u1"] = huge
     st.settle(state, 1)
-    check("a carry larger than the unit's part stays (counted)", state["u1"] is huge and st.left == 1, st.left)
+    check("a carry larger than the unit's part stays (counted)", state["u1"] is huge and st.left == 1, repr(st.left))
     state["u1"] = mb(3, 4)
     st.settle(state, 1)
     check("unit 1's carry in its own part", st._span(state["u1"]) == (2 * MIB, 5 * MIB), repr(st._span(state["u1"])))

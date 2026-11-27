@@ -766,7 +766,7 @@ def run_stripes(units, plan, ckpt, write, bound=None):
 
 
 class CarryStore:
-    """The carries of a video stripe (DESIGN §9.42), in one buffer.
+    """The carries of a video stripe (DESIGN §9.43), in one buffer.
 
     An adapter keeps each unit's per-conv caches in the stripe's state and
     replaces them every chunk with fresh tensors (a clone, or a slice of the
