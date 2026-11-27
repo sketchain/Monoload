@@ -283,6 +283,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | **video 分支**：多帧探测按 latent 截断；LTX-2.5 扩散 decoder 等 F 组的 `vae_ltx` 再托管 | Merge video-probe-clip（`git log --first-parent video`） |
 | **video 分支**：A 组 `vae_wan_video` 注册进 `STRIPE_ADAPTERS`（可选 import），Wan 2.2 多帧走第一层 | Merge video-wan-reg（`git log --first-parent video`） |
 | **video 分支**：F 组 LTX（卷积只走第二层；扩散 decoder 由 `vae_ltx` 接管） | Merge claude/project-thread-b4e366（`git log --first-parent video`） |
+| **video 分支**：D 组 Cosmos 1.0 / Mochi 逐帧流式第二层（`vae_cosmos`、`vae_mochi`） | Merge video-groupd（`git log --first-parent video`） |
 | **video 分支**：B 组 Hunyuan（HunyuanVideo 1.0 / 1.5 多帧第二层、`vae_hunyuan15` 第一层，已注册进 `STRIPE_ADAPTERS`） | Merge video-b-reg（`git log --first-parent video`） |
 | **video 分支**：`test_quant` / `test_quant_formats` 的 fp8 参照改在计算设备反量化（GPU 逐位），`bench_lora` 逐层探测先反量化 | Merge video-quant-ref（`git log --first-parent video`） |
 | video：视频第一层 A 组 Wan 2.1 / 2.2 多帧（`vae_wan_video`） | 见 `git log --first-parent video`（Merge video-wan-l1） |
