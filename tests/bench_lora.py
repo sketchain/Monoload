@@ -325,8 +325,16 @@ def layer_probe(model, clip, loras, reps=3):
 
     def temporary(param):
         # what cast_bias_weight hands the weight function: a private copy in the compute dtype, a quantized
-        # parameter (fp8 scaled, int8, ...: QuantizedTensor) dequantized into it
-        w = comfy.model_management.cast_to_device(param, dev, None, copy=True).to(cdt)
+        # parameter (fp8 scaled, int8, ...: QuantizedTensor) dequantized into it; a GGUF one (Q4_K, ...: GGMLTensor,
+        # whose storage shape is the packed blocks) dequantized on the device by the pack's own dequantize_tensor
+        kind = hotpatch._ggml_kind(param)
+        if kind == "quantized":
+            from monoload import gguf as mgguf
+            return mgguf.dequantize(param.to(dev), cdt)  # as GGMLLayer.cast_bias_weight: s.weight.to(device)
+        w = comfy.model_management.cast_to_device(param, dev, None, copy=True)
+        if kind == "plain":
+            w = hotpatch._plain(w)
+        w = w.to(cdt)
         return w.dequantize() if hotpatch._is_quantized(w) else w
 
     def variant(kind, key, f, moved, w):
@@ -362,7 +370,9 @@ def layer_probe(model, clip, loras, reps=3):
         if not items:
             print("\n=== layer probe: no patched layers ===")
             return
-        cmp = compare_dtype(items[0][1].dtype, cdt, ldt)
+        p0 = items[0][1]
+        # a GGUF quantized parameter is never rounded back to its storage type (uint8 blocks): compare at compute
+        cmp = compare_dtype(cdt if hotpatch._ggml_kind(p0) == "quantized" else p0.dtype, cdt, ldt)
         err = {k: {"d_sq": 0.0, "max": 0.0} for k in ("default", "relaxed", "mm-add")}
         lora_sq = w_sq = bound_sq = 0.0
         for key, param, f, moved, _fused in items:
