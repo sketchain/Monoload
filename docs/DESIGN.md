@@ -2119,7 +2119,7 @@ Monoload 的目标是降峰值，「原生放得进 cap 就走原生」也不做
 
 两档的估算都成了上界，峰值和时间也都略降。估算变大是因为 B 组和 A 组各自把 carry 补进了 `unit_cache`。
 
-**没解决：** HunyuanVideo 1.5 首次自检的峰值仍高于它的上界：冷跑（含自检）reserved 改前 +5.20、改后 +5.46，自检上界 4.70。这是 B 组已知的自检上界问题（模拟器 5350 > 4814 MiB），归 B 组复核。**决定（Nov 27）：Wan 2.1 多帧打开第一层，只作后备**（`WAN21_ENABLED = True`，`Wan21Video.prefer_layer2 = True`，和 HunyuanVideo 1.5 / CogVideoX 一致）：放得下设备就走第二层，放不下才第一层。理由：有了 CarryStore，720p×81 的第一层估算已是上界（+3.57 对 4.12 GiB），§9.40 留着它的原因没了；第二层更快且到约 1440p 都在 55 GiB 内，所以仍排在前面。随 video-l2-frag 的 `prefer_layer2` 路由一起生效。
+**没解决：** HunyuanVideo 1.5 首次自检的峰值仍高于它的上界：冷跑（含自检）reserved 改前 +5.20、改后 +5.46，自检上界 4.70。这是 B 组已知的自检上界问题（模拟器 5350 > 4814 MiB），归 B 组复核。（B 组已修，§9.41：上界计入参照解码留下的缓存段，真机自检 5396 ≤ 上界 5765 MiB。）**决定（Nov 27）：Wan 2.1 多帧打开第一层，只作后备**（`WAN21_ENABLED = True`，`Wan21Video.prefer_layer2 = True`，和 HunyuanVideo 1.5 / CogVideoX 一致）：放得下设备就走第二层，放不下才第一层。理由：有了 CarryStore，720p×81 的第一层估算已是上界（+3.57 对 4.12 GiB），§9.40 留着它的原因没了；第二层更快且到约 1440p 都在 55 GiB 内，所以仍排在前面。随 video-l2-frag 的 `prefer_layer2` 路由一起生效。
 
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
