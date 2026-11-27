@@ -1980,6 +1980,33 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 * **决定**：Wan 2.2 多帧走第一层（注册即生效）；Wan 2.1 多帧先留第二层（`vae_wan_video.WAN21_ENABLED = False`，`match` 返回原因，测试里打开）。理由：Wan 2.1 的第二层 720p 不到 10 GiB、1080p 按面积约 22 GiB，都在 55 GiB 以内且更快，第一层只在约 1440p 以上才有必要，而估算少算的原因还没查（可能和 Wan 2.1 顶层 96 通道全分辨率的块有关）。以后要开：用 `--mem-history` 跑一档 Wan 2.1 720p（测试会回放分配器轨迹，打印分配峰值时活着的块按分配位置分组、reserved 峰值时的段），补上代价模型后把开关打开。
 * 首次自检的开销按进程算一次（`_SELFTEST` 不落盘）：Wan 2.2 75 s，比第二层的整次解码省下的时间多；以后可以把 Wan 2.2 视频自检的 latent 缩到 12（和 Wan 2.1 一样 192 行输出、5 个条带）。
 
+### 9.41 B 组：HunyuanVideo 1.0 / 1.5 多帧第二层、HunyuanVideo 1.5 / Refiner 第一层（分支 claude/project-thread-glsomb）
+
+**第二层的多帧入口（`vae_video.py`，c8f481e）：** HunyuanVideo 1.0（Kandinsky 5 用同一个）和 1.5 的 first-stage 是通用类 `AutoencoderKL` / `AutoencodingEngine`，图片 VAE 也用，所以不按类、按 decoder 结构认：1.0 = `ldm.Decoder` 且 `carried`、`conv_in` 是 `CarriedConv3d`、没有 bn / `max_batch_size` / `tanh_out` / `fused_norm`；1.5 = `vae_refiner.Decoder` 且 `refiner_vae=True`。`multiframe()` 对这两种返回真（H1 放行 T > 1），`chunks()` 按 decoder 自己的 2 帧一块逐块交出（v0.46.3 的 forward 原样搬过来，只是把列表 + `torch.cat` 换成生成器：少一份整段输出），估算走实测探针（`_probe_mf`）。`refiner_vae=False`（sd.py 的 5D `decoder.conv_in.weight`）整段解，不在这里。`vae.py` 的 `nr_multiframe` 提示只列 `MULTIFRAME` 里的类，名字在 `vae_video.MULTIFRAME_NAMES`，要不要加进提示由适配线程定。
+
+**第一层：`monoload/vae_hunyuan15.py`（4e348fa；还没进 `vae.STRIPE_ADAPTERS`，注册归适配线程）。** 1.5 的 decoder 和 Refiner 官方文件同一个（§9.31），一个适配器两种绑定：T = 1（Refiner、单帧）没有时间块；T > 1 用 H2 的时间轴。
+
+* **前缀**（整段视频一次）：`conv_in + repeat`、mid（`block_1`、全局注意力 tokens = T·h·w、`block_2`）、`up[0]` 的三个块；存档 = `up[0]` 的输出（1024 通道、latent 分辨率、全部帧）。原生的 `up[0]` 块是按 2 帧一块带 carry 跑的；carry 正是块前面的 2 帧（已补边的卷积输入），所以对整段一次跑 = 按块跑，数学上相同（`conv_carry_causal_3d`：没有 carry 时前面复制补 2 帧，有 carry 时拼上一块的末 2 帧）。
+* **单元**：`up[0].upsample`、`up[1..4]` 各自的块和 `UpSmpl`、`norm_out`、silu、`conv_out`。`UpSmpl` 是 3×3×3 卷积到 fct × C 通道再做 2×2（和 2 帧）的深度到空间，输出第 2h + i 行只依赖卷积输出第 h 行：在输出级 halo 2；`ResnetBlock` halo 2；`conv_out` halo 1。条带切口的复制补边只影响 halo 行（包括 carry 里的补边行）。
+* **时间块** = 原生的 2 帧一块（T 奇数时最后一块 1 帧）；第一块没有 carry，`UpSmpl`（第 0、1 级的 `tus`）把第一帧只做空间：2 → 3 → 5 帧，其后的块 2 → 4 → 8，总 4T − 3。`chunk_planes` 按这个给每级平面数。
+* **carry**：每个带 carry 的单元在条带状态里有自己的列表（`call_unit`：第 k > 0 块把上一块的列表传进去，弹出顺序与原生共用列表时相同）。`unit_cache` = 每个带 carry 的卷积 2 帧 ×（r + 2）×（W + 2）× C_in。
+* **内存模型**按 v0.46.3 的代码逐阶段数活张量（模块里注释）：`conv_carry_causal_3d` 的补边 / 拼接（Ap，含时间前 2 帧）、卷积的列或第二层行块（`conv3_extra`）、`ResnetBlock` 各阶段、`UpSmpl` 的重排和重复输入（≤ 4H）、RMS norm 的两个临时量加方案 G 的分组临时量（`grouped_norm_bytes`，> 510 通道：H4）。引擎给前缀的宽是「宽 × 一块的存档平面数」，这个前缀实际在全部帧上跑，`_prefix_geom` 换算回去。
+* **自检**：fp32 副本按配置重建 `vae_refiner.Decoder`（整核，多帧要读每个时间片；单帧没有用三片之和的 1×3×3 核，省事优先）；单帧 latent 1 帧，多帧 5 帧（块 2、2、1：满足 H5 的 ≥ 3 块，最后一块只有 1 帧也覆盖到）；两者的结构键不同，分开缓存。
+* **测试**：`tests/test_vae_hunyuan15.py`（测试里临时注册适配器）：认结构 / 拒绝的原因；单帧托管解码 == 原生（多种条带高度、奇数、1×1、batch 2、16 KiB 工作区）；多帧直接 `bound.plan` / `bound.run`（CPU 上 `vae._native_reason` 没有峰值计、T > 1 保持原生）== 原生 decode（T = 2、3、5、6、9，块内首帧特殊处理、carry）；自检通过、注入 halo 太小 / 丢 carry 时自检失败并回第二层；`alloc_sim`（加了 `frames` / `latent_frames` 参数）全尺寸 meta：第一层模拟 reserved ≤ 估算（Refiner 1344×768 … 3072²，HunyuanVideo 1.5 832×480×81、1280×720×121），自检峰值 ≤ `selftest_memory`。真机（GPU fp32 小模型）上测试的容差是自检的 1e-4（条带对整段在 GPU 上卷积求和顺序随行数变，CPU 上 1e-5）；注入的错误改成「所有 halo 置 0」（只把 `UpSmpl` 的 halo 置 0 在这个小模型上误差只有 1.6e-5，低于容差），丢 carry 在引擎里就报帧数不对（`StripeError`），也算自检失败。
+
+**真机（cfui，v0.46.3，gfx1151 / ROCm 7.15，fp16，随机 latent，`tests/bench_b.py` = bench_vae + 进程内注册 vae_hunyuan15；reserved 是解码期间 `max_memory_reserved` 的增量，GiB）：**
+
+| VAE | 尺寸 × 帧 | 原生 | 第二层 | 第一层 |
+|---|---|---|---|---|
+| HunyuanVideo 1.5 | 832×480 × 81 | 50.09（原生估算 10.71），79.0 s | 10.43（估 12.27），warm 77.6 s | 2.54（估 2.33 ✗；冷启动含自检 5.20，估 4.70 ✗），4 条 × 120 行，warm 121.1 s |
+| HunyuanImage 2.1 Refiner（单帧） | 2048×2048 × 1 | 52.67（原生估算 112.50，会卸载一切），16.4 s | 10.06（估 14.38），warm 15.0 s | 0.77（估 1.00 ✓；冷启动含自检 3.45，估 4.27 ✓），16 条 × 128 行，warm 22.6 s |
+
+两层对原生的像素差都 ≤ 0.001（PSNR 79.3），没有 NaN。第二层冷启动 270 s（warm 和原生一样快），是新形状的首次开销。原生基线记在 `/srv/comfy-latest/results/native/hunyuanvideo15_vae_fp16__832x480x81f.md`。
+
+**决定：HunyuanVideo 1.5 的第一层只作后备（`HV15Stripe.prefer_layer2 = True`，多帧单帧都是；`MULTIFRAME_ENABLED = True`，设成 False 则视频一律第二层）。** 适配线程的 `prefer_layer2` 路由（video-l2-frag 784aca3）：默认策略下先算第二层估算，放得下设备（`vae.layer2_room`，CT 700 用 `MONOLOAD_VAE_FIT_CAP`）就走第二层，放不下才走第一层（自检也只在真选第一层时跑）。理由：第一层省 7.9 GiB 但慢 56%，480p 的第二层只要 10.4 GiB；大尺寸第二层放不下时第一层 2.5 GiB 级别兜底。第一层的估算还不是上界，少算的原因用 `alloc_sim` 查到了（模拟 2.90 对估算 2.69，与真机同向）：reserved 峰值时 arena（2094 MiB）里散着各条带各卷积的 carry 克隆，留下的洞都小于 220 MiB，于是有**两个**请求落到 arena 外各开一段——最上一级卷积补边 + 拼 carry 的输入（`cat`，277 MiB）和一段 228 MiB 的 carry 克隆——而估算里的 `largest` 只给一个请求留了位置（270 MiB）。多帧自检的上界也同样不够（模拟 5350 对 `selftest_memory` 4814 MiB）。这和 Wan 2.1 多帧估算少算（§9.40）可能是同一类：带时间块的条带把每个单元的 carry 留在 arena 里，碎片比单帧多；修法在引擎（时间块时 arena 的余量或 `largest` 计入 carry 造成的第二个落单请求，或者 carry 先在 arena 前端预留），已转给改 `vae_engine.py` 的线程。Refiner（单帧）的第一层估算是上界（0.77 对 1.00，自检 3.45 对 4.27），没有碎片问题，但 2048² 第二层只要 10.06 GiB、比第一层快 1.5 倍（15.0 对 22.6 s），所以同样第二层优先、第一层兜底（第二层放不下设备时，例如更大的尺寸或 `MONOLOAD_VAE_FIT_CAP` 压低）。两者对原生像素最大差 0.001。tests/test_vae_hunyuan15.py 里第一层的各项检查临时把 `prefer_layer2` 设成 False，免得路由把小尺寸送去第二层。
+
+**HunyuanVideo 1.0 / Kandinsky 5 的第一层：** 原生 GroupNorm 是每个时间块各自统计（块内 2 帧 × 整幅），条带为主的引擎要每块一个统计遍，H2 不支持统计遍和时间块同时用。先用第二层的真机数据（832×480×81 模拟 14.98 GiB）看够不够，再定做不做。
+
 ### 9.42 视频 F 组：LTX（卷积 VAE 只走第二层；LTX-2.5 扩散 decoder 用 `vae_ltx`，分支 claude/project-thread-b4e366）
 
 （§9.41 留给 B 组的分支。）范围和逐项理由见 PLAN-video F 组，这里记结论和真机数。
