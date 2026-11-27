@@ -2068,6 +2068,25 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 **测试：** `tests/test_vae_stream.py`（随机权重、真实尺寸、真机 GPU）：流式拼起来对原生 fp32 相对误差 ≤ 1e-5（单纯流式和 1 MiB 工作区的 OpChunking 两种），bf16 误差不超过原生的 2 倍，用户 hook / Cosmos 单帧 / 别的类整段解码，模块上不留东西。真机结果见上。
 
 **接入：** 登记在 `vae_video.py`，适配线程按 951868b 的写法合进 video（855469a，可选导入：没有这两个模块时照旧原生）。`tests/group_d_reg.py` 再登记一次也无害（`setdefault`），`tests/sim_group_d.py`、`tests/bench_group_d.py`（包一层 `bench_vae`，例：`python tests/bench_group_d.py --vae mochi_vae.safetensors --res 848x480 --frames 85 --modes native,monoload`）用它。
+### 9.45 第一层视频条带的 carry 放进一块缓冲（`vae_engine.CarryStore`，分支 video-carry-store）
+
+**问题（B 组定位，HunyuanVideo 1.5 480p×81）：** 视频条带里每个单元的逐卷积缓存（carry）每个时间块都换一批新张量（clone，或卷积补边输入的切片）。这些张量要活过整个条带，却被分配器放在和块内临时张量一样的位置：它们散落在 arena 里，留下的空洞比下一个块的大请求小，于是不止一个大请求落到 arena 外（一个 277 MiB 的补边输入加一个 228 MiB 的 carry，估算只给一个留了位置）。实测 reserved +2.54 GiB，估算 2.33；Wan 2.1 720p×81 第一层 +3.93，估算 3.28。
+
+**做法：** 每遍条带开头分配一块 uint8 缓冲，大小是最大条带各单元 `unit_cache` 之和（每份按分配器的 512 字节取整）。计划本来就把这部分算成整个条带都活着，所以估算不变。单元 i 拥有当前条带的 [lo_i, lo_i + unit_cache_i) 这一段。每次 `call_unit` 之后，`settle()` 遍历条带状态（dict / list，显式栈，不建闭包以免引用环），把不在缓冲里、≥ SMALL_ALLOC 的新设备张量复制进该单元那一段里的空隙，再把视图放回原处。状态里还持有的缓冲视图算占用（按 storage 和 storage_offset / stride 算范围），其余都是可复用的死空间。适配器自己的那份在调用后就和其他临时张量一样死掉。放不下的张量（适配器存的比 `unit_cache` 多）原地留着，和以前一样，计数后在 debug 日志里报。`CARRY_STORE = False` 可以关掉。小测试 `tests/test_vae_carry.py`（16 项：分段、搬入、紧凑、死空间复用、放不下、换条带、嵌套和非连续张量、无 `unit_cache` 时不建缓冲）。
+
+**模拟器（tests/alloc_sim.py）：** HV1.5 480p×81 第一层 reserved 回到估算以内（2.41）。第一版用了递归闭包，引用环让 `new` 一直活着，反而涨到 6.47（3.4 GiB 的 clone 没释放）。
+
+**真机（CT 700，2026-11-27，`MONOLOAD_VAE_FIT_CAP=55G`，热跑）：**
+
+| 档 | 改前 reserved / 估算 / 时间 | 改后 reserved / 估算 / 时间 |
+|---|---|---|
+| HunyuanVideo 1.5 832×480×81（B 组 600885c） | +2.54 / 2.33 / 121.1 s | +2.41 / 2.69 / 114.8 s |
+| Wan 2.1 1280×720×81（`WAN21_ENABLED` 本地打开） | +3.93 / 3.28 | +3.57 / 4.12 / 110.9 s |
+
+两档的估算都成了上界，峰值和时间也都略降。估算变大是因为 B 组和 A 组各自把 carry 补进了 `unit_cache`。
+
+**没解决：** HunyuanVideo 1.5 首次自检的峰值仍高于它的上界：冷跑（含自检）reserved 改前 +5.20、改后 +5.46，自检上界 4.70。这是 B 组已知的自检上界问题（模拟器 5350 > 4814 MiB），归 B 组复核。Wan 2.1 多帧是否打开（`WAN21_ENABLED`）由 A 组按这个结果再定。
+
 ## 10. 总开关 `MONOLOAD` 与优先级（settings-master-switch）
 
 **规则：** 环境变量是全局默认值；节点上明确选的值只对那一个模型 / VAE 生效，而且总是压过全局。逐项判断：节点上明确选的 > 高级环境变量 > 内置默认；节点上选「跟随全局」（`default`）的项继承全局。
