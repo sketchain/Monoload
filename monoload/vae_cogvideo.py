@@ -213,9 +213,9 @@ SLICE_TEMPS = 6          # row-slice temporaries bounded by this many workspaces
 SELFTEST_N = 16          # self-test latent rows / cols (128 x 128 output)
 SELFTEST_T = 4           # self-test latent frames (even: 4t = 16 output frames, 4 phase-2 chunks)
 SELFTEST_ROWS = 24       # self-test output rows per slice (3 / 6 / 12 / 24 rows at the four levels)
-MARGIN = 256 * MIB       # allocator rounding on top of the counted tensors
-FRAG = 0.125             # what the allocator reserves beyond the live peak (no arena: the slices' sizes vary), as a
-                         # fraction of it; real machine 720p x 81 (PLAN-video C): reserved 14.62 GiB at live peak 13.04
+MARGIN = 256 * MIB       # allocator rounding on top of the counted tensors. Real machine (PLAN-video C), conv caches in place:
+                         # 720p x 81 reserved 12.05 GiB at live peak 13.04, 720p x 77 11.86 at 13.01 (before, a new cache
+                         # per chunk: 14.62 reserved at 13.04)
 
 
 def _conv_ok(cc):
@@ -579,7 +579,7 @@ class CogPlan:
         self.prefix_bytes, self.stripe_bytes, self.ckpt_bytes, self.persistent = p1, p2, arch, caches
         self.out_segment = out_bytes
         self.live_peak = lat_bytes + out_bytes + max(p1, p2) + temps
-        self.estimate = int(self.live_peak * (1 + FRAG)) + MARGIN
+        self.estimate = self.live_peak + MARGIN
         self.arena = self.estimate          # no arena: what is reserved is the estimate (the default policy's measure)
         self.stripes = [(a, min(self.h_out, a + self.rows)) for a in range(0, self.h_out, self.rows)]
         self.order = list(range(len(self.stripes)))
