@@ -586,6 +586,11 @@ class Wan22Video(WanVideoStripe):
 # matching
 # ---------------------------------------------------------------------------
 
+# Wan 2.1's multi-frame plan is under its reserved growth on the GPU (DESIGN §9.40: +0.65 to +1.0 GiB at 720p),
+# so until the cost model covers it a Wan 2.1 video goes to layer 2 (the tests switch it on to measure it).
+WAN21_ENABLED = False
+
+
 def match(vae, samples, vae_options):
     """(bound adapter, None) or (None, reason): a Wan 2.1 / 2.2 VAE decoding a latent of several frames."""
     if samples.ndim != 5 or samples.shape[2] < 2:
@@ -599,6 +604,8 @@ def match(vae, samples, vae_options):
         e = _check_video_21(fsm, base.units)
         if e:
             return None, "video (Wan 2.1): " + e
+        if not WAN21_ENABLED:
+            return None, "video (Wan 2.1): layer 1 off until its memory estimate holds on the GPU (DESIGN §9.40)"
         cls = Wan21Video
     else:
         reason22, _ = vae_wan22.wan22_structure(fsm)
@@ -614,4 +621,4 @@ def match(vae, samples, vae_options):
     return cls(base, fsm), None
 
 
-__all__ = ["match", "Wan21Video", "Wan22Video", "MIB"]
+__all__ = ["match", "Wan21Video", "Wan22Video", "MIB", "WAN21_ENABLED"]

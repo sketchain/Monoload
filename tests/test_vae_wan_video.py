@@ -64,6 +64,7 @@ import comfy.ldm.wan.vae2_2 as wan22  # noqa: E402
 from monoload import vae as mvae  # noqa: E402
 from monoload import vae_engine as eng  # noqa: E402
 from monoload import vae_wan, vae_wan22, vae_wan_video as wv  # noqa: E402
+wv.WAN21_ENABLED = True   # measure Wan 2.1 here although a decode leaves it to layer 2 for now (DESIGN §9.40)
 from monoload.vae_ops import MIB, OpStats, fmt_bytes  # noqa: E402
 
 torch.manual_seed(0)
