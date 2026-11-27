@@ -830,8 +830,11 @@ class CarryStore:
         lo, hi = self.parts[i]
         busy, new = [], []
         dev = self.buf.device
-
-        def walk(c):
+        # an explicit stack, not a recursive closure: a nested function that calls itself is a reference cycle
+        # holding `new` (the adapter's own copies) until the garbage collector runs
+        stack = [state]
+        while stack:
+            c = stack.pop()
             items = c.items() if isinstance(c, dict) else enumerate(c) if isinstance(c, list) else ()
             for k, v in items:
                 if isinstance(v, torch.Tensor):
@@ -842,8 +845,8 @@ class CarryStore:
                     else:
                         new.append((c, k, v))
                 elif isinstance(v, (dict, list)):
-                    walk(v)
-        walk(state)
+                    stack.append(v)
+        del stack
         busy = sorted(b for b in busy if b[1] > lo and b[0] < hi)
         for c, k, v in new:
             n = -(-v.numel() * v.element_size() // ALLOC_ROUND) * ALLOC_ROUND
@@ -861,6 +864,7 @@ class CarryStore:
             c[k] = dst
             bisect.insort(busy, (at, at + n))
             self.moved += 1
+        new.clear()
 
     def done(self):
         if self.left:
