@@ -1999,6 +1999,7 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 | VAE | 尺寸 × 帧 | 原生 | 第二层 | 第一层 |
 |---|---|---|---|---|
 | HunyuanVideo 1.5 | 832×480 × 81 | 50.09（原生估算 10.71），79.0 s | 10.43（估 12.27），warm 77.6 s | 2.54（估 2.33 ✗；冷启动含自检 5.20，估 4.70 ✗），4 条 × 120 行，warm 121.1 s |
+| HunyuanVideo 1.5 | 1280×720 × 81 | 未跑（原生估算 24.72；480p 已 50.09） | 23.03（估 21.23 ✗），warm 175.6 s | 3.49（估 3.59 ✓；冷启动含自检 5.20，估 5.63 ✓），6 条 × 120 行，warm 284.4 s |
 | HunyuanImage 2.1 Refiner（单帧） | 2048×2048 × 1 | 52.67（原生估算 112.50，会卸载一切），16.4 s | 10.06（估 14.38），warm 15.0 s | 0.77（估 1.00 ✓；冷启动含自检 3.45，估 4.27 ✓），16 条 × 128 行，warm 22.6 s |
 | HunyuanVideo 1.0（bf16） | 832×480 × 81 | **OOM**（单次分配 25.7 / 41.1 GiB 失败，tiled 也 OOM；原生估算 16.66），失败前 reserved 39.33 | 16.90（估 13.97 ✗，alloc 9.56），warm 57.8 s | 不做 |
 | HunyuanVideo 1.0（bf16） | 1280×720 × 129 | 没跑（480p 已 OOM；原生估算 38.45） | 37.66（估 26.68 ✗，alloc 20.84），warm 268.9 s | 不做 |
@@ -2010,6 +2011,8 @@ bench 的 alloc 峰值里有一个时刻是「输出 + 整个 arena」（`reserv
 **引擎修好以后（video-carry-store，`vae_engine.CarryStore`：每条带一遍的 carry 放在一块缓冲里）：** 真机 832×480×81 第一层热跑 reserved 2.41 ≤ 估算 2.69，估算是上界了（适配线程测）。
 
 **自检的上界（dc91365）：** 冷跑含首次自检 reserved +5.46 GiB，仍高于自检上界 4.70。`tests/selftest_mem.py`（真机单独跑一次自检，录分配器轨迹，打印 `selftest_memory` 各项和 reserved 峰值时的每个段、开出它的请求）查到：峰值 +5594 MiB = fp32 权重 3340 + **参考解码留在缓存里的空段 2056** + 条带那遍的 arena 198（缓存里没有 ≥ 198 MiB 的空段，另开一段）。原生解码的张量一级比一级大（像素 ×4、通道 ÷2），上一级释放的块装不下下一级，段都留在缓存里；而上界里参考解码只按活张量算（6 × 144 + 2 × 32 + 7 + carry 512 = 1447 MiB），又和条带那遍取 max，两者其实是叠加的。修法（只改适配器）：`decode_retained` 加上 `reference_cached`——输出分辨率以下每个分辨率按 carry 卷积的补边（行列各 1、前面 2 帧）算一份最大激活 × `activation_copies`（这一档 951 MiB），上界变成 5765 MiB；`reference_decode` 解完先清缓存，条带那遍不再叠在参考解码的空段上（预期峰值约 3340 + 2056）。测试里多帧计划和多帧自检的模拟检查恢复成检查。真机复测（9f48b35）：`selftest_mem.py` 单独自检 reserved +5396 MiB ≤ 5765；832×480×81 冷跑第一层（含首次自检）reserved +5.27 GiB ≤ 估算 5.63，164 s；`test_vae_hunyuan15.py` 45 项全过。
+
+**720p×81（carry-store 和自检修复之后）：** 第一层热跑 reserved +3.49 GiB ≤ 估算 3.59，冷跑含自检 +5.20 ≤ 5.63，两档都是上界；但比第二层慢 1.62 倍（284.4 对 175.6 s），第二层 +23.03 GiB 放得下 55 GiB，所以照 `prefer_layer2` 走第二层，决定不变。第二层估算 21.23 低于实测 23.03（HunyuanVideo 1.0 两档也是这样），归 video-l2-frag 的估算核对。前两次跑 720p 在解码前就撞 GPU 硬件异常（fp16 index_select 越界）：`vae._weights_fingerprint` 用 float32 的 `linspace(0, n-1)` 取下标，元素数超过 2^24 时最后一个下标舍入成 n；HunyuanVideo 1.5 有 30 个这样的权重（最大 `decoder.up.0.upsample.conv.conv.weight`，2.26 亿），HunyuanVideo 1.0 没有。这一档用 `MONOLOAD_PROBE_CACHE=0` 关掉探测缓存跑通；修法（整数下标）归改 `vae.py` 的线程。
 
 **HunyuanVideo 1.0 / Kandinsky 5：第二层已够，不做第一层。** 原生在 480p×81 就解不出来（整块一次要 25.7 GiB、41.1 GiB 的分配，tiled 也 OOM），第二层 480p×81 reserved 16.90 GiB、官方最大的 720p×129 是 37.66 GiB，都在 55 GiB 以内。第一层还要引擎支持「每个时间块一个 GroupNorm 统计遍」（原生的 GroupNorm 按块内 2 帧 × 整幅统计，H2 不支持统计遍和时间块同时用），工作量大而 1.0 没有超过 720p 的用法。要注意的是第二层的估算（`vae._probe_mf` 的探测，video-l2-frag 之前的口径）两档都低于实测 reserved（13.97 对 16.90、26.68 对 37.66），alloc 只有 reserved 的 55%：碎片比例大，按探测的 reserved / allocated 比放大的 video-l2-frag 应能盖住，归适配线程核对。
 

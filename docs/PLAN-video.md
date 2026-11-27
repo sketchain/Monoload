@@ -50,7 +50,7 @@
 * **难点：mid 的全局注意力跨全部帧**（tokens = T·h·w），在全部 latent 帧上一次算完，然后 `torch.split` 成 2 帧一块跑上采样路径。L1：前缀 = `conv_in` + mid（整段视频，latent 分辨率；注意力用第二层的 query 分块）+ 存档；之后条带为主跑各块。
 * HunyuanVideo 1.0 的 GroupNorm：原生是**每个时间块各自统计**（块内全部帧、整幅空间）→ L1 要每块一个统计遍（LDM 的方案 B 机制按块做，H2 的平面数正好描述「每行 2 帧」）。HunyuanVideo 1.5 是 RMS norm，没有统计遍（像 Wan 2.2），但要 H4（方案 G 扩到 `vae_refiner.RMS_norm`）。
 * 顺带：HunyuanImage 2.1 Refiner 官方文件的单帧第一层（DESIGN §9.31，和 Wan 2.2 单帧同类）在这一组做掉。分支 vae-refiner-layer1 的 `refiner_vae=False` 适配器仍不合（官方文件用不上）。
-* **进度（分支 claude/project-thread-glsomb）：** 两种 decoder 的多帧第二层入口（`vae_video` 按 decoder 结构认，逐块交出）；HunyuanVideo 1.5 / Refiner 第一层 `vae_hunyuan15.py`（前缀整段到 `up[0]`，条带为主 2 帧一块，carry 每条带每单元一份，单帧没有时间块；方案 G 的临时量在每个 norm 的计数里）。真机 480p×81：原生 50.09 GiB，第二层 10.43（不慢），第一层 2.54（慢 56%）→ 视频的第一层只作后备（`prefer_layer2`：第二层放得下就走第二层）。Refiner 2048²：原生 52.67，第二层 10.06（15.0 s），第一层 0.77（22.6 s，估算是上界）→ 单帧也第二层优先。待注册。HunyuanVideo 1.0 / Kandinsky 5：第二层已够（原生 480p×81 OOM；第二层 480p×81 16.90、720p×129 37.66 GiB），不做第一层（DESIGN §9.41）。
+* **进度（分支 claude/project-thread-glsomb）：** 两种 decoder 的多帧第二层入口（`vae_video` 按 decoder 结构认，逐块交出）；HunyuanVideo 1.5 / Refiner 第一层 `vae_hunyuan15.py`（前缀整段到 `up[0]`，条带为主 2 帧一块，carry 每条带每单元一份，单帧没有时间块；方案 G 的临时量在每个 norm 的计数里）。真机 480p×81：原生 50.09 GiB，第二层 10.43（不慢），第一层 2.54（慢 56%）→ 视频的第一层只作后备（`prefer_layer2`：第二层放得下就走第二层）。Refiner 2048²：原生 52.67，第二层 10.06（15.0 s），第一层 0.77（22.6 s，估算是上界）→ 单帧也第二层优先。720p×81：第二层 23.03（175.6 s），第一层 3.49（284.4 s，估算是上界）。已注册。HunyuanVideo 1.0 / Kandinsky 5：第二层已够（原生 480p×81 OOM；第二层 480p×81 16.90、720p×129 37.66 GiB），不做第一层（DESIGN §9.41）。
 
 ### C 组：CogVideoX
 
