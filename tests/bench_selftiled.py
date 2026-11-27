@@ -14,19 +14,23 @@ monoload = installed, as the plugin runs it) one VAE.decode of a random latent, 
 
 GGUF VAE files: no loader in ComfyUI v0.46.3 or ComfyUI-GGUF loads one as a VAE (VAELoader lists no
 .gguf, ComfyUI-GGUF only has UNet / CLIP loaders). --gguf reads the file with the gguf package,
-dequantizes every tensor to fp16 and builds comfy.sd.VAE from that state dict: the decode is then the
-fp16 VAE's (the GGUF only saves disk).
+dequantizes every tensor to fp16 (tensors above 4-D, stored flattened, get their shape back from the
+comfy.gguf.orig_shape.<name> fields ComfyUI-GGUF's converter writes, or, for files without them such as
+the community MiniMax-H3 Q8_0, from --shapes-from <safetensors of the same VAE>) and builds comfy.sd.VAE from that
+state dict: the decode is then the fp16 VAE's (the GGUF only saves disk).
 
 Run inside the ComfyUI container, in a separate process, under the GPU lock, after freeing the server:
   curl -s -X POST http://127.0.0.1:8190/free -H 'Content-Type: application/json' -d '{"unload_models":true,"free_memory":true}'
   python tests/bench_selftiled.py --vae minimax_h3_video_vae_fp16.safetensors --res 1280x720,1920x1088 --frames 33,81,121
   python tests/bench_selftiled.py --gguf seedvr2_ema_vae_f16.gguf --res 1280x720,1920x1080 --frames 33,81
+  python tests/bench_selftiled.py --gguf minimax_h3_video_vae_Q8_0.gguf --shapes-from minimax_h3_video_vae_fp16.safetensors --res 1280x720 --frames 33
   python tests/bench_selftiled.py --vae relayvsr_flash_vae_x4_fp32.safetensors --relay --res 1920x1080 --frames 31,61
 (--res is the decoded size; for --relay the low-quality input is --res / the upscale factor.)
 """
 
 import argparse
 import hashlib
+import math
 import json
 import os
 import sys
@@ -45,13 +49,19 @@ from monoload import vae as mvae  # noqa: E402
 GIB = 1024 ** 3
 
 
-def load_gguf_vae(name):
+def load_gguf_vae(name, shapes_from=None):
     import gguf
     import gguf.quants
     import numpy as np
     path = name if os.path.isfile(name) else folder_paths.get_full_path_or_raise("vae", name)
     reader = gguf.GGUFReader(path)
-    sd, types = {}, {}
+    ref = None
+    if shapes_from:
+        from safetensors import safe_open
+        rp = shapes_from if os.path.isfile(shapes_from) else folder_paths.get_full_path_or_raise("vae", shapes_from)
+        with safe_open(rp, framework="pt") as f:   # header only, no tensor data read
+            ref = {k: list(f.get_slice(k).get_shape()) for k in f.keys()}
+    sd, types, reshaped = {}, {}, 0
     for t in reader.tensors:
         shape = tuple(int(x) for x in reversed(t.shape.tolist()))
         qt = gguf.GGMLQuantizationType(t.tensor_type)
@@ -61,15 +71,43 @@ def load_gguf_vae(name):
             ten = torch.from_numpy(arr.view(np.int16)).view(torch.bfloat16) if qt == gguf.GGMLQuantizationType.BF16 else torch.from_numpy(arr)
         else:
             ten = torch.from_numpy(np.array(gguf.quants.dequantize(t.data, qt)))
+        orig = reader.get_field("comfy.gguf.orig_shape." + t.name)   # > 4-D tensors (Conv3d weights) are stored flattened
+        if orig is not None:
+            shape = tuple(int(orig.parts[i][0]) for i in orig.data)
+            reshaped += 1
+        elif ref is not None and t.name in ref and tuple(ref[t.name]) != shape and math.prod(ref[t.name]) == math.prod(shape):
+            shape = tuple(ref[t.name])   # flattened without the metadata: take the reference file's shape
+            reshaped += 1
         sd[t.name] = ten.reshape(shape).to(torch.float16 if ten.dtype != torch.float32 or ten.numel() > 64 else torch.float32)
+    if shapes_from:   # weight-level check against the reference file: a wrong un-flattening shows as relative error ~1
+        dev = mm.get_torch_device()
+        worst, worst_key, n = 0.0, None, 0
+        with safe_open(rp, framework="pt") as f:
+            for k in sd:
+                if k not in ref:
+                    continue
+                a_ = sd[k].to(dev, torch.float32)
+                b_ = f.get_tensor(k).to(dev, torch.float32)
+                if a_.shape != b_.shape:
+                    print("gguf vs {}: shape differs for {}: {} vs {}".format(os.path.basename(rp), k, list(a_.shape), list(b_.shape)), flush=True)
+                    continue
+                e = ((a_ - b_).norm() / b_.norm().clamp_min(1e-12)).item()
+                n += 1
+                if e > worst:
+                    worst, worst_key = e, k
+                del a_, b_
+        print("gguf vs {}: {} tensors compared, worst relative error {:.3e} ({})".format(os.path.basename(rp), n, worst, worst_key), flush=True)
+        torch.cuda.empty_cache()
     meta = {}
     for k, f in reader.fields.items():
+        if k.startswith("comfy.gguf.orig_shape."):
+            continue
         if k.startswith("general.") or k.startswith("comfy.") or k == "config":
             try:
                 meta[k] = bytes(f.parts[f.data[0]]).decode("utf-8")
             except Exception:
                 pass
-    print("gguf: {} tensors, types {}".format(len(sd), types), flush=True)
+    print("gguf: {} tensors, types {}, {} reshaped (comfy.gguf.orig_shape or --shapes-from)".format(len(sd), types, reshaped), flush=True)
     return comfy.sd.VAE(sd=sd, metadata=meta or None), "gguf(dequantized fp16) " + os.path.basename(path)
 
 
@@ -222,6 +260,7 @@ def main():
     p.add_argument("--vae", help="VAE file in models/vae (VAELoader)")
     p.add_argument("--vae-path", help="VAE safetensors by path (comfy.sd.VAE with the file's metadata), for files not in models/vae")
     p.add_argument("--gguf", help="GGUF VAE file (models/vae name or path), dequantized to fp16")
+    p.add_argument("--shapes-from", help="with --gguf: safetensors of the same VAE whose tensor shapes restore > 4-D weights a GGUF stored flattened without comfy.gguf.orig_shape (header only)")
     p.add_argument("--res", default="1280x720", help="decoded WxH list")
     p.add_argument("--frames", default="33", help="pixel frame counts")
     p.add_argument("--modes", default="native,monoload")
@@ -235,7 +274,7 @@ def main():
           "| intermediate", mm.intermediate_device(), "| vram_state", mm.vram_state, flush=True)
     if a.gguf:
         stock_gguf_check(os.path.basename(a.gguf))
-        vae, src = load_gguf_vae(a.gguf)
+        vae, src = load_gguf_vae(a.gguf, a.shapes_from)
     elif a.vae_path:
         import comfy.utils
         sd, meta = comfy.utils.load_torch_file(a.vae_path, return_metadata=True)
