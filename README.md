@@ -23,12 +23,12 @@
 | Flux 1 / Z-Image（Flux `ae`） | 支持 | 第一层（`vae_ldm`） | 0.31.0：VAE（§10.3）；LoRA 无单独记录 |
 | Flux 2（`flux2-vae`；Ideogram 4、Lens、Ernie-Image 同一个 VAE） | 支持 | 第一层（`vae_ldm`） | 0.31.0：VAE（§10.5、§10.6）；0.46.3：`flux2`（fp8mixed UNet，不带 LoRA；50.51 / 55.28）。Flux 2 fp8 的 GPU LoRA 项已撤 |
 | Qwen Image / Krea 2 / Anima（`qwen_image_vae`，即 Wan 2.1 VAE 单帧） | 支持 | 第一层（`vae_wan`） | 0.31.0：VAE（§10.1、§10.2）；0.46.3：`qwen_aio`（AIO checkpoint，不带 LoRA；46.16 / 52.61）。Krea 2 int8 的 GPU 项已撤 |
-| Qwen Image 2.1 VAE（Wan 2.2 结构，patch_size 1、RGBA） | 支持 | 第一层（`vae_wan22`） | CPU 测试（`test_vae_wan22` 第 9 节）；0.46.3 真机验证线程在补测 |
+| Qwen Image 2.1 VAE（Wan 2.2 结构，patch_size 1、RGBA） | 支持 | 第一层（`vae_wan22`） | 0.46.3（verify run `1127_1634_video_qi21`，全部 OK）：仅 VAE 2048² 峰值 alloc 12.06 → 1.67 GiB、on = on2 逐位；t2i 25 步 19.01 → 16.72、69.2 / 69.8 s；官方 8 步 LoRA（`p_q_image_2.1_8_steps_v0.1`）off 103.2 s → on 39.7 s、峰值 25.52 → 18.98，LoRA 生效，on = on2 逐位（对 off 不逐位：默认融合合并） |
 | Wan 2.2 5B 单帧（`wan2.2_vae`） | 支持 | 第一层（`vae_wan22`） | 0.31.0：§10.10、§10.13 |
 | HunyuanImage 2.1 | 支持 | 第一层（`vae_hunyuan`） | 0.31.0：§10.9 |
 | HunyuanImage 2.1 Refiner | 支持 | 第二层（第一层分支没合） | 无 |
-| 图片 GGUF 整模型（ComfyUI-GGUF） | 支持；12 种量化逐层 exact 逐位、0 备份（docs/GGUF-QUANT.md §8） | 跟所用 VAE 一致；GGUF VAE 没有加载器 | 0.46.3：逐层真机已过；整模型 + LoRA 验证线程在补测 |
-| 量化 safetensors（fp8 e4m3 / e5m2、int8、nvfp4、mxfp8 等） | 支持，合并在反量化出的临时权重上、不量化回去 | 跟所用 VAE 一致 | 0.31.0：WAI fp8 UNet（§10 的 9.5）；0.46.3：`test_quant` GPU 8 项逐位 |
+| 图片 GGUF 整模型（ComfyUI-GGUF） | 支持；12 种量化逐层 exact 逐位、0 备份（docs/GGUF-QUANT.md §8） | 跟所用 VAE 一致；GGUF VAE 没有加载器 | 0.46.3：逐层真机已过；Qwen-Image Q4_K_M + Lightning V2.0 整模型（verify run `1127_1608_video_qwengguf`）：打补丁 64.7 s → 0.15 s（720 层全融合、0 备份），exact 下最终 latent 与原生逐位一致；出图 37.1 → 31.5 s、峰值 alloc 24.32 → 21.48 GiB，LoRA 生效，on = on2 逐位 |
+| 量化 safetensors（fp8 e4m3 / e5m2、int8、nvfp4、mxfp8 等） | 支持，合并在反量化出的临时权重上、不量化回去 | 跟所用 VAE 一致 | 0.31.0：WAI fp8 UNet（§10 的 9.5）；0.46.3：`test_quant` GPU 8 项逐位；Qwen Image 2.1 的 int8_convrot（ComfyUI 按 int8_tensorwise 加载）上 LoRA 热合并生效，exact 是否与原生逐位一致**未验证**（`bench_lora` 驱动不了 2.1 的专用节点） |
 | TAE 系列（TAESD 等）、Stable Cascade Stage A / C、Mage | 支持 | 第二层（不做第一层） | 没测 |
 | MiniMax-H3-Image、SeedVR2 | 支持 | 原生透传（`comfy_has_chunked_io`，Monoload 不管） | SeedVR2 原生峰值测过（PLAN-video G 组）；MiniMax-H3-Image 没测 |
 
