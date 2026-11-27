@@ -101,6 +101,15 @@ def multiframe(fsm):
     return type(fsm) in MULTIFRAME
 
 
+def analytic_estimate(fsm, latent_shape, elem, workspace):
+    """Bytes one layer-2 decode of a single sample of latent_shape ([1, C, T, h, w]) adds on the device, weights and
+    the output buffer excluded, when the decoder's own module bounds it analytically (no measured probe): the LTX-2.5
+    diffusion decoder, vae_ltx.plan()'s total on the reserved basis (DESIGN §9.42). None for the others."""
+    if vae_ltx is not None and type(fsm) is ltx_diffusion.CausalDiffusionVAE:
+        return int(vae_ltx.plan(fsm, tuple(int(d) for d in latent_shape), elem, int(workspace))["total"])
+    return None
+
+
 def measured(fsm):
     """Whether layer 2 always bounds this model's decode with the measured probe (WHOLE), whatever the frames."""
     return type(fsm) in WHOLE
