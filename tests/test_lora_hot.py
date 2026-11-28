@@ -217,9 +217,14 @@ def test_refusals(model, clip):
     orig_cls = module.__class__
     module.__class__ = torch.nn.Conv2d if isinstance(module, torch.nn.Conv2d) else torch.nn.Linear
     try:
+        # a plain torch layer (not comfy.ops): merged by a parameter swap around its forward, never baked
         m2, _ = apply_loras(model, clip, COMBOS["duck"])
-        expect_raises("refuse LoRA on a non-comfy.ops parameter", MonoloadUnsupportedError,
-                      lambda: comfy.model_management.load_models_gpu([m2]), "lora_non_comfy_ops_param", key)
+        comfy.model_management.load_models_gpu([m2])
+        swap = (module.__dict__.get("_monoload_param_swaps") or {}).get(key.rsplit(".", 1)[1])
+        check("LoRA on a plain torch layer: parameter swap installed, no backup",
+              swap is not None and swap.key == key and not m2.backup)
+        free_all()
+        check("LoRA on a plain torch layer: swap removed after unload", not module.__dict__.get("_monoload_param_swaps"))
     finally:
         module.__class__ = orig_cls
         free_all()

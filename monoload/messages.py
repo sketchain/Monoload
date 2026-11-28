@@ -57,11 +57,11 @@ M = {
         "[Monoload] VAE 解码已接管：逐算子分块（卷积按行分块、注意力按 query 分块），工作区 {workspace}（MONOLOAD_VAE_WORKSPACE），"
         "自己估算内存，OOM 时缩小分块，绝不退回 tiled；只管图像（4D / T=1 的 5D），设 MONOLOAD_DISABLE_VAE=1 恢复原生"),
     "entry.vae_layer1": (
-        "[Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae single frame; LDM Decoder of "
-        "SD1.5 / SDXL / SD3 / Flux ae / Flux 2 with whole-image GroupNorm statistics, scheme {scheme}; self-tested on first use): {policy}{rows}; "
+        "[Monoload] VAE layer 1 (stripe decoding) on for recognized decoders (Wan 2.1 / qwen_image_vae and Wan 2.2 single frame; LDM Decoder of "
+        "SD1.5 / SDXL / SD3 / Flux ae / Flux 2 and the HunyuanImage 2.1 decoder with whole-image GroupNorm statistics, scheme {scheme}; self-tested on first use): {policy}{rows}; "
         "other decoders use layer 2; set MONOLOAD_DISABLE_VAE_STRIPE=1 to use layer 2 everywhere",
-        "[Monoload] VAE 第一层（条带解码）对认得的 decoder 开启（Wan 2.1 / qwen_image_vae 单帧；SD1.5 / SDXL / SD3 / Flux ae / Flux 2 的 LDM "
-        "Decoder，GroupNorm 用整图统计量，方案 {scheme}；第一次使用时自检）：{policy}{rows}；其他 decoder 走第二层；"
+        "[Monoload] VAE 第一层（条带解码）对认得的 decoder 开启（Wan 2.1 / qwen_image_vae 和 Wan 2.2 单帧；SD1.5 / SDXL / SD3 / Flux ae / Flux 2 的 LDM "
+        "Decoder 和 HunyuanImage 2.1 的 decoder，GroupNorm 用整图统计量，方案 {scheme}；第一次使用时自检）：{policy}{rows}；其他 decoder 走第二层；"
         "设 MONOLOAD_DISABLE_VAE_STRIPE=1 全部走第二层"),
     "entry.scheme_forced": ("{scheme} (forced, MONOLOAD_VAE_GN_SCHEME)", "{scheme}（强制，MONOLOAD_VAE_GN_SCHEME）"),
     "entry.scheme_default": ("{scheme} (default)", "{scheme}（默认）"),
@@ -86,6 +86,15 @@ M = {
         "--disable-dynamic-vram, set the model's Monoload LoRA Settings mode to native, or set MONOLOAD=0 / MONOLOAD_DISABLE=1.",
         "ComfyUI 开启了 DynamicVRAM（comfy-aimdo），Monoload 不支持在这种模式下打 LoRA。请用 --gpu-only / --highvram / "
         "--disable-dynamic-vram 启动，或把这个模型的 Monoload LoRA 设置的模式设成「原生」，或设 MONOLOAD=0 / MONOLOAD_DISABLE=1。"),
+    "lora.gguf_unknown": (
+        "[Monoload] {cls} looks like ComfyUI-GGUF but not a version Monoload knows; its LoRA handling stays native",
+        "[Monoload] {cls} 看起来是 ComfyUI-GGUF，但不是 Monoload 认得的版本；它的 LoRA 处理保持原生"),
+    "lora.gguf_adapter_failed": ("[Monoload] looking for ComfyUI-GGUF failed", "[Monoload] 查找 ComfyUI-GGUF 失败"),
+    "lora.gguf_save": (
+        "a GGUF model cannot be saved as a checkpoint (native ComfyUI-GGUF cannot either: its quantized layers have no "
+        "real state dict). Save the LoRA separately, or load a safetensors model to save a merged checkpoint.",
+        "GGUF 模型不能存成 checkpoint（原生 ComfyUI-GGUF 也不行：量化层没有真实的 state dict）。请单独保存 LoRA，"
+        "或加载 safetensors 模型再存合并后的 checkpoint。"),
     "lora.not_layer_param": ("the patch target is not a parameter of a layer", "patch 的目标不是某个层的参数"),
     "lora.non_comfy_ops": (
         "the module {module} whose parameter the LoRA / patch changes is not a comfy.ops layer and has no runtime merge path; "
@@ -154,8 +163,11 @@ M = {
 
     # ---- VAE: per decode -----------------------------------------------------------------------------------
     "vae.settings_note": (
-        "settings: budget {budget} ({budget_src}), GroupNorm scheme {scheme} ({scheme_src}), stripe rows {rows} ({rows_src}), mode {mode} ({mode_src})",
-        "设置：预算 {budget}（{budget_src}），GroupNorm 方案 {scheme}（{scheme_src}），条带高度 {rows}（{rows_src}），模式 {mode}（{mode_src}）"),
+        "settings: budget {budget} ({budget_src}), {scheme_item}stripe rows {rows} ({rows_src}), mode {mode} ({mode_src})",
+        "设置：预算 {budget}（{budget_src}），{scheme_item}条带高度 {rows}（{rows_src}），模式 {mode}（{mode_src}）"),
+    "vae.settings_scheme": ("GroupNorm scheme {scheme} ({src}), ", "GroupNorm 方案 {scheme}（{src}），"),
+    "vae.settings_scheme_na": ("GroupNorm scheme {scheme} ({src}; not applicable: this decoder has no GroupNorm schemes), ",
+                               "GroupNorm 方案 {scheme}（{src}；不适用：这个 decoder 没有 GroupNorm 方案），"),
     "vae.unlimited": ("unlimited", "不限"),
     "vae.none": ("none", "无"),
     "vae.auto": ("auto", "自动"),
@@ -170,8 +182,11 @@ M = {
     "vae.nr_audio": ("{model} is an audio VAE ({ndim}-dim latent, x{ratio} to samples): audio decodes are not managed",
                      "{model} 是音频 VAE（{ndim} 维 latent，放大 {ratio} 倍到采样点）：音频解码不管理"),
     "vae.nr_dims": ("latent with {ndim} dims for a {ld}D VAE", "{ld}D VAE 收到 {ndim} 维的 latent"),
-    "vae.nr_multiframe": ("multi-frame video latent (T={t}): not managed yet, phase 1 covers images (4D, and 5D with T=1)",
-                          "多帧视频 latent（T={t}）：暂不管理，目前只管图像（4D，以及 T=1 的 5D）"),
+    "vae.nr_multiframe": ("multi-frame video latent (T={t}): {model} is not managed with more than one frame yet (managed: {managed})",
+                          "多帧视频 latent（T={t}）：{model} 的多帧解码暂不管理（已管理：{managed}）"),
+    "vae.nr_mf_no_meter": ("multi-frame video latent (T={t}): bounding its memory needs the device's allocator statistics, "
+                           "not available on {dev}",
+                           "多帧视频 latent（T={t}）：给它的内存定上界要用设备分配器的统计，{dev} 上没有"),
     "vae.nr_batch_time": ("{model}'s decoder mixes frames across the batch (the batch is its time axis, e.g. SVD's VideoDecoder): "
                           "a sample-by-sample decode would change the result",
                           "{model} 的 decoder 把整个 batch 当时间轴、在帧之间混合（例如 SVD 的 VideoDecoder）：逐样本解码会改变结果"),
@@ -300,6 +315,18 @@ M = {
         "[Monoload] VAE 解码 {shape} -> 第一层（{name}）：{plan}；{policy}，工作区 {ws}{retries}；arena {arena}，内存估算 {est}"
         "（原生 {native}），{secs:.2f}s；{note}"),
     "vae.retries": (", {n} OOM retries", "，OOM 重试 {n} 次"),
+    "vae.l2_preferred": (
+        "{name} prefers layer 2, and its estimate {est} fits the device ({room} once the other models are unloaded)",
+        "{name} 优先第二层，估算 {est} 放得下（卸完其他模型后设备可用 {room}）"),
+    "vae.l2_preferred_over": (
+        "[Monoload] {name} prefers layer 2, but it does not fit the device (estimate {est}, room {room}): layer 1",
+        "[Monoload] {name} 优先第二层，但放不下（估算 {est}，可用 {room}）：走第一层"),
+    "vae.env_fit_cap": (
+        "[Monoload] MONOLOAD_VAE_FIT_CAP={raw!r} is not a size (e.g. 55G); ignored",
+        "[Monoload] MONOLOAD_VAE_FIT_CAP={raw!r} 不是大小（例如 55G），忽略"),
+    "vae.mf_probe_failed": (
+        "[Monoload] multi-frame memory probe failed ({err}); without it the memory has no upper bound, this decode is native",
+        "[Monoload] 多帧内存探测失败（{err}）；没有它内存就没有上界，这次解码走原生"),
     "vae.probe_failed": (
         "[Monoload] VAE shape probe failed ({err}); memory estimate falls back to the widest conv at full resolution",
         "[Monoload] VAE 形状探测失败（{err}）；内存估算退回按全分辨率下最宽的卷积计算"),
@@ -391,11 +418,24 @@ M = {
                  "存 H/4 和 H/2 级的输出——内置默认（SDXL 4K 约 2.2 GiB / 42 s）"),
     "scheme.C": ("also keeps every full-resolution block's output - most memory, fastest (SDXL 4K ~4.7 GiB / 36 s)",
                  "再存全分辨率每个块的输出——内存最高、最快（SDXL 4K 约 4.7 GiB / 36 s）"),
+    "scheme_hy.A": ("keeps nothing, recomputes from the H/32 checkpoint - lowest memory, slowest (HunyuanImage 2.1 4K, measured ~0.7 GiB / 80 s)",
+                    "什么都不存，从 H/32 存档重算——内存最低、最慢（HunyuanImage 2.1 4K 实测约 0.7 GiB / 80 s）"),
+    "scheme_hy.D": ("keeps the H/16 level output - little more memory than A (HunyuanImage 2.1 4K, measured ~0.8 GiB / 69 s)",
+                    "存 H/16 级的输出——比 A 多一点内存（HunyuanImage 2.1 4K 实测约 0.8 GiB / 69 s）"),
+    "scheme_hy.B": ("keeps the H/16, H/8, H/4 and H/2 level outputs - the built-in default (HunyuanImage 2.1 4K, measured ~2.1 GiB / 45 s)",
+                    "存 H/16、H/8、H/4、H/2 级的输出——内置默认（HunyuanImage 2.1 4K 实测约 2.1 GiB / 45 s）"),
+    "scheme_hy.C": ("also keeps every full-resolution block's output - most memory, fastest (HunyuanImage 2.1 4K, measured ~4.7 GiB / 22 s)",
+                    "再存全分辨率每个块的输出——内存最高、最快（HunyuanImage 2.1 4K 实测约 4.7 GiB / 22 s）"),
     "info.unused_native": (" (not used in native mode)", "（原生模式下不使用）"),
     "info.unused_layer2": (" (not used: layer 2 only)", "（只用第二层时不使用）"),
+    "info.unused_noscheme": (" (not applicable: this decoder has no GroupNorm schemes)", "（不适用：这个 decoder 没有 GroupNorm 方案）"),
     "info.model_head": ("MODEL ({model}):", "MODEL（{model}）："),
     "info.lora_list": ("  LoRA: {items}", "  LoRA：{items}"),
     "info.lora_other": ("  LoRA: none from the LoRA loader nodes (other patches present)", "  LoRA：没有来自 LoRA 加载节点的（有其他 patch）"),
+    "info.gguf": ("  GGUF model: {q} patched keys on quantized tensors (merged into the dequantized temporary, never "
+                  "re-quantized), {plain} on F16 / F32 tensors (merged at run time, no backup)",
+                  "  GGUF 模型：被改到的 key 中 {q} 个在量化张量上（合并进反量化的临时权重，不量化回去），{plain} 个在 F16 / F32 "
+                  "张量上（运行时合并，不备份）"),
     "info.lora_none": ("  LoRA: none", "  LoRA：无"),
     "info.patched": ("  patched weights: {n}{hooks}", "  被改动的权重：{n}{hooks}"),
     "info.hooks": (", hook-LoRA groups: {n}", "，hook LoRA 组：{n}"),

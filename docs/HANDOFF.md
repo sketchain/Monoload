@@ -1,6 +1,57 @@
-# Monoload 交接说明（第四阶段：VAE 解码管理推广到全部 VAE；4a 盘点、4b-0 修缺口、4b-1 Flux 2 第一层已完成并验收；第二轮代码审查的修正已完成并在 CT 700 上验收，2026-10）
+# Monoload 交接说明（video 分支：适配 ComfyUI v0.46.3、视频 VAE 推广，2026-11；之前：第四阶段 VAE 推广到全部图像 VAE、第五轮，2026-10）
 
 给下一个对话用。到这里为止的功能都已在 CT 700 上验收；这份文档讲：现在是什么状态（§1）、节点和设置体系（§2）、必须遵守的规矩（§3）、第四阶段的盘点结果和下一步（§4）、环境和工具（§5）、代码地图（§6）、提交记录（§7）。细节在 README.md（使用、真机结果、bench 命令）和 docs/DESIGN.md（§9 VAE 设计，§10–§13 总开关 / LoRA 节点 / Info 节点 / 多语言）。
+
+## 0. video 分支（2026-11，先读这一节）
+
+**分支**：长期分支 `video`（从 dev 339b754 开出）。每项工作一个功能分支，从 video 开、`git merge --no-ff` 合回 video 并推送；不开 PR，不碰 `main` / `dev`（以后有空再从 video 往 main 提 PR）。每合进 video 一项就更新本节。
+
+**底座**：ComfyUI **v0.46.3**（cab5f4e，2026-11-24），前端 1.59.6，comfy-aimdo 0.6.0，comfy-kitchen 0.2.41；ComfyUI-GGUF 用 kyuz0/ComfyUI-GGUF-H3 6d33de2。**不再兼容 0.31（62b3c94）**，下面 §1–§7 里 62b3c94 / 锁定镜像的说法是 dev 时代的历史。
+真机：LXC 里的容器 `comfyui-latest`，仓库挂在 `/opt/ComfyUI/custom_nodes/monoload`，端口 8190；真机命令写成 `docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/...`，由专门的验证线程跑。GPU 稳定可用约 **55 GiB**（60 GiB OOM，卡在宿主机 `ttm.pages_limit` 默认值）；LXC 内存只给 48 GiB（运行时什么都不经过内存，§3）。
+云端：venv `/home/user/venv`（torch 2.15 CPU 可用），`COMFYUI_PATH=/home/user/ComfyUI`（v0.46.3）；只跑小测试、一次一个，不跑 `run_all.sh`。
+
+**进度**
+* **阶段 A：适配 v0.46.3（comfy-0.46-adapt，合并 8d89069）**——小测试全过，待真机冒烟。改了什么：
+  * `VAE.decode` 现在把 `load_models_gpu` 和输出分配包在 `comfy.model_prefetch.pause_malloc_graph()` 里：Monoload 的四处 `load_models_gpu`（自检、第一层、探测、第二层）和输出分配照做（`vae_ops.malloc_graph_paused`）。
+  * Flux 2 decoder 新的 `fused_norm` 路径（`Decoder.forward_fused` + `strip_conv`，CUDA + comfy-kitchen fp16/bf16 时启用；HIP 上只有 fp16 + fp16_conv3d，CT 700 的 `--bf16-vae` 不走）：托管解码期间临时关掉（`vae_ops.unfused_norms`），原生不动——融合内核绕过冻结统计量和 OpChunking，第一层的峰值也比它低。测试 `test_vae_flux2` 第 8 节。
+  * 新的 `VAE.clone()`（VAE 精度节点、Select VAE Device 用）只复制固定的属性：Monoload 包了 `clone`，把 VAE Settings 节点的设置带到副本上。
+  * 形状探测缓存的键加上 VAE dtype（`_probe_key`：通道、维数、dtype），换精度的副本不共用探测结果。
+  * Wan 2.2 适配器支持 `patch_size` 1 / 2 和 4D latent：**Qwen Image 2.1 的 VAE**（`WanVAE` patch_size 1、temporal_kernel 1、z 64、RGBA 输出）也走第一层（`test_vae_wan22` 第 9 节）；结构签名不再含时间核（fp32 副本只留一片）。
+  * v0.46.3 的 `pytorch_attention_enabled_vae` 在 AMD 上读 `gcnArchName`，gfx11 返回 False：**CT 700 上原生 VAE 注意力是 split**（Monoload 三种都分块，不受影响）；`vae_inventory` / `check_models` 模拟 gfx1151。
+  * 测试桩跟着改：CLIP 的 `tokenizer_metadata`、SeedVR 新的 `Attention(query_dim, norm_num_groups, eps)`。
+  * 核对过不用改的：`LowVramPatch` 新的 `prepare` / `memory_required`（`MonoloadRuntimePatch` 早已覆盖）；`load()` 现在会把形状变化的 key 烤进权重，Monoload 照旧报 `lora_shape_change`（没改）；"config" patch 变成 object patch；前端 1.59.6 仍不翻译 combo 选项，`monoload_i18n.js` 还需要。
+* **LoRA：量化 safetensors / GGUF / 视频小参数（lora-quant-formats、lora-gguf、lora-video-models 三次合并）**——CPU 小测试全过，待真机。设计和进度在 `docs/GGUF-QUANT.md`。
+  * 各种量化 safetensors（fp8 e4m3 / e5m2、int8_tensorwise、nvfp4、mxfp8、convrot_w4a4、asym_w4a8_int8、w6a8_int8；fp8 的三种来源：文件内 `comfy_quant` / 头部 `_quantization_metadata` / 旧 `scaled_fp8` 标记）：hotpatch 不用改，`tests/test_quant_formats.py`（66 项）锁住「在反量化临时权重上合并、不量化回去、无备份」。
+  * ComfyUI-GGUF（UnetLoaderGGUF / CLIPLoaderGGUF，按结构找，`monoload/gguf.py`）：量化层合并进 GGMLLayer 反量化出的临时权重（exact = 原生 GGUF 的算法逐位一致，默认 fused），F16 / F32 层也运行时合并、不备份（原生会备份）；hook LoRA 也支持（原生 GGUF 对量化层不应用 hook）；保存 GGUF 模型报 `gguf_save`；Info 节点多一行 GGUF 统计。每个 prompt 开始重新找一次（自定义节点可能比 Monoload 后加载）。`tests/test_gguf_lora.py`（38 项）。
+  * 不是 comfy.ops 层 weight / bias 的参数（Wan `modulation`、LTX `scale_shift_table` 等、纯 torch 层）：`MonoloadParamSwap`，所属模块 forward 期间换上合并好的临时参数，出来换回，无备份，原生算法逐位一致。**原生 v0.46.3 加载时静默丢弃这些 key**（`_load_list` 跳过非叶子模块），所以带这类 key 的 LoRA 和原生比 max|Δ| 不为 0（已定：不加「跟原生一样丢掉」的开关）。`tests/test_lora_param_swap.py`（44 项）；`test_lora_hot` 里原来的「纯 torch 层报错」改成「换参数」。
+  * 真机：`test_quant.py` GPU 复测默认 / `MONOLOAD_EXACT=1` 各 8 项全过、逐位一致，容差没放宽。之前 GPU 上的失败是测试参照的问题（fp8 参照在 CPU 反量化，CPU / GPU 的反量化 kernel 末位舍入不同），参照改成在计算设备上反量化（Merge video-quant-ref，GGUF 线程 611a7a6）；`bench_lora.py` 逐层探测像 `cast_bias_weight` 一样先反量化量化参数；新增 `tests/make_model_lora.py`。
+  * K-quant 等云端造不出的 GGUF 类型：`tests/check_gguf_kquant.py`（真机逐层对原生），计划见 `docs/GGUF-QUANT.md` §6.2。**真机已过（GGUF 线程，合并见 §7）**：12 种量化类型逐层 exact 逐位一致、0 备份，Wan 2.2 A14B Q4_K_M + lightx2v 整模型也过，数据在 GGUF-QUANT；`bench_lora` 的逐层探测改成按 GGUF 自己的反量化取权重（之前按打包形状合并会崩，这处修复没上过 GPU）。GGUF VAE 没有加载器（H3 和核心都没有），H7 已取消。下载的两个视频 VAE GGUF 已用 `bench_selftiled --gguf`（自己反量化）真机验证：SeedVR2 F16 能读、1280×720×33 reserved 40.94 GiB；MiniMax-H3 Q8_0 的 5 维卷积权重被压成 4 维且没写 `comfy.gguf.orig_shape`（文件不合约定），加 `--shapes-from` 参考 safetensors 还原后能读、22 帧 reserved 6.24 GiB；两者都原生透传、和原生逐位相同（PLAN-video G 组）。
+  * `bench_lora.py` 加了 `--unet-gguf` / `--clip-gguf` / `--latent C,T,H,W` / `--batch`，每个组合报 GTT 峰值（20 ms 采样）。
+* **H1 / H3 / H6：多帧第二层入口（video-l2-entry，合并见 §7）**——Wan 2.1 / 2.2 和 LTX（0.9.x 卷积 VAE 的 chunked io、LTX 2.5 扩散 decoder `CausalDiffusionVAE`）的 5D latent 走第二层，峰值靠实测探测 `vae._probe_mf` 定上界（16、32 两个 latent 尺寸在 64 MiB 工作区上的 allocated 连线 × `MF_MARGIN` 1.25，加上在解码自己工作区上再跑一次量到的碎片），输出块直接写进预分配的输出缓冲；F 组的扩展点 `vae_ops.EXTRA_CHUNKERS`；C 组的 CogVideoX 登记（`vae_video`，可选导入 `vae_cogvideo`，没合进来时照旧原生）；`bench_vae --frames N`。真机：Wan 2.1 720p×81 原生 reserved 18.90 → 9.84 GiB，估算 13.77，像素 max 0.0166（PSNR 60.8），热解码慢 9%。最终探测的真机读数在排队（DESIGN §9.35 表）。
+* **多帧探测按 latent 截断；LTX-2.5 扩散 decoder 等 F 组（video-probe-clip，合并见 §7）**——最终版探测的真机读数（DESIGN §9.35 表）：Wan 2.2 1280×704×121 原生 reserved 39.68 → 10.65 GiB，估算 11.96 是上界，热跑快 20%；LTX-2 卷积 768×512×97 原生 59.29（碎片）→ 8.33，但冷跑高过估算 7.86（多出的是 32 × 32 的探测本身，比 16 × 24 的真解码还大）；LTX-2.5 扩散 decoder 第二层什么都切不到，冷跑 28.14 是原生 9.91 的 3 倍。改了两处：探测尺寸按解码自己的 latent 截断（截断形状进缓存 key）；`CausalDiffusionVAE` 只有 F 组的 `vae_ltx`（可选导入）在时才托管，没有时多帧原生。CPU 回归全过；LTX-2 截断后的真机复测在排队。H4 的 GPU 测试（`test_vae_norm_g`、`check_norm_reduce --pixelnorm`）真机全过（DESIGN §9.37）。三份原生基线写进 `/srv/comfy-latest/results/native/`。
+* **第二层估算的碎片比例 + prefer_layer2 路由（video-l2-frag，合并见 §7）**——多帧估算里分配器碎片改成按探测各次的 reserved / allocated 最大比例放大 allocated 上界（满尺寸碎片随解码变大，C 组 CogVideoX 720p×77 实测 reserved 25.94 高过旧估算 22.71），旧的绝对碎片量留作下限。真机（DESIGN §9.35）：CogVideoX 720p×81 估 47.89 ≥ reserved 26.81、720p×77 估 33.06 ≥ 25.94，Wan 2.1 720p×81 估 11.10 ≥ 9.92；探测落盘条目也存这个比例（缓存格式 2）。默认策略（没设 MONOLOAD_VAE_BUDGET）下，第一层适配器带 `prefer_layer2`（C 组 CogStripe）时先算第二层估算，放得下（`vae.layer2_room`：设备显存，封顶 `MONOLOAD_VAE_FIT_CAP`，减 VAE 权重和 `--reserve-vram`）就走第二层，放不下或探测失败才走第一层，第一层首次自检只在真选它时跑。显式设了 `MONOLOAD_VAE_STRIPE_ROWS`（或节点的条带高度）视为强制第一层，跳过这一步。**CT 700 的约定（协调者定）**：这台 APU 报 62.5 GiB、稳定可用 55 GiB，测试 / bench 一律 `docker exec -e MONOLOAD_VAE_FIT_CAP=55G …`；**待办**：comfyui-latest 容器下次因别的原因重建时把 `MONOLOAD_VAE_FIT_CAP=55G` 加进 `/opt/comfy-latest/compose.yaml` 的 environment（verify.sh 每次都用 compose 重建容器，加进去之后它也就带上了）。
+* **H2 / H5：引擎的时间轴（video-engine-time，合并见 §7）**——`vae_engine` 认帧：单元的 `tscale`、适配器的 `tdim` / `ckpt_planes` 决定每行平面数；适配器给 `time_chunks` 就按「条带为主」跑时间块，每条带带着自己的因果卷积缓存跨块；统计遍不能和时间块同用（B 组的 HunyuanVideo 1.0 按块统计自己实现）；视频自检至少 3 个时间块。现有图片适配器不受影响，CPU 回归全过。各组第一层接上（DESIGN §9.36）。
+* **H4：方案 G 扩到 Refiner 的 RMS_norm 和 LTX 的 PixelNorm（video-norm-g，合并见 §7）**——`OpChunking` 里把通道 > 510 的 `vae_refiner.RMS_norm` 和每个 `PixelNorm`（按调用判断通道数）换成分组归约，躲开 ROCm 的 32 KiB / 位置归约临时缓冲；小通道逐位相同。现在只第二层用到，各组写第一层时照 Wan 2.2 把 `grouped_norm_bytes` 加进单元（DESIGN §9.37）。H7 取消（PLAN-video §5）。
+* **盘点（video-inventory，合并见 §7）**——`tests/vae_inventory.py` 跟到 v0.46.3（新 VAE 四种、托管多帧走 Monoload 自己的路和 H1 估算），结果 DESIGN §9.39：托管的 Wan 2.1 / 2.2、LTX 0.9.0 / 2 的估算都是上界；LTX 扩散 decoder、RelayFlash 在 meta 上追踪不了，要真机。
+* **E 组 SVD：整批第二层不合，保持原生**——模拟里只省 20%（25.71 → 20.72 GiB），而且探测估算 20.03 给不出上界（整批时碎片随尺寸涨）。代码留在分支 video-svd-l2（DESIGN §9.38）。
+* **G 组：自带分块的 transformer VAE（video-g-selftiled）**——MiniMax H3（视频原版 `ViT3DDecoder`、Sol `NonCausalViT3DDecoder`、MiniMax-H3-Image / P-H3-Image）、SeedVR2、RelayVSR Flash 都声明 `comfy_has_chunked_io`，`_native_reason` 先判这一条，一律原生，Monoload 只透传，**不做第一层 / 第二层**。理由和真机数据在 `docs/PLAN-video.md` G 组：MiniMax 原版 1080p×107 帧总 reserved 11.77 GiB（权重 4.85、输出 2.50，块内工作量 <1 GiB 且不随帧数涨），开/关 Monoload 逐位相同。新增 `tests/test_vae_selftiled.py`（锁路由，含 H1 放开 5D 以后；真机 19 项全过）、`tests/bench_selftiled.py`（原生峰值、RSS/GTT、SeedVR2 的缓存放哪、`--gguf` 反量化加载 GGUF VAE、`--relay`）。Sol、SeedVR2、RelayVSR 也已真机测过原生峰值，结论不变：Sol 1080p×107 帧 ≤ 14.63 GiB，SeedVR2（bf16）1080p×33 帧 reserved 43.11 GiB、4K 由 ComfyUI 直接改走它自己的分块，RelayVSR x4 4K ≤ 7.70 GiB。现在 `_native_reason` 里 `chunked_io` 的判断排在多帧白名单之前，只有 `chunked_io_managed`（LTX `VideoVAE`，按类型精确匹配）放行；**以后改这里要保持这几个类不被放行**，路由测试会拦。
+* **视频第一层 A 组：Wan 2.1 / 2.2 多帧（video-wan-l1，合并见 §7；DESIGN §9.40）**——`monoload/vae_wan_video.py`：T > 1 的 Wan 2.1 VAE（16 ch、8×）和 Wan 2.2 VAE（48 ch、16×）走第一层，条带为主：`conv2` 和前缀按时间块整段算进存档 `[1, C, T, h, w]`，每个输出行条带带着自己的 `feat_cache` 依次跑全部时间块（原生的模块实例和调用方式，Wan 2.1 的 2 帧切片照做），每块直接写进预分配的 5D 输出。用引擎的时间轴（H2：`time_chunks` / `chunk_planes` / `stripe_state` / `call_unit` / `unit_cache`，引擎的 `Plan` 和条带），单元 / halo / 条带划分沿用单帧适配器；Wan 2.1 时间上采样之后不再切 2 帧一片（引擎的链是线性的，数值相同，计划按 8 帧算）。自检跑真正的视频路径（fp32、3 个时间块）。小测试 57 项全过（对原生相对误差 ≤ 1.7e-6，自检、注入错误、未注册时逐位一致）。真机（DESIGN §9.40 有表）：第一层对第二层，Wan 2.2 在 1280×704×121 上 3.54 对 8.91 GiB、不慢，估算全是上界；Wan 2.1 同档 4.34 对 8.00 GiB，但慢 20%，720p 估算少算 0.65–1.0 GiB。81 → 121 帧第一层只涨 0.1 GiB 以内。**决定**：Wan 2.2 多帧走第一层，Wan 2.1 多帧先留第二层（`WAN21_ENABLED = False`；第二层 1080p 约 22 GiB 也够，查清估算之后再开，办法见 §9.40）。
+  * **已注册（video-wan-reg，合并见 §7）**：`vae.py` 照 C 组的可选 import 把 `vae_wan_video` 加进 `STRIPE_ADAPTERS`（只接 T > 1）。真机冒烟 Wan 2.2 1280×704×121（`MONOLOAD_VAE_FIT_CAP=55G`）：走第一层，6 条 × 118 行、3 个时间块，首次自检 5.4e-06 通过（75.7 s）；冷跑含自检 alloc +4.32 / reserved +4.93 GiB，低于自检上界 7.83（不含自检的估算 4.03），原生估算 13.43。Wan 2.1 多帧当时仍关（`WAN21_ENABLED=False`）。
+  * **Wan 2.1 多帧打开、第二层优先（随 video-l2-frag 合入，DESIGN §9.45 末）**：`WAN21_ENABLED = True`，`Wan21Video.prefer_layer2 = True`——放得下设备走第二层，放不下才第一层（和 HV1.5 / CogVideoX 一致）。CarryStore 之后 720p×81 第一层 +3.57 对估算 4.12 GiB，估算已是上界。
+  * 真机命令：`docker exec -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/test_vae_wan_video.py --wan21 /opt/ComfyUI/models/vae/wan_2.1_vae.safetensors --wan22 /opt/ComfyUI/models/vae/wan2.2_vae.safetensors --sizes 832x480,1280x720 --frames 81,121 --native-dir /srv/comfy-latest/results/native --no-native --no-small --route 1280x704x121 --route-l2 2.1,2.2`（`--mem-history` 打印分配器轨迹）。预期：Wan 2.2 全部 PASS；Wan 2.1 的 720p 估算现在会 FAIL（已知，所以默认关着）。
+* **B 组：Hunyuan（分支 claude/project-thread-glsomb，合并见 §7；DESIGN §9.41）**——HunyuanVideo 1.0（Kandinsky 5 同一个）/ 1.5 的多帧第二层：按 decoder 结构认（first-stage 是通用的 `AutoencoderKL` / `AutoencodingEngine`），按原生的 2 帧一块交出（c8f481e）。HunyuanVideo 1.5 / HunyuanImage 2.1 Refiner 官方文件的第一层 `monoload/vae_hunyuan15.py`（4e348fa）：前缀整段跑到 `up[0]`，之后条带为主按 2 帧时间块跑，carry 每条带每单元一份；单帧（Refiner）没有时间块。真机 480p×81 第二层 10.43 GiB 不慢、第一层 2.54 慢 56%，所以第一层只作后备（`prefer_layer2 = True`，配合 video-l2-frag 的路由；估算少算的 carry 碎片归引擎修，video-carry-store）。Refiner 2048² 第二层 10.06 GiB 15.0 s、第一层 0.77 22.6 s（估算是上界），单帧也第二层优先。**已注册**：`vae.py` 照可选 import 把 `vae_hunyuan15` 加进 `STRIPE_ADAPTERS`（video-b-reg，只接 5D）；B 组真机 `test_vae_hunyuan15` 42 项全过（600885c）。`prefer_layer2` 的路由在 video-l2-frag 合入之前不生效（之前第一层照常可用、只是慢）。自检上界补上参考解码留在缓存里的空段（dc91365，真机复测过：+5396 ≤ 5765 MiB，480p×81 冷跑 +5.27 ≤ 5.63 GiB）。HunyuanVideo 1.0 / Kandinsky 5：**第二层已够，不做第一层**（原生 480p×81 就 OOM；第二层 480p×81 16.90、720p×129 37.66 GiB，探测估算两档都偏低，归 video-l2-frag 核对）。HunyuanVideo 1.5 720p×81：第二层 23.03 GiB（估 21.23 偏低）175.6 s，第一层 3.49（估 3.59）284.4 s，照旧第二层优先。**待**：`vae._weights_fingerprint` 的 float32 下标对 > 2^24 元素的权重越界（HunyuanVideo 1.5 第二层探测时 GPU 硬件异常），归改 `vae.py` 的线程（DESIGN §9.41）。
+* **多帧探测落盘（video-probe-cache，合并见 §7；DESIGN §9.44）**——第二层多帧探测（`_probe_mf`）的结果写进 `<user>/monoload/probe_cache.json`（`MONOLOAD_PROBE_CACHE` 改路径，0 关），key 含权重指纹、latent 布局、workspace、显卡、torch 版本、Monoload 源码哈希。重启后不再冷跑探测（Wan 2.1 832×480×33 冷跑 21.0 → 14.3 s）。LTX-2.5 扩散 decoder 的第二层估计直接用 `vae_ltx.plan()`，不探测（768×512×97 冷跑 109.7 → 29.9 s，估算 6.10 ≥ reserved 5.59）。「第二层估计 ≥ 原生估计就走原生」不做：原生估计在视频 VAE 上低好几倍，反例在 §9.44。权重指纹（video-fp-fix，缓存格式 4）：名字 / 形状 / dtype 全部计入，取值只取最大 16 个张量、整数下标；修了两个 HunyuanVideo 1.5 的问题：float32 下标越界撞 GPU 硬件异常，以及 checkpoint 里缺的 4 个 `temb_proj.bias` 是未初始化内存、每进程不同，缓存永不命中。真机两进程指纹一致，第二次命中（探测 163 s → 0）。video 回归（92cbd3d，ComfyUI 0.46.3，verify run `1127_1418_video_regr`）5 个 workflow 全部 OK：flux2、sdxl_lora、sdxl、qwen_aio、wan22_5b，`MONOLOAD=0` 与原生逐位一致；图片模型的汇总表在 README 开头「图片模型一览」。图片两项补测（0.46.3）：Qwen Image 2.1 VAE、t2i、官方 8 步 LoRA 全部 OK（`1127_1634_video_qi21`）；Qwen-Image Q4_K_M GGUF + Lightning V2.0 打补丁 64.7 s → 0.15 s、exact 最终 latent 与原生逐位一致（`1127_1608_video_qwengguf`）；int8_convrot 上 LoRA 热合并生效，exact 逐位未验证。I 组图片全覆盖（DESIGN §9.48）：盘上有的 8 个家族（SD1.5、Z-Image、Krea 2、Anima、Klein 4B、Flux 1 dev、Chroma、LongCat）off / zero / on / on2 全过，13 个图片 VAE 测了 bench（Mage 走第二层、MiniMax 透传，都与原生逐位一致）；没下载的家族这轮不测（盘留给 ROCm）。多帧第二层估算的碎片比例只取两次小工作区的探测（video-cog-ratio，缓存格式 6，DESIGN §9.35）：CogVideoX t=21 从 52.5 降到 37.6（实测 27.6），其他模型不变或略降、仍是上界；格式 6 让旧缓存整个失效，部署后探测和自检各重跑一次。第一层自检的通过结果也落盘（video-selftest-cache，同一文件、格式 5，DESIGN §9.47）：Wan 2.2 5B 视频的自检 74.9 s 每次重启后只跑一次。
+* **视频条带 carry 缓冲（video-carry-store，合并见 §7；DESIGN §9.45）**——`vae_engine.CarryStore`：每遍条带一块缓冲装各单元的 carry，碎片消掉，估算成了上界：HunyuanVideo 1.5 832×480×81 第一层 2.54 → 2.41 GiB（估 2.69）、Wan 2.1 1280×720×81 3.93 → 3.57（估 4.12）。HV1.5 的首次自检峰值曾超它的上界（+5.46 对 4.70），B 组已修（自检 5396 ≤ 上界 5765 MiB，见 B 组条目）；Wan 2.1 多帧已据此打开（第二层优先，见 A 组条目）。
+* **F 组：LTX（分支 claude/project-thread-b4e366，合并见 §7；DESIGN §9.42、PLAN-video F 组）**——卷积 VAE（LTX 0.9.x / LTX-2）**只走第二层，不做第一层**：LTX-2 1280×704×97 原生 reserved 56.76 → 7.99、1920×1088×193 55.95 → 16.14 GiB，时间不变。LTX-2.5 扩散 decoder（`CausalDiffusionVAE`）由新的 `monoload/vae_ltx.py` 经 `vae_ops.EXTRA_CHUNKERS` 接管（`vae_video` 已可选导入它，导入成功才把这个类放进多帧白名单）：算子级邻域注意力按 T 切等长段（光环 k_t − 1，结果和整块相同）、SwiGLU 按工作区分块、精简的 decoder forward。真机 768×512×97 走正常入口 reserved 9.84 → 5.52，热跑 17.9 → 31.3 s（冷跑 109.7 s，含两次探测解码）；1920×1088×97 50.15 → 26.07，106 → 191 s；1920×1088×193 reserved 39.23（主线 55 以内），367 s；fp32 自测 ≤ 5.6e-6。（`comfyui-latest` 容器的环境里没设 `MONOLOAD`，没设就是开（`settings._master_from_env`）；bench 的 monoload 档日志里应有「[Monoload] VAE decode … -> layer」那一行。）
+  * 真机命令：`docker exec -e MONOLOAD=1 -w /opt/ComfyUI/custom_nodes/monoload comfyui-latest python tests/bench_ltx.py --vae ltx-2.5-video-vae-bf16.safetensors --res 768x512 --frames 97 --modes monoload,native --repeat 2 --compare`（`--modes lean` 直接装 `vae_ltx`，不经探测）；精度 `python tests/check_ltx_dd.py --vae ltx-2.5-video-vae-bf16.safetensors`（fp32，默认三档小尺寸，估算低于实测 reserved 会打 `!!`）。
+* **D 组 Mochi / Cosmos 1.0：逐帧流式的第二层（分支 claude/project-thread-gjyfzb，待适配线程 --no-ff 合；DESIGN §9.43）**——`vae_mochi.py` / `vae_cosmos.py` 的 `chunks` 按帧深度优先、因果卷积带缓存，登记已在 video（855469a，可选导入）。两种都不做第一层。真机（2026-11-27，reserved Δ）：Cosmos 1280×704×121 原生 30.18 → **2.96 GiB**（估算 4.58，warm 8.5 → 10.4 s，像素 max 0.0215 / PSNR 54.8，bf16 噪声级）；Mochi（VAE 是 fp16）848×480×85 原生 OOM → tiled，Monoload **5.16 GiB**（估算 6.83，warm 67 s，0 次 OOM 重试）；`test_vae_stream` 22/22（fp32 相对误差 ≤ 3.4e-6）；`check_group_d_zero` 4/4（MONOLOAD=0 两种都对原生逐位一致）。真机命令：`docker exec -e MONOLOAD=1 -w <仓库> comfyui-latest python tests/test_vae_stream.py`、`tests/check_group_d_zero.py`、`tests/bench_vae.py --vae cosmos_cv8x8x8_1.0.safetensors --res 1280x704 --frames 121 --modes native,monoload`（Mochi：`mochi_vae.safetensors --res 848x480 --frames 85`）。
+* **视频第一层 C 组：CogVideoX（claude/project-thread-9jsphn，合并见 §7；DESIGN §9.46）**——`monoload/vae_cogvideo.py`：第二层 `chunks()`（登记在 `vae_video._CHUNKS`）把 `up_blocks[1]` 的时间 + 空间上采样改成按第二阶段的 4 帧块现算，第二阶段照原生循环逐块写进输出缓冲，不加算子分块时与原生逐位相同；第一层 `CogStripe` / `decode_rows`（`vae.STRIPE_ADAPTERS`）每个 resnet 按输出行切、GroupNorm 用整张量 fp32 统计、`conv_caches` 逐行原地写回上一块的缓冲，fp32 自检 5e-6。帧数：latent t 奇 → 4t−3、偶 → 4t（`output_frames`）。`prefer_layer2`：第二层估算放得下（`layer2_room`）就走第二层，否则第一层。真机：720p×81 第二层 26.81 GiB / 163 s（估 47.89），第一层 12.05 / 236 s（估 13.29），FIT_CAP=20G 时选第一层；720×480×49 原生 35.10 → 第二层 12.26 → 第一层 4.64，像素 PSNR 68.5；MONOLOAD=0 逐位。真机检查：`tests/check_cogvideo.py --vae cogvideox_vae.safetensors`（加 `-e MONOLOAD=0` 跑逐位那一项）。
+* **阶段 B**：**`docs/PLAN-video.md` 已写（合并见 §7）**——共用钩子 H1–H7、各 VAE 的第一层方案和 A–H 分组、模型清单与单次峰值（> 55 只有 MiniMax H3 完整版 bf16 DiT）、开工顺序。`docs/PLAN-video.md`（每种视频 VAE + 新图像 VAE 的第一层方案，分组可并行，含 safetensors / GGUF；覆盖 v0.46.3 里量化能跑的全部视频模型，扩散模型和文本编码器分开算；单次峰值 ≤ 55G 为主线，> 55G 单列「等宿主机调 ttm 后再验」；超大模型不分批会 OOM 时才把 TE 和视频模型分开加载；不做 MAGI-2）。
+* **阶段 C（进行中）**：多帧第二层入口已合（上面 H1）；剩下feat_cache 和因果时间卷积；SVD 整批第二层；LTX 分块 IO 的输出缓冲（音频仍原生）；`bench_vae --frames`；共用的第一层视频钩子（参考 vae-refiner-layer1 f51a6bc）。每项一个功能分支。
+
+**待办（视频这一轮之后）**：形状变化的 LoRA 的运行时支持——协调者替用户定：这次冲刺先保持报错（原生 v0.46.3 会烤进权重），视频做完再考虑。
+
+**未决（等用户定）**：Refiner 第一层分支 vae-refiner-layer1；polish-after-ui-test 的复测（换底座后一起测）。
 
 ## 1. 当前状态
 
@@ -9,7 +60,7 @@
 * **LoRA 运行时合并**（`monoload/hotpatch.py`、`release.py`）：所有 `ModelPatcher` 的 LoRA 不写进权重、不留备份，每一层计算时在临时权重上合并；默认融合 fp16 `addmm_`，可选逐位一致；每个 prompt 结束后释放 LoRA，底模常驻。CT 700：SDXL 比原生少用约 4.7 GiB（8.2 对 12.9 GiB），每步 fused 0.73 s、exact 0.90 s、原生 0.654 s（19d7694，命令 V）。
 * **VAE 解码降峰值**（`monoload/vae*.py`）：包装 `comfy.sd.VAE.decode`。
   * 第二层（所有 VAE 的图像解码）：卷积按输出行分块，注意力按 query 分块，整图语义不变。
-  * 第一层（认得的 decoder）：H/8 前缀整图算出存档，之后按输出行条带倒推重算；整个解码在一个 arena 里。适配器：Wan 2.1 单帧（`qwen_image_vae`）、LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae`，GroupNorm 整图统计量用统计遍求，方案 A / D / B / C，默认 B）。
+  * 第一层（认得的 decoder）：低分辨率前缀整图算出存档，之后按输出行条带倒推重算；整个解码在一个 arena 里。适配器：Wan 2.1 单帧（`qwen_image_vae`，`vae_wan`）、Wan 2.2 单帧（`vae_wan22`，已验收；> 510 通道的 RMS_norm 在托管解码里分组求范数，DESIGN §9.28 / §9.29）、LDM decoder（SDXL / SD1.5 / SD3 / Flux `ae` / Flux 2，`vae_ldm`，GroupNorm 整图统计量用统计遍求，方案 A / D / B / C，默认 B）、HunyuanImage 2.1（`vae_hunyuan`，同样的方案，已验收）。
   * 不设预算：默认条带策略；设了预算（环境变量或节点）：预算内预计最快（第二层放得下就用第二层）。
   * 自己的内存估算交给 `load_models_gpu`；OOM 只缩块重试；从不退回 tiled。
 * **三个节点**（分类 `Monoload`）：Monoload LoRA Settings、Monoload VAE Settings、Monoload Info（§2）。
@@ -22,13 +73,38 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | SDXL / Flux `ae` | 52.5 GiB / 11.9 s | 15.0 GiB / 9.9 s | 默认 B 2.17 GiB / 42 s（A 1.10 / 75，D 1.52 / 58，C 4.70 / 36） |
 | `qwen_image_vae` | 59.2 GiB / 7.9 s | 9.6 GiB / 6.9 s | 0.87 GiB / 8.5 s |
 
-验收情况：VAE 三个阶段、预算策略、VAE 节点、总开关、LoRA 节点、Info 节点、多语言都已在 CT 700 上通过（最近一次 e924a77：第二轮审查修正后的 `run_all.sh` 和命令 AC / AD / AE / Z，README §10.8）。polish-after-ui-test（05ded8d）修了 UI 实测发现的六处问题，待 CT 700 复测（README §9.10）。
+验收情况：VAE 三个阶段、预算策略、VAE 节点、总开关、LoRA 节点、Info 节点、多语言都已在 CT 700 上通过（第二轮审查之后 e924a77，README §10.8；图像补齐最近一次 0593f27：Wan 2.2 方案 G 之后的 GA–GK 和 `run_all.sh` 43 组 1614 项，README §10.13）。polish-after-ui-test（05ded8d）修了 UI 实测发现的六处问题，待 CT 700 复测（README §9.10）。
 
 **第四阶段 4a（vae-inventory，575fc46；命令 W 的识别修正 87e6262）**：只加了盘点脚本和文档，插件行为没变。结论：用户实际在用的三个 VAE（SDXL、Flux `ae`、`qwen_image_vae`）的图像解码**已经全部走第一层**；其余 VAE 的结构、现在的路、模拟峰值和建议顺序见 §4 和 DESIGN §9.16；发现现有代码的 4 处缺口（SVD 结果被改变、2D latent 的音频 VAE 被管理且 ACE 的估算约 1 PiB、像素空间被管理、TAESD 小图第二层反而更高）。用户已定顺序（§4.0）。
 
 **第二轮代码审查（基准 main 5d9ac63，ComfyUI 62b3c94，2026-10）：已完成并在 CT 700 上验收**（8c5cb37，README §10.8）。清单 01–20 全部改完；21、23 按用户的决定做了，22 不做（§4.0）。最要紧的是 01：默认设置下 `CheckpointSave` / `ModelSave` / `CLIPSave` 以前会把 LoRA 悄悄丢掉、存成底模；CT 700 上 SDXL + Smooth Booster 存出的 checkpoint 与原生 2515 个张量逐个相同（也与整进程 `MONOLOAD=0` 相同）。验收之后又改了：`run_all` 的「VAE 接口变了」那组在容器里没拿到 `TEST_BROKEN_VAE_API`、实际跑的是普通入口测试，已修（eee564c）；`bench_vae` 没跑原生时写「native not run」（17880b8）；21 / 23 见 §4.0。**这些也已在 CT 700 上复查通过**（e924a77，README §10.8 复查）：`run_all.sh` 41 组 1490 项 0 失败 0 跳过，「VAE 接口变了」那组 11 项、有 NOT managed 警告；命令 AE 不变；命令 Z（Flux 2 预算 3G / 1.5G）六档选择与 §10.5 相同，每档第一次（探测 + 自检 + 解码）都 ≤ 估算。
 
 **4b-1（vae-flux2-layer1，4fbaa22，CT 700 验收通过）**：Flux 2 VAE（`AutoencoderKL` + batch-norm latent）走第一层，复用 LDM 适配器：latent 的反归一化和 2×2 还原是前缀第一个模块（`vae_ldm.LatentUnpatch`），引擎加 `decoder_hw` 钩子在 decoder 的分辨率上做计划。模拟与 Flux `ae` 相同（4K 默认 B 2.18 GiB）。DESIGN §9.18，测试 `tests/test_vae_flux2.py`，真机命令 README §9.12。
+
+**图像补齐（2026-10）——CT 700 结果（dev 189741e，README §10.9 / §10.10；Wan 2.2 方案 G 之后 0593f27，§10.13）：两种都已验收**：
+* **HunyuanImage 2.1：验收通过**（README §10.9）。XH / YH / ZH 与预测一致，8 次自检通过、峰值 1.43 ≤ 上界 1.49 GiB。
+* **Wan 2.2：验收通过**（CT 700，dev 0593f27，README §10.13）。第一次测（README §10.10）默认 128 行和更矮的条带超估算，来源是 ROCm 上 `F.normalize` → `torch.linalg.vector_norm` 的归约内核：每输出跨多块时申请 32 KiB / 位置的临时缓冲（ROCm 把每输出的块数至少设成 64），1024 通道、位置数是 4 的倍数且 ≤ 40960（gfx1151 target 320）时触发（命令 N，README §10.12）。**方案 G**（用户定）：托管解码期间（`OpChunking`：第一层前缀 / 条带、自检、第二层；原生不动）把通道 > 510 的 Wan `RMS_norm` 实例 forward 换成分组求范数（每组 ≤ 510 通道，fp32 里合并）；Wan 2.1（384 通道）不换；临时量 1 MiB + (4G + 4 + 2e) B / 位置算进模型；alloc_sim 的跟踪器模拟这个缓冲（不用 G 时复现旧读数）。复测 GA–GK：第一层 4K 默认 1.04 / 1.34 / 估算 1.35（以前 1.49 / 3.27），2688 0.72 / 0.92 / 0.94，1344 0.45 / 0.45 / 0.59，fp32、各条带高度、预算、节点、D1 全部 ≤ 估算、与模拟一致；精度（PSNR 对原生 57–59 dB）、耗时不变；Wan 2.1 / HunyuanImage / SDXL 不变；`run_all` 43 组 1614 项 0 失败。注意力块的模型比实测多算 196 MiB（偏保守，记录在案，不改）。
+
+图像补齐（实现，2026-10）：
+* **Wan 2.2 单帧（vae-wan22-layer1，合并 d6473d3）**：`vae2_2.WanVAE`；带 `DupUp3D` 捷径的上采样块整块是一个 ×2 单元（halo 13，逐块测过是精确边界），最后 `unpatchify` 也是单元。4K 模拟：原生 34.2 → 第二层 19.8 → 第一层 1.34 GiB。自检的 fp32 副本只留每个 CausalConv3d 时间核的最后一片（单帧只读它；0.79 GiB 而不是 2.2 GB）。顺带修了第二层估算（`decode_retained`：`WanVAE.decode` 单帧也把每个卷积的输入克隆进 feat_cache，4K 13.5 GiB；以前估算 10.0 < 模拟 19.8）。DESIGN §9.23，测试 `test_vae_wan22.py`（50 项），真机命令 README §9.16（W / XW / YW / ZW）。
+* **HunyuanImage 2.1（vae-hunyuan21-layer1，合并 838f7fc）**：LDM 的块和 GroupNorm 统计遍，多了第一步 `conv_in + repeat`、`PixelUnshuffle2D`（depth-to-space ×2，halo 2）、6 级；方案按结构定义（D = H/16，B = H/16…H/2）。4K（3840×2176）模拟：原生 38.1 → 第二层 11.1 → 第一层 B 2.13（A 0.74、C 4.67）GiB。自检几何按适配器（`selftest_size` 12）；第二层估算按 6 份激活（`activation_copies`；以前 4K 10.06 < 模拟 11.10）。Info 节点有 HunyuanImage 自己的方案说明，`gn_scheme` tooltip 改成按结构描述。DESIGN §9.24，测试 `test_vae_hunyuan.py`（57 项），真机命令 README §9.17（W / XH / YH / ZH，4K 用 3840×2176）。
+* **HunyuanImage 2.1 Refiner（第五轮，见下面「第五轮」）：** §9.25 的分析对错了 sd.py 的分支——官方文件是 `refiner_vae=True` 的 decoder（与 HunyuanVideo 1.5 相同，单张图 1 帧、RMS norm），不是分析的 `refiner_vae=False`（DESIGN §9.31）。
+* **用户定的（两种新 VAE 共同，接受的行为）**：自检不改。fp32 自检峰值（Wan 2.2 1.51、HunyuanImage 1.41 GiB）比多数尺寸的解码本身大；预算低于自检上界（Wan 2.2 1.61、HunyuanImage 2.1 1.49 GiB）时第一次解码报错是接受的行为。**任何方案都不许放到 CPU 上。**
+* **Refiner：先不动**，等这一轮（Wan 2.2 显存）结束再说。（第五轮已做，见下。）
+
+**第五轮（2026-10，基于 dev 907ef25）：**
+* **一 Refiner 第二层估算（vae-refiner-l2-estimate，合并 f7e1aa2）：** `vae_hunyuan.decoder_terms` 对 `vae_refiner.Decoder(refiner_vae=False)` 取 6 份激活（alloc_sim `--model hyr`：2048² 模拟 23.44 / 以前估算 18.05，扫 50 个尺寸 × 4 种工作区 + fp32 最多要 5.67 份）。**之后发现官方 Refiner 文件不是这一支**（docs-refiner-file，合并 b426588）：官方文件的 decoder 是 `refiner_vae=True`，第二层估算本来就是上界（alloc_sim `--model hv15`：2048² 10.46 / 14.43，最多要 2.72 份），不用改；6 份那条只对 `refiner_vae=False` 生效。DESIGN §9.30 / §9.31，README §9.21（命令 W / RA / RB）。
+* **二 Refiner 第一层：按用户的规格（`refiner_vae=False`、条带带 4 帧、跨帧 GroupNorm 方案、引擎的「每行平面数」）做完、测试过（`test_vae_refiner` 69 项，alloc_sim 48 个配置 reserved ≤ 估算），但官方文件用不上它，所以留在分支 `vae-refiner-layer1`（f51a6bc），没有合并，等用户定**（分支上的 DESIGN §9.34）。官方文件的第一层只做了分析（DESIGN §9.31）：和 Wan 2.2 单帧同类（无整图统计、无方案），要先定方案 G 是否扩到 `vae_refiner.RMS_norm`。
+* **三 视频（video-analysis，合并 565e73b，只有文档）：** DESIGN §9.32（每种视频 VAE 的解码路径、原生峰值来源、第二层怎么套、alloc_sim 的原生 / 第二层、现有估算不是上界、方案 G 的影响、建议顺序），README §9.22（文件清单、bench 命令；bench 要先加 `--frames`，没加）。
+* **四 Flux 2 dev（flux2-dev-run，合并 2219844）：** `tests/run_flux2_dev.py`，README §9.23 / DESIGN §9.33；CPU 冒烟测试过，没在真模型上跑。
+* **用户定的（第五轮）：** Refiner 自检约 3 GiB：预算低于自检上界时第一次解码报错，**暂时接受（先不管，不是定死）**；不许放到 CPU 上。默认方案和条带目标等真机数据。（这两条当时针对 `refiner_vae=False` 的设想；官方文件的第一层如果做，自检预计约 1.5 GiB，DESIGN §9.31。）
+
+**第二轮其余各项（2026-10，基于 dev 189741e 的真机日志；CT 700 复查通过，dev 1dc61b2，README §10.11：`run_all` 43 组 1603 项 0 失败 0 跳过；方案 G 之后 0593f27：43 组 1614 项，README §10.13）**：
+* 三 `test_entry.py` 的适配器列表改成 `vae_wan, vae_wan22, vae_ldm, vae_hunyuan`（`run_all.sh` 的 9 组入口测试本地都过：17 / 17 / 17 / 8 / 17 / 17 / 17 / 17 / 11 项）。
+* 四 `check_vae_node.py` 先 `load_models_gpu` 再测（以前第一行含整个权重：Wan 2.2 1.31、HunyuanImage 0.755 GiB）。
+* 五 `bench_vae.py` 汇总表的内存各列和估算取自同一次运行（增量最大的那次），是冷启动那次时标 `[cold]` / `[cold: incl. the first-use self-test]`。
+* 六 没有 GroupNorm 方案的 decoder（Wan 2.1 / 2.2、第一层不认的）：解码日志的设置不写方案这一项，节点 / 环境变量设了时写「not applicable」，Info 节点标「不适用」，不显示方案说明（`vae.gn_schemes_apply`，适配器的 `has_schemes`）。HunyuanImage 的方案数字改成实测。
+* 七 第二层估算的 retained / copies 按 decoder 的类取（适配器的 `decoder_terms`），第一层拒绝（forward hook、`vae_options`）时也算：以前 Wan 2.2 4K 少算 13.47 GiB、HunyuanImage 少 2 份激活（DESIGN §9.27）。
 
 **4b-0（vae-coverage-fixes）**：盘点的缺口 1–3 已修（DESIGN §9.17）：SVD 这类在 batch 各帧之间混合的 decoder、2D latent 的音频 VAE、没有可分块算子的像素空间 VAE 都走原生；`_native_reason` 的理由改走消息表。缺口 4（TAESD 小图）不在范围内。
 
@@ -81,7 +157,7 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * **现有缺口**（这一步只报告）：① SVD 的 `VideoDecoder` 以 batch 为时间轴，第二层逐样本解码改变了结果；② ACE-Step / LTX 2 音频 / MiniMax 音频（2D latent）被管理，ACE 的估算约 1 PiB（`load_models_gpu` 会卸载一切）；③ 像素空间被管理（估算 2 GiB）；④ TAESD 1344 第二层 2.66 > 原生 1.77 GiB。
 * **建议顺序**：0 修缺口 ① – ③ → 1 Flux 2 第一层 → 2 多帧视频第二层（通用）→ 3 Wan 2.2 单帧第一层 → 4 HunyuanImage 2.1 第一层 → 5 视频第一层（等有需要）。不建议做：TAE 系列、Stage A / C、Mage、MiniMax 视频、SeedVR2 第一层、音频、3D。
 * **用户定的（4a 之后）**：顺序 ① 修缺口 1–3 → ② Flux 2 第一层（一定会用）→ ③ 视频等用户定了再说（不是不做，往后放）。SVD 先走原生（并进 ①），以后做视频第二层时把 SVD 整批第二层一起做。每项一个分支，分开提交，合进 dev。
-* **进度**：① 完成（4b-0，DESIGN §9.17）；② 完成并在 CT 700 上**验收通过**（4b-1，DESIGN §9.18，实测 README §10.5：W / X / Y / Z / check_vae_node 都与预测一致）；③ 视频等用户定。
+* **进度**：① 完成（4b-0，DESIGN §9.17）；② 完成并在 CT 700 上**验收通过**（4b-1，DESIGN §9.18，实测 README §10.5：W / X / Y / Z / check_vae_node 都与预测一致）；③ 视频等用户定。之后用户定的「图像补齐」：Wan 2.2 单帧、HunyuanImage 2.1 第一层完成并验收（Wan 2.2 经方案 G，见 §1）；Refiner 见 §1「第五轮」；视频（多帧）第五轮只做了分析（DESIGN §9.32），路由不变。
 * **自检峰值（DESIGN §9.19 → §9.20）**：用户选 B + A，已实现（vae-selftest-budget）：参照解码在第二层分块下跑（自检 0.74 → 约 0.38 GiB），自检上界（430 MiB）算进第一次解码的估算和预算比较。
 * **第一次解码多 0.13 GiB / arena 被输出钉住（DESIGN §9.21 → §9.22）**：用户选 ① a、② a + 结束时清缓存，已实现（vae-arena-output）：`StripeAdapter.run` 先清缓存、再分配输出（单独一段）、再预留 arena，解码完清缓存；估算 = 输出段 + arena + largest + 16 MiB。布局变了使方案 A（无存档）4K 128 MiB 工作区高了 0.12 GiB（前缀在检查点前留下的洞以前被输出填上），加了 `move_low`（检查点挪进下面的洞，只在洞放得下时）。alloc_sim：37 个配置峰值都不升、≤ 估算（手工跑的结果；自动测试只断言其中一部分），解码后只留输出；63 个 CT 700 读数（含新加的 Flux 2 的 12 个）按旧布局重放都对得上；预算选择不变。
 * **代码审查（基准 4f140ea，ComfyUI 62b3c94）**，每项一个分支：
@@ -104,10 +180,14 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 |---|---|
 | SD1.5 / SDXL / SD3 / Flux `ae` / Flux 2（LDM `Decoder`，`AutoencoderKL` / `AutoencodingEngine`；Flux 2 带 `batch_norm_latent`，4b-1） | 第一层（`vae_ldm`） |
 | Wan 2.1 / `qwen_image_vae` 单帧（5D，T=1） | 第一层（`vae_wan`） |
+| Wan 2.2 单帧（`vae2_2.WanVAE`，5D，T=1） | 第一层（`vae_wan22`） |
+| HunyuanImage 2.1（`AutoencodingEngine` + `hunyuan_video.vae.Decoder`，4D，32x） | 第一层（`vae_hunyuan`） |
 | 其他 2D 图像 VAE（带注意力的 up 级、TAESD、Stable Cascade Stage A / C、Mage-VAE 等） | 第二层（逐算子分块），或第一层识别不通过时第二层 |
-| 3D VAE 的单帧 latent（5D，T=1）：Wan 2.2、Hunyuan 系（含 HunyuanImage 2.1 Refiner）、Mochi、Cosmos、CogVideoX、TAEHV、SeedVR2（`latent_dim` 3）等，Wan 2.1 / `qwen_image_vae` 以外 | 第二层（SeedVR2 的注意力在 `optimized_vae_attention`，审查 2026-10 第 12 项起也分块） |
-| 多帧视频 latent（T>1）：Wan 2.1 / 2.2、Hunyuan 系（3D 卷积 `AutoencoderKL` / `AutoencodingEngine`）、Mochi、Cosmos、CogVideoX、MiniMax H3、TAEHV 等 | **原生**（`_native_reason`：multi-frame video latent，第一阶段暂不做） |
-| 自己往预分配输出写的（`comfy_has_chunked_io`，如 LTX） | 原生 |
+| 3D VAE 的单帧 latent（5D，T=1）：Hunyuan 系（含 HunyuanImage 2.1 Refiner）、Mochi、Cosmos、CogVideoX、TAEHV 等，Wan 2.1 / 2.2 以外 | 第二层（SeedVR2 在 v0.46.3 声明了 `comfy_has_chunked_io`，单帧也走原生，见下面一行） |
+| 多帧 Wan 2.1 / 2.2（T>1，`wan.WanVAE` / `vae2_2.WanVAE`） | 第一层（`vae_wan_video`，**注册到 `STRIPE_ADAPTERS` 之后**）；没注册时第二层（H1，`vae_video.MULTIFRAME`，实测探测定上界） |
+| 多帧 LTX（0.9.x 卷积 VAE、LTX 2.5 扩散 decoder） | 第二层（H1）；扩散 decoder 由 `vae_ltx` 经 `EXTRA_CHUNKERS` 换算子（F 组），`vae_ltx` 导入失败时扩散 decoder 原生 |
+| 多帧视频 latent（T>1），`vae_video.MULTIFRAME` 之外：Hunyuan 系（3D 卷积 `AutoencoderKL` / `AutoencodingEngine`）、Mochi、Cosmos、CogVideoX、MiniMax H3、TAEHV 等 | **原生**（`_native_reason`：multi-frame video latent，第一阶段暂不做） |
+| 自己往预分配输出写的（`comfy_has_chunked_io`）：MiniMax H3 视频 / Sol / 图像、SeedVR2（`VideoAutoencoderKLWrapper`）、RelayVSR Flash | 原生，单帧也不管（`tests/test_vae_selftiled.py`；G 组，PLAN-video）。例外：LTX 卷积 VAE（`ltx.VideoVAE`）由 H1 接管（`vae_video.chunked_io_managed`，按类型精确匹配） |
 | 1D / 音频（Stable Audio、ACE、MMAudio、LTX Audio 等） | 原生 |
 
 **入口和做法：**
@@ -127,7 +207,10 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * **网页实测**：在锁定镜像里起服务（`docker run -p 127.0.0.1:8188:8188 ... python main.py --cpu --listen 0.0.0.0`），Playwright（`/opt/node-tools/node_modules/playwright`，Chromium `/opt/pw-browsers/chromium-1194`）打开真实前端，或用 `/prompt` API 跑工作流看日志（第 5 项的泄漏就是这样复现的）。
 * **CT 700 的事实**：`--gpu-only --bf16-vae`；AMD 上 `cudnn.enabled = False`，4D 卷积走 Slow2d（im2col + GEMM），5D 走 SlowDilated3d；VAE 注意力是 split；统一内存，看 GTT。用户终端是 `LANG=C`，中文日志显示成下划线（字节是正确的 UTF-8，不用改）。
 * **`tests/bench_vae.py`**（README §9.7）：`--checkpoint` / `--vae`；`--res`；`--modes native,monoload,monoload-l2,monoload-r<N>,native2`，模式名后缀 `-g<S>`（方案）、`-b<GiB>`（预算）、`-w<MiB>`（工作区）；`--stripe-rows`；`--budgets`；`--gn-schemes`；`--fp32-ref`；`--profile-only`；`--json`。
-* **`tests/alloc_sim.py`**（DESIGN §9.13.10、§9.14.6）：meta 设备上跑全尺寸 decoder，按缓存分配器的规则重放，复现了 63 个 CT 700 读数（手工跑全表时 ≤ 0.02 GiB；自动测试只抽查其中一部分，阈值 0.03 GiB（`test_vae_stripe` / `test_vae_flux2`）/ 0.05 GiB（`test_vae_ldm`）；第一层的旧布局用 `output_in_arena` 重放，DESIGN §9.22）。改内存相关代码先用它看。
+* **`tests/alloc_sim.py`**（DESIGN §9.13.10、§9.14.6；模型 `qwen` / `sdxl` / `flux` / `flux2` / `wan22` / `hy21` / `hyr`（sd.py 的 `refiner_vae=False` 那一支）/ `hv15`（官方 Refiner 文件和 HunyuanVideo 1.5 的 decoder），`hy21` 的宽高要是 32 的倍数，4K 用 3840×2176）：meta 设备上跑全尺寸 decoder，按缓存分配器的规则重放，复现了 63 个 CT 700 读数（手工跑全表时 ≤ 0.02 GiB；自动测试只抽查其中一部分，阈值 0.03 GiB（`test_vae_stripe` / `test_vae_flux2`）/ 0.05 GiB（`test_vae_ldm`）；第一层的旧布局用 `output_in_arena` 重放，DESIGN §9.22）。改内存相关代码先用它看。
+* **方案 G**（`vae_ops.GROUP_NORM_MAX` / `_GroupedRMSNorm` / `grouped_norm_bytes`，DESIGN §9.29）：改 Wan 的 RMS_norm 或 `OpChunking` 时看 `test_vae_wan22` 第 7、8 节。
+* **`tests/check_norm_reduce.py`**（DESIGN §9.28）：纯 PyTorch，量 `F.normalize` 在各种通道 / 位置数 / 布局下的归约临时缓冲，按 `Reduce.cuh` 的启动配置预测（`--predict` 不要 GPU），并对比分组求范数的候选方案。
+* **`tests/check_l1_units.py`**（DESIGN §9.26）：第一层逐单元的真机显存——每次调用自己的峰值、模型对同一次调用的计数、调用中新开的段；`--sim MODEL` 用 alloc_sim 出同样的表（无 GPU）对照。`bench_vae.py --profile` 另有 reserved 峰值时的段和开段请求的栈。
 * **盘点脚本**（DESIGN §9.16）：`tests/vae_inventory.py`（`--only` / `--no-trace` / `--json`；每种 VAE 的结构、路径、原生 / 第二层 / 第一层模拟峰值，带 60 GiB 设备上限；新适配器的 meta 构造可以从这里的 `KINDS` 抄）、`tests/probe_vae_gaps.py`（缺口和多帧第二层精度的小解码）、`tests/check_models.py`（CT 700 的命令 W）。
 * **检查脚本**：`tests/check_vae_node.py`（命令 U）、`tests/check_lora_node.py`（命令 V，不带 `--lora` 时列文件）。
 
@@ -142,13 +225,16 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 * `monoload/vae.py`：VAE 入口和策略（`_decode` → `_managed_decode` → 预算 `choose_budget` / 默认 `choose_plan` → `_decode_layer1` / `_decode_layer2`）；`resolve_settings` / `settings_note` / `_Applied` / `_from`（来源）；`global_mode()`；`decode_record()` / `_MemProbe`（测量前先清分配器缓存）；`STRIPE_ADAPTERS`。
 * `monoload/vae_ops.py`：第二层引擎（`OpChunking`、`_ConvChunker`、注意力 query 分块、`OpStats`）。
 * `monoload/vae_engine.py`：第一层引擎（区间、`Plan`、统计遍、arena、`StripeAdapter` 基类、自检 `_SELFTEST`）。
+* `monoload/vae_wan22.py`：Wan 2.2 单帧适配器（复合单元 `DUPUP`、`UNPATCH`、`decode_retained`、只留时间核最后一片的 fp32 副本；DESIGN §9.23）。`monoload/vae_hunyuan.py`：HunyuanImage 2.1 适配器（复用 `vae_ldm` 的块、内存模型和方案，`ConvIn`、`PU` 单元、`selftest_size` 12、`activation_copies` 6；DESIGN §9.24）。引擎为它们加了：`need_in` 按 `scale > 1`、`Unit.extra`、`skeleton()`、`StripeAdapter.decode_retained` / `activation_copies` / `selftest_size`；`vae._decoder_terms` 把后两者给第二层估算。
+* `monoload/vae_refiner.py`（**只在分支 vae-refiner-layer1 上**）：`vae_refiner.Decoder(refiner_vae=False)` 的适配器（条带带 4 帧、`Unit.tscale`、跨帧 GroupNorm 方案，DESIGN §9.34）。dev 上 `vae_hunyuan.decoder_terms` 给这一支 6 份激活（§9.30）。
 * `monoload/vae_wan.py`、`monoload/vae_ldm.py`：两个适配器（LDM 的含 Flux 2 batch-norm latent，`LatentUnpatch`；`vae_ldm.scheme_positions`：A 不存，D 存 H/4 级输出，B 存 H/4 和 H/2，C 再加全分辨率各块的输出（块 1、块 2 和 norm_out 的输入；块 0 的输入不存）；耗时模型 `TIME_COEF`）。
+* `monoload/vae_ltx.py`（F 组）：LTX-2.5 扩散 decoder 的第二层扩展（`chunker` 挂进 `vae_ops.EXTRA_CHUNKERS`）：`_NASlabs`（邻域注意力按 T 等长段，`t_blocks` / `na_block_frames` / `na_slab_bytes`）、SwiGLU 分块、`_DecoderForward`（精简 forward）、`plan()`（reserved 口径的诊断估算）/ `native_estimate()`。测试：`tests/check_ltx_dd.py`（fp32 精度 + 估算对照）、`tests/bench_ltx.py`（卷积 / 扩散两种，`--modes native,lean,monoload,l2x`，`--compare`）。
 * `monoload/vae_overrides.py`：VAE 节点的设置（不导入 torch / ComfyUI）。
 * `monoload/info.py`：Info 节点的文字。
 * `monoload/nodes/`：注册表 + 三个节点。`web/`：`monoload_info.js`、`monoload_i18n.js`。`locales/`：界面翻译。
-* **小测试**（都不需要真实模型）：`test_entry.py`（开关组合，见文件头；其中 `MONOLOAD_VAE_BUDGET` + `MONOLOAD_VAE_STRIPE_ROWS`、`MONOLOAD_VAE_GN_SCHEME` 两种不在 `run_all.sh` 里，要手动跑）、`test_master_switch.py`、`test_messages.py`、`test_info_node.py`、`test_release_chain.py`、`test_vae_node.py`、`test_vae.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_stripe.py`、`test_dtype_paths.py`（默认和 `MONOLOAD_EXACT=1`）、`test_lora_node.py` 和 `test_lora_save.py`（要合成 checkpoint）。CT 700 检查脚本另有 `check_lora_save.py`（README §9.15）。需要真实 SD1.5 的：`test_lora_hot.py`、`test_quant.py`、`test_release.py`。
+* **小测试**（都不需要真实模型）：`test_entry.py`（开关组合，见文件头；其中 `MONOLOAD_VAE_BUDGET` + `MONOLOAD_VAE_STRIPE_ROWS`、`MONOLOAD_VAE_GN_SCHEME` 两种不在 `run_all.sh` 里，要手动跑）、`test_master_switch.py`、`test_messages.py`、`test_info_node.py`、`test_release_chain.py`、`test_vae_node.py`、`test_vae.py`、`test_vae_ldm.py`、`test_vae_flux2.py`、`test_vae_wan22.py`、`test_vae_hunyuan.py`、`test_vae_refiner.py`（`refiner_vae=False` 的第二层估算和官方 Refiner 文件的 decoder）、`test_vae_stripe.py`、`test_dtype_paths.py`（默认和 `MONOLOAD_EXACT=1`）、`test_lora_node.py` 和 `test_lora_save.py`（要合成 checkpoint）。CT 700 检查脚本另有 `check_lora_save.py`（README §9.15）、`run_flux2_dev.py`（Flux 2 dev 整套，README §9.23）。需要真实 SD1.5 的：`test_lora_hot.py`、`test_quant.py`、`test_release.py`。
 
-## 7. 提交记录（`dev` 上的合并）
+## 7. 提交记录（`dev` 上的合并；video 分支的在表末）
 
 | 内容 | 合并 |
 |---|---|
@@ -177,6 +263,49 @@ CT 700（Strix Halo，gfx1151，62.5 GiB 统一内存）4K 解码的 GTT 增量�
 | 第二轮审查的文档和真机清单 | 8c5cb37 |
 | 验收后：`TEST_BROKEN_VAE_API` 传进容器 / bench_vae「native not run」/ 21 / 22 / 23 | eee564c / 17880b8 / 56b9e93 / a0ce191 / c9e6bcf |
 | 第二轮审查的真机结果 | e924a77 |
-| 复查结果（21 / 23 / 测试工具修正后） | 本文件所在的合并（`git log --first-parent dev` 最上面一条） |
+| 复查结果（21 / 23 / 测试工具修正后） | 531bf32 |
+| 图像补齐：Wan 2.2 单帧第一层 / HunyuanImage 2.1 第一层 | d6473d3 / 838f7fc |
+| 图像补齐的文档、Refiner 分析 | 189741e |
+| HunyuanImage 2.1 验收结果 / Wan 2.2 矮条带超估算的分析和诊断 | 8c432bd / c1e8be6 |
+| test_entry 适配器列表 / check_vae_node 先装权重 / bench 汇总同一次 / 无方案不写方案 / 第二层估算按类型 | 5dd96b7 / 161155d / 403c366 / 3c6786b / 23391cd |
+| 第二轮的 HANDOFF | 1dc61b2 |
+| 第 3–7 项复查结果 / check_vae_node 不打印 Wan 的方案 / F.normalize 归约临时缓冲的分析 | 3825aea / 86a966f / 2711c3e |
+| 第三轮的 HANDOFF | 2c24452 |
+| check_norm_reduce 的汇总口径 / 命令 N 的结果 / 方案 G（分组求范数）/ 复测清单 | 9bc1c4c / e2feb57 / f1f3fc1 / cf1b7c3 |
+| 第四轮的 HANDOFF | 0593f27 |
+| Wan 2.2 验收结果（README §10.13） | d714185 |
+| Wan 2.2 验收那一轮的 HANDOFF | 907ef25 |
+| Refiner 第二层估算（`refiner_vae=False`）/ 官方 Refiner 文件的更正 | f7e1aa2 / b426588 |
+| 视频分析 / Flux 2 dev 整套脚本 | 565e73b / 2219844 |
+| （未合并）`refiner_vae=False` 的第一层：分支 vae-refiner-layer1 | f51a6bc |
+| **video 分支**：适配 ComfyUI v0.46.3（阶段 A） | 8d89069 |
+| video：PLAN-video.md | d58707f |
+| **video 分支**：LoRA 量化 safetensors 测试 / GGUF / 视频小参数 | 见 `git log --first-parent video`（Merge lora-quant-formats / lora-gguf / lora-video-models） |
+| **video 分支**：H1 / H3 / H6 多帧第二层入口、LTX 进第二层、`EXTRA_CHUNKERS` | 5fddc22 |
+| **video 分支**：H2 / H5 引擎时间轴 | 0e1b913 |
+| **video 分支**：H4 方案 G（Refiner RMS_norm、LTX PixelNorm） | Merge video-norm-g（`git log --first-parent video`） |
+| video：G 组（自带分块的 transformer VAE）保持原生、路由测试、bench_selftiled | 见 `git log --first-parent video`（Merge video-g-selftiled） |
+| **video 分支**：多帧探测按 latent 截断；LTX-2.5 扩散 decoder 等 F 组的 `vae_ltx` 再托管 | Merge video-probe-clip（`git log --first-parent video`） |
+| **video 分支**：A 组 `vae_wan_video` 注册进 `STRIPE_ADAPTERS`（可选 import），Wan 2.2 多帧走第一层 | Merge video-wan-reg（`git log --first-parent video`） |
+| **video 分支**：F 组 LTX（卷积只走第二层；扩散 decoder 由 `vae_ltx` 接管） | Merge claude/project-thread-b4e366（`git log --first-parent video`） |
+| **video 分支**：多帧探测落盘、LTX-2.5 扩散 decoder 用 `plan()` 估计 | Merge video-probe-cache（`git log --first-parent video`） |
+| **video 分支**：视频条带 carry 放进一块缓冲（`CarryStore`） | Merge video-carry-store（`git log --first-parent video`） |
+| **video 分支**：第二层碎片按比例放大、`prefer_layer2` 路由、Wan 2.1 多帧第一层作后备、探测缓存存比例 | Merge video-l2-frag（`git log --first-parent video`） |
+| **video 分支**：权重指纹只取最大 16 个张量、整数下标，探测缓存格式 4（HunyuanVideo 1.5 不再崩、跨进程命中） | Merge video-fp-fix（`git log --first-parent video`） |
+| **video 分支**：第一层自检的通过结果写进探测缓存文件，格式 5 | Merge video-selftest-cache（`git log --first-parent video`） |
+| **video 分支**：多帧探测的碎片比例不再取大工作区那次，缓存格式 6 | Merge video-cog-ratio（`git log --first-parent video`） |
+| **video 分支**：README 图片模型汇总表；HANDOFF 记 0.46.3 上 video 回归 5 个 workflow 全过 | Merge video-image-table（`git log --first-parent video`） |
+| **video 分支**：图片表补 Qwen Image 2.1、图片 GGUF + LoRA 真机结果 | Merge video-image-qi21（`git log --first-parent video`） |
+| **video 分支**：I 组图片家族全覆盖的 0.46.3 真机结果（8 个家族出图 + 13 个 VAE），只改文档 | Merge claude/project-thread-5n25s5（`git log --first-parent video`） |
+| **video 分支**：GGUF 真机结果（Q8_0 / K-quant 逐层、Wan 2.2 整模型）、bench_lora 探测反量化 GGUF | Merge GGUF thread (baacfe0)（`git log --first-parent video`） |
+| **video 分支**：GGUF 其余 9 种量化类型逐层真机结果（共 12 种） | Merge GGUF thread (2109f38)（`git log --first-parent video`） |
+| **video 分支**：B 组 HV1.5 720p×81 真机行、自检上界复测（文档） | Merge B group (ee07355)（`git log --first-parent video`） |
+| **video 分支**：B 组 HV1.5 自检上界计入参照缓存、HV1.0 只走第二层 | Merge B group (9f48b35)（`git log --first-parent video`） |
+| **video 分支**：C 组 CogVideoX 第一层 / 第二层（`vae_cogvideo`） | Merge group C (6d7aa87)（`git log --first-parent video`） |
+| **video 分支**：D 组 Cosmos 1.0 / Mochi 逐帧流式第二层（`vae_cosmos`、`vae_mochi`） | Merge video-groupd（`git log --first-parent video`） |
+| **video 分支**：B 组 Hunyuan（HunyuanVideo 1.0 / 1.5 多帧第二层、`vae_hunyuan15` 第一层，已注册进 `STRIPE_ADAPTERS`） | Merge video-b-reg（`git log --first-parent video`） |
+| **video 分支**：`test_quant` / `test_quant_formats` 的 fp8 参照改在计算设备反量化（GPU 逐位），`bench_lora` 逐层探测先反量化 | Merge video-quant-ref（`git log --first-parent video`） |
+| video：视频第一层 A 组 Wan 2.1 / 2.2 多帧（`vae_wan_video`） | 见 `git log --first-parent video`（Merge video-wan-l1） |
+| 本文件 | 本文件所在的提交（`git log --first-parent video` 最上面几条） |
 
 LoRA 部分更早的历史：3c473fa … 5bfbc8e（v1 文件格式 → v2 运行时合并 → 释放、fp8、融合 addmm），见 `git log --first-parent dev`。各阶段的设计和真机数据：DESIGN §9.12–§9.15、README §10。

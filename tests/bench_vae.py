@@ -259,13 +259,28 @@ def load_latent(path):
     return lat["latent_tensor"].float() * mult
 
 
-def random_latent(vae, w, h, seed, std):
+def latent_frames(vae, frames):
+    """Latent frames for `frames` output frames: the fewest whose decode (sd.py's upscale_ratio[0]) gives at least that many."""
+    r = getattr(vae, "upscale_ratio", None)
+    if not (isinstance(r, tuple) and r and callable(r[0])):
+        raise SystemExit("--frames: this VAE has no frame rule (upscale_ratio)")
+    t = 1
+    while r[0](t) < frames:
+        t += 1
+    if r[0](t) != frames:
+        print("[bench] --frames {}: the decode gives {} frames ({} latent frames)".format(frames, r[0](t), t))
+    return t
+
+
+def random_latent(vae, w, h, seed, std, frames=1):
     r = vae.spacial_compression_decode()
     if w % r or h % r:
         raise SystemExit("resolution {}x{} is not a multiple of {}".format(w, h, r))
     shape = [1, vae.latent_channels]
     if vae.latent_dim == 3:
-        shape.append(1)
+        shape.append(latent_frames(vae, frames) if frames > 1 else 1)
+    elif frames > 1:
+        raise SystemExit("--frames: not a video VAE (latent_dim {})".format(vae.latent_dim))
     shape += [h // r, w // r]
     g = torch.Generator().manual_seed(seed)
     return torch.randn(shape, generator=g) * std
@@ -439,6 +454,10 @@ def configure(mode):
 
 def mono_line(m):
     """One line on what Monoload did in a run."""
+    if not m or m.get("estimate") is None:
+        # MONOLOAD=0 (or a decode Monoload left to ComfyUI): no record of this run
+        return "no Monoload decode recorded{}".format(
+            " ({})".format(m.get("reason") or m.get("strategy")) if m and (m.get("reason") or m.get("strategy")) else " (MONOLOAD=0?)")
     if m.get("strategy") == "layer1":
         e = m["estimate"]
         st = m.get("stats", {})
@@ -478,6 +497,8 @@ def run_mode(vae, latent, mode, a, label):
     total = 1 + a.warm
     for i in range(total):
         capture = (i == total - 1) or a.warm == 0
+        if mode.startswith("monoload"):
+            mvae._LAST.clear()   # with MONOLOAD=0 the wrapper records nothing: do not show the previous run's record
         row, r, p = decode_once(vae, latent, capture, a.sample_ms / 1000.0)
         row["run"] = "cold" if i == 0 else "warm{}".format(i)
         if mode.startswith("monoload"):
@@ -502,11 +523,19 @@ def run_mode(vae, latent, mode, a, label):
     summary = {"mode": mode, "res": label, "status": runs[0]["status"] if not ok else ("ok" if len(ok) == len(runs) else "partial"),
                "cold": runs[0]["seconds"], "warm": statistics.median([r["seconds"] for r in runs[1:] if r["status"] == "ok"]) if len(ok) > 1 else None,
                "runs": runs}
-    for k in ("alloc_peak", "alloc_delta", "res_peak", "res_delta", "gtt_delta", "vram_delta", "cg_delta", "cg_mempeak_delta", "unloaded"):
-        vals = [r.get(k) for r in runs if r.get(k) is not None]
-        summary[k] = max(vals) if vals else None
+    # the memory columns and the estimate come from one run: the one with the largest increase (GTT, else reserved, else
+    # alloc), so that a cold run's peak (first GPU work, first-use self-test) is never set against a warm run's estimate
+    pool = ok or runs
+    key = next((k for k in ("gtt_delta", "res_delta", "alloc_delta") if any(r.get(k) is not None for r in pool)), None)
+    peak = max(pool, key=lambda r: r.get(key) or 0) if key else pool[-1]
+    for k in ("alloc_peak", "alloc_delta", "res_peak", "res_delta", "gtt_delta", "vram_delta", "cg_delta", "cg_mempeak_delta"):
+        summary[k] = peak.get(k)
+    summary["peak_run"] = peak["run"]
+    vals = [r.get("unloaded") for r in runs if r.get("unloaded") is not None]
+    summary["unloaded"] = max(vals) if vals else None
     if mode.startswith("monoload") and ok:
-        summary["mono"] = ok[-1]["mono"]
+        summary["mono"] = ok[-1]["mono"]          # the captured (last) run: its stripes are the boundaries of the comparison
+        summary["peak_mono"] = peak.get("mono")
     return summary, raw, px
 
 
@@ -797,6 +826,53 @@ def profile_decode(vae, latent, label, top, mode, cpp):
         print("  {:>9s}".format(vae_ops.fmt_bytes(ev["size"])))
         for s in _frames_str(ev.get("frames", []), 12 if cpp else 8):
             print("             at {}".format(s))
+    reserved_peak_report(trace, free_act, top, cpp)
+
+
+def reserved_peak_report(trace, free_act, top, cpp):
+    """The segments the allocator reserved during the decode, at the moment their sum peaked: each one's size, what was
+    allocated in it at that moment, and the request that made the allocator reserve it (DESIGN §9.26)."""
+    segs, cur, peak, peak_i = {}, 0, 0, -1
+    for i, ev in enumerate(trace):
+        act = ev.get("action")
+        if act in ("segment_alloc", "segment_map"):
+            segs[ev["addr"]] = ev
+            cur += ev["size"]
+            if cur > peak:
+                peak, peak_i = cur, i
+        elif act in ("segment_free", "segment_unmap"):
+            s = segs.pop(ev["addr"], None)
+            if s is not None:
+                cur -= s["size"]
+    print("\n=== reserved during the decode: segments when their sum peaked ({}; segments reserved before the decode not included) ===".format(
+        vae_ops.fmt_bytes(peak)))
+    if peak_i < 0:
+        print("no segment was reserved during the decode")
+        return
+    segs, live, order = {}, {}, []
+    for ev in trace[:peak_i + 1]:
+        act = ev.get("action")
+        if act in ("segment_alloc", "segment_map"):
+            segs[ev["addr"]] = ev
+            order.append(ev["addr"])
+        elif act in ("segment_free", "segment_unmap"):
+            segs.pop(ev["addr"], None)
+        elif act == "alloc":
+            live[ev["addr"]] = ev["size"]
+        elif act == free_act:
+            live.pop(ev["addr"], None)
+    shown = [a for a in order if a in segs]
+    for n, addr in enumerate(shown):
+        s = segs[addr]
+        inside = [sz for a, sz in live.items() if addr <= a < addr + s["size"]]
+        if n >= top and len(shown) > top + 1:
+            rest = shown[n:]
+            print("  ... {} more segments, {}".format(len(rest), vae_ops.fmt_bytes(sum(segs[a]["size"] for a in rest))))
+            break
+        print("  {:>9s} segment, {} allocated in it ({} blocks, largest {}); reserved for:".format(
+            vae_ops.fmt_bytes(s["size"]), vae_ops.fmt_bytes(sum(inside)), len(inside), vae_ops.fmt_bytes(max(inside) if inside else 0)))
+        for f in _frames_str(s.get("frames", []), 12 if cpp else 8):
+            print("             at {}".format(f))
 
 
 # ---------------------------------------------------------------------------
@@ -845,6 +921,7 @@ def main():
     p.add_argument("--res", default="1344x768,2688x1536,3840x2160", help="output resolutions WxH, comma separated (random latents)")
     p.add_argument("--latent", action="append", help="SaveLatent .latent file instead of random latents (repeatable; path, or name in input/ or output/)")
     p.add_argument("--seed", type=int, default=0, help="seed of the random latents")
+    p.add_argument("--frames", type=int, default=1, help="output frames of the random latents (video VAEs; e.g. 81 for Wan)")
     p.add_argument("--latent-std", type=float, default=1.0, help="std of the random latents")
     p.add_argument("--modes", default="native,monoload,native2",
                    help="comma list run in order per resolution: native, monoload (layer 1 where recognized, else layer 2), "
@@ -903,7 +980,8 @@ def main():
     else:
         for res in a.res.split(","):
             w, h = (int(x) for x in res.lower().split("x"))
-            inputs.append((res, random_latent(vae, w, h, a.seed, a.latent_std), "random seed {}".format(a.seed)))
+            inputs.append((res + ("x{}f".format(a.frames) if a.frames > 1 else ""), random_latent(vae, w, h, a.seed, a.latent_std, a.frames),
+                           "random seed {}".format(a.seed)))
     for label, lat, what in inputs:
         print("input {}: latent {} ({}), native estimate {}".format(label, list(lat.shape), what,
                                                                      vae_ops.fmt_bytes(mvae._native_estimate(vae, lat.shape))))
@@ -994,12 +1072,13 @@ def main():
         gc.collect()
     mvae.uninstall()
 
-    print("\n=== summary: time and memory (GiB; Δ = increase over the value right before the run; peaks = max over the runs) ===")
+    print("\n=== summary: time and memory (GiB; Δ = increase over the value right before the run; the memory columns and the estimate "
+          "are those of one run, the one with the largest increase: [cold] after the layer when that is the cold run) ===")
     hdr = "{:11s} {:13s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6s} | {}"
     print(hdr.format("res", "mode", "status", "cold s", "warm s", "alloc pk", "alloc Δ", "resv Δ", "GTT Δ", "cg peakΔ", "cg sampΔ", "estimate",
                      "native est", "unload", "layer"))
     for s in results:
-        m = s.get("mono") or {}
+        m = s.get("peak_mono") or s.get("mono") or {}
         est = (m.get("estimate") or {}).get("total")
         nat = mvae._native_estimate(vae32 if s["mode"].endswith("fp32") else vae, next(l for lb, l, _ in inputs if lb == s["res"]).shape)
         if m.get("strategy") == "layer1":
@@ -1015,6 +1094,8 @@ def main():
             layer = ""
         if m.get("candidates"):
             layer += " [budget {}, {} candidates]".format(vae_ops.fmt_bytes(m.get("budget")), len(m["candidates"]))
+        if s.get("peak_run") == "cold" and len(s.get("runs", ())) > 1:
+            layer += " [cold{}]".format(": incl. the first-use self-test" if (m.get("estimate") or {}).get("selftest") else "")
         print("{:11s} {:13s} {:10s} {:>8s} {:>8s} | {:>10s} {:>10s} {:>8s} {:>8s} {:>9s} {:>9s} | {:>9s} {:>9s} {:>6} | {}".format(
             s["res"], s["mode"], s["status"], "{:.3f}".format(s["cold"]), "{:.3f}".format(s["warm"]) if s["warm"] is not None else "n/a",
             gib(s.get("alloc_peak")), gib(s.get("alloc_delta")), gib(s.get("res_delta")), gib(s.get("gtt_delta")), gib(s.get("cg_mempeak_delta")),

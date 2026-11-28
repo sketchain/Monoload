@@ -31,6 +31,10 @@ kept whole (saves) is the GroupNorm scheme:
     B  the output of every level below full resolution (H/4, H/2)
     C  B and the output of every block at full resolution
 
+ComfyUI v0.46.3 gives the Flux 2 decoder (ddconfig fused_norm=True) a fused path (Decoder.forward_fused, strip kernels
+of comfy-kitchen) when model.fused_norm_served(device, dtype) holds; a managed decode turns it off for its duration
+(vae_ops.unfused_norms), so the module calls are the plain ones above.
+
 Recognized only when every piece is the one checked here (exact classes,
 kernels, paddings, no attention in the up levels, no time dimension / carried
 convs, no tanh_out / give_pre_end, no hooks); anything else stays on layer 2
@@ -156,7 +160,7 @@ def ldm_structure(fsm):
         return "first-stage model is {}, not comfy.ldm.models.autoencoder.AutoencoderKL / AutoencodingEngine".format(type(fsm).__name__), None
     dec = getattr(fsm, "decoder", None)
     if type(dec) is not ldm.Decoder:
-        return "decoder is {}, not comfy.ldm.modules.diffusionmodules.model.Decoder".format(type(dec).__name__), None
+        return "decoder is {}.{}, not comfy.ldm.modules.diffusionmodules.model.Decoder".format(type(dec).__module__, type(dec).__name__), None
     pqc = None
     if type(fsm) is not ae.AutoencodingEngine:
         pqc = fsm.post_quant_conv
@@ -587,6 +591,11 @@ class _CopyStripe(LDMStripe):
 
     def reference_decode(self, z):
         return self.cls.decode(self.module, z)
+
+
+def has_schemes(fsm):
+    """Whether fsm is a decoder this adapter handles, i.e. one the GroupNorm schemes apply to (vae.gn_schemes_apply)."""
+    return fsm is not None and ldm_structure(fsm)[0] is None
 
 
 def match(vae, samples, vae_options):

@@ -169,12 +169,15 @@ def vae_section(v):
     mode_src = msg("info.src_envvar", var=eff["mode_env"]) if eff.get("mode_env") else _src(src["mode"])
     mode = {"layer2": msg("vae.layer2_only"), "native": msg("info.native"), "auto": msg("vae.auto")}.get(eff["mode"], eff["mode"])
     rows = str(eff["stripe_rows"] or msg("vae.auto"))
+    schemes = vae.gn_schemes_apply(v)
     if eff["mode"] == "native":      # ComfyUI's own decode: none of the other items is used
         unused = msg("info.unused_native")
         budget, scheme, rows = budget + unused, scheme + unused, rows + unused
     elif eff["mode"] == "layer2":    # no stripes: scheme and stripe height do not apply
         unused = msg("info.unused_layer2")
-        scheme, rows = scheme + unused, rows + unused
+        scheme, rows = scheme + (unused if schemes else msg("info.unused_noscheme")), rows + unused
+    elif not schemes:                # Wan 2.1 / 2.2, or a decoder layer 1 does not handle
+        scheme = eff["gn_scheme"] + msg("info.unused_noscheme")
     lines.append(msg("info.vae_settings", mode=mode, mode_src=mode_src, budget=budget, budget_src=_src(src["budget"]), scheme=scheme,
                      scheme_src=_src(src["gn_scheme"]), rows=rows, rows_src=_src(src["stripe_rows"])))
     r = vae.decode_record(v)
@@ -182,16 +185,19 @@ def vae_section(v):
     shown = None   # the scheme to explain: the one the last decode used, else the one the settings fix
     if r is not None and r.get("strategy") == "layer1" and r.get("gn_scheme"):
         shown = r["gn_scheme"]
-    elif eff["mode"] != "native" and eff["mode"] != "layer2" and (eff["gn_forced"] or not eff["budget"]):
+    elif eff["mode"] != "native" and eff["mode"] != "layer2" and schemes and (eff["gn_forced"] or not eff["budget"]):
         shown = eff["gn_scheme"]
     if shown in ("A", "B", "C", "D"):
-        lines.append(msg("info.scheme_hint", scheme=shown, hint=msg("scheme." + shown)))
+        from . import vae_hunyuan
+        hy = vae_hunyuan.is_hunyuan(getattr(v, "first_stage_model", None))   # its levels are not the LDM decoder's
+        lines.append(msg("info.scheme_hint", scheme=shown, hint=msg(("scheme_hy." if hy else "scheme.") + shown)))
     return lines
 
 
 def _runtime_patches(model):
     return sum(1 for m in model.modules() for a in ("weight_function", "bias_function")
-               for f in (m.__dict__.get(a) or ()) if getattr(f, "is_monoload_patch", False))
+               for f in (m.__dict__.get(a) or ()) if getattr(f, "is_monoload_patch", False)) \
+        + sum(len(m.__dict__.get("_monoload_param_swaps") or {}) for m in model.modules())
 
 
 def model_section(p):
@@ -207,6 +213,13 @@ def model_section(p):
     else:
         lines.append(msg("info.lora_none"))
     lines.append(msg("info.patched", n=n_patched, hooks=msg("info.hooks", n=n_hooks) if n_hooks else ""))
+    try:
+        from . import gguf
+        g = gguf.summary(p)
+    except Exception:
+        g = None
+    if g is not None:
+        lines.append(msg("info.gguf", q=g[0], plain=g[1]))
     eff, src = lo.resolve(p)
     if eff["mode"] == "native":      # ComfyUI's own LoRA handling: the merge path is not used
         from .messages import label

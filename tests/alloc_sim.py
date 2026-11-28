@@ -23,7 +23,11 @@ reproduces that without a GPU:
                   Slow2d (4D conv without cuDNN) and SlowDilated3d (5D) copy a
                   non-contiguous input / weight, allocate the output, then the
                   im2col / vol2col columns (Slow2d skips them for 1x1 / stride 1 /
-                  unpadded); upsampling copies a non-contiguous input.
+                  unpadded); upsampling copies a non-contiguous input; a
+                  vector_norm over a channel dim allocates the reduction scratch
+                  of gpu_reduce_kernel when its launch configuration splits each
+                  output over blocks (DESIGN §9.28: tests/check_norm_reduce.py's
+                  model with the CT 700 device, ROCM_DEVICE).
   * decode_trace  builds the Wan 2.1 decoder (qwen_image_vae dimensions) on the
                   meta device and runs Monoload's layer 1 or layer 2 on it, with
                   the switches the earlier versions had (cache emptied between
@@ -216,6 +220,27 @@ def _tensors(x):
 
 
 CONV_OPS = ("aten::convolution", "aten::_convolution", "aten::conv2d", "aten::conv3d")
+# the CT 700 GPU for the reduction scratch (command N, README §10.12): multiProcessorCount, maxThreadsPerMultiProcessor,
+# warp size, ROCm (ctas_per_output >= 64)
+ROCM_DEVICE = dict(mp=20, threads_per_mp=2048, warp=32, rocm=True)
+
+
+def norm_scratch(x, dims):
+    """Bytes of gpu_reduce_kernel's global-reduce buffer + semaphores for torch.linalg.vector_norm(x, dim=dims): a
+    reduction over one dim that is not the fastest-moving one (channels of NC[T]HW, contiguous or a row slice -- the
+    remaining dims coalesce into one output dim). Other layouts are not modelled (0)."""
+    from check_norm_reduce import predict
+    dims = [d % x.dim() for d in (dims if isinstance(dims, (list, tuple)) else [dims])]
+    if len(dims) != 1 or x.shape[dims[0]] <= 1:
+        return 0
+    d = dims[0]
+    others = [i for i in range(x.dim()) if i != d and x.shape[i] > 1]
+    if not others or x.stride(d) <= min(x.stride(i) for i in others):
+        return 0
+    c = int(x.shape[d])
+    n = x.numel() // c
+    size, cfg = predict(n, c, int(x.stride(d)), int(x.storage_offset()), **ROCM_DEVICE)
+    return size + (4 * cfg["grid"] if size else 0)
 
 
 def _ints(v):
@@ -234,6 +259,7 @@ def make_tracer(sim):
             super().__init__()
             self.live = {}
             self.static = set()   # storages allocated outside the trace (weights): views of them are not allocations
+            self.paused = False
 
         def poll(self):
             dead = [k for k, (w, _) in self.live.items() if w.expired()]
@@ -249,6 +275,8 @@ def make_tracer(sim):
 
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
             kwargs = kwargs or {}
+            if self.paused:   # vae_engine.skeleton(): modules built on the meta device for real, no memory
+                return func(*args, **kwargs)
             self.poll()
             temps, after = [], []
             name = func.name()
@@ -267,10 +295,18 @@ def make_tracer(sim):
                 after.append(("cols", x.dim() == 5 or not one, w))
             elif "upsample_nearest" in name and not args[0].is_contiguous():
                 temps.append(sim.malloc(args[0].numel() * args[0].element_size()))
+            elif name == "aten::linalg_vector_norm":
+                dim = args[2] if len(args) > 2 else kwargs.get("dim")
+                if dim is not None:
+                    after.append(("norm", norm_scratch(args[0], dim), None))
             out = func(*args, **kwargs)
             for t in _tensors(out):
                 self._track(t)
             for kind, need, w in after:
+                if kind == "norm":       # allocated after the result, freed when the kernel is launched
+                    if need:
+                        temps.append(sim.malloc(need))
+                    continue
                 if need:
                     o = next(_tensors(out))
                     cols = w.shape[1] * w[0, 0].numel() * o[0, 0].numel() * o.element_size()
@@ -284,12 +320,23 @@ def make_tracer(sim):
 
 WAN_QWEN = dict(dim=96, z_dim=16, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_scales=[],
                 temperal_downsample=[False, True, True], dropout=0.0)
+# the Wan 2.2 VAE as comfy.sd.VAE builds it (vae2_2.WanVAE, decoder dim 256 by default)
+WAN22 = dict(dim=160, z_dim=48, dim_mult=[1, 2, 4, 4], num_res_blocks=2, attn_scales=[], temperal_downsample=[False, True, True], dropout=0.0)
+# the HunyuanImage 2.1 VAE as comfy.sd.VAE builds it (AutoencodingEngine with hunyuan_video.vae.Decoder, z 64, 32x)
+HY21 = {"block_out_channels": [128, 256, 512, 512, 1024, 1024], "in_channels": 3, "out_channels": 3, "num_res_blocks": 2,
+        "ffactor_spatial": 32, "downsample_match_channel": True, "upsample_match_channel": True, "z_channels": 64}
+# sd.py's refiner_vae=False branch (a 5D decoder.conv_in.weight with 32 input channels, ComfyUI #10150): AutoencodingEngine
+# with vae_refiner.Decoder, plain Conv3d and GroupNorm; z 32, 16x, an image decoded as 4 frames. NOT the official HunyuanImage
+# 2.1 Refiner file (DESIGN §9.31), which is "hv15"
+HYR = {"block_out_channels": [128, 256, 512, 1024, 1024], "in_channels": 3, "out_channels": 3, "num_res_blocks": 2, "ffactor_spatial": 16,
+       "ffactor_temporal": 4, "downsample_match_channel": True, "upsample_match_channel": True, "refiner_vae": False, "z_channels": 32}
 # the LDM ddconfig comfy.sd.VAE builds for SDXL / SD1.5 (z 4, AutoencoderKL with post_quant_conv) and Flux ae /
 # SD3 (z 16, AutoencodingEngine, no post_quant_conv)
 LDM_DDCONFIG = {'double_z': True, 'z_channels': 4, 'resolution': 256, 'in_channels': 3, 'out_ch': 3, 'ch': 128,
                 'ch_mult': [1, 2, 4, 4], 'num_res_blocks': 2, 'attn_resolutions': [], 'dropout': 0.0}
 # model name -> (latent channels, latent dims[, spatial ratio (default 8)])
-LATENT = {"qwen": (16, 5), "sdxl": (4, 4), "flux": (16, 4), "flux2": (128, 4, 16)}
+LATENT = {"qwen": (16, 5), "sdxl": (4, 4), "flux": (16, 4), "flux2": (128, 4, 16), "wan22": (48, 5, 16), "hy21": (64, 4, 32),
+          "hyr": (32, 5, 16), "hv15": (32, 5, 16), "cogvideo": (16, 5)}
 
 
 class _MetaVAE:
@@ -301,6 +348,11 @@ class _MetaVAE:
         self.device = self.output_device = torch.device("meta")
         self.vae_dtype = dtype
         self.process_output = lambda image: image.add_(1.0).div_(2.0).clamp_(0.0, 1.0)
+        self.output_channels = 3
+        self.latent_dim = 3
+
+    def spacial_compression_decode(self):
+        return 8
 
     def vae_output_dtype(self):
         import torch
@@ -315,12 +367,34 @@ def _build(model):
     if model == "qwen":
         import comfy.ldm.wan.vae as wan
         return wan.WanVAE(**WAN_QWEN)
+    if model == "wan22":
+        import comfy.ldm.wan.vae2_2 as wan22
+        return wan22.WanVAE(**WAN22)
+    if model == "cogvideo":
+        # CogVideoX (2B / 5B / 1.5) VAE, as sd.py builds it (latent 16 channels, x8, time x4: 4t - 3 frames)
+        import comfy.ldm.cogvideo.vae as cog
+        return cog.AutoencoderKLCogVideoX(latent_channels=16)
     from comfy.ldm.models.autoencoder import AutoencoderKL, AutoencodingEngine
     if model == "sdxl":
         return AutoencoderKL(ddconfig=dict(LDM_DDCONFIG), embed_dim=4)
     if model == "flux2":
         # Flux 2: AutoencoderKL with a batch-norm latent (z 32, latent 128 channels at H/16), as comfy.sd.VAE builds it
         return AutoencoderKL(ddconfig=dict(LDM_DDCONFIG, z_channels=32, batch_norm_latent=True), embed_dim=32)
+    if model == "hy21":
+        return AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
+                                  encoder_config={'target': "comfy.ldm.hunyuan_video.vae.Encoder", 'params': HY21},
+                                  decoder_config={'target': "comfy.ldm.hunyuan_video.vae.Decoder", 'params': HY21})
+    if model == "hv15":
+        # the HunyuanImage 2.1 Refiner file (hunyuan_image_refiner_vae_fp16) and the HunyuanVideo 1.5 VAE: decoder.conv_in.conv.weight,
+        # vae_refiner.Decoder with refiner_vae=True (CarriedConv3d, RMS norm), EmptyRegularizer
+        dd = {k: v for k, v in HYR.items() if k != "refiner_vae"}
+        return AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.EmptyRegularizer"},
+                                  encoder_config={'target': "comfy.ldm.hunyuan_video.vae_refiner.Encoder", 'params': dd},
+                                  decoder_config={'target': "comfy.ldm.hunyuan_video.vae_refiner.Decoder", 'params': dd})
+    if model == "hyr":
+        return AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
+                                  encoder_config={'target': "comfy.ldm.hunyuan_video.vae_refiner.Encoder", 'params': HYR},
+                                  decoder_config={'target': "comfy.ldm.hunyuan_video.vae_refiner.Decoder", 'params': HYR})
     if model == "flux":
         dd = dict(LDM_DDCONFIG, z_channels=16)
         return AutoencodingEngine(regularizer_config={'target': "comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer"},
@@ -340,6 +414,22 @@ def meta_vae(dtype, model="qwen"):
     return _MODELS[key]
 
 
+def _skeleton(tracer):
+    """vae_engine.skeleton for a trace: modules built there are on the meta device in reality too (their parameters
+    are replaced before use), not on the device the trace stands for."""
+    @contextlib.contextmanager
+    def skeleton():
+        import torch
+        old = tracer.paused
+        tracer.paused = True
+        try:
+            with torch.device("meta"):
+                yield
+        finally:
+            tracer.paused = old
+    return skeleton
+
+
 @contextlib.contextmanager
 def _patched(obj, name, value):
     old = getattr(obj, name)
@@ -352,7 +442,7 @@ def _patched(obj, name, value):
 
 def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, order="largest", conv2d=True, arena=None, batch=1, out_first=True,
                  layer1_ws=None, contiguous=True, model="qwen", scheme=None, arena_need=False, units=False, output_in_arena=False,
-                 probe=False):
+                 probe=False, frames=1):
     """alloc / reserved deltas (bytes) of one decode of a w x h image, as bench_vae measures them
     (cache emptied and peaks reset right before the decode, the weights already loaded).
 
@@ -365,16 +455,21 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     layer1_ws  monoload.vae.LAYER1_WORKSPACE for this decode (384 MiB up to 5d668b6, 128 MiB since)
     contiguous the row slice into a Resample is made contiguous first (False: up to 725a010)
     model   "qwen" (Wan 2.1, qwen_image_vae), "sdxl" (LDM AutoencoderKL, z 4), "flux" (LDM AutoencodingEngine, z 16),
-            "flux2" (LDM AutoencoderKL with a batch-norm latent, z 32, latent 128 x H/16)
+            "flux2" (LDM AutoencoderKL with a batch-norm latent, z 32, latent 128 x H/16), "wan22" (Wan 2.2 VAE, z 48, H/16),
+            "hy21" (HunyuanImage 2.1 VAE, z 64, H/32: heights / widths multiples of 32, e.g. 3840x2176),
+            "hyr" (sd.py's vae_refiner refiner_vae=False branch, z 32, H/16, 5D latent with one frame decoded as 4),
+            "hv15" (the HunyuanImage 2.1 Refiner file and the HunyuanVideo 1.5 VAE: vae_refiner refiner_vae=True, z 32, H/16)
     scheme  GroupNorm scheme of an LDM layer-1 decode (None: the current setting)
     units   tag every allocation with the layer-1 unit / prefix module that made it (for --peak)
     output_in_arena  the layer-1 layout up to 6324592 (vae_engine.OUTPUT_IN_ARENA): no cache emptied before / after the
             decode, the output buffer allocated after the first prefix, in the arena (False: the current layout, DESIGN §9.22)
+    frames  output frames of a video latent (5D models; CogVideoX: (frames + 3) // 4 latent frames, Wan: (frames - 1) // 4 + 1)
     probe   run choose_budget's layer-2 shape probe (8 x 8) right before a layer-1 decode: the first decode with a
             budget (DESIGN §9.21). With output_in_arena (the code up to 6324592) its blocks stay cached (vae._probe);
             otherwise vae._shape_probe empties the cache after it (review 2026-10 item 21)
     info["stays"]  reserved after the decode with its output still alive and the cache emptied (check_selftest_mem's
             "stays reserved after empty_cache")
+    frames  output frames of a 5D (video) latent: (frames + 3) // 4 latent frames (HunyuanVideo 1.5's 4x; default 1)
     arena_need  run in an arena 4x the plan's live peak and report (info["arena_need"]) the highest offset any
             block reached in it: the smallest arena with the same placements (best fit keeps choosing the same
             blocks while the arena's tail is the largest free block), i.e. the arena this plan needs
@@ -399,7 +494,8 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     # the bench's latent is on the CPU: not counted, its copy is. float64, so that the decode's .to(device, dtype) is a
     # real copy for every decode dtype (an fp32 latent on meta would be returned as is by .to(meta, fp32): review
     # 2026-10 item 15, the fp32 configurations missed the latent's copy)
-    lat = torch.empty((batch, zc, 1, h // r, w // r) if nd == 5 else (batch, zc, h // r, w // r), device="meta", dtype=torch.float64)
+    lt = (frames + 3) // 4 if frames > 1 else 1
+    lat = torch.empty((batch, zc, lt, h // r, w // r) if nd == 5 else (batch, zc, h // r, w // r), device="meta", dtype=torch.float64)
     tracer = make_tracer(sim)
     tracer.static.update(t.untyped_storage()._cdata for t in itertools.chain(fsm.parameters(), fsm.buffers(), [lat]))
     events = {"empty_cache": 0}
@@ -419,6 +515,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
 
     with contextlib.ExitStack() as es:
         es.enter_context(_patched(vae_ops, "slow_dilated3d", lambda x: conv2d))
+        es.enter_context(_patched(eng, "skeleton", _skeleton(tracer)))
         es.enter_context(_patched(vae_ops, "OUT_FIRST", out_first))
         es.enter_context(_patched(mm, "soft_empty_cache", soft_empty_cache))
         es.enter_context(_patched(eng, "arena_supported", lambda device: True))
@@ -437,7 +534,11 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
             from monoload import vae_ldm
             es.enter_context(_patched(vae_ldm, "_SCHEME", [scheme]))
         if layer == 1:
-            bound, why = mvae._select_layer1(v, lat, {})
+            if model == "cogvideo":   # group C's layer 1, also before vae.py registers it
+                from monoload import vae_cogvideo
+                bound, why = vae_cogvideo.match(v, lat, {})
+            else:
+                bound, why = mvae._select_layer1(v, lat, {})
             assert bound is not None, why
             if units:
                 def tagged(fn, label):
@@ -455,7 +556,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
                         if nr.partial is not None:
                             nr.partial.module = tagged(nr.partial.module, nr.partial.name.replace("decoder.", ""))
                 bound.prefix_pass = tagged(bound.prefix_pass, "prefix")
-            outb = batch * 3 * h * w * 4
+            outb = batch * 3 * h * w * 4 * (4 * lt - 3)   # output frames of a 4x video latent (1 for an image)
             if rows:
                 ws_ = ws or mvae.layer1_workspace()
                 plan = bound.plan(v, lat, 0, ws_, rows=rows, out_bytes=outb)
@@ -507,7 +608,7 @@ def decode_trace(w, h, dtype="bf16", rows=None, layer=1, ws=None, clear=False, o
     return info
 
 
-def selftest_trace(model, dtype="bf16", tail=True, info=None, probe=False):
+def selftest_trace(model, dtype="bf16", tail=True, info=None, probe=False, latent_frames=1):
     """Reserved peak (bytes) of the first-use layer-1 self-test on the full-size decoder (meta device), the steps
     of vae_engine._self_test_run: the fp32 copy, the reference whole-image decode under layer-2 chunking
     (SELFTEST_REF_WORKSPACE), the forced small stripes (SELFTEST_ROWS, SELFTEST_WORKSPACE); the VAE's own weights
@@ -524,8 +625,8 @@ def selftest_trace(model, dtype="bf16", tail=True, info=None, probe=False):
     v = meta_vae(dt, model)
     fsm = v.first_stage_model
     zc, nd, r = (LATENT[model] + (8,))[:3]
-    lat = torch.empty((1, zc, 1, 64, 64) if nd == 5 else (1, zc, 64, 64), device="meta")
-    bound, why = mvae._select_layer1(v, lat, {})
+    lat = torch.empty((1, zc, latent_frames, 64, 64) if nd == 5 else (1, zc, 64, 64), device="meta")   # latent_frames > 1: a video adapter's
+    bound, why = mvae._select_layer1(v, lat, {})                                                        # multi-frame self-test
     assert bound is not None, why
     sim = AllocatorSim()
     sim.tag = "weights"
@@ -544,6 +645,7 @@ def selftest_trace(model, dtype="bf16", tail=True, info=None, probe=False):
     free = 48 << 30
     with contextlib.ExitStack() as es:
         es.enter_context(_patched(vae_ops, "slow_dilated3d", lambda x: True))
+        es.enter_context(_patched(eng, "skeleton", _skeleton(tracer)))
         es.enter_context(_patched(mm, "soft_empty_cache", soft_empty_cache))
         es.enter_context(_patched(mm, "get_free_memory", lambda dev=None, torch_free_too=False: (free, free) if torch_free_too else free))
         es.enter_context(torch.inference_mode())
@@ -556,10 +658,10 @@ def selftest_trace(model, dtype="bf16", tail=True, info=None, probe=False):
                 info["after_probe"] = sim.reserved - base
         dev = torch.device("meta")
         tb = bound.fp32_copy(dev)
-        z = torch.empty(list(bound.selftest_latent(eng.SELFTEST_LATENT)), device=dev)
+        n = tb.selftest_size
+        z = torch.empty(list(bound.selftest_latent(n)), device=dev)
         with vae_ops.OpChunking(tb.module, eng.SELFTEST_REF_WORKSPACE, vae_ops.OpStats()):
             ref = tb.reference_decode(z)
-        n = eng.SELFTEST_LATENT
         plan = eng.Plan(tb, n, n, eng.SELFTEST_ROWS, eng.SELFTEST_WORKSPACE, 4, 0, 0)
         out = torch.empty_like(ref)
 
@@ -690,7 +792,8 @@ def main():
     ap.add_argument("--rows", default=None)
     ap.add_argument("--dtype", default="bf16")
     ap.add_argument("--version", default="current", help="current / v1 / v2 / v3 / w128")
-    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux / flux2")
+    ap.add_argument("--model", default="qwen", help="qwen / sdxl / flux / flux2 / wan22 / hy21 / hyr / hv15 / cogvideo")
+    ap.add_argument("--frames", type=int, default=1, help="output frames (video models)")
     ap.add_argument("--scheme", default=None, help="GroupNorm scheme of an LDM layer-1 decode: A / B / C / D")
     ap.add_argument("--layer", type=int, default=1)
     ap.add_argument("--ws", default=None, help="workspace MiB (layer 2: default 1024; layer 1: the layer-1 default)")
@@ -702,7 +805,8 @@ def main():
     if a.res:
         w, h = (int(x) for x in a.res.lower().split("x"))
         for r in ([int(x) for x in a.rows.split(",")] if a.rows else [None]):
-            kw = dict(_version(a.version), model=a.model, scheme=a.scheme, layer=a.layer, units=a.layer == 1)
+            kw = dict(_version(a.version), model=a.model, scheme=a.scheme, layer=a.layer, units=a.layer == 1 and a.model != "cogvideo",
+                      frames=a.frames)
             if a.probe:
                 kw["probe"] = True
             if a.ws:

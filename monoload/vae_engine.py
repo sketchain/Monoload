@@ -32,6 +32,35 @@ The adapter interface (StripeAdapter):
   ckpt_channels        channels of the checkpoint
   hdim                 the row dimension of the tensors (5D Wan: 3, 4D: 2)
   scale                output rows per checkpoint row (per row of the decoder's input)
+  tdim, ckpt_planes    the planes (frames) dimension of the tensors and the checkpoint's
+                       planes, for a decoder whose rows carry several planes (the
+                       HunyuanImage 2.1 Refiner decodes one image as 4 frames: its stripes
+                       carry them all); None / 1 for the others. A unit's Unit.tscale
+                       multiplies the planes (time upsampling 2, taking the last frame
+                       1/4): the elements of a row are width x planes, which the memory
+                       and work counts use; the row intervals do not depend on it
+  time_chunks(shape)   video (H2 of docs/PLAN-video.md, DESIGN §9.36): None for an image; else
+                       [TimeChunk]: the decoder runs causally chunk by chunk along tdim, chunk k
+                       reading checkpoint planes [ct0, ct1) and producing output frames
+                       [ot0, ot1). The checkpoint (the prefix's output, all frames) is kept
+                       whole; each output stripe then runs every chunk in order, carrying its
+                       own state between chunks (the per-conv caches of its rows, halo rows
+                       included: a cache holds a conv's input), so the peak is the checkpoint +
+                       one stripe x one chunk + that stripe's caches + the output, nearly
+                       independent of the number of frames ("stripe-major"). Statistics passes
+                       (whole-image GroupNorm) are not combined with chunks.
+  chunk_planes(chunk)  planes of each level ([checkpoint] + one per unit) while running `chunk`
+                       (default: ct1 - ct0 times the units' tscale); the plan's activations use
+                       the largest over the chunks
+  stripe_state()       a fresh per-stripe state (the caches), passed to call_unit
+  call_unit(u, x, state, k)  unit u on x during chunk k (default u.module(x))
+  unit_cache(u, r, w, elem)  bytes unit u keeps in a stripe's state between chunks when it
+                       receives r rows of width w (default 0): live for the whole stripe.
+                       The engine moves those carries into one buffer (CarryStore): after
+                       each call_unit, every device tensor >= SMALL_ALLOC in the state
+                       (dicts / lists, nested) that is not already in it is copied into
+                       the unit's part of that buffer (unit_cache bytes) and replaced
+                       there; the adapter's own clones die right after the call
   decoder_hw(samples)  rows / cols the decoder works at below the prefix (the plan's
                        h8 x w8): the latent's, unless the first prefix step changes the
                        resolution (Flux 2's 2x2 un-patchify of the latent)
@@ -43,10 +72,22 @@ The adapter interface (StripeAdapter):
   fp32_copy(device)    an adapter bound to an fp32 copy of the decoder (self-test)
   reference_decode(z)  the decoder's own whole-image decode (on such a copy)
   selftest_latent(n)   the latent shape of the self-test
+  selftest_size        rows / cols of the decoder's input in the self-test (SELFTEST_LATENT; a
+                       decoder with a larger scale may take fewer, HunyuanImage 2.1: 12)
   selftest_params()    parameter count of what fp32_copy copies
+  activation_copies    the layer-2 bound's activation copies for this decoder (vae.ACTIVATION_COPIES,
+                       4; HunyuanImage 2.1: 6): part of the self-test's bound and of the
+                       layer-2 estimate
+  decode_retained(h, w, e)  bytes the model's own whole-image decode of an h x w (decoder
+                       resolution) sample keeps alive beyond its live activations, e.g. Wan
+                       2.2's feat_cache clones (0 by default): part of the self-test's bound
+                       (its reference is that decode) and of the layer-2 estimate
 """
 
+import bisect
+import contextlib
 import gc
+import logging
 import os
 import time
 
@@ -56,6 +97,7 @@ import comfy.model_management as mm
 import comfy.ops
 
 from .errors import MonoloadError, MonoloadVAEOOMError
+from . import vae_ops
 from .vae_ops import MIB, OpChunking, OpStats, fmt_bytes
 
 POINT, CONV, RES, UP = "point", "conv", "res", "up"
@@ -67,6 +109,7 @@ SELFTEST_REF_WORKSPACE = 32 * MIB  # the reference whole-image decode under laye
                              # stripes'): without it its fp32 im2col columns made the self-test peak ~0.74 GiB (DESIGN §9.19)
 SELFTEST_MARGIN = 32 * MIB   # allocator rounding / fragmentation on top of the self-test's tensors (selftest_memory)
 SELFTEST_TOL = 1e-4          # max|stripes - whole| / max(1, max|whole|), fp32
+SELFTEST_MIN_CHUNKS = 3      # a video adapter's self-test latent runs at least this many time chunks (state crosses chunk boundaries)
 
 
 class StripeError(MonoloadError):
@@ -80,21 +123,30 @@ class StripeError(MonoloadError):
 class Unit:
     """One step of the stripe part: kind, halo (rows on each side a unit
     needs, at its output level), scale (output rows per input row), channels."""
-    __slots__ = ("kind", "module", "halo", "scale", "cin", "cout", "name", "macs_row", "shortcut", "norms", "contiguous")
+    __slots__ = ("kind", "module", "halo", "scale", "cin", "cout", "name", "macs_row", "shortcut", "norms", "contiguous", "extra",
+                 "tscale")
 
-    def __init__(self, kind, module, halo, scale, cin, cout, name, macs_row=0, shortcut=False, norms=(), contiguous=False):
+    def __init__(self, kind, module, halo, scale, cin, cout, name, macs_row=0, shortcut=False, norms=(), contiguous=False, extra=None,
+                 tscale=1):
         self.kind, self.module, self.halo, self.scale = kind, module, halo, scale
         self.cin, self.cout, self.name, self.macs_row = cin, cout, name, macs_row
         self.shortcut = shortcut   # residual block with a 1x1 conv shortcut
         self.norms = tuple(norms)  # NormRef: norms in this unit that need whole-image statistics, in call order
         self.contiguous = contiguous   # its row slice is made contiguous before the call (as for the CONTIGUOUS_INPUT kinds)
+        self.extra = extra         # what the adapter's cost model needs besides the above (e.g. the blocks of a compound unit)
+        self.tscale = tscale       # output planes per input plane (int, or a Fraction: the module docstring's tdim)
 
 
 def need_in(unit, a, b, h_in, h_out):
-    """Input rows unit needs to produce output rows [a, b), within the image."""
-    if unit.kind == UP:  # nearest x2, then a conv with `halo` rows on each side at the output level
+    """Input rows unit needs to produce output rows [a, b), within the image.
+    An upsampling unit (scale s > 1: nearest x2 then a conv, depth-to-space, a
+    compound block, ...) is described at its output level: output row o reads
+    input row o // s, and `halo` output rows on each side are needed (or, where
+    the slice is not at the image edge, inexact: valid_out)."""
+    if unit.scale > 1:
+        s = unit.scale
         c0, c1 = max(0, a - unit.halo), min(h_out, b + unit.halo)
-        return c0 // 2, min(h_in, -(-c1 // 2))
+        return c0 // s, min(h_in, -(-c1 // s))
     return max(0, a - unit.halo), min(h_in, b + unit.halo)
 
 
@@ -131,13 +183,24 @@ def split_rows(h, rows):
 def hooked_module(model):
     """Name of a module whose call would not be its class' forward (forward
     hooks, instance-level forward replacements such as bypass injections),
-    or None."""
+    or None. OpChunking's own replacements (vae_ops.is_replacement) are not
+    hooks: they compute the class' forward (DESIGN §9.29)."""
     for name, m in model.named_modules():
-        if "forward" in m.__dict__ or m._forward_hooks or m._forward_pre_hooks:
+        fwd = m.__dict__.get("forward")
+        if (fwd is not None and not vae_ops.is_replacement(fwd)) or m._forward_hooks or m._forward_pre_hooks:
             return name or "<root>"
     if torch.nn.modules.module._global_forward_hooks or torch.nn.modules.module._global_forward_pre_hooks:
         return "<global module hooks>"
     return None
+
+
+@contextlib.contextmanager
+def skeleton():
+    """Build modules whose parameters are all replaced before use (an fp32 copy
+    with other shapes): on the meta device, no memory. tests/alloc_sim.py,
+    whose device is the meta device, keeps what is built here out of its trace."""
+    with torch.device("meta"):
+        yield
 
 
 def conv_io(m):
@@ -172,6 +235,7 @@ ESTIMATE_PAD = 16 * MIB      # small-block pool (<= 1 MiB requests come from the
                              # what the model leaves out: place() always splits a free block (the allocator keeps a
                              # remainder <= 1 MiB attached), a bf16 latent's CPU -> GPU copy may stage an fp32 temporary
 CONTIGUOUS_INPUT = (UP,)     # units whose row slice is made contiguous before the call
+CARRY_STORE = True           # video stripes: the carries live in one buffer (CarryStore) instead of scattered over the arena
 ARENA_ENABLED = True         # bench --no-arena: off, to measure the tensors' own peak (the arena block counts as allocated)
 CKPT_LOW = True              # a checkpoint that is not at the front of the arena moves into a free block below it if one fits
 OUTPUT_IN_ARENA = False      # True: the layout up to 6324592 (tests/alloc_sim.py replays the readings of those versions):
@@ -291,18 +355,20 @@ class Pass:
     unit `unit`) on stripes of rows at the norm's input level, and accumulate
     the norm's statistics over each stripe's core rows. On the way, the saves
     in `builds` (positions start < p <= unit) are filled with the core rows."""
-    __slots__ = ("start", "unit", "norm", "chain", "heights", "widths", "rows", "stripes", "needs", "order", "builds",
+    __slots__ = ("start", "unit", "norm", "chain", "heights", "widths", "planes", "rows", "stripes", "needs", "order", "builds",
                  "alive", "live", "largest", "work", "work_levels")
 
 
-def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
+def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None, planes=None, caches=False):
     """(needs, order, live, largest, work) of running `chain` on `stripes` (rows at
     the chain's output level). live: the largest unit peak (the first unit reads a
     slice of a save, counted on its own); tail(rows, s) -> the peak after the chain
     (the statistics of a pass). The peaks depend only on the rows each unit runs
     on, so each distinct pattern of rows is evaluated once. work: conv MACs by
     output width (identifies the resolution level), and under the key CALLS the
-    number of conv GEMM calls (row blocks under the workspace; bound.unit_calls)."""
+    number of conv GEMM calls (row blocks under the workspace; bound.unit_calls). planes: the planes of each level
+    (None: 1): the cost model gets the elements of a row (width x planes) as its width. caches: a video stripe's state
+    (bound.unit_cache of every unit, at the rows it receives) is alive while each unit runs."""
     needs_all = [stripe_needs(chain, heights, a, b) for a, b in stripes]
     # the stripe with the largest slices runs first: the blocks it leaves in the allocator's cache fit every later stripe
     size = [sum(n[1] - n[0] for n in needs) for needs in needs_all]
@@ -315,17 +381,20 @@ def _chain_cost(bound, chain, heights, widths, stripes, elem, ws, tail=None):
     live = largest = 0
     work = {CALLS: 0}
     unit_calls = getattr(bound, "unit_calls", None)
+    ew = widths if planes is None else [w * p for w, p in zip(widths, planes)]
+    unit_cache = getattr(bound, "unit_cache", None) if caches else None
     for rows, count in patterns.items():
         s = 0
+        held = sum(unit_cache(u, rows[i], widths[i], elem) for i, u in enumerate(chain)) if unit_cache is not None else 0
         for i, u in enumerate(chain):
             r = rows[i]
-            live = max(live, bound.unit_peak(u, r, widths[i], elem, ws, s))
-            largest = max(largest, bound.unit_largest(u, r, widths[i], elem, ws))
-            s = r * u.scale * widths[i + 1] * u.cout * elem
+            live = max(live, bound.unit_peak(u, r, ew[i], elem, ws, s) + held)
+            largest = max(largest, bound.unit_largest(u, r, ew[i], elem, ws))
+            s = r * u.scale * ew[i + 1] * u.cout * elem
             w_out = widths[i + 1]
-            work[w_out] = work.get(w_out, 0) + count * r * u.scale * w_out * u.macs_row
+            work[w_out] = work.get(w_out, 0) + count * r * u.scale * ew[i + 1] * u.macs_row
             if unit_calls is not None:
-                work[CALLS] += count * unit_calls(u, r, widths[i], elem, ws)
+                work[CALLS] += count * unit_calls(u, r, ew[i], elem, ws)
         if tail is not None:
             live = max(live, tail(rows[-1], s))
     return needs_all, order, live, largest, work
@@ -353,28 +422,46 @@ class Plan:
     pass per norm of the stripe part (in chain order, each from the latest save),
     then the final pass of output stripes from the last save."""
 
-    def __init__(self, bound, h8, w8, rows, ws, elem, out_bytes, lat_bytes):
+    def __init__(self, bound, h8, w8, rows, ws, elem, out_bytes, lat_bytes, chunks=None):
         self.rows = rows
+        self.chunks = list(chunks) if chunks else None
         self.workspace = ws
+        self.elem = elem
         self.hdim = bound.hdim
         units = bound.units
         heights = [h8]
         widths = [w8]
+        planes = [getattr(bound, "ckpt_planes", 1)]
         for u in units:
             heights.append(heights[-1] * u.scale)
             widths.append(widths[-1] * u.scale)
-        self.heights, self.widths = heights, widths
+            p = planes[-1] * u.tscale
+            if p != int(p) or p < 1:
+                raise StripeError("[Monoload] internal error: {} gives {} planes".format(u.name, p))
+            planes.append(int(p))
+        ckpt_planes = planes[0]
+        if self.chunks:
+            # video: the checkpoint holds every plane; the activations are those of the largest chunk at each level
+            ckpt_planes = max(c.ct1 for c in self.chunks)
+            per = [bound.chunk_planes(c) for c in self.chunks]
+            planes = [max(pp[i] for pp in per) for i in range(len(units) + 1)]
+        self.heights, self.widths, self.planes = heights, widths, planes
+        self.tdim = getattr(bound, "tdim", None)
+        if self.chunks and self.tdim is None:
+            raise StripeError("[Monoload] internal error: {} has time chunks but no tdim".format(bound.name))
         self.h_out, self.w_out = heights[-1], widths[-1]
-        self.ckpt_bytes = bound.ckpt_channels * h8 * w8 * elem
+        self.ckpt_bytes = bound.ckpt_channels * h8 * w8 * ckpt_planes * elem
         self.channels = [bound.ckpt_channels] + [u.cout for u in units]
         targets = [(i, nr) for i, u in enumerate(units) for nr in u.norms]
         if len(split_rows(self.h_out, rows)) == 1:
             targets = []   # one stripe: the whole image goes through every norm at once, no statistics passes needed
         saves = sorted(p for p in set(bound.save_positions()) if 0 < p <= targets[-1][0]) if targets else []
+        if targets and self.chunks:
+            raise StripeError("[Monoload] internal error: {}: statistics passes with time chunks are not supported".format(bound.name))
         self.saves = saves
 
         def save_bytes(p):
-            return self.ckpt_bytes if p == 0 else units[p - 1].cout * heights[p] * widths[p] * elem
+            return self.ckpt_bytes if p == 0 else units[p - 1].cout * heights[p] * widths[p] * planes[p] * elem
         self.save_bytes = {p: save_bytes(p) for p in [0] + saves}
 
         # the final pass: output stripes from the last save
@@ -388,18 +475,22 @@ class Plan:
         self.out_segment = 0 if OUTPUT_IN_ARENA else out_segment(out_bytes)
         prefix_live = s = 0
         largest = max(out_arena, lat_bytes)
+        # the prefix runs at the checkpoint's planes (its cost model gets width x planes as the width)
+        pw = w8 * planes[0]
         for _, m in bound.prefix:
-            prefix_live = max(prefix_live, bound.prefix_peak(m, h8, w8, elem, ws, s))
-            largest = max(largest, bound.prefix_largest(m, h8, w8, elem, ws))
-            s = bound.prefix_out_channels(m) * h8 * w8 * elem
+            prefix_live = max(prefix_live, bound.prefix_peak(m, h8, pw, elem, ws, s))
+            largest = max(largest, bound.prefix_largest(m, h8, pw, elem, ws))
+            s = bound.prefix_out_channels(m) * h8 * pw * elem
         self.needs, self.order, strip_live, lg, final_levels = _chain_cost(
-            bound, self.final_units, self.final_heights, widths[sf:], self.stripes, elem, ws)
+            bound, self.final_units, self.final_heights, widths[sf:], self.stripes, elem, ws, planes=planes[sf:], caches=bool(self.chunks))
         largest = max(largest, lg)
         # with saves, the checkpoint is a buffer allocated before the prefix (the front of the arena) and the
         # prefix's output is copied into it, so that the saves' places are known (saves_fit): the prefix holds it too
         self.ckpt_front = bool(saves)
         self.prefix_live, self.stripe_live = prefix_live, strip_live
-        self.prefix_bytes = prefix_live + (self.ckpt_bytes if saves else 0)
+        # video: the prefix runs chunk by chunk (its state at the checkpoint's resolution is in the adapter's
+        # prefix_peak) and fills the whole checkpoint as it goes
+        self.prefix_bytes = prefix_live + (self.ckpt_bytes if saves or self.chunks else 0)
         self.stripe_bytes = strip_live + self.ckpt_bytes if sf == 0 else None   # with saves: set by the save layout below
 
         # statistics passes: the peak none of them can avoid is the saves they hold plus their smallest stripes;
@@ -413,6 +504,7 @@ class Plan:
             ps.chain = units[cur:i] + ([nr.partial] if nr.partial is not None else [])
             ps.heights = heights[cur:i + 1] + ([heights[i] * nr.partial.scale] if nr.partial is not None else [])
             ps.widths = widths[cur:i + 1] + ([widths[i] * nr.partial.scale] if nr.partial is not None else [])
+            ps.planes = planes[cur:i + 1] + ([int(planes[i] * nr.partial.tscale)] if nr.partial is not None else [])
             self.passes.append(ps)
             built.update(ps.builds)
             if ps.builds:
@@ -457,9 +549,9 @@ class Plan:
             hit = cache.get(key)
             if hit is None:
                 st = split_rows(ps.heights[-1], r)
-                c_t, w_t = ps.norm.channels, ps.widths[-1]
+                c_t, w_t = ps.norm.channels, ps.widths[-1] * ps.planes[-1]
                 hit = cache[key] = (st, _chain_cost(bound, ps.chain, ps.heights, ps.widths, st, elem, ws,
-                                                    tail=lambda rr, s_: s_ + norm_temp(c_t, rr, w_t, ws)))
+                                                    tail=lambda rr, s_: s_ + norm_temp(c_t, rr, w_t, ws), planes=ps.planes))
             return hit
 
         def layout(alive, final_bytes):
@@ -500,7 +592,7 @@ class Plan:
         for ps, a, (r, (st, (needs, order, live, plg, work))) in zip(self.passes, alive, rows):
             ps.alive, ps.rows, ps.stripes, ps.needs, ps.order, ps.live, ps.largest = a, r, st, needs, order, live, plg
             ps.work_levels, ps.work = work, _macs(work)
-            largest = max(largest, plg, norm_temp(ps.norm.channels, max(b - a_ for a_, b in st), ps.widths[-1], ws))
+            largest = max(largest, plg, norm_temp(ps.norm.channels, max(b - a_ for a_, b in st), ps.widths[-1] * ps.planes[-1], ws))
         self.persistent = persistent
         self.front_arena = 0
         if saves:
@@ -528,8 +620,8 @@ class Plan:
         # reserved = the output's segment and the arena, unless fragmentation strands one request outside it (then
         # that request's own segment); the saves are not among the candidates when saves_fit guarantees their place
         self.estimate = self.out_segment + self.arena + self.largest + ESTIMATE_PAD
-        work_prefix = sum(bound.prefix_macs(m) for _, m in bound.prefix) * h8 * w8
-        work_whole = work_prefix + sum(heights[i + 1] * widths[i + 1] * u.macs_row for i, u in enumerate(units))
+        work_prefix = sum(bound.prefix_macs(m) for _, m in bound.prefix) * h8 * pw
+        work_whole = work_prefix + sum(heights[i + 1] * widths[i + 1] * planes[i + 1] * u.macs_row for i, u in enumerate(units))
         work_stripes = _macs(final_levels)
         self.work_passes = sum(ps.work for ps in self.passes)
         self.recompute = (work_prefix + work_stripes + self.work_passes) / max(1, work_whole)
@@ -593,15 +685,27 @@ def run_prefix(prefix, z):
     return x
 
 
-def run_chain(chain, heights, src, needs, hdim, label, after=None):
+class TimeChunk:
+    """One time chunk of a video decode (StripeAdapter.time_chunks): checkpoint planes [ct0, ct1) -> output frames [ot0, ot1)."""
+    __slots__ = ("ct0", "ct1", "ot0", "ot1")
+
+    def __init__(self, ct0, ct1, ot0, ot1):
+        self.ct0, self.ct1, self.ot0, self.ot1 = ct0, ct1, ot0, ot1
+
+    def __repr__(self):
+        return "TimeChunk([{}, {}) -> [{}, {}))".format(self.ct0, self.ct1, self.ot0, self.ot1)
+
+
+def run_chain(chain, heights, src, needs, hdim, label, after=None, call=None):
     """Run the units of `chain` on rows needs[0] of src (global rows of src's
     level); returns the rows needs[-1] of the last unit's output. Every unit is
     checked to have produced the next needed rows exactly. after(k, x, a, b):
-    called with the rows [a, b) of the output of chain[k - 1]."""
+    called with the rows [a, b) of the output of chain[k - 1]. call(u, x): how a
+    unit is called (a video stripe's state, StripeAdapter.call_unit), else u.module(x)."""
     xa, xb = needs[0]
     x = src.narrow(hdim, xa, xb - xa)
     for i, u in enumerate(chain):
-        y = u.module(x)
+        y = u.module(x) if call is None else call(u, x)
         del x
         oa = xa * u.scale
         if y.shape[hdim] != (xb - xa) * u.scale:
@@ -621,14 +725,151 @@ def run_chain(chain, heights, src, needs, hdim, label, after=None):
     return x
 
 
-def run_stripes(units, plan, ckpt, write):
+def run_stripes(units, plan, ckpt, write, bound=None):
     """Run every output stripe from the save `ckpt` (units = plan.final_units);
-    write(o0, o1, rows) receives the stripe's core rows (rows along plan.hdim)."""
+    write(o0, o1, rows) receives the stripe's core rows (rows along plan.hdim).
+    A video plan (plan.chunks): stripe-major, each stripe runs every time chunk with
+    its own state (bound.stripe_state / call_unit); write(o0, o1, rows, t0, t1)."""
+    if plan.chunks:
+        tdim = plan.tdim
+        store = CarryStore.make(bound, units, plan, ckpt.device) if CARRY_STORE else None
+        index = {id(u): i for i, u in enumerate(units)}
+        for k in plan.order:
+            (o0, o1), needs = plan.stripes[k], plan.needs[k]
+            state = bound.stripe_state()
+            if store is not None:
+                store.stripe(needs)
+
+            def call(u, y, ci, state=state):
+                out = bound.call_unit(u, y, state, ci)
+                if store is not None:
+                    store.settle(state, index[id(u)])
+                return out
+            for ci, c in enumerate(plan.chunks):
+                src = ckpt.narrow(tdim, c.ct0, c.ct1 - c.ct0)
+                x = run_chain(units, plan.final_heights, src, needs, plan.hdim, "stripe [{}, {}) chunk {}".format(o0, o1, ci),
+                              call=lambda u, y, ci=ci: call(u, y, ci))
+                del src
+                if x.shape[tdim] != c.ot1 - c.ot0:
+                    raise StripeError("[Monoload] internal error: chunk {} gave {} frames for [{}, {})".format(ci, x.shape[tdim], c.ot0, c.ot1))
+                write(o0, o1, x, c.ot0, c.ot1)
+                del x
+            del state
+        if store is not None:
+            store.done()
+        return
     for k in plan.order:
         (o0, o1), needs = plan.stripes[k], plan.needs[k]
         x = run_chain(units, plan.final_heights, ckpt, needs, plan.hdim, "stripe [{}, {})".format(o0, o1))
         write(o0, o1, x)
         del x
+
+
+class CarryStore:
+    """The carries of a video stripe (DESIGN §9.45), in one buffer.
+
+    An adapter keeps each unit's per-conv caches in the stripe's state and
+    replaces them every chunk with fresh tensors (a clone, or a slice of the
+    conv's padded input). Left where the allocator put them, those long-lived
+    blocks end up scattered over the arena between the chunk's temporaries:
+    the holes they leave are smaller than the next chunk's large requests,
+    and more than one request lands outside the arena (B group's HunyuanVideo
+    1.5 diagnosis: a 277 MiB padded input and a 228 MiB carry, the estimate
+    only has room for one). Here one buffer of the largest stripe's carries
+    (sum of unit_cache, what the plan already counts as alive for the whole
+    stripe) is allocated once per stripe pass; unit i owns the part
+    [lo_i, lo_i + unit_cache_i) of it for the current stripe. After each
+    call_unit, settle() copies every new device tensor of the state into a
+    free gap of that unit's part (the views of the buffer the state still
+    holds are busy, everything else in it is dead) and puts the view in its
+    place, so the adapter's own copy dies right after the call like any other
+    temporary. A tensor that does not fit (an adapter keeping more than its
+    unit_cache) stays where it is, as before."""
+
+    __slots__ = ("bound", "units", "widths", "elem", "buf", "key", "parts", "moved", "left")
+
+    def __init__(self, bound, units, widths, elem):
+        self.bound, self.units, self.widths, self.elem = bound, units, widths, elem
+        self.buf = self.key = None
+        self.parts = []
+        self.moved = self.left = 0
+
+    def caps(self, needs):
+        """Bytes of each unit's part for a stripe with these row intervals (unit_cache, rounded like the allocator)."""
+        uc = self.bound.unit_cache
+        return [-(-int(uc(u, needs[i][1] - needs[i][0], self.widths[i], self.elem)) // ALLOC_ROUND) * ALLOC_ROUND
+                for i, u in enumerate(self.units)]
+
+    @classmethod
+    def make(cls, bound, units, plan, device):
+        """The store of a stripe pass of `plan`, its buffer allocated; None when the adapter keeps no carries."""
+        if getattr(bound, "unit_cache", None) is None:
+            return None
+        self = cls(bound, units, plan.widths[-len(units) - 1:], plan.elem)
+        total = max(sum(self.caps(needs)) for needs in plan.needs)
+        if total <= 0:
+            return None
+        self.buf = torch.empty(int(total), dtype=torch.uint8, device=device)
+        self.key = self.buf.untyped_storage()._cdata
+        return self
+
+    def stripe(self, needs):
+        """A new stripe (its state is fresh: the whole buffer is free)."""
+        lo, self.parts = 0, []
+        for c in self.caps(needs):
+            self.parts.append((lo, lo + c))
+            lo += c
+
+    def _span(self, t):
+        a = t.storage_offset() * t.element_size()
+        n = 1 + sum((d - 1) * st for d, st in zip(t.shape, t.stride()) if d > 0) if t.numel() else 0
+        return a, a + n * t.element_size()
+
+    def settle(self, state, i):
+        """After unit i ran: move the new carries of `state` into unit i's part."""
+        lo, hi = self.parts[i]
+        busy, new = [], []
+        dev = self.buf.device
+        # an explicit stack, not a recursive closure: a nested function that calls itself is a reference cycle
+        # holding `new` (the adapter's own copies) until the garbage collector runs
+        stack = [state]
+        while stack:
+            c = stack.pop()
+            items = c.items() if isinstance(c, dict) else enumerate(c) if isinstance(c, list) else ()
+            for k, v in items:
+                if isinstance(v, torch.Tensor):
+                    if v.device != dev or v.numel() * v.element_size() < SMALL_ALLOC:
+                        continue
+                    if v.untyped_storage()._cdata == self.key:
+                        busy.append(self._span(v))
+                    else:
+                        new.append((c, k, v))
+                elif isinstance(v, (dict, list)):
+                    stack.append(v)
+        del stack
+        busy = sorted(b for b in busy if b[1] > lo and b[0] < hi)
+        for c, k, v in new:
+            n = -(-v.numel() * v.element_size() // ALLOC_ROUND) * ALLOC_ROUND
+            at, pos = None, lo
+            for a, b in busy + [(hi, hi)]:
+                if a - pos >= n:
+                    at = pos
+                    break
+                pos = max(pos, b)
+            if at is None:
+                self.left += 1
+                continue
+            dst = self.buf.narrow(0, at, v.numel() * v.element_size()).view(v.dtype).view(v.shape)
+            dst.copy_(v)
+            c[k] = dst
+            bisect.insort(busy, (at, at + n))
+            self.moved += 1
+        new.clear()
+
+    def done(self):
+        if self.left:
+            logging.debug("[Monoload] %s: %d carries did not fit the carry buffer (%d moved)", self.bound.name, self.left, self.moved)
+        self.buf = None
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +1034,8 @@ def run_passes(plan, saves, hdim, ws, norms):
             shape = list(src.shape)
             shape[1] = plan.channels[p]
             shape[hdim], shape[hdim + 1] = plan.heights[p], plan.widths[p]
+            if plan.tdim is not None:
+                shape[plan.tdim] = plan.planes[p]
             if pool is None:
                 saves[p] = torch.empty(shape, dtype=src.dtype, device=src.device)
                 continue
@@ -891,8 +1134,12 @@ class StripeAdapter:
 
     name = "?"
     hdim = 2
+    tdim = None      # the planes dimension (the module docstring), None: one plane per row
+    ckpt_planes = 1
     scale = 8
     schemes = ()     # GroupNorm schemes the variants differ by (LDM); empty: one variant
+    selftest_size = SELFTEST_LATENT   # the self-test's decoder input rows / cols
+    activation_copies = 4             # = vae.ACTIVATION_COPIES (the layer-2 bound's live full-size activations)
 
     def plan(self, vae, samples, budget, ws, rows=None, out_bytes=0, measure="estimate"):
         """rows=None: the largest stripe height whose `measure` ("estimate", the
@@ -902,15 +1149,16 @@ class StripeAdapter:
         h8, w8 = self.decoder_hw(samples)
         elem = mm.dtype_size(vae.vae_dtype)
         lat = samples[0:1].numel() * elem
+        chunks = self.time_chunks(tuple(samples.shape))
         if rows is not None:
-            return Plan(self, h8, w8, rows, ws, elem, out_bytes, lat)
+            return Plan(self, h8, w8, rows, ws, elem, out_bytes, lat, chunks)
         h_out = h8 * self.scale
         lo, hi = min(MIN_ROWS, h_out), h_out
         # the smallest height that fits; doubling from MIN_ROWS, since the peak is not monotone at the smallest
         # heights when there are statistics passes (squeezed to a few rows, the save pool: an LDM decode with
         # scheme B can need more with 8-row stripes than with 32)
         while True:
-            best = Plan(self, h8, w8, lo, ws, elem, out_bytes, lat)
+            best = Plan(self, h8, w8, lo, ws, elem, out_bytes, lat, chunks)
             if getattr(best, measure) <= budget:
                 break
             if lo >= h_out:
@@ -919,7 +1167,7 @@ class StripeAdapter:
         lo += 1
         while lo <= hi:
             mid = (lo + hi) // 2
-            p = Plan(self, h8, w8, mid, ws, elem, out_bytes, lat)
+            p = Plan(self, h8, w8, mid, ws, elem, out_bytes, lat, chunks)
             if getattr(p, measure) <= budget:
                 best, lo = p, mid + 1
             else:
@@ -939,6 +1187,23 @@ class StripeAdapter:
             if r >= h_out:
                 return best
             r = min(h_out, r * 2)
+
+    def time_chunks(self, shape):
+        """None (an image), or the [TimeChunk] of a video latent of this shape (module docstring)."""
+        return None
+
+    def chunk_planes(self, chunk):
+        """Planes of each level while running `chunk` (module docstring)."""
+        p = [chunk.ct1 - chunk.ct0]
+        for u in self.units:
+            p.append(int(p[-1] * u.tscale))
+        return p
+
+    def stripe_state(self):
+        return None
+
+    def call_unit(self, u, x, state, k):
+        return u.module(x)
 
     def decoder_hw(self, samples):
         """(rows, cols) of the decoder below the prefix for this latent: the latent's own."""
@@ -960,6 +1225,10 @@ class StripeAdapter:
     def norm_refs(self):
         return [nr for u in self.units for nr in u.norms]
 
+    def decode_retained(self, h, w, e):
+        """Bytes the model's own decode of one h x w sample keeps alive besides its activations (see the module docstring)."""
+        return 0
+
     def prefix_pass(self, z):
         """The prefix on the whole image -> the checkpoint."""
         return run_prefix(self.prefix, z)
@@ -968,7 +1237,7 @@ class StripeAdapter:
         """The statistics passes (if any) and the output stripes; saves =
         {0: the checkpoint}, emptied as the saves are no longer needed."""
         if not plan.passes:
-            run_stripes(self.units, plan, saves.pop(0), write)
+            run_stripes(self.units, plan, saves.pop(0), write, self)
             return
         with GlobalNorms(self.norm_refs(), self.hdim, plan.workspace) as norms:
             src = run_passes(plan, saves, self.hdim, plan.workspace, norms)
@@ -990,7 +1259,8 @@ class StripeAdapter:
         pixel_samples = None
         if not OUTPUT_IN_ARENA:
             mm.soft_empty_cache()
-            pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
+            with vae_ops.malloc_graph_paused():
+                pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
         arena = bool(plan.arena) and arena_supported(vae.device)
         if arena:
             reserve_arena(vae.device, plan.arena)
@@ -1014,11 +1284,15 @@ class StripeAdapter:
                 elif arena and CKPT_LOW and not OUTPUT_IN_ARENA:
                     ckpt = move_low(ckpt, vae.device)
                 if pixel_samples is None:
-                    pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
+                    with vae_ops.malloc_graph_paused():
+                        pixel_samples = torch.empty(self.output_shape(samples_in), device=vae.output_device, dtype=vae.vae_output_dtype())
                 dst = pixel_samples[i:i + 1]
 
-                def write(o0, o1, rows, dst=dst):
-                    dst.narrow(hdim, o0, o1 - o0).copy_(rows)  # = native's .to(output dtype) + copy_, per stripe
+                def write(o0, o1, rows, t0=None, t1=None, dst=dst):
+                    d = dst.narrow(hdim, o0, o1 - o0)
+                    if t0 is not None:
+                        d = d.narrow(plan.tdim, t0, t1 - t0)
+                    d.copy_(rows)  # = native's .to(output dtype) + copy_, per stripe (and time chunk)
                 saves = {0: ckpt}
                 del ckpt
                 self.stripe_pass(saves, plan, write)
@@ -1042,20 +1316,21 @@ class StripeAdapter:
         """Upper bound of what the self-test reserves on the device (load_models_gpu,
         and the first decode's estimate / budget, DESIGN §9.20): the fp32 copy of
         the weights, then the larger of the reference decode (whole image, layer-2
-        chunked at SELFTEST_REF_WORKSPACE: 4 x its largest activation + 2 x the
-        workspace, the layer-2 bound of vae.estimate) and the stripe pass (its
-        plan's estimate), the reference's output alive through both, a margin.
+        chunked at SELFTEST_REF_WORKSPACE: activation_copies x its largest activation
+        + 2 x the workspace, the layer-2 bound of vae.estimate, plus what that decode keeps
+        alive, decode_retained) and the stripe pass (its plan's estimate), the
+        reference's output alive through both, a margin.
         All fp32, at the self-test's geometry: the same for every image."""
         key = ("selftest_memory", self.key)
         hit = _PASS_COST.get(key)
         if hit is not None:
             return hit
-        n = SELFTEST_LATENT
-        plan = Plan(self, n, n, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0)
-        act = max(c * h * w for c, h, w in zip(plan.channels, plan.heights, plan.widths))
-        act = max(act, max(self.prefix_out_channels(m) for _, m in self.prefix) * n * n) * 4
-        out = self.out_channels * plan.h_out * plan.w_out * 4
-        ref = 4 * act + 2 * SELFTEST_REF_WORKSPACE + out
+        n = self.selftest_size
+        plan = Plan(self, n, n, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0, self.time_chunks(tuple(self.selftest_latent(n))))
+        act = max(c * h * w * p for c, h, w, p in zip(plan.channels, plan.heights, plan.widths, plan.planes))
+        act = max(act, max(self.prefix_out_channels(m) for _, m in self.prefix) * n * n * plan.planes[0]) * 4
+        out = self.out_channels * plan.h_out * plan.w_out * (max(c.ot1 for c in plan.chunks) if plan.chunks else 1) * 4
+        ref = self.activation_copies * act + 2 * SELFTEST_REF_WORKSPACE + out + self.decode_retained(n, n, 4)
         need = int(self.selftest_params() * 4 + max(ref, plan.estimate + out) + out + SELFTEST_MARGIN)
         _PASS_COST[key] = need
         return need
@@ -1083,7 +1358,8 @@ def self_test(bound, vae):
         return hit
     oom = False
     try:
-        ok, detail = _self_test_run(bound, vae)
+        run = getattr(bound, "self_test_run", None)   # an adapter outside the engine's stripe units (CogVideoX) tests itself
+        ok, detail = run(vae) if run else _self_test_run(bound, vae)
     except Exception as e:
         if not mm.is_oom(e):
             ok, detail = False, "{}: {}".format(type(e).__name__, str(e).splitlines()[0] if str(e) else "")
@@ -1108,21 +1384,29 @@ def _self_test_run(bound, vae):
         if tb.key != bound.key:
             raise StripeError("fp32 copy has structure {} instead of {}".format(tb.key, bound.key))
         g = torch.Generator().manual_seed(0)
-        z = torch.randn(bound.selftest_latent(SELFTEST_LATENT), generator=g).to(dev)
+        n = tb.selftest_size
+        z = torch.randn(bound.selftest_latent(n), generator=g).to(dev)
         with OpChunking(tb.module, SELFTEST_REF_WORKSPACE, OpStats()):
             ref = tb.reference_decode(z)
-        plan = Plan(tb, SELFTEST_LATENT, SELFTEST_LATENT, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0)
+        plan = Plan(tb, n, n, SELFTEST_ROWS, SELFTEST_WORKSPACE, 4, 0, 0, tb.time_chunks(tuple(z.shape)))
+        if plan.chunks is not None and len(plan.chunks) < SELFTEST_MIN_CHUNKS:
+            raise StripeError("video self-test latent {} gives {} time chunks, at least {} needed (state carried across chunks)".format(
+                list(z.shape), len(plan.chunks), SELFTEST_MIN_CHUNKS))
         out = torch.empty_like(ref)
         stats = OpStats()
         hdim = tb.hdim
 
-        def write(o0, o1, rows):
-            out.narrow(hdim, o0, o1 - o0).copy_(rows)
+        def write(o0, o1, rows, t0=None, t1=None):
+            d = out.narrow(hdim, o0, o1 - o0)
+            if t0 is not None:
+                d = d.narrow(plan.tdim, t0, t1 - t0)
+            d.copy_(rows)
         with OpChunking(tb.module, SELFTEST_WORKSPACE, stats):
             tb.stripe_pass({0: tb.prefix_pass(z)}, plan, write)
         scale = max(1.0, float(ref.abs().max()))
         err = float((out - ref).abs().max()) / scale
         ok = bool(torch.isfinite(out).all()) and err <= SELFTEST_TOL
-        detail = "max|stripes - whole| / max(1, max|whole|) = {:.2g} (tolerance {:g}), {} stripes, {} conv calls in row blocks, {:.2f}s".format(
-            err, SELFTEST_TOL, len(plan.stripes), stats.conv_chunked, time.perf_counter() - t0)
+        detail = "max|stripes - whole| / max(1, max|whole|) = {:.2g} (tolerance {:g}), {} stripes{}, {} conv calls in row blocks, {:.2f}s".format(
+            err, SELFTEST_TOL, len(plan.stripes), " x {} time chunks".format(len(plan.chunks)) if plan.chunks else "", stats.conv_chunked,
+            time.perf_counter() - t0)
     return ok, detail

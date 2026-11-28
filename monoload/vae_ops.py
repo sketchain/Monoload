@@ -35,17 +35,77 @@ floating-point differences (different GEMM shapes), with ~1x the arithmetic:
             stay whole, so every query still takes a softmax over the whole
             image. The arithmetic per block is that of the original function.
 
-Everything else (GroupNorm, RMS norm, upsampling, ...) stays native.
+  RMS norm  a comfy.ldm.wan.vae.RMS_norm with more than GROUP_NORM_MAX channels
+            gets an instance `forward` computing the same F.normalize(x, dim=1)
+            * scale * gamma + bias with the norm taken over channel groups of at
+            most GROUP_NORM_MAX in fp32 and combined (_GroupedRMSNorm, DESIGN
+            §9.28 / §9.29): torch.linalg.vector_norm over more channels can make
+            the reduction kernel split every output over many thread blocks,
+            which on ROCm allocates a scratch of 32 KiB per position (1.2 GiB
+            for a 4K Wan 2.2 stripe); over <= 510 it never does. Smaller
+            RMS norms (Wan 2.1) are left alone. The same for the RMS_norm of
+            comfy.ldm.hunyuan_video.vae_refiner (HunyuanVideo 1.5 / Refiner:
+            channel dim 1, no bias, _GroupedRefinerRMSNorm) and for LTX's
+            comfy.ldm.lightricks.vae.pixel_norm.PixelNorm (x / sqrt(mean(x^2)
+            + eps): its channel count is only known per call, so every
+            PixelNorm gets _GroupedPixelNorm, which calls the module's own
+            forward when the channels are <= GROUP_NORM_MAX; DESIGN §9.37).
+
+Everything else (GroupNorm, smaller RMS norms, upsampling, ...) stays native.
 """
+
+import contextlib
 
 import torch
 import torch.nn.functional as F
 
 import comfy.ops
+import comfy.ldm.wan.vae as wan_vae
+import comfy.ldm.hunyuan_video.vae_refiner as refiner_vae
+import comfy.ldm.lightricks.vae.pixel_norm as ltx_pixel_norm
+import comfy.model_management
 from comfy.ldm.modules.diffusionmodules import model as ldm_model
 
 GIB = 1024 ** 3
 MIB = 1024 ** 2
+
+
+def malloc_graph_paused():
+    """ComfyUI v0.46's VAE.decode loads the weights and allocates its output buffer under
+    comfy.model_prefetch.pause_malloc_graph(): a comfy-compiler allocation graph being recorded on this thread
+    (a no-op otherwise) must not take allocations that outlive it. Monoload's managed decode does the same."""
+    try:
+        import comfy.model_prefetch as mp
+        return mp.pause_malloc_graph()
+    except Exception:
+        return contextlib.nullcontext()
+
+
+class unfused_norms:
+    """Turns ComfyUI v0.46's fused GroupNorm path off on a decoder while Monoload manages its decode (layer 1, its
+    self-test, layer 2, the shape probe), restored after. The LDM Decoder of the Flux 2 VAE (ddconfig fused_norm=True)
+    takes Decoder.forward_fused / ResnetBlock / Upsample strip kernels (comfy.quant_ops.ck) when
+    model.fused_norm_served(device, dtype) holds (CUDA with comfy-kitchen; on ROCm fp16 only): they compute GroupNorm
+    over whatever tensor they get and call F.conv2d directly, which breaks the stripes' frozen whole-image statistics
+    and bypasses OpChunking. With the flag off every module takes its plain path (the one 62b3c94 had)."""
+
+    def __init__(self, model):
+        self.model = model
+        self.saved = []
+
+    def __enter__(self):
+        mods = self.model.modules() if isinstance(self.model, torch.nn.Module) else ()
+        for m in mods:
+            if m.__dict__.get("fused_norm") is True:
+                self.saved.append(m)
+                m.fused_norm = False
+        return self
+
+    def __exit__(self, *exc):
+        for m in self.saved:
+            m.fused_norm = True
+        self.saved = []
+        return False
 
 
 class OpStats:
@@ -68,6 +128,7 @@ class OpStats:
         self.attn_score_max = 0       # largest per-block score bytes (x2: scores + softmax)
         self.arena = 0                # bytes reserved as one allocator segment for a layer-1 decode (0: none)
         self.conv3d_as_2d = 0         # single-frame Conv3d calls run as conv2d (no per-channel bias fill)
+        self.norm_grouped = 0         # RMS / pixel norms replaced by the grouped norm (modules; every LTX PixelNorm)
 
     def as_dict(self):
         d = dict(self.__dict__)
@@ -422,16 +483,135 @@ class _AttnChunker:
 _MISSING = object()
 
 
+# ---------------------------------------------------------------------------
+# RMS norm (DESIGN §9.28 / §9.29)
+# ---------------------------------------------------------------------------
+# torch.linalg.vector_norm over dim 1 of an NC[T]HW tensor (aten/src/ATen/native/cuda/Reduce.cuh, setReduceConfig):
+# the reduction is split over the warps of a block (block height >= 2) and, when each thread still has >= 256 values
+# and the grid is small enough, over several blocks per output -- then gpu_reduce_kernel allocates
+# 4 B x outputs x ctas_per_output x block.x x vec from the caching allocator, and ROCm raises ctas_per_output to >= 64.
+# With at most 510 channels a thread has at most 255 values: never.
+
+GROUP_NORM_MAX = 510
+NORM_SCRATCH_FIXED = MIB      # the grouped norm's temporaries: this + (4 G + 4 + 2 e) bytes per position (G groups,
+                              # e the element size), the envelope of the CT 700 measurement (command N, README §10.12)
+
+
+def norm_groups(c):
+    """Channels per group of the grouped norm for a c-channel RMS norm (c itself: not grouped)."""
+    if c <= GROUP_NORM_MAX:
+        return c
+    return max(d for d in range(1, GROUP_NORM_MAX + 1) if c % d == 0)
+
+
+def grouped_norm_bytes(c, positions, e):
+    """Bytes the grouped norm of a c-channel RMS norm over `positions` positions allocates besides its input and
+    output (0 when c is not grouped: F.normalize's own small results are in the callers' counts)."""
+    if c <= GROUP_NORM_MAX:
+        return 0
+    g = c // norm_groups(c)
+    return NORM_SCRATCH_FIXED + positions * (4 * g + 4 + 2 * e)
+
+
+def grouped_normalize(x, dim, gsize, eps=1e-12):
+    """F.normalize(x, p=2, dim, eps) with the norm over channel groups of gsize: each group's norm in fp32 (the
+    reduction reads x and accumulates in fp32, as torch.norm does), the groups combined in fp32 and cast to x's dtype
+    like torch.norm's result; then the same clamp_min / expand / divide as F.normalize. The fp32 partial norms are
+    freed before the division's output is allocated."""
+    c = x.shape[dim]
+    shape = list(x.shape)
+    shape[dim:dim + 1] = [c // gsize, gsize]
+    denom = torch.linalg.vector_norm(torch.linalg.vector_norm(x.view(shape), 2, dim + 1, dtype=torch.float32), 2, dim,
+                                     keepdim=True).to(x.dtype)
+    return x / denom.clamp_min(eps).expand_as(x)
+
+
+class _GroupedRMSNorm:
+    """Instance `forward` of a comfy.ldm.wan.vae.RMS_norm (62b3c94 vae.py:62: F.normalize(x, dim) * self.scale *
+    self.gamma.to(x) + bias) with the grouped norm. vae_engine.hooked_module does not count it as a hook."""
+    __slots__ = ("m", "gsize", "stats")
+    monoload_replacement = True
+
+    def __init__(self, m, gsize, stats):
+        self.m, self.gsize, self.stats = m, gsize, stats
+
+    def __call__(self, x):
+        m = self.m
+        out = grouped_normalize(x, 1 if m.channel_first else -1, self.gsize) * m.scale * m.gamma.to(x)
+        return out + (m.bias.to(x) if m.bias is not None else 0)
+
+
+class _GroupedRefinerRMSNorm:
+    """Instance `forward` of a comfy.ldm.hunyuan_video.vae_refiner.RMS_norm (cab5f4e vae_refiner.py:19: F.normalize(x,
+    dim=1) * self.scale * cast_to(self.gamma, x's dtype / device)) with the grouped norm; no channel_first, no bias."""
+    __slots__ = ("m", "gsize", "stats")
+    monoload_replacement = True
+
+    def __init__(self, m, gsize, stats):
+        self.m, self.gsize, self.stats = m, gsize, stats
+
+    def __call__(self, x):
+        m = self.m
+        return grouped_normalize(x, 1, self.gsize) * m.scale * comfy.model_management.cast_to(m.gamma, dtype=x.dtype, device=x.device)
+
+
+def grouped_pixel_norm(x, dim, gsize, eps):
+    """x / sqrt(mean(x^2, dim) + eps) (LTX PixelNorm) without a reduction over more than gsize channels: the sum of
+    squares as the fp32 norms of channel groups combined in fp32, then mean / + eps / sqrt in place in fp32 and cast to
+    x's dtype (the native mean is accumulated in fp32 too, but squares, rounds and adds eps in x's dtype: <= 1 ulp
+    of the divisor apart). No full-size x^2 temporary, unlike the native forward."""
+    c = x.shape[dim]
+    shape = list(x.shape)
+    shape[dim:dim + 1] = [c // gsize, gsize]
+    ss = torch.linalg.vector_norm(torch.linalg.vector_norm(x.view(shape), 2, dim + 1, dtype=torch.float32), 2, dim,
+                                  keepdim=True)
+    return x / ss.square_().div_(c).add_(eps).sqrt_().to(x.dtype)
+
+
+class _GroupedPixelNorm:
+    """Instance `forward` of a comfy.ldm.lightricks.vae.pixel_norm.PixelNorm (cab5f4e pixel_norm.py:12). The module has
+    no parameter that tells its channel count, so the choice is made per call: <= GROUP_NORM_MAX channels (or a dim
+    that is not the channels) runs the class's own forward unchanged."""
+    __slots__ = ("m", "stats")
+    monoload_replacement = True
+
+    def __init__(self, m, stats):
+        self.m, self.stats = m, stats
+
+    def __call__(self, x):
+        m = self.m
+        d = m.dim % x.ndim
+        c = int(x.shape[d])
+        if d != 1 or c <= GROUP_NORM_MAX:
+            return type(m).forward(m, x)
+        return grouped_pixel_norm(x, d, norm_groups(c), m.eps)
+
+
+def is_replacement(fn):
+    """Whether an instance attribute is one of OpChunking's own replacements."""
+    return getattr(fn, "monoload_replacement", False) is True
+
+
+# Extension point for model-specific op handling (docs/PLAN-video.md, group F: LTX in monoload/vae_ltx.py): each entry is
+# a callable (model, workspace, stats) -> context manager or None, entered (in list order) by every OpChunking after its
+# own replacements are installed and exited (in reverse) before they are restored, also when the block raises. A
+# callable returns None for a model it does not handle. Whatever it installs on the model it must restore itself; an
+# instance attribute it installs should carry monoload_replacement = True (is_replacement) so that recognition
+# (vae_engine.hooked_module) does not take it for a user hook.
+EXTRA_CHUNKERS = []
+
+
 class OpChunking:
     """Install the per-instance conv / attention replacements on `model` for
-    the duration of the `with` block; everything is restored in __exit__,
-    also when the block raises (OOM included)."""
+    the duration of the `with` block, then enter EXTRA_CHUNKERS; everything is
+    restored in __exit__, also when the block raises (OOM included)."""
 
     def __init__(self, model, budget, stats=None):
         self.model = model
         self.budget = int(budget)
         self.stats = stats if stats is not None else OpStats()
         self._saved = []
+        self._extra = None
 
     def __enter__(self):
         known = known_attention()
@@ -444,6 +624,22 @@ class OpChunking:
                     as2d = isinstance(m, torch.nn.Conv3d) and prev is _MISSING and type(m)._conv_forward in _CONV3D_FORWARDS
                     m.__dict__["_conv_forward"] = _ConvChunker(m, orig, self.budget, self.stats, as2d)
                     self.stats.conv_modules += 1
+                if type(m) is wan_vae.RMS_norm and m.channel_first and "forward" not in m.__dict__:
+                    c = int(m.gamma.shape[0])
+                    if c > GROUP_NORM_MAX:
+                        self._saved.append((m, "forward", _MISSING))
+                        m.__dict__["forward"] = _GroupedRMSNorm(m, norm_groups(c), self.stats)
+                        self.stats.norm_grouped += 1
+                elif type(m) is refiner_vae.RMS_norm and "forward" not in m.__dict__:
+                    c = int(m.gamma.shape[0])
+                    if c > GROUP_NORM_MAX:
+                        self._saved.append((m, "forward", _MISSING))
+                        m.__dict__["forward"] = _GroupedRefinerRMSNorm(m, norm_groups(c), self.stats)
+                        self.stats.norm_grouped += 1
+                elif type(m) is ltx_pixel_norm.PixelNorm and "forward" not in m.__dict__:
+                    self._saved.append((m, "forward", _MISSING))
+                    m.__dict__["forward"] = _GroupedPixelNorm(m, self.stats)
+                    self.stats.norm_grouped += 1
                 for attr in ATTENTION_ATTRS:
                     fn = m.__dict__.get(attr, None)
                     if fn is None:
@@ -455,10 +651,21 @@ class OpChunking:
                     self._saved.append((m, attr, fn))
                     m.__dict__[attr] = _AttnChunker(impl, self.budget, self.stats)
                     self.stats.attn_modules += 1
+            self._extra = contextlib.ExitStack()
+            for make in list(EXTRA_CHUNKERS):
+                cm = make(self.model, self.budget, self.stats)
+                if cm is not None:
+                    self._extra.enter_context(cm)
         except BaseException:
+            self._close_extra()
             self._restore()
             raise
         return self.stats
+
+    def _close_extra(self, *exc):
+        extra, self._extra = self._extra, None
+        if extra is not None:
+            extra.__exit__(*(exc or (None, None, None)))
 
     def _restore(self):
         while self._saved:
@@ -469,7 +676,10 @@ class OpChunking:
                 m.__dict__[attr] = prev
 
     def __exit__(self, *exc):
-        self._restore()
+        try:
+            self._close_extra(*exc)
+        finally:
+            self._restore()
         return False
 
 
